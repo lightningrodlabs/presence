@@ -13,7 +13,7 @@
     "applet-dev-3": "concurrently \"UI_PORT=8888 npm run start -w ui\" \"weave --agent-idx 1 --dev-config ./weave.dev.config.ts\" \"sleep 5 && weave --agent-idx 2 --dev-config ./weave.dev.config.ts --sync-time 10000\" \"sleep 5 && weave --agent-idx 3 --dev-config ./weave.dev.config.ts --sync-time 10000\"",
     "applet-dev-1": "concurrently \"UI_PORT=8888 npm run start -w ui\" \"weave --agent-idx 1 --dev-config ./weave.dev.config.ts\"",
     "help": "weave --help",
-    "launch:happ": "concurrently \"hc run-local-services --bootstrap-port 9998 --signal-port 9999\" \"echo pass | RUST_LOG=warn hc launch --piped -n $AGENTS workdir/presence.happ --ui-port $UI_PORT network --bootstrap http://127.0.0.1:9998 webrtc ws://127.0.0.1:9999\"",
+    "launch:happ": "hc-spin --ui-port $UI_PORT -n $AGENTS workdir/presence.happ",
     "package": "npm run build:happ && npm run package -w ui && hc web-app pack workdir --recursive",
     "package:ui": "npm run package -w ui && hc web-app pack workdir --recursive",
     "build:happ": "npm run build:zomes && hc app pack workdir --recursive",
@@ -22,8 +22,9 @@
     "hash": "weave hash-webhapp FIXME ./workdir/presence.webhapp"
   },
   "devDependencies": {
+    "@holochain/hc-spin": "^0.600.2-rc.0",
     "@holochain-playground/cli": "^0.1.1",
-    "@theweave/cli": "^0.15.11",
+    "@theweave/cli": "^0.15.12",
     "concurrently": "^6.2.1",
     "rimraf": "^3.0.2"
   },
