@@ -11,6 +11,7 @@ import {
 import { AsyncStatus, StoreSubscriber } from '@holochain-open-dev/stores';
 import {
   mdiAccount,
+  mdiAccountOff,
   mdiChartLine,
   mdiChevronUp,
   mdiClose,
@@ -183,6 +184,9 @@ export class RoomView extends LitElement {
 
   @state()
   _camera = false;
+
+  @state()
+  _selfViewHidden = false;
 
   @state()
   _maximizedVideo: string | undefined; // id of the maximized video if any
@@ -1171,6 +1175,33 @@ export class RoomView extends LitElement {
           </div>
         </sl-tooltip>
 
+        <sl-tooltip
+          content="${this._selfViewHidden
+            ? msg('Show Self View')
+            : msg('Hide Self View')}"
+          hoist
+        >
+          <div
+            class="toggle-btn ${this._selfViewHidden ? 'btn-off' : ''}"
+            tabindex="0"
+            @click=${() => {
+              this._selfViewHidden = !this._selfViewHidden;
+            }}
+            @keypress=${(e: KeyboardEvent) => {
+              if (e.key === 'Enter') {
+                this._selfViewHidden = !this._selfViewHidden;
+              }
+            }}
+          >
+            <sl-icon
+              class="toggle-btn-icon ${this._selfViewHidden ? 'btn-icon-off' : ''}"
+              .src=${this._selfViewHidden
+                ? wrapPathInSvg(mdiAccountOff)
+                : wrapPathInSvg(mdiAccount)}
+            ></sl-icon>
+          </div>
+        </sl-tooltip>
+
         <sl-tooltip content="${msg('Leave Call')}" hoist>
           <div
             class="btn-stop"
@@ -1533,6 +1564,7 @@ export class RoomView extends LitElement {
 
         <!-- My own video stream -->
         <div
+          style="${this._selfViewHidden ? 'display: none;' : ''}"
           class="video-container ${this.idToLayout('my-own-stream')}"
           @dblclick=${() => this.toggleMaximized('my-own-stream')}
         >
@@ -1544,12 +1576,11 @@ export class RoomView extends LitElement {
             id="my-own-stream"
             class="video-el"
           ></video>
-          <sl-icon
-            style="color: #b98484; height: 30%; width: 30%;${this._camera
-              ? 'display: none;'
-              : ''}"
-            .src=${wrapPathInSvg(mdiVideoOff)}
-          ></sl-icon>
+          <avatar-with-nickname
+            .hideNickname=${true}
+            .agentPubKey=${this.roomStore.client.client.myPubKey}
+            style="width: 35%;${this._camera ? ' display: none;' : ''}"
+          ></avatar-with-nickname>
 
           <!-- Connection states indicators -->
           ${this._showConnectionDetails
@@ -1562,10 +1593,31 @@ export class RoomView extends LitElement {
 
           <!-- Avatar and nickname -->
           <div
-            style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
+            style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
           >
+            <sl-icon
+              title="${this._maximizedVideo === 'my-own-stream'
+                ? 'minimize'
+                : 'maximize'}"
+              .src=${this._maximizedVideo === 'my-own-stream'
+                ? wrapPathInSvg(mdiFullscreenExit)
+                : wrapPathInSvg(mdiFullscreen)}
+              tabindex="0"
+              style="color: #ffe100; height: 30px; width: 30px; cursor: pointer; margin-right: 4px;${this._camera
+                ? ''
+                : ' display: none;'}"
+              @click=${() => {
+                this.toggleMaximized('my-own-stream');
+              }}
+              @keypress=${(e: KeyboardEvent) => {
+                if (e.key === 'Enter') {
+                  this.toggleMaximized('my-own-stream');
+                }
+              }}
+            ></sl-icon>
             <avatar-with-nickname
               .size=${36}
+              .hideAvatar=${this._camera}
               .agentPubKey=${this.roomStore.client.client.myPubKey}
               style="height: 36px;"
             ></avatar-with-nickname>
@@ -1593,13 +1645,11 @@ export class RoomView extends LitElement {
                 id="${conn.connectionId}"
                 class="video-el"
               ></video>
-              <sl-icon
-                style="color: #b98484; height: 30%; width: 30%;${!conn.connected ||
-                conn.video
-                  ? 'display: none;'
-                  : ''}"
-                .src=${wrapPathInSvg(mdiVideoOff)}
-              ></sl-icon>
+              <avatar-with-nickname
+                .hideNickname=${true}
+                .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
+              ></avatar-with-nickname>
               <div
                 style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
               >
@@ -1625,10 +1675,31 @@ export class RoomView extends LitElement {
 
               <!-- Avatar and nickname -->
               <div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
+                style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
               >
+                <sl-icon
+                  title="${this._maximizedVideo === conn.connectionId
+                    ? 'minimize'
+                    : 'maximize'}"
+                  .src=${this._maximizedVideo === conn.connectionId
+                    ? wrapPathInSvg(mdiFullscreenExit)
+                    : wrapPathInSvg(mdiFullscreen)}
+                  tabindex="0"
+                  style="color: #ffe100; height: 30px; width: 30px; cursor: pointer; margin-right: 4px;${conn.video
+                    ? ''
+                    : ' display: none;'}"
+                  @click=${() => {
+                    this.toggleMaximized(conn.connectionId);
+                  }}
+                  @keypress=${(e: KeyboardEvent) => {
+                    if (e.key === 'Enter') {
+                      this.toggleMaximized(conn.connectionId);
+                    }
+                  }}
+                ></sl-icon>
                 <avatar-with-nickname
                   .size=${36}
+                  .hideAvatar=${conn.video}
                   .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                   style="height: 36px;"
                 ></avatar-with-nickname>
@@ -1977,8 +2048,8 @@ export class RoomView extends LitElement {
         align-items: center;
         justify-content: center;
         position: relative;
-        aspect-ratio: 16 / 9;
-        border-radius: 20px;
+        aspect-ratio: 1 / 1;
+        border-radius: 50%;
         border: 2px solid #7291c9;
         margin: 5px;
         overflow: hidden;
@@ -1989,6 +2060,11 @@ export class RoomView extends LitElement {
         height: 98.5vh;
         width: 98.5vw;
         margin: 0;
+      }
+
+      .video-container.screen-share.maximized {
+        width: 98.5vw;
+        min-width: 98.5vw;
       }
 
       .maximize-icon {
@@ -2016,13 +2092,18 @@ export class RoomView extends LitElement {
         display: none;
       }
 
-      .screen-share {
+      .video-container.screen-share {
         border: 4px solid #ffe100;
+        aspect-ratio: 16 / 9;
+        border-radius: 20px;
+        width: 60vw;
+        min-width: min(50vw, calc(50% - 12px));
       }
 
       .video-el {
+        width: 100%;
         height: 100%;
-        max-width: 100%;
+        object-fit: cover;
       }
 
       .identicon canvas {
@@ -2182,7 +2263,7 @@ export class RoomView extends LitElement {
         font-size: 19px;
         bottom: 10px;
         right: 10px;
-        width: 298px;
+        padding: 0 12px;
         height: 74px;
         border-radius: 37px;
         background: #0e142c;

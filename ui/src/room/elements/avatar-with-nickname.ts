@@ -36,6 +36,12 @@ export class AvatarWithNickname extends LitElement {
   @property({ type: Number })
   size = 40;
 
+  @property({ type: Boolean, attribute: 'hide-nickname' })
+  hideNickname = false;
+
+  @property({ type: Boolean, attribute: 'hide-avatar' })
+  hideAvatar = false;
+
   /** Dependencies */
 
   /**
@@ -83,12 +89,13 @@ export class AvatarWithNickname extends LitElement {
     return html`
       <div class="row" style="align-items: center; margin: 0; padding: 0;">
         <img
-          style="height: ${this.size}px; width: ${this
-            .size}px; border-radius: 50%;"
+          style="${this.hideNickname
+            ? 'width: 100%; height: auto;'
+            : `height: ${this.size}px; width: ${this.size}px;`} border-radius: 50%;${this.hideAvatar ? ' display: none;' : ''}"
           src=${profile.entry.fields.avatar}
           alt="${profile.entry.nickname}'s avatar"
         />
-        <span style="margin-left: 10px; font-size: 23px; color: #cd9f9f;"
+        <span style="margin-left: 10px; font-size: 23px; color: #cd9f9f;${this.hideNickname ? ' display: none;' : ''}"
           >${profile.entry.nickname}</span
         >
       </div>
