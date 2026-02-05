@@ -12,4 +12,5 @@
 .running
 ui/*.png
 !ui/icon.png
+!ui/tennis_club.png
 .kitsune2_bootstrap_srv
