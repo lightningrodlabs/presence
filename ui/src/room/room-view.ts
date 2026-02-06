@@ -213,6 +213,12 @@ export class RoomView extends LitElement {
   _showVideoSources = false;
 
   @state()
+  _showViewShapeOptions = false;
+
+  @state()
+  _circleView = true;
+
+  @state()
   _panelMode: 'assets' | 'people' | 'settings' = 'assets';
 
   @state()
@@ -242,6 +248,9 @@ export class RoomView extends LitElement {
     }
     if (this._showVideoSources) {
       this._showVideoSources = false;
+    }
+    if (this._showViewShapeOptions) {
+      this._showViewShapeOptions = false;
     }
     if (this._showCustomLogDialog) {
       this.closeCustomLogDialog();
@@ -1199,6 +1208,94 @@ export class RoomView extends LitElement {
                 ? wrapPathInSvg(mdiAccountOff)
                 : wrapPathInSvg(mdiAccount)}
             ></sl-icon>
+
+            <!-- View shape toggle -->
+            <div
+              class="toggle-sub-btn column center-content"
+              tabindex="0"
+              @click=${(e: any) => {
+                e.stopPropagation();
+                this._showViewShapeOptions = !this._showViewShapeOptions;
+              }}
+              @keypress=${(e: KeyboardEvent) => {
+                if (e.key === 'Enter') {
+                  e.stopPropagation();
+                  this._showViewShapeOptions = !this._showViewShapeOptions;
+                }
+              }}
+              @mouseover=${(e: any) => e.stopPropagation()}
+              @focus=${() => {}}
+            >
+              <sl-icon
+                class="sub-btn-icon"
+                .src=${wrapPathInSvg(mdiChevronUp)}
+              ></sl-icon>
+            </div>
+
+            <!-- View shape options -->
+            ${this._showViewShapeOptions
+              ? html`
+                  <div
+                    class="column audio-input-sources secondary-font"
+                    @click=${(e: any) => {
+                      e.stopPropagation();
+                    }}
+                    @keypress=${(e: KeyboardEvent) => {
+                      if (e.key === 'Enter') {
+                        e.stopPropagation();
+                      }
+                    }}
+                    @mouseover=${(e: any) => e.stopPropagation()}
+                    @focus=${() => {}}
+                  >
+                    <div class="input-source-title">
+                      ${msg('View Shape')}
+                    </div>
+                    <div
+                      class="audio-source column"
+                      tabindex="0"
+                      @click=${() => {
+                        this._circleView = true;
+                        this.closeClosables();
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this._circleView = true;
+                          this.closeClosables();
+                        }
+                      }}
+                    >
+                      <div class="row">
+                        <div style="${this._circleView ? '' : 'color: transparent'}">
+                          &#10003;&nbsp;
+                        </div>
+                        <div>${msg('Circle')}</div>
+                      </div>
+                    </div>
+                    <div
+                      class="audio-source column"
+                      tabindex="0"
+                      @click=${() => {
+                        this._circleView = false;
+                        this.closeClosables();
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this._circleView = false;
+                          this.closeClosables();
+                        }
+                      }}
+                    >
+                      <div class="row">
+                        <div style="${!this._circleView ? '' : 'color: transparent'}">
+                          &#10003;&nbsp;
+                        </div>
+                        <div>${msg('Rectangle')}</div>
+                      </div>
+                    </div>
+                  </div>
+                `
+              : html``}
           </div>
         </sl-tooltip>
 
@@ -1565,7 +1662,7 @@ export class RoomView extends LitElement {
         <!-- My own video stream -->
         <div
           style="${this._selfViewHidden ? 'display: none;' : ''}"
-          class="video-container ${this.idToLayout('my-own-stream')}"
+          class="video-container ${this.idToLayout('my-own-stream')}${this._circleView ? '' : ' square-view'}"
           @dblclick=${() => this.toggleMaximized('my-own-stream')}
         >
           <video
@@ -1591,44 +1688,77 @@ export class RoomView extends LitElement {
               </div>`
             : html``}
 
-          <!-- Avatar and nickname -->
-          <div
-            style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
-          >
-            <sl-icon
-              title="${this._maximizedVideo === 'my-own-stream'
-                ? 'minimize'
-                : 'maximize'}"
-              .src=${this._maximizedVideo === 'my-own-stream'
-                ? wrapPathInSvg(mdiFullscreenExit)
-                : wrapPathInSvg(mdiFullscreen)}
-              tabindex="0"
-              style="color: #ffe100; height: 30px; width: 30px; cursor: pointer; margin-right: 4px;${this._camera
-                ? ''
-                : ' display: none;'}"
-              @click=${() => {
-                this.toggleMaximized('my-own-stream');
-              }}
-              @keypress=${(e: KeyboardEvent) => {
-                if (e.key === 'Enter') {
-                  this.toggleMaximized('my-own-stream');
-                }
-              }}
-            ></sl-icon>
-            <avatar-with-nickname
-              .size=${36}
-              .hideAvatar=${this._camera}
-              .agentPubKey=${this.roomStore.client.client.myPubKey}
-              style="height: 36px;"
-            ></avatar-with-nickname>
-          </div>
-          <sl-icon
-            style="position: absolute; bottom: 10px; left: 10px; color: red; height: 30px; width: 30px; ${this
-              ._microphone
-              ? 'display: none'
-              : ''}"
-            .src=${wrapPathInSvg(mdiMicrophoneOff)}
-          ></sl-icon>
+          <!-- Icons and Avatar/nickname for circle view (centered, stacked) -->
+          ${this._circleView
+            ? html`
+                <div
+                  style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
+                >
+                  <div class="row" style="margin-bottom: 4px;">
+                    <sl-icon
+                      title="${this._maximizedVideo === 'my-own-stream'
+                        ? 'minimize'
+                        : 'maximize'}"
+                      .src=${this._maximizedVideo === 'my-own-stream'
+                        ? wrapPathInSvg(mdiFullscreenExit)
+                        : wrapPathInSvg(mdiFullscreen)}
+                      tabindex="0"
+                      style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
+                      @click=${() => {
+                        this.toggleMaximized('my-own-stream');
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this.toggleMaximized('my-own-stream');
+                        }
+                      }}
+                    ></sl-icon>
+                    <sl-icon
+                      style="color: red; height: 30px; width: 30px; margin-left: 8px;${this._microphone ? ' display: none;' : ''}"
+                      .src=${wrapPathInSvg(mdiMicrophoneOff)}
+                    ></sl-icon>
+                  </div>
+                  <avatar-with-nickname
+                    .size=${36}
+                    .hideAvatar=${this._camera}
+                    .agentPubKey=${this.roomStore.client.client.myPubKey}
+                    style="height: 36px;"
+                  ></avatar-with-nickname>
+                </div>
+              `
+            : html`
+                <sl-icon
+                  title="${this._maximizedVideo === 'my-own-stream'
+                    ? 'minimize'
+                    : 'maximize'}"
+                  .src=${this._maximizedVideo === 'my-own-stream'
+                    ? wrapPathInSvg(mdiFullscreenExit)
+                    : wrapPathInSvg(mdiFullscreen)}
+                  tabindex="0"
+                  class="maximize-icon"
+                  @click=${() => {
+                    this.toggleMaximized('my-own-stream');
+                  }}
+                  @keypress=${(e: KeyboardEvent) => {
+                    if (e.key === 'Enter') {
+                      this.toggleMaximized('my-own-stream');
+                    }
+                  }}
+                ></sl-icon>
+                <sl-icon
+                  style="position: absolute; bottom: 10px; left: 50px; color: red; height: 30px; width: 30px;${this._microphone ? ' display: none;' : ''}"
+                  .src=${wrapPathInSvg(mdiMicrophoneOff)}
+                ></sl-icon>
+                <div
+                  style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
+                >
+                  <avatar-with-nickname
+                    .size=${36}
+                    .agentPubKey=${this.roomStore.client.client.myPubKey}
+                    style="height: 36px;"
+                  ></avatar-with-nickname>
+                </div>
+              `}
         </div>
 
         <!-- Video stream of others -->
@@ -1637,7 +1767,7 @@ export class RoomView extends LitElement {
           ([_pubkeyB64, conn]) => conn.connectionId,
           ([pubkeyB64, conn]) => html`
             <div
-              class="video-container ${this.idToLayout(conn.connectionId)}"
+              class="video-container ${this.idToLayout(conn.connectionId)}${this._circleView ? '' : ' square-view'}"
               @dblclick=${() => this.toggleMaximized(conn.connectionId)}
             >
               <video
@@ -1673,109 +1803,211 @@ export class RoomView extends LitElement {
                   </div>`
                 : html``}
 
-              <!-- Avatar and nickname -->
-              <div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
-              >
-                <sl-icon
-                  title="${this._maximizedVideo === conn.connectionId
-                    ? 'minimize'
-                    : 'maximize'}"
-                  .src=${this._maximizedVideo === conn.connectionId
-                    ? wrapPathInSvg(mdiFullscreenExit)
-                    : wrapPathInSvg(mdiFullscreen)}
-                  tabindex="0"
-                  style="color: #ffe100; height: 30px; width: 30px; cursor: pointer; margin-right: 4px;${conn.video
-                    ? ''
-                    : ' display: none;'}"
-                  @click=${() => {
-                    this.toggleMaximized(conn.connectionId);
-                  }}
-                  @keypress=${(e: KeyboardEvent) => {
-                    if (e.key === 'Enter') {
-                      this.toggleMaximized(conn.connectionId);
-                    }
-                  }}
-                ></sl-icon>
-                <avatar-with-nickname
-                  .size=${36}
-                  .hideAvatar=${conn.video}
-                  .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                  style="height: 36px;"
-                ></avatar-with-nickname>
-                <sl-tooltip content="reconnect" class="tooltip-filled">
-                  <sl-icon-button
-                    class="phone-refresh"
-                    style="margin-left: 4px; margin-bottom: -5px;"
-                    src=${wrapPathInSvg(mdiPhoneRefresh)}
-                    @click=${() => {
-                      this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                    }}
-                  ></sl-icon-button>
-                </sl-tooltip>
-                ${this._showConnectionDetails
-                  ? html`
-                      <sl-tooltip
-                        content="log stream info"
-                        class="tooltip-filled"
-                      >
-                        <sl-icon-button
-                          src=${wrapPathInSvg(mdiPencilCircleOutline)}
-                          style="margin-bottom: -5px;"
+              <!-- Icons and Avatar/nickname -->
+              ${this._circleView
+                ? html`
+                    <div
+                      style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
+                    >
+                      <div class="row" style="margin-bottom: 4px;">
+                        <sl-icon
+                          title="${this._maximizedVideo === conn.connectionId
+                            ? 'minimize'
+                            : 'maximize'}"
+                          .src=${this._maximizedVideo === conn.connectionId
+                            ? wrapPathInSvg(mdiFullscreenExit)
+                            : wrapPathInSvg(mdiFullscreen)}
+                          tabindex="0"
+                          style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
                           @click=${() => {
-                            const videoEl = this.shadowRoot?.getElementById(
-                              conn.connectionId
-                            ) as HTMLVideoElement;
-                            if (videoEl) {
-                              const stream = videoEl.srcObject;
-                              const tracks = stream
-                                ? (stream as MediaStream).getTracks()
-                                : null;
-                              console.log(
-                                '\nSTREAMINFO:',
-                                stream,
-                                '\nTRACKS: ',
-                                tracks
-                              );
-                              const tracksInfo: any[] = [];
-                              tracks?.forEach(track => {
-                                tracksInfo.push({
-                                  kind: track.kind,
-                                  enabled: track.enabled,
-                                  muted: track.muted,
-                                  readyState: track.readyState,
-                                });
-                              });
-                              const streamInfo = stream
-                                ? {
-                                    active: (stream as MediaStream).active,
-                                  }
-                                : null;
-
-                              navigator.clipboard.writeText(
-                                JSON.stringify(
-                                  {
-                                    stream: streamInfo,
-                                    tracks: tracksInfo,
-                                  },
-                                  undefined,
-                                  2
-                                )
-                              );
+                            this.toggleMaximized(conn.connectionId);
+                          }}
+                          @keypress=${(e: KeyboardEvent) => {
+                            if (e.key === 'Enter') {
+                              this.toggleMaximized(conn.connectionId);
                             }
                           }}
+                        ></sl-icon>
+                        <sl-icon
+                          style="color: red; height: 30px; width: 30px; margin-left: 8px;${conn.audio ? ' display: none;' : ''}"
+                          .src=${wrapPathInSvg(mdiMicrophoneOff)}
+                        ></sl-icon>
+                      </div>
+                      <div class="row" style="align-items: center;">
+                        <avatar-with-nickname
+                          .size=${36}
+                          .hideAvatar=${conn.video}
+                          .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                          style="height: 36px;"
+                        ></avatar-with-nickname>
+                        <sl-tooltip content="reconnect" class="tooltip-filled">
+                          <sl-icon-button
+                            class="phone-refresh"
+                            style="margin-left: 4px; margin-bottom: -5px;"
+                            src=${wrapPathInSvg(mdiPhoneRefresh)}
+                            @click=${() => {
+                              this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                            }}
+                          ></sl-icon-button>
+                        </sl-tooltip>
+                        ${this._showConnectionDetails
+                          ? html`
+                              <sl-tooltip
+                                content="log stream info"
+                                class="tooltip-filled"
+                              >
+                                <sl-icon-button
+                                  src=${wrapPathInSvg(mdiPencilCircleOutline)}
+                                  style="margin-bottom: -5px;"
+                                  @click=${() => {
+                                    const videoEl = this.shadowRoot?.getElementById(
+                                      conn.connectionId
+                                    ) as HTMLVideoElement;
+                                    if (videoEl) {
+                                      const stream = videoEl.srcObject;
+                                      const tracks = stream
+                                        ? (stream as MediaStream).getTracks()
+                                        : null;
+                                      console.log(
+                                        '\nSTREAMINFO:',
+                                        stream,
+                                        '\nTRACKS: ',
+                                        tracks
+                                      );
+                                      const tracksInfo: any[] = [];
+                                      tracks?.forEach(track => {
+                                        tracksInfo.push({
+                                          kind: track.kind,
+                                          enabled: track.enabled,
+                                          muted: track.muted,
+                                          readyState: track.readyState,
+                                        });
+                                      });
+                                      const streamInfo = stream
+                                        ? {
+                                            active: (stream as MediaStream).active,
+                                          }
+                                        : null;
+
+                                      navigator.clipboard.writeText(
+                                        JSON.stringify(
+                                          {
+                                            stream: streamInfo,
+                                            tracks: tracksInfo,
+                                          },
+                                          undefined,
+                                          2
+                                        )
+                                      );
+                                    }
+                                  }}
+                                ></sl-icon-button>
+                                <sl-tooltip></sl-tooltip>
+                              </sl-tooltip>
+                            `
+                          : html``}
+                      </div>
+                    </div>
+                  `
+                : html`
+                    <sl-icon
+                      title="${this._maximizedVideo === conn.connectionId
+                        ? 'minimize'
+                        : 'maximize'}"
+                      .src=${this._maximizedVideo === conn.connectionId
+                        ? wrapPathInSvg(mdiFullscreenExit)
+                        : wrapPathInSvg(mdiFullscreen)}
+                      tabindex="0"
+                      class="maximize-icon"
+                      @click=${() => {
+                        this.toggleMaximized(conn.connectionId);
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this.toggleMaximized(conn.connectionId);
+                        }
+                      }}
+                    ></sl-icon>
+                    <sl-icon
+                      style="position: absolute; bottom: 10px; left: 50px; color: red; height: 30px; width: 30px;${conn.audio ? ' display: none;' : ''}"
+                      .src=${wrapPathInSvg(mdiMicrophoneOff)}
+                    ></sl-icon>
+                    <div
+                      style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
+                    >
+                      <avatar-with-nickname
+                        .size=${36}
+                        .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                        style="height: 36px;"
+                      ></avatar-with-nickname>
+                      <sl-tooltip content="reconnect" class="tooltip-filled">
+                        <sl-icon-button
+                          class="phone-refresh"
+                          style="margin-left: 4px; margin-bottom: -5px;"
+                          src=${wrapPathInSvg(mdiPhoneRefresh)}
+                          @click=${() => {
+                            this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                          }}
                         ></sl-icon-button>
-                        <sl-tooltip></sl-tooltip>
                       </sl-tooltip>
-                    `
-                  : html``}
-              </div>
-              <sl-icon
-                style="position: absolute; bottom: 10px; left: 10px; color: red; height: 30px; width: 30px; ${conn.audio
-                  ? 'display: none'
-                  : ''}"
-                .src=${wrapPathInSvg(mdiMicrophoneOff)}
-              ></sl-icon>
+                      ${this._showConnectionDetails
+                        ? html`
+                            <sl-tooltip
+                              content="log stream info"
+                              class="tooltip-filled"
+                            >
+                              <sl-icon-button
+                                src=${wrapPathInSvg(mdiPencilCircleOutline)}
+                                style="margin-bottom: -5px;"
+                                @click=${() => {
+                                  const videoEl = this.shadowRoot?.getElementById(
+                                    conn.connectionId
+                                  ) as HTMLVideoElement;
+                                  if (videoEl) {
+                                    const stream = videoEl.srcObject;
+                                    const tracks = stream
+                                      ? (stream as MediaStream).getTracks()
+                                      : null;
+                                    console.log(
+                                      '\nSTREAMINFO:',
+                                      stream,
+                                      '\nTRACKS: ',
+                                      tracks
+                                    );
+                                    const tracksInfo: any[] = [];
+                                    tracks?.forEach(track => {
+                                      tracksInfo.push({
+                                        kind: track.kind,
+                                        enabled: track.enabled,
+                                        muted: track.muted,
+                                        readyState: track.readyState,
+                                      });
+                                    });
+                                    const streamInfo = stream
+                                      ? {
+                                          active: (stream as MediaStream).active,
+                                        }
+                                      : null;
+
+                                    navigator.clipboard.writeText(
+                                      JSON.stringify(
+                                        {
+                                          stream: streamInfo,
+                                          tracks: tracksInfo,
+                                        },
+                                        undefined,
+                                        2
+                                      )
+                                    );
+                                  }
+                                }}
+                              ></sl-icon-button>
+                              <sl-tooltip></sl-tooltip>
+                            </sl-tooltip>
+                          `
+                        : html``}
+                    </div>
+                  `}
             </div>
           `
         )}
@@ -2054,6 +2286,13 @@ export class RoomView extends LitElement {
         margin: 5px;
         overflow: hidden;
         background: black;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      .video-container.square-view {
+        aspect-ratio: 16 / 9;
+        border-radius: 20px;
       }
 
       .maximized {
