@@ -1,6 +1,6 @@
 {
   "name": "ui",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "scripts": {
     "start": "vite --port $UI_PORT --clearScreen false",
     "build": "vite build",
@@ -20,7 +20,7 @@
     "@holochain-open-dev/profiles": "^0.601.2",
     "@holochain-open-dev/stores": "^0.601.0",
     "@holochain-open-dev/utils": "^0.601.0",
-    "@theweave/api": "^0.6.4",
+    "@theweave/api": "^0.6.6",
     "@lit/context": "^1.1.0",
     "@lit/task": "^1.0.0",
     "@lit/localize": "0.12.1",

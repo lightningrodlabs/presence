@@ -63,6 +63,10 @@ export type PendingAccept = {
    * to connected state instead for a connection with the same Agent.
    */
   peer: SimplePeer.Instance;
+  /**
+   * Timestamp when this PendingAccept was created, used for cleanup of stale entries.
+   */
+  createdAt: number;
 };
 
 export type StreamInfo = {

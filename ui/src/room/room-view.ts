@@ -852,6 +852,79 @@ export class RoomView extends LitElement {
                 >trickle ICE (ON by default)</span
               >
             </div>
+            <div style="margin-top: 24px; width: 100%;">
+              <span
+                class="secondary-font"
+                style="color: #c3c9eb; font-size: 23px;"
+                >TURN Server</span
+              >
+              <div style="margin-top: 8px;">
+                <input
+                  type="text"
+                  placeholder="turn:host:port"
+                  .value=${this.streamsStore.turnUrl}
+                  @input=${(e: InputEvent) => {
+                    this.streamsStore.setTurnUrl(
+                      (e.target as HTMLInputElement).value
+                    );
+                  }}
+                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px; margin-bottom: 6px;"
+                />
+                <input
+                  type="text"
+                  placeholder="Username"
+                  .value=${this.streamsStore.turnUsername}
+                  @input=${(e: InputEvent) => {
+                    this.streamsStore.setTurnUsername(
+                      (e.target as HTMLInputElement).value
+                    );
+                  }}
+                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px; margin-bottom: 6px;"
+                />
+                <input
+                  type="password"
+                  placeholder="Credential"
+                  .value=${this.streamsStore.turnCredential}
+                  @input=${(e: InputEvent) => {
+                    this.streamsStore.setTurnCredential(
+                      (e.target as HTMLInputElement).value
+                    );
+                  }}
+                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px;"
+                />
+              </div>
+            </div>
+            <div style="margin-top: 24px; width: 100%;">
+              <span
+                class="secondary-font"
+                style="color: #c3c9eb; font-size: 23px;"
+                >Signal Delay (ms)</span
+              >
+              <div style="margin-top: 8px;">
+                <input
+                  type="number"
+                  min="0"
+                  step="100"
+                  placeholder="0"
+                  .value=${String(this.streamsStore.signalDelayMs)}
+                  @input=${(e: InputEvent) => {
+                    const val = parseInt(
+                      (e.target as HTMLInputElement).value,
+                      10
+                    );
+                    this.streamsStore.setSignalDelay(
+                      isNaN(val) ? 0 : Math.max(0, val)
+                    );
+                  }}
+                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px;"
+                />
+                <span
+                  class="secondary-font"
+                  style="color: #888ea8; font-size: 14px; margin-top: 4px; display: block;"
+                  >Random 0-N ms delay per signal. For testing only.</span
+                >
+              </div>
+            </div>
             <button
               style="margin-top: 30px;"
               @click=${() => {

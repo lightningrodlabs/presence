@@ -34,10 +34,17 @@ import { getStreamInfo } from './utils';
 
 declare const __APP_VERSION__: string;
 
-const ICE_CONFIG = [
+const STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
 ];
+
+/**
+ * Timeout in ms for the SDP exchange phase. If a connection does not progress
+ * from SdpExchange to Connected within this duration, the stale peer is destroyed
+ * and the connection is reset to Disconnected so the next ping/pong cycle can retry.
+ */
+const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
  * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent
@@ -71,7 +78,23 @@ export class StreamsStore {
 
   trickleICE = true;
 
+  turnUrl = '';
+
+  turnUsername = '';
+
+  turnCredential = '';
+
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
+
+  /**
+   * Max random delay in ms to add before processing each incoming signal.
+   * 0 = no delay (production). Set via settings UI to simulate high-latency signaling.
+   */
+  signalDelayMs = 0;
+
+  private _signalQueue: RoomSignal[] = [];
+
+  private _processingSignal = false;
 
   constructor(
     roomStore: RoomStore,
@@ -96,6 +119,13 @@ export class StreamsStore {
     const trickleICE = window.localStorage.getItem('trickleICE');
     if (trickleICE) {
       this.trickleICE = JSON.parse(trickleICE);
+    }
+    this.turnUrl = window.localStorage.getItem('turnUrl') || '';
+    this.turnUsername = window.localStorage.getItem('turnUsername') || '';
+    this.turnCredential = window.localStorage.getItem('turnCredential') || '';
+    const signalDelay = window.localStorage.getItem('signalDelayMs');
+    if (signalDelay) {
+      this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
     navigator.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
@@ -163,6 +193,38 @@ export class StreamsStore {
     this.trickleICE = false;
   }
 
+  get iceConfig(): RTCIceServer[] {
+    const servers: RTCIceServer[] = [...STUN_SERVERS];
+    if (this.turnUrl) {
+      servers.push({
+        urls: this.turnUrl,
+        username: this.turnUsername,
+        credential: this.turnCredential,
+      });
+    }
+    return servers;
+  }
+
+  setTurnUrl(url: string) {
+    this.turnUrl = url;
+    window.localStorage.setItem('turnUrl', url);
+  }
+
+  setTurnUsername(username: string) {
+    this.turnUsername = username;
+    window.localStorage.setItem('turnUsername', username);
+  }
+
+  setTurnCredential(credential: string) {
+    this.turnCredential = credential;
+    window.localStorage.setItem('turnCredential', credential);
+  }
+
+  setSignalDelay(ms: number) {
+    this.signalDelayMs = ms;
+    window.localStorage.setItem('signalDelayMs', String(ms));
+  }
+
   onEvent(cb: (ev: StoreEventPayload) => any) {
     this.eventCallback = cb;
   }
@@ -224,6 +286,40 @@ export class StreamsStore {
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
+
+    // Cleanup stale pending accepts older than 20 seconds
+    const now = Date.now();
+    const PENDING_ACCEPT_TTL = 20000;
+    for (const [agent, accepts] of Object.entries(this._pendingAccepts)) {
+      const stale = accepts.filter(a => now - a.createdAt > PENDING_ACCEPT_TTL);
+      if (stale.length > 0) {
+        stale.forEach(a => a.peer.destroy());
+        const remaining = accepts.filter(
+          a => now - a.createdAt <= PENDING_ACCEPT_TTL
+        );
+        if (remaining.length > 0) {
+          this._pendingAccepts[agent] = remaining;
+        } else {
+          delete this._pendingAccepts[agent];
+        }
+      }
+    }
+    for (const [agent, accepts] of Object.entries(
+      this._pendingScreenShareAccepts
+    )) {
+      const stale = accepts.filter(a => now - a.createdAt > PENDING_ACCEPT_TTL);
+      if (stale.length > 0) {
+        stale.forEach(a => a.peer.destroy());
+        const remaining = accepts.filter(
+          a => now - a.createdAt <= PENDING_ACCEPT_TTL
+        );
+        if (remaining.length > 0) {
+          this._pendingScreenShareAccepts[agent] = remaining;
+        } else {
+          delete this._pendingScreenShareAccepts[agent];
+        }
+      }
+    }
   }
 
   async changeVideoInput(deviceId: string) {
@@ -892,12 +988,41 @@ export class StreamsStore {
     const options: SimplePeer.Options = {
       initiator,
       config: {
-        iceServers: ICE_CONFIG,
+        iceServers: this.iceConfig,
       },
       objectMode: true,
       trickle: this.trickleICE,
     };
     const peer = new SimplePeer(options);
+
+    // Monitor ICE connection state for diagnostics (uses addEventListener to
+    // avoid overwriting SimplePeer's own on* property handlers)
+    const monitorICE = () => {
+      const pc = (peer as any)._pc as RTCPeerConnection | undefined;
+      if (!pc) {
+        setTimeout(monitorICE, 100);
+        return;
+      }
+      pc.addEventListener('iceconnectionstatechange', () => {
+        this.logger.logCustomMessage(
+          `ICE [${pubKeyB64.slice(0, 8)}]: ${pc.iceConnectionState}`
+        );
+      });
+      pc.addEventListener('icegatheringstatechange', () => {
+        this.logger.logCustomMessage(
+          `ICE gathering [${pubKeyB64.slice(0, 8)}]: ${pc.iceGatheringState}`
+        );
+      });
+      pc.addEventListener('icecandidate', (event: RTCPeerConnectionIceEvent) => {
+        if (event.candidate) {
+          this.logger.logCustomMessage(
+            `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${event.candidate.type} ${event.candidate.protocol}`
+          );
+        }
+      });
+    };
+    monitorICE();
+
     peer.on('signal', async data => {
       this.roomClient.sendSdpData({
         to_agent: connectingAgent,
@@ -1110,6 +1235,9 @@ export class StreamsStore {
       console.log('#### GOT ERROR EVENT ####: ', e);
       peer.destroy();
 
+      this.logger.logCustomMessage(
+        `SimplePeerError [${pubKeyB64.slice(0, 8)}]: ${e.message || e}`
+      );
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
@@ -1146,7 +1274,7 @@ export class StreamsStore {
     const pubKeyB64 = encodeHashToBase64(connectingAgent);
     const options: SimplePeer.Options = {
       initiator,
-      config: { iceServers: ICE_CONFIG },
+      config: { iceServers: this.iceConfig },
       objectMode: true,
       trickle: this.trickleICE,
     };
@@ -1278,6 +1406,9 @@ export class StreamsStore {
     });
     peer.on('error', e => {
       console.log('#### GOT SCREEN SHARE ERROR EVENT ####: ', e);
+      this.logger.logCustomMessage(
+        `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${e.message || e}`
+      );
       peer.destroy();
 
       if (initiator) {
@@ -1441,7 +1572,11 @@ export class StreamsStore {
         });
         const peer = get(this._openConnections)[pubkey];
         if (peer) {
-          peer.peer.addStream(this.mainStream);
+          try {
+            peer.peer.addStream(this.mainStream);
+          } catch (e: any) {
+            console.warn('Failed to re-add stream during reconcile:', e.message);
+          }
         }
         return;
       }
@@ -1542,6 +1677,22 @@ export class StreamsStore {
   // ********************************************************************************************
 
   async handleSignal(signal: RoomSignal) {
+    this._signalQueue.push(signal);
+    if (this._processingSignal) return;
+
+    this._processingSignal = true;
+    while (this._signalQueue.length > 0) {
+      const nextSignal = this._signalQueue.shift()!;
+      if (this.signalDelayMs > 0) {
+        const delay = Math.floor(Math.random() * this.signalDelayMs);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      await this._processSignal(nextSignal);
+    }
+    this._processingSignal = false;
+  }
+
+  private async _processSignal(signal: RoomSignal) {
     switch (signal.type) {
       case 'PingUi': {
         await this.handlePingUi(signal);
@@ -1757,7 +1908,7 @@ export class StreamsStore {
     const alreadyOpenScreenShareOutgoing = Object.keys(
       get(this._screenShareConnectionsOutgoing)
     ).includes(pubkeyB64);
-    const pendingScreenShareInits = this._pendingInits[pubkeyB64];
+    const pendingScreenShareInits = this._pendingScreenShareInits[pubkeyB64];
     if (!!this.screenShareStream && !alreadyOpenScreenShareOutgoing) {
       if (!pendingScreenShareInits) {
         console.log('#### SENDING FIRST SCREEN SHARE INIT REQUEST.');
@@ -1841,6 +1992,7 @@ export class StreamsStore {
       const accept: PendingAccept = {
         connectionId: signal.connection_id,
         peer: newPeer,
+        createdAt: Date.now(),
       };
       const allPendingAccepts = this._pendingAccepts;
       const pendingAcceptsForAgent = allPendingAccepts[pubKey64];
@@ -1869,6 +2021,7 @@ export class StreamsStore {
       const accept: PendingAccept = {
         connectionId: signal.connection_id,
         peer: newPeer,
+        createdAt: Date.now(),
       };
       const allPendingScreenShareAccepts = this._pendingScreenShareAccepts;
       const pendingScreenShareAcceptsForAgent =
@@ -1922,6 +2075,17 @@ export class StreamsStore {
             .map(pendingInit => pendingInit.connectionId)
             .includes(signal.connection_id)
         ) {
+          // Measure signaling round-trip time
+          const matchingInit = agentPendingInits.find(
+            pi => pi.connectionId === signal.connection_id
+          );
+          if (matchingInit) {
+            const rtt = Date.now() - matchingInit.t0;
+            this.logger.logCustomMessage(
+              `Signaling RTT [${pubKey64.slice(0, 8)}]: ${rtt}ms`
+            );
+          }
+
           console.log('#### RECEIVED INIT ACCEPT AND CEATING INITIATING PEER.');
           const newPeer = this.createPeer(
             signal.from_agent,
@@ -1945,6 +2109,25 @@ export class StreamsStore {
           delete this._pendingInits[pubKey64];
 
           this.updateConnectionStatus(pubKey64, { type: 'SdpExchange' });
+
+          // SDP exchange timeout: if still not connected after 15s, clean up and retry
+          setTimeout(() => {
+            const currentStatus = get(this._connectionStatuses)[pubKey64];
+            if (currentStatus && currentStatus.type === 'SdpExchange') {
+              this.logger.logCustomMessage(
+                `SDP timeout [${pubKey64.slice(0, 8)}]: destroying stale connection`
+              );
+              const conn = get(this._openConnections)[pubKey64];
+              if (conn && !conn.connected) {
+                conn.peer.destroy();
+                this._openConnections.update(current => {
+                  delete current[pubKey64];
+                  return current;
+                });
+              }
+              this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
+            }
+          }, SDP_EXCHANGE_TIMEOUT);
         }
       }
     }
@@ -2015,6 +2198,18 @@ export class StreamsStore {
   async handleSdpData(signal: Extract<RoomSignal, { type: 'SdpData' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, signal.data);
+
+    // Log the SDP sub-type for diagnostics
+    try {
+      const sdpPayload = JSON.parse(signal.data);
+      const sdpType = sdpPayload.type || 'candidate';
+      this.logger.logCustomMessage(
+        `SDP ${sdpType} [${pubkeyB64.slice(0, 8)}] connId=${signal.connection_id.slice(0, 8)}`
+      );
+    } catch {
+      // ignore parse errors for logging
+    }
+
     this.logger.logAgentEvent({
       agent: pubkeyB64,
       timestamp: Date.now(),
