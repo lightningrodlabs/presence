@@ -305,25 +305,18 @@ export type DescendentRoom = {
   meta_data: string | undefined;
 };
 
-export type PongInput = {
-  to_agent: AgentPubKey;
-  meta_data: string;
-};
-
-export type InitAcceptInput = {
+/**
+ * Typed payload for InitRequest / InitAccept messages
+ */
+export type InitPayload = {
   connection_id: string;
-  to_agent: AgentPubKey;
-  connection_type?: 'screen' | 'video';
+  connection_type?: string;
 };
 
-export type InitRequestInput = {
-  connection_id: string;
-  to_agent: AgentPubKey;
-  connection_type?: 'screen' | 'video';
-};
-
-export type SdpDataInput = {
-  to_agent: AgentPubKey;
+/**
+ * Typed payload for SdpData messages
+ */
+export type SdpPayload = {
   connection_id: string;
   data: string;
 };
@@ -334,31 +327,10 @@ export type RoomSignal =
       from_agent: AgentPubKey;
     }
   | {
-      type: 'PingUi';
+      type: 'Message';
       from_agent: AgentPubKey;
-    }
-  | {
-      type: 'PongUi';
-      from_agent: AgentPubKey;
-      meta_data: string;
-    }
-  | {
-      type: 'SdpData';
-      from_agent: AgentPubKey;
-      connection_id: string;
-      data: string;
-    }
-  | {
-      type: 'InitRequest';
-      connection_type: string | undefined;
-      from_agent: AgentPubKey;
-      connection_id: string;
-    }
-  | {
-      type: 'InitAccept';
-      connection_type: string | undefined;
-      from_agent: AgentPubKey;
-      connection_id: string;
+      msg_type: string;
+      payload: string;
     }
   | {
       type: 'EntryCreated';

@@ -17,6 +17,7 @@ import {
   AgentInfo,
   ConnectionStatus,
   ConnectionStatuses,
+  InitPayload,
   OpenConnectionInfo,
   PendingAccept,
   PendingInit,
@@ -24,6 +25,7 @@ import {
   PongMetaDataV1,
   RoomSignal,
   RTCMessage,
+  SdpPayload,
   StoreEventPayload,
   StreamAndTrackInfo,
 } from './types';
@@ -143,11 +145,23 @@ export class StreamsStore {
       logger
     );
 
+    // Wait for allAgents to load before first ping so we actually have peers to contact
+    await new Promise<void>((resolve) => {
+      roomStore.allAgents.subscribe(val => {
+        if (val.status === 'complete') {
+          streamsStore.allAgents = val.value;
+          resolve();
+        } else if (val.status === 'error') {
+          console.error('Failed to get all agents: ', val.error);
+          resolve(); // Don't block forever on error
+        }
+      });
+    });
+
+    // Keep subscribing for ongoing updates
     roomStore.allAgents.subscribe(val => {
       if (val.status === 'complete') {
         streamsStore.allAgents = val.value;
-      } else if (val.status === 'error') {
-        console.error('Failed to get all agents: ', val.error);
       }
     });
 
@@ -165,10 +179,21 @@ export class StreamsStore {
   }
 
   disconnect() {
+    // Notify peers immediately before tearing down
+    const agentsToNotify = Object.keys(get(this._knownAgents))
+      .filter(a => a !== this.myPubKeyB64)
+      .map(b64 => decodeHashFromBase64(b64));
+    if (agentsToNotify.length > 0) {
+      this.roomClient.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
+    }
+
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this.signalUnsubscribe) this.signalUnsubscribe();
-    // TODO Close all connections and stop all streams
+    // Close all connections and stop all streams
     Object.values(get(this._openConnections)).forEach(conn => {
+      conn.peer.destroy();
+    });
+    Object.values(get(this._screenShareConnectionsIncoming)).forEach(conn => {
       conn.peer.destroy();
     });
     this.videoOff();
@@ -181,6 +206,8 @@ export class StreamsStore {
     this._screenShareConnectionsIncoming.set({});
     this._pendingAccepts = {};
     this._pendingInits = {};
+    this._pendingScreenShareInits = {};
+    this._pendingScreenShareAccepts = {};
   }
 
   enableTrickleICE() {
@@ -282,7 +309,7 @@ export class StreamsStore {
     const agentsToPing = Object.keys(get(this._knownAgents))
       .filter(agent => !get(this.blockedAgents).includes(agent))
       .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
-    await this.roomStore.client.pingFrontend(agentsToPing);
+    await this.roomStore.client.sendMessage(agentsToPing, 'PingUi');
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
@@ -1024,11 +1051,11 @@ export class StreamsStore {
     monitorICE();
 
     peer.on('signal', async data => {
-      this.roomClient.sendSdpData({
-        to_agent: connectingAgent,
-        connection_id: connectionId,
-        data: JSON.stringify(data),
-      });
+      this.roomClient.sendMessage(
+        [connectingAgent],
+        'SdpData',
+        JSON.stringify({ connection_id: connectionId, data: JSON.stringify(data) }),
+      );
     });
     peer.on('data', data => {
       try {
@@ -1224,6 +1251,20 @@ export class StreamsStore {
         return openConnections;
       });
 
+      // Also tear down any outgoing screen share to this peer since they
+      // have disconnected. Without this, the stale WebRTC connection may
+      // linger and block re-initiation when the peer rejoins.
+      const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
+      if (outgoingScreenShare) {
+        console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
+        outgoingScreenShare.peer.destroy();
+        this._screenShareConnectionsOutgoing.update(currentValue => {
+          delete currentValue[pubKeyB64];
+          return currentValue;
+        });
+        delete this._pendingScreenShareInits[pubKeyB64];
+      }
+
       this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
       this.eventCallback({
         type: 'peer-disconnected',
@@ -1255,6 +1296,17 @@ export class StreamsStore {
         return openConnections;
       });
 
+      // Also tear down any outgoing screen share to this peer
+      const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
+      if (outgoingScreenShare) {
+        outgoingScreenShare.peer.destroy();
+        this._screenShareConnectionsOutgoing.update(currentValue => {
+          delete currentValue[pubKeyB64];
+          return currentValue;
+        });
+        delete this._pendingScreenShareInits[pubKeyB64];
+      }
+
       this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
       this.eventCallback({
         type: 'peer-disconnected',
@@ -1280,11 +1332,11 @@ export class StreamsStore {
     };
     const peer = new SimplePeer(options);
     peer.on('signal', async data => {
-      this.roomStore.client.sendSdpData({
-        to_agent: connectingAgent,
-        connection_id: connectionId,
-        data: JSON.stringify(data),
-      });
+      this.roomStore.client.sendMessage(
+        [connectingAgent],
+        'SdpData',
+        JSON.stringify({ connection_id: connectionId, data: JSON.stringify(data) }),
+      );
     });
     peer.on('stream', stream => {
       console.log(
@@ -1694,28 +1746,33 @@ export class StreamsStore {
 
   private async _processSignal(signal: RoomSignal) {
     switch (signal.type) {
-      case 'PingUi': {
-        await this.handlePingUi(signal);
-        break;
-      }
-      case 'PongUi': {
-        await this.handlePongUi(signal);
-        break;
-      }
-      case 'InitRequest': {
-        await this.handleInitRequest(signal);
-        break;
-      }
-      case 'InitAccept': {
-        await this.handleInitAccept(signal);
-        break;
-      }
-      case 'SdpData': {
-        await this.handleSdpData(signal);
+      case 'Message': {
+        switch (signal.msg_type) {
+          case 'PingUi':
+            await this.handlePingUi(signal);
+            break;
+          case 'PongUi':
+            await this.handlePongUi(signal);
+            break;
+          case 'InitRequest':
+            await this.handleInitRequest(signal);
+            break;
+          case 'InitAccept':
+            await this.handleInitAccept(signal);
+            break;
+          case 'SdpData':
+            await this.handleSdpData(signal);
+            break;
+          case 'LeaveUi':
+            await this.handleLeaveUi(signal);
+            break;
+          default:
+            console.warn('Unknown msg_type:', signal.msg_type);
+        }
         break;
       }
       default:
-        console.warn('Got unexpected signal type: ', signal);
+        break;
     }
   }
 
@@ -1724,7 +1781,7 @@ export class StreamsStore {
    *
    * @param signal
    */
-  async handlePingUi(signal: Extract<RoomSignal, { type: 'PingUi' }>) {
+  async handlePingUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     if (get(this.blockedAgents).includes(pubkeyB64)) return;
     // console.log(`Got PingUi from ${pubkeyB64}: `, signal);
@@ -1745,11 +1802,97 @@ export class StreamsStore {
           audio: get(this._openConnections)[pubkeyB64]?.audio,
         },
       };
-      await this.roomClient.pongFrontend({
-        to_agent: signal.from_agent,
-        meta_data: JSON.stringify(metaData),
-      });
+      await this.roomClient.sendMessage(
+        [signal.from_agent],
+        'PongUi',
+        JSON.stringify(metaData),
+      );
+
+      // If we have an active screen share, check whether we need to
+      // initiate a screen share connection to this peer. This handles
+      // the case where a peer re-joins and pings us — we can start the
+      // screen share connection immediately rather than waiting for
+      // the next Pong cycle.
+      if (this.screenShareStream) {
+        // Clean up stale outgoing connection if WebRTC state is dead
+        const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
+        if (outgoing) {
+          const pc = (outgoing.peer as any)._pc as RTCPeerConnection | undefined;
+          const iceState = pc?.iceConnectionState;
+          if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+            outgoing.peer.destroy();
+            this._screenShareConnectionsOutgoing.update(v => {
+              delete v[pubkeyB64];
+              return v;
+            });
+            delete this._pendingScreenShareInits[pubkeyB64];
+          }
+        }
+        const hasOutgoing = Object.keys(
+          get(this._screenShareConnectionsOutgoing)
+        ).includes(pubkeyB64);
+        const hasPending = this._pendingScreenShareInits[pubkeyB64];
+        if (!hasOutgoing && !hasPending) {
+          console.log(`#### SENDING SCREEN SHARE INIT REQUEST ON PING FROM ${pubkeyB64.slice(0, 8)}`);
+          const newConnectionId = uuidv4();
+          this._pendingScreenShareInits[pubkeyB64] = [
+            { connectionId: newConnectionId, t0: Date.now() },
+          ];
+          await this.roomClient.sendMessage(
+            [signal.from_agent],
+            'InitRequest',
+            JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
+          );
+          this.updateScreenShareConnectionStatus(pubkeyB64, {
+            type: 'InitSent',
+          });
+        }
+      }
     }
+  }
+
+  /**
+   * Handle a LeaveUi signal — the remote peer is leaving the room.
+   * Immediately tear down all connections and pending state for this agent.
+   */
+  async handleLeaveUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    console.log(`#### GOT LeaveUi FROM ${pubkeyB64.slice(0, 8)}`);
+
+    // Destroy video connection
+    const openConn = get(this._openConnections)[pubkeyB64];
+    if (openConn) {
+      openConn.peer.destroy();
+      this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
+    }
+
+    // Destroy incoming screen share
+    const inSS = get(this._screenShareConnectionsIncoming)[pubkeyB64];
+    if (inSS) {
+      inSS.peer.destroy();
+      this._screenShareConnectionsIncoming.update(v => { delete v[pubkeyB64]; return v; });
+    }
+
+    // Destroy outgoing screen share
+    const outSS = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
+    if (outSS) {
+      outSS.peer.destroy();
+      this._screenShareConnectionsOutgoing.update(v => { delete v[pubkeyB64]; return v; });
+    }
+
+    // Clean up video streams and pending state
+    delete this._videoStreams[pubkeyB64];
+    delete this._pendingInits[pubkeyB64];
+    delete this._pendingAccepts[pubkeyB64];
+    delete this._pendingScreenShareInits[pubkeyB64];
+    delete this._pendingScreenShareAccepts[pubkeyB64];
+
+    // Mark as disconnected
+    this.updateConnectionStatus(pubkeyB64, { type: 'Disconnected' });
+    this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
+
+    // Fire event so UI updates
+    this.eventCallback({ type: 'peer-disconnected', pubKeyB64: pubkeyB64, connectionId: '' });
   }
 
   /**
@@ -1763,7 +1906,7 @@ export class StreamsStore {
    *
    * @param signal
    */
-  async handlePongUi(signal: Extract<RoomSignal, { type: 'PongUi' }>) {
+  async handlePongUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     const now = Date.now();
     this.logger.logAgentEvent({
@@ -1776,7 +1919,7 @@ export class StreamsStore {
     let metaDataExt: PongMetaData<PongMetaDataV1> | undefined;
     try {
       const metaData: PongMetaData<PongMetaDataV1> = JSON.parse(
-        signal.meta_data
+        signal.payload
       );
       this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
       metaDataExt = metaData;
@@ -1835,6 +1978,21 @@ export class StreamsStore {
      * no pending InitRequest from less than 5 seconds ago (and we therefore have to
      * assume that a remote signal got lost), send an InitRequest.
      */
+    // Clean up stale video connection if the underlying WebRTC is dead.
+    // This allows the normal initiation flow to proceed for a re-joining peer.
+    const existingConn = get(this._openConnections)[pubkeyB64];
+    if (existingConn) {
+      const pc = (existingConn.peer as any)._pc as RTCPeerConnection | undefined;
+      const iceState = pc?.iceConnectionState;
+      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
+        existingConn.peer.destroy();
+        this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
+        delete this._pendingInits[pubkeyB64];
+        delete this._videoStreams[pubkeyB64];
+      }
+    }
+
     // alreadyOpen here does not include the case where SDP exchange is already ongoing
     // but no actual connection has happened yet
     const alreadyOpen = get(this._openConnections)[pubkeyB64];
@@ -1846,11 +2004,11 @@ export class StreamsStore {
         this._pendingInits[pubkeyB64] = [
           { connectionId: newConnectionId, t0: now },
         ];
-        await this.roomClient.sendInitRequest({
-          connection_type: 'video',
-          connection_id: newConnectionId,
-          to_agent: signal.from_agent,
-        });
+        await this.roomClient.sendMessage(
+          [signal.from_agent],
+          'InitRequest',
+          JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
+        );
         this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
       } else {
         console.log(
@@ -1863,11 +2021,11 @@ export class StreamsStore {
           const newConnectionId = uuidv4();
           pendingInits.push({ connectionId: newConnectionId, t0: now });
           this._pendingInits[pubkeyB64] = pendingInits;
-          await this.roomClient.sendInitRequest({
-            connection_type: 'video',
-            connection_id: newConnectionId,
-            to_agent: signal.from_agent,
-          });
+          await this.roomClient.sendMessage(
+            [signal.from_agent],
+            'InitRequest',
+            JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
+          );
           this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
         }
       }
@@ -1904,7 +2062,25 @@ export class StreamsStore {
      * screen share connection yet with this agent and there is no pending
      * InitRequest from less than 5 seconds ago (and we therefore have to
      * assume that a remote signal got lost), send an InitRequest.
+     *
+     * Also clean up stale outgoing screen share connections where the
+     * underlying WebRTC connection is no longer alive (e.g. peer left
+     * without a clean close event reaching us).
      */
+    const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
+    if (outgoingScreenShare) {
+      const pc = (outgoingScreenShare.peer as any)._pc as RTCPeerConnection | undefined;
+      const iceState = pc?.iceConnectionState;
+      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
+        outgoingScreenShare.peer.destroy();
+        this._screenShareConnectionsOutgoing.update(currentValue => {
+          delete currentValue[pubkeyB64];
+          return currentValue;
+        });
+        delete this._pendingScreenShareInits[pubkeyB64];
+      }
+    }
     const alreadyOpenScreenShareOutgoing = Object.keys(
       get(this._screenShareConnectionsOutgoing)
     ).includes(pubkeyB64);
@@ -1916,11 +2092,11 @@ export class StreamsStore {
         this._pendingScreenShareInits[pubkeyB64] = [
           { connectionId: newConnectionId, t0: now },
         ];
-        await this.roomClient.sendInitRequest({
-          connection_type: 'screen',
-          connection_id: newConnectionId,
-          to_agent: signal.from_agent,
-        });
+        await this.roomClient.sendMessage(
+          [signal.from_agent],
+          'InitRequest',
+          JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
+        );
         this.updateScreenShareConnectionStatus(pubkeyB64, {
           type: 'InitSent',
         });
@@ -1940,11 +2116,11 @@ export class StreamsStore {
             t0: now,
           });
           this._pendingScreenShareInits[pubkeyB64] = pendingScreenShareInits;
-          await this.roomClient.sendInitRequest({
-            connection_type: 'screen',
-            connection_id: newConnectionId,
-            to_agent: signal.from_agent,
-          });
+          await this.roomClient.sendMessage(
+            [signal.from_agent],
+            'InitRequest',
+            JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
+          );
         }
         this.updateScreenShareConnectionStatus(pubkeyB64, {
           type: 'InitSent',
@@ -1959,9 +2135,10 @@ export class StreamsStore {
    * @param signal
    */
   async handleInitRequest(
-    signal: Extract<RoomSignal, { type: 'InitRequest' }>
+    signal: Extract<RoomSignal, { type: 'Message' }>
   ) {
     const pubKey64 = encodeHashToBase64(signal.from_agent);
+    const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
     this.logger.logAgentEvent({
       agent: pubKey64,
       timestamp: Date.now(),
@@ -1969,7 +2146,7 @@ export class StreamsStore {
     });
     console.log(
       `#### GOT ${
-        signal.connection_type === 'screen' ? 'SCREEN SHARE ' : ''
+        connection_type === 'screen' ? 'SCREEN SHARE ' : ''
       }INIT REQUEST.`
     );
 
@@ -1978,19 +2155,19 @@ export class StreamsStore {
      *
      * Only accept init requests from agents who's pubkey is alphabetically  "higher" than ours
      */
-    if (signal.connection_type === 'video' && pubKey64 > this.myPubKeyB64) {
+    if (connection_type === 'video' && pubKey64 > this.myPubKeyB64) {
       console.log(
-        '#### SENDING INIT ACCEPT. signal.connection_type: ',
-        signal.connection_type
+        '#### SENDING INIT ACCEPT. connection_type: ',
+        connection_type
       );
       console.log('#### Creating normal peer');
       const newPeer = this.createPeer(
         signal.from_agent,
-        signal.connection_id,
+        connection_id,
         false
       );
       const accept: PendingAccept = {
-        connectionId: signal.connection_id,
+        connectionId: connection_id,
         peer: newPeer,
         createdAt: Date.now(),
       };
@@ -2001,25 +2178,25 @@ export class StreamsStore {
         : [accept];
       allPendingAccepts[pubKey64] = newPendingAcceptsForAgent;
       this._pendingAccepts = allPendingAccepts;
-      await this.roomClient.sendInitAccept({
-        connection_type: signal.connection_type,
-        connection_id: signal.connection_id,
-        to_agent: signal.from_agent,
-      });
+      await this.roomClient.sendMessage(
+        [signal.from_agent],
+        'InitAccept',
+        JSON.stringify({ connection_id, connection_type }),
+      );
       this.updateConnectionStatus(pubKey64, { type: 'AcceptSent' });
     }
 
     /**
      * InitRequests for incoming screen shares
      */
-    if (signal.connection_type === 'screen') {
+    if (connection_type === 'screen') {
       const newPeer = this.createScreenSharePeer(
         signal.from_agent,
-        signal.connection_id,
+        connection_id,
         false
       );
       const accept: PendingAccept = {
-        connectionId: signal.connection_id,
+        connectionId: connection_id,
         peer: newPeer,
         createdAt: Date.now(),
       };
@@ -2032,11 +2209,11 @@ export class StreamsStore {
           : [accept];
       allPendingScreenShareAccepts[pubKey64] = newPendingAcceptsForAgent;
       this._pendingScreenShareAccepts = allPendingScreenShareAccepts;
-      await this.roomClient.sendInitAccept({
-        connection_type: signal.connection_type,
-        connection_id: signal.connection_id,
-        to_agent: signal.from_agent,
-      });
+      await this.roomClient.sendMessage(
+        [signal.from_agent],
+        'InitAccept',
+        JSON.stringify({ connection_id, connection_type }),
+      );
     }
   }
 
@@ -2045,8 +2222,9 @@ export class StreamsStore {
    *
    * @param signal
    */
-  async handleInitAccept(signal: Extract<RoomSignal, { type: 'InitAccept' }>) {
+  async handleInitAccept(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubKey64 = encodeHashToBase64(signal.from_agent);
+    const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
     this.logger.logAgentEvent({
       agent: pubKey64,
       timestamp: Date.now(),
@@ -2061,7 +2239,7 @@ export class StreamsStore {
      * for this agent.
      *
      */
-    if (signal.connection_type === 'video') {
+    if (connection_type === 'video') {
       const agentPendingInits = this._pendingInits[pubKey64];
       if (!Object.keys(get(this._openConnections)).includes(pubKey64)) {
         if (!agentPendingInits) {
@@ -2073,11 +2251,11 @@ export class StreamsStore {
         if (
           agentPendingInits
             .map(pendingInit => pendingInit.connectionId)
-            .includes(signal.connection_id)
+            .includes(connection_id)
         ) {
           // Measure signaling round-trip time
           const matchingInit = agentPendingInits.find(
-            pi => pi.connectionId === signal.connection_id
+            pi => pi.connectionId === connection_id
           );
           if (matchingInit) {
             const rtt = Date.now() - matchingInit.t0;
@@ -2089,14 +2267,14 @@ export class StreamsStore {
           console.log('#### RECEIVED INIT ACCEPT AND CEATING INITIATING PEER.');
           const newPeer = this.createPeer(
             signal.from_agent,
-            signal.connection_id,
+            connection_id,
             true
           );
 
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
             openConnections[pubKey64] = {
-              connectionId: signal.connection_id,
+              connectionId: connection_id,
               peer: newPeer,
               video: false,
               audio: false,
@@ -2140,7 +2318,7 @@ export class StreamsStore {
      * Instance and add it to open connections, then delete all PendingInits
      * for this agent
      */
-    if (signal.connection_type === 'screen') {
+    if (connection_type === 'screen') {
       const agentPendingScreenShareInits =
         this._pendingScreenShareInits[pubKey64];
       if (
@@ -2156,21 +2334,21 @@ export class StreamsStore {
         if (
           agentPendingScreenShareInits
             .map(pendingInit => pendingInit.connectionId)
-            .includes(signal.connection_id)
+            .includes(connection_id)
         ) {
           console.log(
             '#### RECEIVED INIT ACCEPT FOR SCREEN SHARING AND INITIATING PEER.'
           );
           const newPeer = this.createScreenSharePeer(
             signal.from_agent,
-            signal.connection_id,
+            connection_id,
             true
           );
 
           this._screenShareConnectionsOutgoing.update(currentValue => {
             const screenShareConnectionsOutgoing = currentValue;
             screenShareConnectionsOutgoing[pubKey64] = {
-              connectionId: signal.connection_id,
+              connectionId: connection_id,
               peer: newPeer,
               video: true,
               audio: false,
@@ -2195,16 +2373,17 @@ export class StreamsStore {
    *
    * @param signal
    */
-  async handleSdpData(signal: Extract<RoomSignal, { type: 'SdpData' }>) {
+  async handleSdpData(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, signal.data);
+    const { connection_id, data } = JSON.parse(signal.payload) as SdpPayload;
+    console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, data);
 
     // Log the SDP sub-type for diagnostics
     try {
-      const sdpPayload = JSON.parse(signal.data);
-      const sdpType = sdpPayload.type || 'candidate';
+      const sdpContent = JSON.parse(data);
+      const sdpType = sdpContent.type || 'candidate';
       this.logger.logCustomMessage(
-        `SDP ${sdpType} [${pubkeyB64.slice(0, 8)}] connId=${signal.connection_id.slice(0, 8)}`
+        `SDP ${sdpType} [${pubkeyB64.slice(0, 8)}] connId=${connection_id.slice(0, 8)}`
       );
     } catch {
       // ignore parse errors for logging
@@ -2225,9 +2404,9 @@ export class StreamsStore {
     const maybeOpenConnection = get(this._openConnections)[pubkeyB64];
     if (
       maybeOpenConnection &&
-      maybeOpenConnection.connectionId === signal.connection_id
+      maybeOpenConnection.connectionId === connection_id
     ) {
-      maybeOpenConnection.peer.signal(JSON.parse(signal.data));
+      maybeOpenConnection.peer.signal(JSON.parse(data));
     } else {
       /**
        * If there is no open connection yet but a PendingAccept then move that
@@ -2239,17 +2418,17 @@ export class StreamsStore {
       const pendingAcceptsForAgent = allPendingAccepts[pubkeyB64];
       if (pendingAcceptsForAgent) {
         const maybePendingAccept = pendingAcceptsForAgent.find(
-          pendingAccept => pendingAccept.connectionId === signal.connection_id
+          pendingAccept => pendingAccept.connectionId === connection_id
         );
         if (maybePendingAccept) {
-          maybePendingAccept.peer.signal(JSON.parse(signal.data));
+          maybePendingAccept.peer.signal(JSON.parse(data));
           console.log(
             '#### FOUND PENDING ACCEPT! Moving to open connections...'
           );
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
             openConnections[pubkeyB64] = {
-              connectionId: signal.connection_id,
+              connectionId: connection_id,
               peer: maybePendingAccept.peer,
               video: false,
               audio: false,
@@ -2259,7 +2438,7 @@ export class StreamsStore {
             return openConnections;
           });
           const otherPendingAccepts = pendingAcceptsForAgent.filter(
-            pendingAccept => pendingAccept.connectionId !== signal.connection_id
+            pendingAccept => pendingAccept.connectionId !== connection_id
           );
           otherPendingAccepts.forEach(pendingAccept =>
             pendingAccept.peer.destroy()
@@ -2282,9 +2461,9 @@ export class StreamsStore {
     )[pubkeyB64];
     if (
       maybeOutgoingScreenShareConnection &&
-      maybeOutgoingScreenShareConnection.connectionId === signal.connection_id
+      maybeOutgoingScreenShareConnection.connectionId === connection_id
     ) {
-      maybeOutgoingScreenShareConnection.peer.signal(JSON.parse(signal.data));
+      maybeOutgoingScreenShareConnection.peer.signal(JSON.parse(data));
     }
 
     /**
@@ -2295,9 +2474,9 @@ export class StreamsStore {
     )[pubkeyB64];
     if (
       maybeIncomingScreenShareConnection &&
-      maybeIncomingScreenShareConnection.connectionId === signal.connection_id
+      maybeIncomingScreenShareConnection.connectionId === connection_id
     ) {
-      maybeIncomingScreenShareConnection.peer.signal(JSON.parse(signal.data));
+      maybeIncomingScreenShareConnection.peer.signal(JSON.parse(data));
     } else {
       /**
        * If there's no open connection but a PendingAccept then move that
@@ -2309,14 +2488,14 @@ export class StreamsStore {
         this._pendingScreenShareAccepts[pubkeyB64];
       if (pendingScreenShareAccepts) {
         const maybePendingAccept = pendingScreenShareAccepts.find(
-          pendingAccept => pendingAccept.connectionId === signal.connection_id
+          pendingAccept => pendingAccept.connectionId === connection_id
         );
         if (maybePendingAccept) {
-          maybePendingAccept.peer.signal(JSON.parse(signal.data));
+          maybePendingAccept.peer.signal(JSON.parse(data));
           this._screenShareConnectionsIncoming.update(currentValue => {
             const screenShareConnectionsIncoming = currentValue;
             screenShareConnectionsIncoming[pubkeyB64] = {
-              connectionId: signal.connection_id,
+              connectionId: connection_id,
               peer: maybePendingAccept.peer,
               video: false,
               audio: false,
@@ -2326,7 +2505,7 @@ export class StreamsStore {
             return screenShareConnectionsIncoming;
           });
           const otherPendingAccepts = pendingScreenShareAccepts.filter(
-            pendingAccept => pendingAccept.connectionId !== signal.connection_id
+            pendingAccept => pendingAccept.connectionId !== connection_id
           );
           otherPendingAccepts.forEach(pendingAccept =>
             pendingAccept.peer.destroy()

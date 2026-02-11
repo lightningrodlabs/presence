@@ -3,33 +3,21 @@ use hdk::prelude::*;
 #[derive(Serialize, Deserialize, SerializedBytes, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum SignalPayload {
+    /// Backend auto-response: automatically replies with Pong, no UI involvement
     Ping {
         from_agent: AgentPubKey,
     },
+    /// Backend auto-response to Ping
     Pong {
         from_agent: AgentPubKey,
     },
-    PingUi {
+    /// Generic UI message — all frontend signal types go through this variant.
+    /// msg_type and payload are opaque to the backend; semantics are defined
+    /// entirely in the frontend.
+    Message {
         from_agent: AgentPubKey,
-    },
-    PongUi {
-        from_agent: AgentPubKey,
-        meta_data: String,
-    },
-    InitRequest {
-        from_agent: AgentPubKey,
-        connection_id: String,
-        connection_type: Option<String>,
-    },
-    InitAccept {
-        from_agent: AgentPubKey,
-        connection_id: String,
-        connection_type: Option<String>,
-    },
-    SdpData {
-        from_agent: AgentPubKey,
-        connection_id: String,
-        data: String,
+        msg_type: String,
+        payload: String,
     },
 }
 
@@ -43,11 +31,7 @@ pub fn recv_remote_signal(signal: ExternIO) -> ExternResult<()> {
     match signal_payload.clone() {
         SignalPayload::Ping { from_agent } => pong(from_agent),
         SignalPayload::Pong { .. } => emit_signal(signal_payload),
-        SignalPayload::PingUi { .. } => emit_signal(signal_payload),
-        SignalPayload::PongUi { .. } => emit_signal(signal_payload),
-        SignalPayload::InitRequest { .. } => emit_signal(signal_payload),
-        SignalPayload::InitAccept { .. } => emit_signal(signal_payload),
-        SignalPayload::SdpData { .. } => emit_signal(signal_payload),
+        SignalPayload::Message { .. } => emit_signal(signal_payload),
     }
 }
 
@@ -78,99 +62,25 @@ fn pong(from_agent: AgentPubKey) -> ExternResult<()> {
     send_remote_signal(encoded_signal, vec![from_agent])
 }
 
-/// Send a remote signal to the given users to check whether they are online AND their UI is running
-/// The pong to this ping needs to be emitted by the UI of the other agent
-#[hdk_extern]
-pub fn ping_ui(agents_pub_keys: Vec<AgentPubKey>) -> ExternResult<()> {
-    let signal_payload = SignalPayload::PingUi {
-        from_agent: agent_info()?.agent_initial_pubkey,
-    };
-
-    let encoded_signal = ExternIO::encode(signal_payload)
-        .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
-
-    send_remote_signal(encoded_signal, agents_pub_keys)
-}
-
 #[derive(Serialize, Deserialize, Debug)]
-pub struct PongInput {
-    to_agent: AgentPubKey,
-    meta_data: String,
+pub struct SendMessageInput {
+    pub to_agents: Vec<AgentPubKey>,
+    pub msg_type: String,
+    pub payload: String,
 }
 
-/// Respond with a pong to a PongUi signal. Needs to be actively called by the UI.
+/// Send a generic message to the given agents. The msg_type and payload are
+/// opaque to the backend — all semantics are defined in the frontend.
 #[hdk_extern]
-pub fn pong_ui(input: PongInput) -> ExternResult<()> {
-    let signal_payload = SignalPayload::PongUi {
+pub fn send_message(input: SendMessageInput) -> ExternResult<()> {
+    let signal_payload = SignalPayload::Message {
         from_agent: agent_info()?.agent_initial_pubkey,
-        meta_data: input.meta_data,
+        msg_type: input.msg_type,
+        payload: input.payload,
     };
 
     let encoded_signal = ExternIO::encode(signal_payload)
         .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
 
-    send_remote_signal(encoded_signal, vec![input.to_agent])
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct InitRequestInput {
-    pub connection_type: Option<String>, // e.g. "screen" for screen sharing
-    pub connection_id: String,
-    pub to_agent: AgentPubKey,
-}
-
-#[hdk_extern]
-pub fn send_init_request(input: InitRequestInput) -> ExternResult<()> {
-    let signal_payload = SignalPayload::InitRequest {
-        from_agent: agent_info()?.agent_initial_pubkey,
-        connection_id: input.connection_id,
-        connection_type: input.connection_type,
-    };
-
-    let encoded_signal = ExternIO::encode(signal_payload)
-        .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
-
-    send_remote_signal(encoded_signal, vec![input.to_agent])
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct InitAcceptInput {
-    pub connection_type: Option<String>, // e.g. "screen" for screen sharing
-    pub connection_id: String,
-    pub to_agent: AgentPubKey,
-}
-
-#[hdk_extern]
-pub fn send_init_accept(input: InitAcceptInput) -> ExternResult<()> {
-    let signal_payload = SignalPayload::InitAccept {
-        from_agent: agent_info()?.agent_initial_pubkey,
-        connection_id: input.connection_id,
-        connection_type: input.connection_type,
-    };
-
-    let encoded_signal = ExternIO::encode(signal_payload)
-        .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
-
-    send_remote_signal(encoded_signal, vec![input.to_agent])
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SdpDataInput {
-    pub to_agent: AgentPubKey,
-    pub connection_id: String,
-    pub data: String,
-}
-
-#[hdk_extern]
-pub fn send_sdp_data(input: SdpDataInput) -> ExternResult<()> {
-    let signal_payload = SignalPayload::SdpData {
-        from_agent: agent_info()?.agent_initial_pubkey,
-        connection_id: input.connection_id,
-        data: input.data,
-    };
-
-    let encoded_signal = ExternIO::encode(signal_payload)
-        .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
-
-    send_remote_signal(encoded_signal, vec![input.to_agent])
+    send_remote_signal(encoded_signal, input.to_agents)
 }

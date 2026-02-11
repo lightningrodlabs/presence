@@ -225,6 +225,12 @@ export class RoomView extends LitElement {
   _showConnectionDetails = false;
 
   @state()
+  _splitRatio = 70;
+
+  @state()
+  _isResizing = false;
+
+  @state()
   _logsGraphEnabled = true;
 
   @state()
@@ -320,6 +326,9 @@ export class RoomView extends LitElement {
           break;
         }
         case 'my-screen-share-on': {
+          // Wait for re-render so the conditionally-rendered video element exists in DOM
+          this.requestUpdate();
+          await this.updateComplete;
           const myScreenVideo = this.shadowRoot?.getElementById(
             'my-own-screen'
           ) as HTMLVideoElement;
@@ -428,6 +437,48 @@ export class RoomView extends LitElement {
     }
   }
 
+  _onResizeStart = (e: MouseEvent | TouchEvent) => {
+    e.preventDefault();
+    this._isResizing = true;
+
+    const onMove = (e: MouseEvent | TouchEvent) => {
+      if (!this._isResizing) return;
+      const container = this.shadowRoot?.querySelector(
+        '.videos-container'
+      ) as HTMLElement;
+      if (!container) return;
+
+      const rect = container.getBoundingClientRect();
+      const isHorizontal = rect.width > rect.height;
+      const clientX =
+        e instanceof MouseEvent ? e.clientX : e.touches[0].clientX;
+      const clientY =
+        e instanceof MouseEvent ? e.clientY : e.touches[0].clientY;
+
+      if (isHorizontal) {
+        this._splitRatio = ((clientX - rect.left) / rect.width) * 100;
+      } else {
+        // column-reverse: screen shares at bottom, people at top
+        this._splitRatio = ((rect.bottom - clientY) / rect.height) * 100;
+      }
+
+      this._splitRatio = Math.max(20, Math.min(80, this._splitRatio));
+    };
+
+    const onEnd = () => {
+      this._isResizing = false;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onEnd);
+      document.removeEventListener('touchmove', onMove);
+      document.removeEventListener('touchend', onEnd);
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onEnd);
+    document.addEventListener('touchmove', onMove);
+    document.addEventListener('touchend', onEnd);
+  };
+
   disconnectedCallback(): void {
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this._unsubscribe) this._unsubscribe();
@@ -435,24 +486,35 @@ export class RoomView extends LitElement {
     this.streamsStore.disconnect();
   }
 
-  idToLayout(id: string) {
+  idToLayout(id: string, isScreenShare: boolean = false) {
     if (id === this._maximizedVideo) return 'maximized';
     if (this._maximizedVideo) return 'hidden';
     const incomingScreenShareNum = Object.keys(
       this._screenShareConnectionsIncoming.value
     ).length;
     const ownScreenShareNum = this.streamsStore.screenShareStream ? 1 : 0;
-    const num =
-      Object.keys(this._openConnections.value).length +
-      incomingScreenShareNum +
-      ownScreenShareNum +
-      1;
+    const totalScreenShares = incomingScreenShareNum + ownScreenShareNum;
+    const hasScreenShares = totalScreenShares > 0;
+
+    const videoOnlyCount =
+      Object.keys(this._openConnections.value).length + 1;
+    const totalCount = videoOnlyCount + totalScreenShares;
+
+    // In split mode, size items based on their panel's count
+    const num = isScreenShare
+      ? totalScreenShares
+      : hasScreenShares
+        ? videoOnlyCount
+        : totalCount;
 
     if (num === 1) {
       return 'single';
     }
     if (num <= 2) {
       return 'double';
+    }
+    if (num === 3) {
+      return 'triplett';
     }
     if (num <= 4) {
       return 'quartett';
@@ -1497,6 +1559,12 @@ export class RoomView extends LitElement {
   }
 
   render() {
+    const incomingScreenShares = Object.entries(this._screenShareConnectionsIncoming.value).filter(
+      ([_, conn]) => conn.direction === 'incoming'
+    );
+    const hasScreenShares =
+      !!this.streamsStore.screenShareStream || incomingScreenShares.length > 0;
+    const splitMode = hasScreenShares && !this._maximizedVideo;
     return html`
       <div
         class="custom-log-dialog"
@@ -1604,12 +1672,15 @@ export class RoomView extends LitElement {
           : html``}
         ${this.roomName()}
       </div>
-      <div class="videos-container">
+      <div class="videos-container${splitMode ? ' split-mode' : ''}">
+        ${hasScreenShares ? html`
+        <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
         <!-- My own screen first if screen sharing is enabled -->
         <div
           style="${this.streamsStore.screenShareStream ? '' : 'display: none;'}"
           class="video-container screen-share ${this.idToLayout(
-            'my-own-screen'
+            'my-own-screen',
+            true
           )}"
           @dblclick=${() => this.toggleMaximized('my-own-screen')}
         >
@@ -1663,7 +1734,8 @@ export class RoomView extends LitElement {
           ([pubkeyB64, conn]) => html`
             <div
               class="video-container screen-share ${this.idToLayout(
-                conn.connectionId
+                conn.connectionId,
+                true
               )}"
               @dblclick=${() => this.toggleMaximized(conn.connectionId)}
             >
@@ -1731,7 +1803,10 @@ export class RoomView extends LitElement {
             </div>
           `
         )}
-
+        </div>
+        ${splitMode ? html`<div class="resize-handle" @mousedown=${this._onResizeStart} @touchstart=${this._onResizeStart}></div>` : html``}
+        ` : html``}
+        <div class="${splitMode ? 'people-panel' : 'layout-transparent'}">
         <!-- My own video stream -->
         <div
           style="${this._selfViewHidden ? 'display: none;' : ''}"
@@ -1765,7 +1840,7 @@ export class RoomView extends LitElement {
           ${this._circleView
             ? html`
                 <div
-                  style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
+                  style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
                 >
                   <div class="row" style="margin-bottom: 4px;">
                     <sl-icon
@@ -1793,7 +1868,7 @@ export class RoomView extends LitElement {
                   </div>
                   <avatar-with-nickname
                     .size=${36}
-                    .hideAvatar=${this._camera}
+                    .hideAvatar=${!this._camera}
                     .agentPubKey=${this.roomStore.client.client.myPubKey}
                     style="height: 36px;"
                   ></avatar-with-nickname>
@@ -1864,15 +1939,10 @@ export class RoomView extends LitElement {
                 ? html`<div
                     style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
                   >
+                    <div style="display: flex; flex-direction: column; margin-right: 6px;">
+                      ${this.renderTrackStatuses(pubkeyB64)}
+                    </div>
                     ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
-                  </div>`
-                : html``}
-              ${this._showConnectionDetails
-                ? html`<div
-                    class="row"
-                    style="position: absolute; top: 3px; right: 9px;"
-                  >
-                    ${this.renderTrackStatuses(pubkeyB64)}
                   </div>`
                 : html``}
 
@@ -1880,7 +1950,7 @@ export class RoomView extends LitElement {
               ${this._circleView
                 ? html`
                     <div
-                      style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none;"
+                      style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
                     >
                       <div class="row" style="margin-bottom: 4px;">
                         <sl-icon
@@ -1909,7 +1979,7 @@ export class RoomView extends LitElement {
                       <div class="row" style="align-items: center;">
                         <avatar-with-nickname
                           .size=${36}
-                          .hideAvatar=${conn.video}
+                          .hideAvatar=${!conn.video}
                           .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                           style="height: 36px;"
                         ></avatar-with-nickname>
@@ -2084,6 +2154,7 @@ export class RoomView extends LitElement {
             </div>
           `
         )}
+        </div>
       </div>
       ${this.renderToggles()}
       ${this._showAttachmentsPanel ? this.renderAttachmentPanel() : undefined}
@@ -2363,6 +2434,14 @@ export class RoomView extends LitElement {
         -webkit-user-select: none;
       }
 
+      .video-container:not(.square-view):not(.screen-share) {
+        overflow: visible;
+      }
+
+      .video-container:not(.square-view):not(.screen-share) .video-el {
+        border-radius: 50%;
+      }
+
       .video-container.square-view {
         aspect-ratio: 16 / 9;
         border-radius: 20px;
@@ -2408,8 +2487,66 @@ export class RoomView extends LitElement {
         border: 4px solid #ffe100;
         aspect-ratio: 16 / 9;
         border-radius: 20px;
-        width: 60vw;
-        min-width: min(50vw, calc(50% - 12px));
+      }
+
+      /* Split-mode layout for screen shares */
+      .videos-container.split-mode {
+        flex-wrap: nowrap;
+        align-items: stretch;
+        padding-top: 45px;
+        padding-bottom: 35px;
+        box-sizing: border-box;
+      }
+      @media (min-aspect-ratio: 1/1) {
+        .videos-container.split-mode { flex-direction: row; }
+      }
+      @media (max-aspect-ratio: 1/1) {
+        .videos-container.split-mode { flex-direction: column-reverse; }
+      }
+
+      .screen-share-panel, .people-panel {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        align-content: center;
+        overflow: hidden;
+        container-type: size;
+      }
+
+      .screen-share-panel {
+        min-width: 0;
+        min-height: 0;
+      }
+
+      /* When not in split mode (e.g. maximized), make the panel invisible */
+      .videos-container:not(.split-mode) .screen-share-panel {
+        display: contents;
+      }
+
+      .people-panel {
+        flex: 1;
+        min-width: 0;
+        min-height: 0;
+      }
+
+      .layout-transparent {
+        display: contents;
+      }
+
+      .resize-handle {
+        flex-shrink: 0;
+        background: #4a5568;
+        z-index: 10;
+      }
+      .resize-handle:hover {
+        background: #667eea;
+      }
+      @media (min-aspect-ratio: 1/1) {
+        .resize-handle { width: 6px; cursor: col-resize; }
+      }
+      @media (max-aspect-ratio: 1/1) {
+        .resize-handle { height: 6px; cursor: row-resize; }
       }
 
       .video-el {
@@ -2435,6 +2572,11 @@ export class RoomView extends LitElement {
         min-width: max(280px, 48.5vw);
       }
 
+      .triplett {
+        width: min(48.5%, 48.5vw, 84vh);
+        min-width: min(84vh, max(280px, 48.5vw));
+      }
+
       .quartett {
         width: min(48.5%, 48.5vw, 84vh);
         min-width: min(84vh, max(280px, 48.5vw));
@@ -2448,6 +2590,130 @@ export class RoomView extends LitElement {
       .octett {
         width: min(32.5%, 32.5vw, 55vh);
         min-width: min(55vh, max(280px, 32.5vw));
+      }
+
+      .unlimited {
+        width: min(24%, 24vw, 42vh);
+        min-width: min(42vh, max(200px, 24vw));
+      }
+
+      /* Circle mode: 1:1 aspect ratio means height = width, so use
+         tighter vh constraints to prevent vertical overflow.
+         Triplett uses max(min(),min()) to auto-pick the better layout:
+         wide viewport -> 3-per-row (32vw), square/tall -> 2+1 (47vh) */
+      .video-container:not(.square-view):not(.screen-share).triplett {
+        width: max(min(32%, 32vw, 95vh), min(48.5%, 48.5vw, 47vh));
+        min-width: max(280px, min(32vw, 95vh), min(48.5vw, 47vh));
+      }
+
+      .video-container:not(.square-view):not(.screen-share).quartett {
+        width: min(48.5%, 48.5vw, 47vh);
+        min-width: min(47vh, max(280px, 48.5vw));
+      }
+
+      .video-container:not(.square-view):not(.screen-share).sextett {
+        width: min(32.5%, 32.5vw, 47vh);
+        min-width: min(47vh, max(280px, 32.5vw));
+      }
+
+      .video-container:not(.square-view):not(.screen-share).octett {
+        width: min(32.5%, 32.5vw, 31vh);
+        min-width: min(31vh, max(280px, 32.5vw));
+      }
+
+      .video-container:not(.square-view):not(.screen-share).unlimited {
+        width: min(24%, 24vw, 23vh);
+        min-width: min(23vh, max(200px, 24vw));
+      }
+
+      /* People panel: use container query units so videos size
+         relative to the panel, not the full viewport.
+         For 2 people, stack vertically (full width, 49% height) since
+         the people panel is typically narrow. */
+      .people-panel .single {
+        height: min(98cqh, 100%);
+        width: min(98cqw, 100%);
+        max-height: 98cqh;
+      }
+      .people-panel .double {
+        width: min(98%, 98cqw);
+        min-width: 0;
+        max-height: 49cqh;
+      }
+      .people-panel .triplett,
+      .people-panel .quartett {
+        width: min(49%, 49cqw);
+        min-width: 0;
+        max-height: 49cqh;
+      }
+      .people-panel .sextett {
+        width: min(32%, 32cqw);
+        min-width: 0;
+        max-height: 49cqh;
+      }
+      .people-panel .octett {
+        width: min(32%, 32cqw);
+        min-width: 0;
+        max-height: 32cqh;
+      }
+      .people-panel .unlimited {
+        width: min(24%, 24cqw);
+        min-width: 0;
+        max-height: 32cqh;
+      }
+
+      /* Screen share panel: screen shares are 16:9, so stack vertically
+         for 2 (full width, 49% height each) to maximize visible area.
+         For 3+, use a grid that constrains both dimensions. */
+      .screen-share-panel .single {
+        height: min(98cqh, 100%);
+        width: min(98cqw, 100%);
+        max-height: 98cqh;
+      }
+      .screen-share-panel .double {
+        width: 100%;
+        min-width: 0;
+        max-height: 49cqh;
+      }
+      .screen-share-panel .triplett,
+      .screen-share-panel .quartett {
+        width: min(49%, 49cqw);
+        min-width: 0;
+        max-height: 49cqh;
+      }
+      .screen-share-panel .sextett {
+        width: min(32%, 32cqw);
+        min-width: 0;
+        max-height: 49cqh;
+      }
+      .screen-share-panel .octett {
+        width: min(32%, 32cqw);
+        min-width: 0;
+        max-height: 32cqh;
+      }
+      .screen-share-panel .unlimited {
+        width: min(24%, 24cqw);
+        min-width: 0;
+        max-height: 32cqh;
+      }
+
+      /* People panel circle-mode: constrain width by height so
+         containers stay roughly square for circular video rendering */
+      .people-panel .video-container:not(.square-view):not(.screen-share).double {
+        width: min(98cqw, 49cqh);
+      }
+      .people-panel .video-container:not(.square-view):not(.screen-share).triplett,
+      .people-panel .video-container:not(.square-view):not(.screen-share).quartett {
+        width: min(49cqw, 49cqh);
+      }
+      .people-panel .video-container:not(.square-view):not(.screen-share).sextett {
+        width: min(32cqw, 49cqh);
+      }
+      .people-panel .video-container:not(.square-view):not(.screen-share).octett {
+        width: min(32cqw, 32cqh);
+      }
+      .people-panel .video-container:not(.square-view):not(.screen-share).unlimited {
+        width: min(24cqw, 32cqh);
       }
 
       .btn-stop {

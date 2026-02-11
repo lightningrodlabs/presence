@@ -3,12 +3,8 @@ import { AgentPubKey, AppClient, RoleName, Record, ActionHash } from '@holochain
 import {
   Attachment,
   DescendentRoom,
-  InitAcceptInput,
-  InitRequestInput,
-  PongInput,
   RoomInfo,
   RoomSignal,
-  SdpDataInput,
 } from '../types';
 
 export class RoomClient extends ZomeClient<RoomSignal> {
@@ -70,28 +66,15 @@ export class RoomClient extends ZomeClient<RoomSignal> {
     return this.callZome('ping', agentPubKeys);
   }
 
-  async pingFrontend(agentPubKeys: AgentPubKey[]): Promise<void> {
-    return this.callZome('ping_ui', agentPubKeys);
-  }
-
   /**
-   * Send a pong to an agent that sent a ping_ui
-   * @param agentPubKey
-   * @returns
+   * Send a generic message to the given agents. The msg_type and payload are
+   * opaque to the backend — all semantics are defined in the frontend.
    */
-  async pongFrontend(input: PongInput): Promise<void> {
-    return this.callZome('pong_ui', input);
-  }
-
-  async sendInitRequest(payload: InitRequestInput): Promise<void> {
-    return this.callZome('send_init_request', payload);
-  }
-
-  async sendInitAccept(payload: InitAcceptInput): Promise<void> {
-    return this.callZome('send_init_accept', payload);
-  }
-
-  async sendSdpData(payload: SdpDataInput): Promise<void> {
-    return this.callZome('send_sdp_data', payload);
+  async sendMessage(toAgents: AgentPubKey[], msgType: string, payload: string = ''): Promise<void> {
+    return this.callZome('send_message', {
+      to_agents: toAgents,
+      msg_type: msgType,
+      payload,
+    });
   }
 }

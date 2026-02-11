@@ -293,7 +293,7 @@ export class PresenceApp extends LitElement {
     }, 10000);
 
     this._unsubscribe = this._mainRoomStore.client.onSignal(async signal => {
-      if (signal.type === 'PingUi') {
+      if (signal.type === 'Message' && signal.msg_type === 'PingUi') {
         // This is the case if the other agent is in the main room
         const newOnlineAgentsList = this._activeMainRoomParticipants.filter(
           info => info.pubkey.toString() !== signal.from_agent.toString()
@@ -303,6 +303,12 @@ export class PresenceApp extends LitElement {
           lastSeen: Date.now(),
         });
         this._activeMainRoomParticipants = newOnlineAgentsList;
+      }
+      if (signal.type === 'Message' && signal.msg_type === 'LeaveUi') {
+        this._activeMainRoomParticipants =
+          this._activeMainRoomParticipants.filter(
+            info => info.pubkey.toString() !== signal.from_agent.toString()
+          );
       }
     });
   }

@@ -94,8 +94,8 @@ export class SharedRoomCard extends LitElement {
 
       // Listen to pings from agents
       this._unsubscribe = roomClient.onSignal(async signal => {
-        if (signal.type === 'PingUi') {
-          console.log('Gog pingUI from room ', roomClient.roleName);
+        if (signal.type === 'Message' && signal.msg_type === 'PingUi') {
+          console.log('Got pingUI from room ', roomClient.roleName);
           // This is the case if the other agent is in the main room
           const newOnlineAgentsList = this._activeRoomParticipants.filter(
             info => info.pubkey.toString() !== signal.from_agent.toString()
@@ -109,6 +109,12 @@ export class SharedRoomCard extends LitElement {
             'this._activeRoomParticipants',
             this._activeRoomParticipants
           );
+        }
+        if (signal.type === 'Message' && signal.msg_type === 'LeaveUi') {
+          this._activeRoomParticipants =
+            this._activeRoomParticipants.filter(
+              info => info.pubkey.toString() !== signal.from_agent.toString()
+            );
         }
       });
     } else {
