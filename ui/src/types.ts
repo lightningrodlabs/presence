@@ -38,6 +38,7 @@ export type OpenConnectionInfo = {
   video: boolean;
   audio: boolean;
   connected: boolean;
+  relayed?: boolean; // true if the ICE candidate pair uses a TURN relay
   direction: 'outgoing' | 'incoming' | 'duplex'; // In which direction streams are expected
 };
 

@@ -27,6 +27,7 @@ import {
   mdiPaperclip,
   mdiPencilCircleOutline,
   mdiPhoneRefresh,
+  mdiHub,
   mdiVideo,
   mdiVideoOff,
 } from '@mdi/js';
@@ -734,7 +735,26 @@ export class RoomView extends LitElement {
   renderTrackStatuses(pubkeyB64: AgentPubKeyB64) {
     const perceivedStreamInfo =
       this._othersConnectionStatuses.value[pubkeyB64]?.perceivedStreamInfo;
+    const conn = this._openConnections.value[pubkeyB64];
     return html`
+      <!-- Relay indicator (only shown when connection goes through TURN) -->
+      ${conn?.relayed
+        ? html`
+            <sl-tooltip
+              hoist
+              class="tooltip-filled"
+              placement="top"
+              content="Relayed via TURN server"
+              style="--sl-tooltip-background-color: #e7a008;"
+            >
+              <sl-icon
+                style="font-size: 20px; color: #e7a008;"
+                .src=${wrapPathInSvg(mdiHub)}
+              ></sl-icon>
+            </sl-tooltip>
+          `
+        : html``}
+
       <!-- Audio track icon -->
       <sl-tooltip
         hoist

@@ -1248,6 +1248,42 @@ export class StreamsStore {
         pubKeyB64,
         connectionId,
       });
+
+      // Check whether connection is relayed (TURN) after ICE settles
+      setTimeout(async () => {
+        try {
+          const pc = (peer as any)._pc as RTCPeerConnection | undefined;
+          if (!pc) return;
+          const stats = await pc.getStats();
+          let isRelayed = false;
+          const reportsById: Record<string, any> = {};
+          stats.forEach((report: any) => {
+            reportsById[report.id] = report;
+          });
+          Object.values(reportsById).forEach((report: any) => {
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+              const localCandidate = reportsById[report.localCandidateId];
+              if (localCandidate?.candidateType === 'relay') {
+                isRelayed = true;
+              }
+            }
+          });
+          this._openConnections.update(current => {
+            const conn = current[pubKeyB64];
+            if (conn) {
+              conn.relayed = isRelayed;
+            }
+            return current;
+          });
+          if (isRelayed) {
+            this.logger.logCustomMessage(
+              `Connection [${pubKeyB64.slice(0, 8)}]: relayed via TURN`
+            );
+          }
+        } catch (e) {
+          // getStats may fail if connection was already closed
+        }
+      }, 2000);
     });
     peer.on('close', async () => {
       console.log('#### GOT CLOSE EVENT ####');
