@@ -886,6 +886,12 @@ export class StreamsStore {
   mainStreamClones: MediaStream[] = [];
 
   /**
+   * Tracks the last time reconcileVideoStreamState was triggered per agent,
+   * to avoid firing more than once per 30s interval.
+   */
+  _lastReconcileTime: Record<AgentPubKeyB64, number> = {};
+
+  /**
    * Our own screen share stream
    */
   screenShareStream: MediaStream | undefined | null;
@@ -1076,7 +1082,15 @@ export class StreamsStore {
             });
           }
           if (msg.message === 'video-on') {
-            // Only log, nothing else to do
+            this._openConnections.update(currentValue => {
+              const openConnections = currentValue;
+              const relevantConnection = openConnections[pubKeyB64];
+              if (relevantConnection) {
+                relevantConnection.video = true;
+                openConnections[pubKeyB64] = relevantConnection;
+              }
+              return openConnections;
+            });
             this.logger.logAgentEvent({
               agent: pubKeyB64,
               timestamp: Date.now(),
@@ -1211,9 +1225,15 @@ export class StreamsStore {
       const relevantConnection = openConnections[pubKeyB64];
       relevantConnection.connected = true;
 
-      // if we are already sharing video or audio, add the relevant streams
+      // Add stream if not already added before connect (e.g. mainStream was null at peer
+      // creation time but is available now). If already added, the try-catch silently
+      // ignores the duplicate-track error from RTCPeerConnection.addTrack.
       if (this.mainStream) {
-        relevantConnection.peer.addStream(this.mainStream);
+        try {
+          relevantConnection.peer.addStream(this.mainStream);
+        } catch (e: any) {
+          // Tracks were already included in the initial offer/answer — no action needed
+        }
       }
 
       this._openConnections.update(currentValue => {
@@ -1249,6 +1269,17 @@ export class StreamsStore {
         const openConnections = currentValue;
         delete openConnections[pubKeyB64];
         return openConnections;
+      });
+
+      // Clear stale perceivedStreamInfo so icons don't show stale state during reconnection
+      this._othersConnectionStatuses.update(statuses => {
+        if (statuses[pubKeyB64]) {
+          statuses[pubKeyB64] = {
+            ...statuses[pubKeyB64],
+            perceivedStreamInfo: undefined,
+          };
+        }
+        return statuses;
       });
 
       // Also tear down any outgoing screen share to this peer since they
@@ -1294,6 +1325,17 @@ export class StreamsStore {
         const openConnections = currentValue;
         delete openConnections[pubKeyB64];
         return openConnections;
+      });
+
+      // Clear stale perceivedStreamInfo so icons don't show stale state during reconnection
+      this._othersConnectionStatuses.update(statuses => {
+        if (statuses[pubKeyB64]) {
+          statuses[pubKeyB64] = {
+            ...statuses[pubKeyB64],
+            perceivedStreamInfo: undefined,
+          };
+        }
+        return statuses;
       });
 
       // Also tear down any outgoing screen share to this peer
@@ -1610,6 +1652,10 @@ export class StreamsStore {
     pubkey: AgentPubKeyB64,
     streamAndTrackInfo: StreamAndTrackInfo
   ) {
+    const RECONCILE_COOLDOWN_MS = 30_000;
+    const lastReconcile = this._lastReconcileTime[pubkey] || 0;
+    if (Date.now() - lastReconcile < RECONCILE_COOLDOWN_MS) return;
+
     if (this.mainStream) {
       // If we have an active video stream but the other peer doesn't see it,
       // re-add it to their peer and return
@@ -1626,6 +1672,7 @@ export class StreamsStore {
         if (peer) {
           try {
             peer.peer.addStream(this.mainStream);
+            this._lastReconcileTime[pubkey] = Date.now();
           } catch (e: any) {
             console.warn('Failed to re-add stream during reconcile:', e.message);
           }
@@ -1678,11 +1725,11 @@ export class StreamsStore {
           //
           const clonedStream = this.mainStream.clone();
           this.mainStreamClones = [...this.mainStreamClones, clonedStream];
-          peer.peer.addStream(clonedStream);
           peer.peer.addTrack(myAudioTrack, clonedStream);
           if (myVideoTrack) {
             peer.peer.addTrack(myVideoTrack, clonedStream);
           }
+          this._lastReconcileTime[pubkey] = Date.now();
 
           // We add the video track too if it exists so we can skip the if condition below
           // to not potentially re-add the stream yet again
@@ -1712,11 +1759,11 @@ export class StreamsStore {
           // Same logic as above with the audio tracks
           const clonedStream = this.mainStream.clone();
           this.mainStreamClones = [...this.mainStreamClones, clonedStream];
-          peer.peer.addStream(clonedStream);
           peer.peer.addTrack(myVideoTrack, clonedStream);
           if (myAudioTrack) {
             peer.peer.addTrack(myAudioTrack, clonedStream);
           }
+          this._lastReconcileTime[pubkey] = Date.now();
         }
       }
     }
@@ -2166,6 +2213,13 @@ export class StreamsStore {
         connection_id,
         false
       );
+
+      // Add stream before processing the offer so our tracks are included in the answer.
+      // This prevents the non-initiator from needing to renegotiate post-connect.
+      if (this.mainStream) {
+        newPeer.addStream(this.mainStream);
+      }
+
       const accept: PendingAccept = {
         connectionId: connection_id,
         peer: newPeer,
@@ -2270,6 +2324,12 @@ export class StreamsStore {
             connection_id,
             true
           );
+
+          // Add stream before SDP exchange so tracks are included in the initial offer.
+          // This prevents the need for post-connect renegotiation on the initiator side.
+          if (this.mainStream) {
+            newPeer.addStream(this.mainStream);
+          }
 
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
@@ -2448,7 +2508,7 @@ export class StreamsStore {
         }
       } else {
         console.warn(
-          `Got SDP data from agent (${pubkeyB64}) for which we have pending accepts but none with a matching connection id.`
+          `Got SDP data from agent (${pubkeyB64}) but no pending accepts exist for this agent. Discarding as stale.`
         );
       }
     }

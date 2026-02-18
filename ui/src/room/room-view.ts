@@ -733,7 +733,7 @@ export class RoomView extends LitElement {
 
   renderTrackStatuses(pubkeyB64: AgentPubKeyB64) {
     const perceivedStreamInfo =
-      this._othersConnectionStatuses.value[pubkeyB64].perceivedStreamInfo;
+      this._othersConnectionStatuses.value[pubkeyB64]?.perceivedStreamInfo;
     return html`
       <!-- Audio track icon -->
       <sl-tooltip
