@@ -91,7 +91,10 @@ export type SimpleEventType =
   | 'MyVideoOn'
   | 'MyVideoOff'
   | 'ChangeMyAudioInput'
-  | 'ChangeMyVideoInput';
+  | 'ChangeMyVideoInput'
+  | 'TrackArrivedMuted'
+  | 'TrackUnmuted'
+  | 'TrackUnmuteTimeout';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;

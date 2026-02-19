@@ -39,6 +39,9 @@ import { repeat } from 'lit/directives/repeat.js';
 import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/icon-button/icon-button.js';
 import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
+import '@shoelace-style/shoelace/dist/components/dropdown/dropdown.js';
+import '@shoelace-style/shoelace/dist/components/menu/menu.js';
+import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
 import { AssetStoreContent, WAL, WeaveClient } from '@theweave/api';
 
 import { roomStoreContext, streamsStoreContext } from '../contexts';
@@ -1494,6 +1497,7 @@ export class RoomView extends LitElement {
     let knownAgents: Record<AgentPubKeyB64, AgentInfo> | undefined;
     let staleInfo: boolean;
     let connectionStatuses: ConnectionStatuses;
+    let perceivedStreamInfo: StreamAndTrackInfo | undefined;
 
     if (type === 'my-screen-share') {
       knownAgents = this._knownAgents.value;
@@ -1517,6 +1521,7 @@ export class RoomView extends LitElement {
         >`;
 
       knownAgents = statuses.knownAgents;
+      perceivedStreamInfo = statuses.perceivedStreamInfo;
       const now = Date.now();
       staleInfo = now - statuses.lastUpdated > 2.8 * PING_INTERVAL;
 
@@ -1540,6 +1545,10 @@ export class RoomView extends LitElement {
       }
     }
 
+    const myPubKeyB64 = encodeHashToBase64(
+      this.roomStore.client.client.myPubKey
+    );
+
     const nConnections = Object.values(connectionStatuses).filter(
       status => status.type === 'Connected'
     ).length;
@@ -1553,27 +1562,56 @@ export class RoomView extends LitElement {
         ${repeat(
           sortedStatuses,
           ([pubkeyb64, _status]) => pubkeyb64,
-          ([pubkeyb64, status]) => {
+          ([innerPubkey, status]) => {
             // Check whether the agent for which the statuses are rendered has only been told by others that
             // the rendered agent exists
             const onlyToldAbout = !!(
               knownAgents &&
-              knownAgents[pubkeyb64] &&
-              knownAgents[pubkeyb64].type === 'told'
+              knownAgents[innerPubkey] &&
+              knownAgents[innerPubkey].type === 'told'
             );
 
             const lastSeen = knownAgents
-              ? knownAgents[pubkeyb64]?.lastSeen
+              ? knownAgents[innerPubkey]?.lastSeen
               : undefined;
+
+            // Determine track status for this avatar
+            let audioStatus: 'on' | 'muted' | 'off' | undefined;
+            let videoStatus: 'on' | 'muted' | 'off' | undefined;
+
+            if (type === 'my-video') {
+              // Our tile: show what we receive from each peer
+              const conn = this._openConnections.value[innerPubkey];
+              if (conn?.connected) {
+                audioStatus = conn.audio ? 'on' : 'off';
+                videoStatus = conn.video
+                  ? 'on'
+                  : conn.videoMuted
+                    ? 'muted'
+                    : 'off';
+              }
+            } else if (type === 'video' && innerPubkey === myPubKeyB64) {
+              // Peer's tile: show how they see OUR stream (only on our avatar)
+              audioStatus = streamInfoToTrackStatus(
+                perceivedStreamInfo,
+                'audio'
+              );
+              videoStatus = streamInfoToTrackStatus(
+                perceivedStreamInfo,
+                'video'
+              );
+            }
 
             return html`<agent-connection-status-icon
               style="margin-right: 2px; margin-bottom: 2px; ${staleInfo
                 ? 'opacity: 0.5;'
                 : ''}"
-              .agentPubKey=${decodeHashFromBase64(pubkeyb64)}
+              .agentPubKey=${decodeHashFromBase64(innerPubkey)}
               .connectionStatus=${status}
               .onlyToldAbout=${onlyToldAbout}
               .lastSeen=${lastSeen}
+              .audioStatus=${audioStatus}
+              .videoStatus=${videoStatus}
             ></agent-connection-status-icon>`;
           }
         )}
@@ -1866,7 +1904,7 @@ export class RoomView extends LitElement {
           <!-- Connection states indicators -->
           ${this._showConnectionDetails
             ? html`<div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
+                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
               >
                 ${this.renderAgentConnectionStatuses('my-video')}
               </div>`
@@ -1972,15 +2010,33 @@ export class RoomView extends LitElement {
               >
                 establishing connection...
               </div>
+              <div
+                style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
+              >
+                connecting media...
+              </div>
 
               <!-- Connection states indicators -->
               ${this._showConnectionDetails
                 ? html`<div
                     style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
                   >
-                    <div style="display: flex; flex-direction: column; margin-right: 6px;">
-                      ${this.renderTrackStatuses(pubkeyB64)}
-                    </div>
+                    ${this._openConnections.value[pubkeyB64]?.relayed
+                      ? html`
+                          <sl-tooltip
+                            hoist
+                            class="tooltip-filled"
+                            placement="top"
+                            content="Relayed via TURN server"
+                            style="--sl-tooltip-background-color: #e7a008;"
+                          >
+                            <sl-icon
+                              style="font-size: 20px; color: #e7a008; margin-right: 4px;"
+                              .src=${wrapPathInSvg(mdiHub)}
+                            ></sl-icon>
+                          </sl-tooltip>
+                        `
+                      : html``}
                     ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
                   </div>`
                 : html``}
@@ -2023,16 +2079,43 @@ export class RoomView extends LitElement {
                           .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                           style="height: 36px;"
                         ></avatar-with-nickname>
-                        <sl-tooltip content="reconnect" class="tooltip-filled">
-                          <sl-icon-button
-                            class="phone-refresh"
-                            style="margin-left: 4px; margin-bottom: -5px;"
-                            src=${wrapPathInSvg(mdiPhoneRefresh)}
-                            @click=${() => {
-                              this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                            }}
-                          ></sl-icon-button>
-                        </sl-tooltip>
+                        ${conn.videoMuted || (conn.connected && !conn.video)
+                          ? html`
+                              <sl-dropdown placement="top" distance="4" hoist>
+                                <sl-icon-button
+                                  slot="trigger"
+                                  class="phone-refresh"
+                                  style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
+                                  src=${wrapPathInSvg(mdiPhoneRefresh)}
+                                ></sl-icon-button>
+                                <sl-menu class="reconnect-menu secondary-font">
+                                  <sl-menu-item
+                                    class="reconnect-menu-item"
+                                    @click=${() => {
+                                      this.streamsStore.refreshTracksForPeer(pubkeyB64);
+                                    }}
+                                  >Reset media</sl-menu-item>
+                                  <sl-menu-item
+                                    class="reconnect-menu-item"
+                                    @click=${() => {
+                                      this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                                    }}
+                                  >Full reconnect</sl-menu-item>
+                                </sl-menu>
+                              </sl-dropdown>
+                            `
+                          : html`
+                              <sl-tooltip content="reconnect" class="tooltip-filled">
+                                <sl-icon-button
+                                  class="phone-refresh"
+                                  style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
+                                  src=${wrapPathInSvg(mdiPhoneRefresh)}
+                                  @click=${() => {
+                                    this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                                  }}
+                                ></sl-icon-button>
+                              </sl-tooltip>
+                            `}
                         ${this._showConnectionDetails
                           ? html`
                               <sl-tooltip
@@ -2125,16 +2208,43 @@ export class RoomView extends LitElement {
                         .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                         style="height: 36px;"
                       ></avatar-with-nickname>
-                      <sl-tooltip content="reconnect" class="tooltip-filled">
-                        <sl-icon-button
-                          class="phone-refresh"
-                          style="margin-left: 4px; margin-bottom: -5px;"
-                          src=${wrapPathInSvg(mdiPhoneRefresh)}
-                          @click=${() => {
-                            this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                          }}
-                        ></sl-icon-button>
-                      </sl-tooltip>
+                      ${conn.videoMuted || (conn.connected && !conn.video)
+                        ? html`
+                            <sl-dropdown placement="top" distance="4" hoist>
+                              <sl-icon-button
+                                slot="trigger"
+                                class="phone-refresh"
+                                style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
+                                src=${wrapPathInSvg(mdiPhoneRefresh)}
+                              ></sl-icon-button>
+                              <sl-menu class="reconnect-menu secondary-font">
+                                <sl-menu-item
+                                  class="reconnect-menu-item"
+                                  @click=${() => {
+                                    this.streamsStore.refreshTracksForPeer(pubkeyB64);
+                                  }}
+                                >Reset media</sl-menu-item>
+                                <sl-menu-item
+                                  class="reconnect-menu-item"
+                                  @click=${() => {
+                                    this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                                  }}
+                                >Full reconnect</sl-menu-item>
+                              </sl-menu>
+                            </sl-dropdown>
+                          `
+                        : html`
+                            <sl-tooltip content="reconnect" class="tooltip-filled">
+                              <sl-icon-button
+                                class="phone-refresh"
+                                style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
+                                src=${wrapPathInSvg(mdiPhoneRefresh)}
+                                @click=${() => {
+                                  this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                                }}
+                              ></sl-icon-button>
+                            </sl-tooltip>
+                          `}
                       ${this._showConnectionDetails
                         ? html`
                             <sl-tooltip
@@ -3010,6 +3120,25 @@ export class RoomView extends LitElement {
         --sl-tooltip-font-family: 'Ubuntu', sans-serif;
       }
 
+      .reconnect-menu {
+        background: #0e142c;
+        border-radius: 8px;
+        padding: 4px 0;
+        font-size: 15px;
+        color: #c3c9eb;
+      }
+
+      .reconnect-menu-item::part(base) {
+        font-size: 14px;
+        color: #c3c9eb;
+        padding: 2px 10px;
+      }
+
+      .reconnect-menu-item::part(base):hover {
+        background: #263368;
+        color: white;
+      }
+
       /* sl dialog styles below */
       sl-dialog::part(panel) {
         background: white;
@@ -3041,6 +3170,16 @@ function streamAndTrackInfoToText(
   if (track && !track.muted) return `${kind} WebRTC track in state 1`;
   if (track && track.muted) return `${kind} WebRTC track in state 2`;
   return `Unusual ${kind} WebRTC track state: ${track}`;
+}
+
+function streamInfoToTrackStatus(
+  info: StreamAndTrackInfo | undefined,
+  kind: 'audio' | 'video'
+): 'on' | 'muted' | 'off' {
+  if (!info || !info.stream) return 'off';
+  const track = info.tracks.find(t => t.kind === kind);
+  if (!track) return 'off';
+  return track.muted ? 'muted' : 'on';
 }
 
 function deviceLabel(label: string): string {

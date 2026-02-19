@@ -25,7 +25,7 @@ export type ConnectionId = string;
 export type RTCMessage =
   | {
       type: 'action';
-      message: 'video-off' | 'video-on' | 'audio-off' | 'audio-on' | 'change-audio-input' | 'change-video-input';
+      message: 'video-off' | 'video-on' | 'audio-off' | 'audio-on' | 'change-audio-input' | 'change-video-input' | 'request-track-refresh';
     }
   | {
       type: 'text';
@@ -39,6 +39,7 @@ export type OpenConnectionInfo = {
   audio: boolean;
   connected: boolean;
   relayed?: boolean; // true if the ICE candidate pair uses a TURN relay
+  videoMuted?: boolean; // true when a video track arrived but is still muted (waiting for unmute)
   direction: 'outgoing' | 'incoming' | 'duplex'; // In which direction streams are expected
 };
 

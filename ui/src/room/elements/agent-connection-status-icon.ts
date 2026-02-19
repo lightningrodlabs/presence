@@ -8,8 +8,11 @@ import { StoreSubscriber } from '@holochain-open-dev/stores';
 
 import '@holochain-open-dev/elements/dist/elements/display-error.js';
 import '@shoelace-style/shoelace/dist/components/avatar/avatar.js';
+import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/skeleton/skeleton.js';
 import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
+import { mdiMicrophone, mdiVideo } from '@mdi/js';
+import { wrapPathInSvg } from '@holochain-open-dev/elements';
 
 import {
   profilesStoreContext,
@@ -47,6 +50,12 @@ export class AgentConnectionStatusIcon extends LitElement {
 
   @property()
   lastSeen: number | undefined;
+
+  @property({ type: String })
+  audioStatus: 'on' | 'muted' | 'off' | undefined;
+
+  @property({ type: String })
+  videoStatus: 'on' | 'muted' | 'off' | undefined;
 
   /** Dependencies */
 
@@ -117,7 +126,9 @@ export class AgentConnectionStatusIcon extends LitElement {
         hoist
         content=${`${
           profile ? profile.entry.nickname : 'Unknown'
-        } (${this.statusToText(this.connectionStatus)})`}
+        } (${this.statusToText(this.connectionStatus)})${
+          this.audioStatus ? ` | audio: ${this.audioStatus}` : ''
+        }${this.videoStatus ? ` | video: ${this.videoStatus}` : ''}`}
       >
         <div
           class="row"
@@ -177,6 +188,40 @@ export class AgentConnectionStatusIcon extends LitElement {
                 >
                 </holo-identicon>
               `}
+          ${this.audioStatus !== undefined || this.videoStatus !== undefined
+            ? html`
+                <div class="track-indicators">
+                  ${this.audioStatus !== undefined
+                    ? html`<sl-tooltip
+                        hoist
+                        class="tooltip-filled"
+                        placement="top"
+                        content="audio: ${this.audioStatus}"
+                      >
+                        <sl-icon
+                          class="track-icon"
+                          style="color: ${trackStatusColor(this.audioStatus)};"
+                          .src=${wrapPathInSvg(mdiMicrophone)}
+                        ></sl-icon>
+                      </sl-tooltip>`
+                    : html``}
+                  ${this.videoStatus !== undefined
+                    ? html`<sl-tooltip
+                        hoist
+                        class="tooltip-filled"
+                        placement="top"
+                        content="video: ${this.videoStatus}"
+                      >
+                        <sl-icon
+                          class="track-icon"
+                          style="color: ${trackStatusColor(this.videoStatus)};"
+                          .src=${wrapPathInSvg(mdiVideo)}
+                        ></sl-icon>
+                      </sl-tooltip>`
+                    : html``}
+                </div>
+              `
+            : html``}
         </div>
       </sl-tooltip>
     `;
@@ -241,6 +286,20 @@ export class AgentConnectionStatusIcon extends LitElement {
         width: 14px;
         height: 14px;
       }
+
+      .track-indicators {
+        position: absolute;
+        top: -14px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: row;
+        gap: 0px;
+      }
+
+      .track-icon {
+        font-size: 16px;
+      }
     `,
   ];
 }
@@ -261,5 +320,16 @@ function lastSeenToColor(lastSeen: number | undefined): string {
   if (now - lastSeen < 15000) return '#48e708';
   if (now - lastSeen < 30000) return '#ffd900';
   return 'gray';
+}
+
+function trackStatusColor(status: 'on' | 'muted' | 'off'): string {
+  switch (status) {
+    case 'on':
+      return '#0886e7';
+    case 'muted':
+      return '#e7bb08';
+    case 'off':
+      return 'gray';
+  }
 }
 

@@ -592,6 +592,14 @@ function simpleEventTypeToColor(
     case 'ReconcileVideo':
       return ['darkblue', undefined];
 
+    // Track recovery events
+    case 'TrackArrivedMuted':
+      return ['orange', 'dash'];
+    case 'TrackUnmuted':
+      return ['green', 'dot'];
+    case 'TrackUnmuteTimeout':
+      return ['red', 'dash'];
+
     default:
       return ['pink', undefined];
   }
@@ -654,6 +662,14 @@ function yEventType(event: SimpleEventType): [number, number] {
     case 'ReconcileAudio':
       return [-1.2, 1.2];
     case 'ReconcileVideo':
+      return [-1.2, 1.2];
+
+    // Track recovery events
+    case 'TrackArrivedMuted':
+      return [-1.2, 1.2];
+    case 'TrackUnmuted':
+      return [-1.2, 1.2];
+    case 'TrackUnmuteTimeout':
       return [-1.2, 1.2];
     default:
       return [0, 0.5];

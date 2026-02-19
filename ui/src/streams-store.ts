@@ -347,6 +347,9 @@ export class StreamsStore {
         }
       }
     }
+
+    // Health check for dead tracks (bytesReceived stall detection)
+    await this._checkTrackHealth();
   }
 
   async changeVideoInput(deviceId: string) {
@@ -892,6 +895,23 @@ export class StreamsStore {
   _lastReconcileTime: Record<AgentPubKeyB64, number> = {};
 
   /**
+   * Tracks how many consecutive reconciliation attempts have been made per agent,
+   * for exponential backoff of the cooldown.
+   */
+  _reconcileAttemptCount: Record<AgentPubKeyB64, number> = {};
+
+  /**
+   * Tracks the last bytesReceived value per peer per track kind,
+   * for detecting dead tracks via getStats().
+   */
+  private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
+
+  /**
+   * Number of consecutive health check cycles where bytesReceived did not increase.
+   */
+  private _staleCycles: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
+
+  /**
    * Our own screen share stream
    */
   screenShareStream: MediaStream | undefined | null;
@@ -1011,6 +1031,46 @@ export class StreamsStore {
   //   S I M P L E   P E E R   H A N D L I N G
   //
   // ********************************************************************************************
+
+  /**
+   * Marks a received track as ready — sets the audio/video flag on the connection
+   * and fires the appropriate event callback. Called either immediately when a track
+   * arrives unmuted, or later via onunmute/timeout for initially-muted tracks.
+   */
+  private _setTrackReady(
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    track: MediaStreamTrack
+  ) {
+    this._openConnections.update(currentValue => {
+      const openConnections = currentValue;
+      const relevantConnection = openConnections[pubKeyB64];
+      if (!relevantConnection) return openConnections;
+      if (track.kind === 'audio') {
+        relevantConnection.audio = true;
+      }
+      if (track.kind === 'video') {
+        relevantConnection.video = true;
+        relevantConnection.videoMuted = false;
+      }
+      openConnections[pubKeyB64] = relevantConnection;
+      return openConnections;
+    });
+    if (track.kind === 'audio') {
+      this.eventCallback({
+        type: 'peer-audio-on',
+        pubKeyB64,
+        connectionId,
+      });
+    }
+    if (track.kind === 'video') {
+      this.eventCallback({
+        type: 'peer-video-on',
+        pubKeyB64,
+        connectionId,
+      });
+    }
+  }
 
   createPeer(
     connectingAgent: AgentPubKey,
@@ -1139,6 +1199,13 @@ export class StreamsStore {
               event: 'PeerChangeVideoInput',
             });
           }
+          if (msg.message === 'request-track-refresh') {
+            console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
+            this.logger.logCustomMessage(
+              `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
+            );
+            this.refreshTracksForPeer(pubKeyB64);
+          }
         }
       } catch (e) {
         console.warn(
@@ -1159,22 +1226,28 @@ export class StreamsStore {
       existingPeerStreams[pubKeyB64] = stream;
       this._videoStreams = existingPeerStreams;
 
-      const withAudio = stream.getAudioTracks().length > 0;
-      const withVideo = stream.getVideoTracks().length > 0;
+      const audioTracks = stream.getAudioTracks();
+      const videoTracks = stream.getVideoTracks();
       this._openConnections.update(currentValue => {
         const openConnections = currentValue;
         const relevantConnection = openConnections[pubKeyB64];
         if (relevantConnection) {
-          if (withAudio) {
+          // Audio: set immediately (audio muted state is less critical for UX)
+          if (audioTracks.length > 0) {
             relevantConnection.audio = true;
           }
-          if (withVideo) {
+          // Video: only set if the track is not muted; the 'track' handler
+          // will handle muted tracks via the onunmute patience logic
+          if (videoTracks.length > 0 && !videoTracks[0].muted) {
             relevantConnection.video = true;
+          } else if (videoTracks.length > 0 && videoTracks[0].muted) {
+            relevantConnection.videoMuted = true;
           }
           openConnections[pubKeyB64] = relevantConnection;
         }
         return openConnections;
       });
+      // Always fire peer-stream so srcObject gets assigned to the <video> element
       this.eventCallback({
         type: 'peer-stream',
         pubKeyB64,
@@ -1183,32 +1256,59 @@ export class StreamsStore {
       });
     });
     peer.on('track', track => {
-      console.log('#### GOT TRACK from:', pubKeyB64, track);
-      this._openConnections.update(currentValue => {
-        const openConnections = currentValue;
-        const relevantConnection = openConnections[pubKeyB64];
-        if (track.kind === 'audio') {
-          relevantConnection.audio = true;
-        }
-        if (track.kind === 'video') {
-          relevantConnection.video = true;
-        }
-        openConnections[pubKeyB64] = relevantConnection;
-        return openConnections;
+      console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: 'SimplePeerTrack',
       });
-      if (track.kind === 'audio') {
-        this.eventCallback({
-          type: 'peer-audio-on',
-          pubKeyB64,
-          connectionId,
+
+      if (!track.muted) {
+        // Track is immediately usable — set flags and fire events right away
+        this._setTrackReady(pubKeyB64, connectionId, track);
+      } else {
+        // Track arrived muted — wait for onunmute with a 5-second timeout
+        console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'TrackArrivedMuted',
         });
-      }
-      if (track.kind === 'video') {
-        this.eventCallback({
-          type: 'peer-video-on',
-          pubKeyB64,
-          connectionId,
-        });
+
+        // Mark as "connecting media" in the UI for video tracks
+        if (track.kind === 'video') {
+          this._openConnections.update(current => {
+            const conn = current[pubKeyB64];
+            if (conn) {
+              conn.videoMuted = true;
+            }
+            return current;
+          });
+        }
+
+        const unmuteTimeout = setTimeout(() => {
+          if (track.muted) {
+            console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'TrackUnmuteTimeout',
+            });
+            // Still set the flag so the tile shows something; the health check can request recovery later
+            this._setTrackReady(pubKeyB64, connectionId, track);
+          }
+        }, 5000);
+
+        track.onunmute = () => {
+          clearTimeout(unmuteTimeout);
+          console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
+          this.logger.logAgentEvent({
+            agent: pubKeyB64,
+            timestamp: Date.now(),
+            event: 'TrackUnmuted',
+          });
+          this._setTrackReady(pubKeyB64, connectionId, track);
+        };
       }
     });
     peer.on('connect', async () => {
@@ -1317,6 +1417,11 @@ export class StreamsStore {
         }
         return statuses;
       });
+
+      // Clean up health check state for this peer
+      delete this._lastBytesReceived[pubKeyB64];
+      delete this._staleCycles[pubKeyB64];
+      delete this._reconcileAttemptCount[pubKeyB64];
 
       // Also tear down any outgoing screen share to this peer since they
       // have disconnected. Without this, the stale WebRTC connection may
@@ -1628,6 +1733,48 @@ export class StreamsStore {
       connectionStatuses[pubKey] = status;
       return connectionStatuses;
     });
+
+    // When transitioning to Connected, send an immediate Pong to all known agents
+    // so their UI updates within milliseconds rather than waiting for the next ping cycle
+    if (status.type === 'Connected') {
+      this._sendImmediatePongToAll();
+    }
+  }
+
+  /**
+   * Send an immediate PongUi to all known agents. Used when connection status
+   * changes to Connected so other peers see green rings right away.
+   */
+  private async _sendImmediatePongToAll() {
+    const knownAgents = get(this._knownAgents);
+    const agentsToPong = Object.keys(knownAgents)
+      .filter(agent => agent !== this.myPubKeyB64 && !get(this.blockedAgents).includes(agent));
+
+    for (const agentB64 of agentsToPong) {
+      const streamInfo = getStreamInfo(this._videoStreams[agentB64]);
+      const metaData: PongMetaData<PongMetaDataV1> = {
+        formatVersion: 1,
+        data: {
+          connectionStatuses: get(this._connectionStatuses),
+          screenShareConnectionStatuses: this.screenShareStream
+            ? get(this._screenShareConnectionStatuses)
+            : undefined,
+          knownAgents: get(this._knownAgents),
+          appVersion: __APP_VERSION__,
+          streamInfo,
+          audio: get(this._openConnections)[agentB64]?.audio,
+        },
+      };
+      try {
+        await this.roomClient.sendMessage(
+          [decodeHashFromBase64(agentB64)],
+          'PongUi',
+          JSON.stringify(metaData),
+        );
+      } catch (e) {
+        // Best-effort; don't block on failure
+      }
+    }
   }
 
   updateScreenShareConnectionStatus(
@@ -1679,7 +1826,8 @@ export class StreamsStore {
 
   /**
    * Compares how the other peer sees our stream and if this mismatches our expectations,
-   * reset streams accordingly
+   * reset streams accordingly. Uses exponential backoff (10s, 20s, 40s...) and tries
+   * lightweight replaceTrack first before falling back to the heavier clone approach.
    *
    * @param pubkey
    * @param streamAndTrackInfo
@@ -1688,119 +1836,252 @@ export class StreamsStore {
     pubkey: AgentPubKeyB64,
     streamAndTrackInfo: StreamAndTrackInfo
   ) {
-    const RECONCILE_COOLDOWN_MS = 30_000;
+    // Exponential backoff: 10s, 20s, 40s, 80s, 160s (capped)
+    const BASE_COOLDOWN_MS = 10_000;
+    const reconcileCount = this._reconcileAttemptCount[pubkey] || 0;
+    const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
     const lastReconcile = this._lastReconcileTime[pubkey] || 0;
-    if (Date.now() - lastReconcile < RECONCILE_COOLDOWN_MS) return;
+    if (Date.now() - lastReconcile < cooldown) return;
 
-    if (this.mainStream) {
-      // If we have an active video stream but the other peer doesn't see it,
-      // re-add it to their peer and return
-      if (!streamAndTrackInfo.stream) {
-        console.warn(
-          'Peer does not seem to see our own stream. Re-adding it to their peer object...'
-        );
-        this.logger.logAgentEvent({
-          agent: pubkey,
-          timestamp: Date.now(),
-          event: 'ReconcileStream',
-        });
-        const peer = get(this._openConnections)[pubkey];
-        if (peer) {
-          try {
-            peer.peer.addStream(this.mainStream);
-            this._lastReconcileTime[pubkey] = Date.now();
-          } catch (e: any) {
-            console.warn('Failed to re-add stream during reconcile:', e.message);
-          }
-        }
-        return;
-      }
+    if (!this.mainStream) return;
+
+    // Case 1: Peer doesn't see our stream at all — re-add the whole stream
+    if (!streamAndTrackInfo.stream) {
+      console.warn(
+        'Peer does not seem to see our own stream. Re-adding it to their peer object...'
+      );
+      this.logger.logAgentEvent({
+        agent: pubkey,
+        timestamp: Date.now(),
+        event: 'ReconcileStream',
+      });
       const peer = get(this._openConnections)[pubkey];
-
-      const myAudioTracks = this.mainStream?.getAudioTracks();
-      const myAudioTrack = myAudioTracks ? myAudioTracks[0] : undefined;
-
-      const myVideoTracks = this.mainStream?.getVideoTracks();
-      const myVideoTrack = myVideoTracks ? myVideoTracks[0] : undefined;
-
-      // If we have an audio track but the other peer doesn't see it or sees it non-functional,
-      // re-add it to their peer
-      if (myAudioTrack) {
-        const audioTrackPerceived = streamAndTrackInfo.tracks.find(
-          track => track.kind === 'audio'
-        );
-        if (!audioTrackPerceived || audioTrackPerceived.muted) {
-          console.warn(
-            'Peer does not seem to see our audio track or it is muted:',
-            audioTrackPerceived,
-            '\nRe-adding it to their peer object...'
-          );
-          this.logger.logAgentEvent({
-            agent: pubkey,
-            timestamp: Date.now(),
-            event: 'ReconcileAudio',
-          });
-
-          peer.peer.removeStream(this.mainStream);
-
-          // It is not really clear why but things only work properly if done exactly in this way
-          // where a cloned stream is created and the original tracks are being added back
-          // to the cloned stream. It is also important (!) that this cloned stream is stored
-          // and in audioOff() the audio tracks of this cloned stream are being disabled explicitly.
-          // Otherwise, audio *will* keep running on the remote peer's side!
-          //
-          // If not the full stream is removed and re-added but only tracks, the stream on the
-          // remote peer's side will be set to "active: false" and re-added tracks will never
-          // show up on their side.
-          // This may be the reason why removing and re-adding tracks throws a hard error
-          // in simple-peer: https://github.com/feross/simple-peer/issues/606
-          //
-          // If re-adding tracks should ever be required anyway, there's the
-          // @matthme/simple-peer@9.11.2 packaged based off
-          // https://github.com/matthme/simple-peer/commit/8076d57b21a405992750fe4546fa242da5d9ed96
-          //
-          const clonedStream = this.mainStream.clone();
-          this.mainStreamClones = [...this.mainStreamClones, clonedStream];
-          peer.peer.addTrack(myAudioTrack, clonedStream);
-          if (myVideoTrack) {
-            peer.peer.addTrack(myVideoTrack, clonedStream);
-          }
+      if (peer) {
+        try {
+          peer.peer.addStream(this.mainStream);
           this._lastReconcileTime[pubkey] = Date.now();
+          this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
+        } catch (e: any) {
+          console.warn('Failed to re-add stream during reconcile:', e.message);
+        }
+      }
+      return;
+    }
 
-          // We add the video track too if it exists so we can skip the if condition below
-          // to not potentially re-add the stream yet again
-          return;
+    const connInfo = get(this._openConnections)[pubkey];
+    if (!connInfo) return;
+
+    const myAudioTrack = this.mainStream.getAudioTracks()[0];
+    const myVideoTrack = this.mainStream.getVideoTracks()[0];
+
+    let needsRecovery = false;
+
+    // Check audio track
+    if (myAudioTrack) {
+      const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'audio');
+      if (!perceived || perceived.muted) {
+        needsRecovery = true;
+        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileAudio' });
+      }
+    }
+
+    // Check video track
+    if (myVideoTrack) {
+      const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'video');
+      if (!perceived || perceived.muted) {
+        needsRecovery = true;
+        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileVideo' });
+      }
+    }
+
+    if (!needsRecovery) {
+      // Tracks are healthy — reset attempt count
+      this._reconcileAttemptCount[pubkey] = 0;
+      return;
+    }
+
+    console.warn(`Reconciling tracks for ${pubkey.slice(0, 8)} (attempt ${reconcileCount + 1})`);
+
+    // Try lightweight replaceTrack first
+    const success = this._tryReplaceTrackRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
+
+    if (!success) {
+      // Fall back to heavier clone approach
+      this._cloneStreamRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
+    }
+
+    this._lastReconcileTime[pubkey] = Date.now();
+    this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
+  }
+
+  /**
+   * Attempt lightweight track recovery using replaceTrack on the RTCRtpSender.
+   * This avoids renegotiation and stream cloning.
+   * Returns true if replaceTrack was possible, false if fallback is needed.
+   */
+  private _tryReplaceTrackRecovery(
+    pubkey: AgentPubKeyB64,
+    connInfo: OpenConnectionInfo,
+    audioTrack: MediaStreamTrack | undefined,
+    videoTrack: MediaStreamTrack | undefined
+  ): boolean {
+    try {
+      const pc = (connInfo.peer as any)._pc as RTCPeerConnection | undefined;
+      if (!pc) return false;
+
+      const senders = pc.getSenders();
+      let success = true;
+
+      if (audioTrack) {
+        const audioSender = senders.find(s => s.track?.kind === 'audio');
+        if (audioSender) {
+          connInfo.peer.replaceTrack(audioSender.track!, audioTrack, this.mainStream!);
+          this.logger.logCustomMessage(`replaceTrack audio [${pubkey.slice(0, 8)}]: success`);
+        } else {
+          success = false;
         }
       }
 
-      // If we have a video track but the other peer doesn't see it or sees it non-functional,
-      // re-add it to their peer
-      if (myVideoTrack) {
-        const videoTrackPerceived = streamAndTrackInfo.tracks.find(
-          track => track.kind === 'video'
-        );
-        if (!videoTrackPerceived || videoTrackPerceived.muted) {
-          console.warn(
-            'Peer does not seem to see our video track or it is muted:',
-            videoTrackPerceived,
-            '\nRe-adding it to their peer object...'
-          );
-          this.logger.logAgentEvent({
-            agent: pubkey,
-            timestamp: Date.now(),
-            event: 'ReconcileVideo',
-          });
-
-          peer.peer.removeStream(this.mainStream);
-          // Same logic as above with the audio tracks
-          const clonedStream = this.mainStream.clone();
-          this.mainStreamClones = [...this.mainStreamClones, clonedStream];
-          peer.peer.addTrack(myVideoTrack, clonedStream);
-          if (myAudioTrack) {
-            peer.peer.addTrack(myAudioTrack, clonedStream);
-          }
-          this._lastReconcileTime[pubkey] = Date.now();
+      if (videoTrack) {
+        const videoSender = senders.find(s => s.track?.kind === 'video');
+        if (videoSender) {
+          connInfo.peer.replaceTrack(videoSender.track!, videoTrack, this.mainStream!);
+          this.logger.logCustomMessage(`replaceTrack video [${pubkey.slice(0, 8)}]: success`);
+        } else {
+          success = false;
         }
+      }
+
+      return success;
+    } catch (e: any) {
+      console.warn(`replaceTrack recovery failed for ${pubkey.slice(0, 8)}:`, e.message);
+      this.logger.logCustomMessage(`replaceTrack [${pubkey.slice(0, 8)}]: failed -- ${e.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Heavier track recovery: removes the stream, clones it, and re-adds tracks.
+   * This triggers renegotiation but is more reliable than replaceTrack for some edge cases.
+   *
+   * NOTE: It is important that cloned streams are stored in mainStreamClones so that
+   * audioOff() can disable audio tracks on them too. See simple-peer issue #606.
+   */
+  private _cloneStreamRecovery(
+    pubkey: AgentPubKeyB64,
+    connInfo: OpenConnectionInfo,
+    audioTrack: MediaStreamTrack | undefined,
+    videoTrack: MediaStreamTrack | undefined
+  ) {
+    if (!this.mainStream) return;
+    console.warn(`Falling back to clone-based recovery for ${pubkey.slice(0, 8)}`);
+    this.logger.logCustomMessage(`Clone recovery [${pubkey.slice(0, 8)}]`);
+    connInfo.peer.removeStream(this.mainStream);
+    const clonedStream = this.mainStream.clone();
+    this.mainStreamClones = [...this.mainStreamClones, clonedStream];
+    if (audioTrack) connInfo.peer.addTrack(audioTrack, clonedStream);
+    if (videoTrack) connInfo.peer.addTrack(videoTrack, clonedStream);
+  }
+
+  /**
+   * Public method for manual track recovery. Tries replaceTrack first,
+   * falls back to clone approach. Does not tear down the WebRTC connection.
+   */
+  refreshTracksForPeer(pubKeyB64: AgentPubKeyB64) {
+    const connInfo = get(this._openConnections)[pubKeyB64];
+    if (!connInfo || !this.mainStream) {
+      console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no connection or stream`);
+      return;
+    }
+    const myAudioTrack = this.mainStream.getAudioTracks()[0];
+    const myVideoTrack = this.mainStream.getVideoTracks()[0];
+
+    const success = this._tryReplaceTrackRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
+    if (!success) {
+      this._cloneStreamRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
+    }
+    this.logger.logCustomMessage(
+      `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
+    );
+  }
+
+  /**
+   * Checks inbound RTP bytesReceived for each open connection.
+   * If bytes haven't increased for 2+ consecutive cycles (4+ seconds at 2s ping interval),
+   * the track is considered dead and we request the sender to refresh via data channel.
+   */
+  private async _checkTrackHealth() {
+    const openConnections = get(this._openConnections);
+    for (const [pubKeyB64, connInfo] of Object.entries(openConnections)) {
+      if (!connInfo.connected) continue;
+      if (!connInfo.video && !connInfo.audio) continue;
+
+      const pc = (connInfo.peer as any)._pc as RTCPeerConnection | undefined;
+      if (!pc) continue;
+
+      try {
+        const stats = await pc.getStats();
+        let audioBytes = 0;
+        let videoBytes = 0;
+
+        stats.forEach((report: any) => {
+          if (report.type === 'inbound-rtp') {
+            if (report.kind === 'audio' || report.mediaType === 'audio') {
+              audioBytes = report.bytesReceived || 0;
+            }
+            if (report.kind === 'video' || report.mediaType === 'video') {
+              videoBytes = report.bytesReceived || 0;
+            }
+          }
+        });
+
+        const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
+        const stale = this._staleCycles[pubKeyB64] || { audio: 0, video: 0 };
+
+        // Check video
+        if (connInfo.video && videoBytes > 0) {
+          if (videoBytes === lastBytes.video) {
+            stale.video++;
+          } else {
+            stale.video = 0;
+          }
+        }
+
+        // Check audio
+        if (connInfo.audio && audioBytes > 0) {
+          if (audioBytes === lastBytes.audio) {
+            stale.audio++;
+          } else {
+            stale.audio = 0;
+          }
+        }
+
+        this._lastBytesReceived[pubKeyB64] = { audio: audioBytes, video: videoBytes };
+        this._staleCycles[pubKeyB64] = stale;
+
+        // If 2+ consecutive stale cycles (4+ seconds), request track refresh
+        if (stale.video >= 2 || stale.audio >= 2) {
+          console.warn(
+            `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
+          );
+          this.logger.logCustomMessage(
+            `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
+          );
+
+          const msg: RTCMessage = {
+            type: 'action',
+            message: 'request-track-refresh',
+          };
+          try {
+            connInfo.peer.send(JSON.stringify(msg));
+            // Reset stale count to avoid spamming
+            this._staleCycles[pubKeyB64] = { audio: 0, video: 0 };
+          } catch (e: any) {
+            console.error('Failed to send request-track-refresh:', e.toString());
+          }
+        }
+      } catch (e) {
+        // getStats may fail if connection was already closed
       }
     }
   }
