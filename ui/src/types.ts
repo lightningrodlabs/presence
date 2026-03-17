@@ -362,3 +362,11 @@ export type RoomSignal =
     };
 
 export type EntryTypes = {};
+
+export type DiagnosticSnapshot = {
+  fromAgent: AgentPubKeyB64;
+  sessionId: string;
+  agentEvents: import('./logging').SimpleEvent[];
+  customLogs: import('./logging').CustomLog[];
+  generatedAt: number;
+};

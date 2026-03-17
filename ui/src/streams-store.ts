@@ -17,6 +17,7 @@ import {
   AgentInfo,
   ConnectionStatus,
   ConnectionStatuses,
+  DiagnosticSnapshot,
   InitPayload,
   OpenConnectionInfo,
   PendingAccept,
@@ -1026,6 +1027,16 @@ export class StreamsStore {
     >
   > = writable({});
 
+  /**
+   * Diagnostic logs received from remote peers via Holochain signals
+   */
+  _receivedDiagnosticLogs: Writable<Record<AgentPubKeyB64, import('./types').DiagnosticSnapshot>> = writable({});
+
+  /**
+   * Tracks pending diagnostic requests (for UI timeout display)
+   */
+  _pendingDiagnosticRequests: Set<AgentPubKeyB64> = new Set();
+
   // ********************************************************************************************
   //
   //   S I M P L E   P E E R   H A N D L I N G
@@ -1216,6 +1227,18 @@ export class StreamsStore {
       }
     });
     peer.on('stream', stream => {
+      const trackDesc = stream.getTracks().map(t =>
+        `${t.kind}:muted=${t.muted},readyState=${t.readyState}`
+      ).join(', ');
+      this.logger.logCustomMessage(
+        `stream received [${pubKeyB64.slice(0, 8)}]: ${stream.getTracks().length} tracks [${trackDesc}]`
+      );
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: 'StreamReceived',
+        connectionId,
+      });
       console.log(
         '#### GOT STREAM with tracks from:',
         pubKeyB64,
@@ -1261,6 +1284,7 @@ export class StreamsStore {
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'SimplePeerTrack',
+        connectionId,
       });
 
       if (!track.muted) {
@@ -1317,6 +1341,7 @@ export class StreamsStore {
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'Connected',
+        connectionId,
       });
 
       delete this._pendingInits[pubKeyB64];
@@ -1331,6 +1356,9 @@ export class StreamsStore {
       if (this.mainStream) {
         try {
           relevantConnection.peer.addStream(this.mainStream);
+          this.logger.logCustomMessage(
+            `addStream on-connect [${pubKeyB64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks`
+          );
         } catch (e: any) {
           // Tracks were already included in the initial offer/answer — no action needed
         }
@@ -1363,9 +1391,13 @@ export class StreamsStore {
           Object.values(reportsById).forEach((report: any) => {
             if (report.type === 'candidate-pair' && report.state === 'succeeded') {
               const localCandidate = reportsById[report.localCandidateId];
+              const remoteCandidate = reportsById[report.remoteCandidateId];
               if (localCandidate?.candidateType === 'relay') {
                 isRelayed = true;
               }
+              this.logger.logCustomMessage(
+                `ICE pair [${pubKeyB64.slice(0, 8)}]: local=${localCandidate?.candidateType} remote=${remoteCandidate?.candidateType} proto=${localCandidate?.protocol}`
+              );
             }
           });
           this._openConnections.update(current => {
@@ -1392,6 +1424,7 @@ export class StreamsStore {
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'SimplePeerClose',
+        connectionId,
       });
 
       // Remove from existing streams
@@ -1455,6 +1488,7 @@ export class StreamsStore {
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'SimplePeerError',
+        connectionId,
       });
 
       // Remove from existing streams
@@ -1996,6 +2030,10 @@ export class StreamsStore {
     const myAudioTrack = this.mainStream.getAudioTracks()[0];
     const myVideoTrack = this.mainStream.getVideoTracks()[0];
 
+    this.logger.logCustomMessage(
+      `Track refresh [${pubKeyB64.slice(0, 8)}]: audio=${myAudioTrack ? `${myAudioTrack.enabled ? 'enabled' : 'disabled'},${myAudioTrack.muted ? 'muted' : 'unmuted'},${myAudioTrack.readyState}` : 'none'} video=${myVideoTrack ? `${myVideoTrack.enabled ? 'enabled' : 'disabled'},${myVideoTrack.muted ? 'muted' : 'unmuted'},${myVideoTrack.readyState}` : 'none'}`
+    );
+
     const success = this._tryReplaceTrackRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
     if (!success) {
       this._cloneStreamRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
@@ -2003,6 +2041,109 @@ export class StreamsStore {
     this.logger.logCustomMessage(
       `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
     );
+  }
+
+  /**
+   * Request diagnostic logs from a specific peer (or all known agents) via Holochain signal.
+   */
+  async requestDiagnosticLogs(pubKeyB64?: AgentPubKeyB64) {
+    const targets = pubKeyB64
+      ? [decodeHashFromBase64(pubKeyB64)]
+      : Object.keys(get(this._knownAgents))
+          .filter(a => a !== this.myPubKeyB64)
+          .map(b64 => decodeHashFromBase64(b64));
+
+    if (targets.length === 0) return;
+
+    const targetKeys = pubKeyB64
+      ? [pubKeyB64]
+      : Object.keys(get(this._knownAgents)).filter(a => a !== this.myPubKeyB64);
+    targetKeys.forEach(k => this._pendingDiagnosticRequests.add(k));
+
+    await this.roomClient.sendMessage(targets, 'DiagnosticRequest', '');
+    this.logger.logCustomMessage(
+      `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
+    );
+
+    // Timeout: clear pending state after 10s if no response
+    setTimeout(() => {
+      targetKeys.forEach(k => this._pendingDiagnosticRequests.delete(k));
+    }, 10_000);
+  }
+
+  /**
+   * Build a merged diagnostic log combining local and received remote events for a peer.
+   */
+  exportMergedLogs(pubKeyB64: AgentPubKeyB64): object {
+    const localAgentEvents = this.logger.getRecentAgentEvents();
+    const localCustomLogs = this.logger.getRecentCustomLogs();
+    const remoteSnapshot = get(this._receivedDiagnosticLogs)[pubKeyB64];
+
+    type MergedEntry = { timestamp: number; source: 'local' | 'remote'; type: string; detail: string; connectionId?: string };
+    const merged: MergedEntry[] = [];
+
+    // Add local agent events (all agents, to see the full picture)
+    Object.entries(localAgentEvents).forEach(([agent, events]) => {
+      events.forEach(e => {
+        merged.push({
+          timestamp: e.timestamp,
+          source: 'local',
+          type: 'event',
+          detail: `[${agent.slice(0, 8)}] ${e.event}`,
+          connectionId: e.connectionId,
+        });
+      });
+    });
+
+    // Add local custom logs
+    localCustomLogs.forEach(log => {
+      merged.push({
+        timestamp: log.timestamp,
+        source: 'local',
+        type: 'custom',
+        detail: log.log,
+      });
+    });
+
+    // Add remote events if available
+    if (remoteSnapshot) {
+      Object.entries(
+        remoteSnapshot.agentEvents.reduce((acc, e) => {
+          (acc[e.agent] = acc[e.agent] || []).push(e);
+          return acc;
+        }, {} as Record<string, typeof remoteSnapshot.agentEvents>)
+      ).forEach(([agent, events]) => {
+        events.forEach(e => {
+          merged.push({
+            timestamp: e.timestamp,
+            source: 'remote',
+            type: 'event',
+            detail: `[${agent.slice(0, 8)}] ${e.event}`,
+            connectionId: e.connectionId,
+          });
+        });
+      });
+
+      remoteSnapshot.customLogs.forEach(log => {
+        merged.push({
+          timestamp: log.timestamp,
+          source: 'remote',
+          type: 'custom',
+          detail: log.log,
+        });
+      });
+    }
+
+    merged.sort((a, b) => a.timestamp - b.timestamp);
+
+    return {
+      generatedAt: Date.now(),
+      localAgent: this.myPubKeyB64,
+      remoteAgent: pubKeyB64,
+      hasRemoteLogs: !!remoteSnapshot,
+      remoteSessionId: remoteSnapshot?.sessionId,
+      entries: merged,
+    };
   }
 
   /**
@@ -2130,6 +2271,12 @@ export class StreamsStore {
           case 'LeaveUi':
             await this.handleLeaveUi(signal);
             break;
+          case 'DiagnosticRequest':
+            await this.handleDiagnosticRequest(signal);
+            break;
+          case 'DiagnosticResponse':
+            this.handleDiagnosticResponse(signal);
+            break;
           default:
             console.warn('Unknown msg_type:', signal.msg_type);
         }
@@ -2222,6 +2369,11 @@ export class StreamsStore {
   async handleLeaveUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     console.log(`#### GOT LeaveUi FROM ${pubkeyB64.slice(0, 8)}`);
+    this.logger.logAgentEvent({
+      agent: pubkeyB64,
+      timestamp: Date.now(),
+      event: 'PeerLeave',
+    });
 
     // Destroy video connection
     const openConn = get(this._openConnections)[pubkeyB64];
@@ -2273,12 +2425,8 @@ export class StreamsStore {
   async handlePongUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     const now = Date.now();
-    this.logger.logAgentEvent({
-      agent: pubkeyB64,
-      timestamp: now,
-      event: 'Pong',
-    });
-    // console.log(`Got PongUI from ${pubkeyB64}: `, signal);
+    // Pong timing is captured via agentPongMetadataLogs (with deduplication).
+    // No need for a per-pong SimpleEvent entry — it just adds noise.
     // Update their connection statuses and the list of known agents
     let metaDataExt: PongMetaData<PongMetaDataV1> | undefined;
     try {
@@ -2350,6 +2498,13 @@ export class StreamsStore {
       const iceState = pc?.iceConnectionState;
       if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
         console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
+        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState}`);
+        this.logger.logAgentEvent({
+          agent: pubkeyB64,
+          timestamp: Date.now(),
+          event: 'StaleCleanup',
+          connectionId: existingConn.connectionId,
+        });
         existingConn.peer.destroy();
         this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
         delete this._pendingInits[pubkeyB64];
@@ -2507,6 +2662,7 @@ export class StreamsStore {
       agent: pubKey64,
       timestamp: Date.now(),
       event: 'InitRequest',
+      connectionId: connection_id,
     });
     console.log(
       `#### GOT ${
@@ -2535,6 +2691,9 @@ export class StreamsStore {
       // This prevents the non-initiator from needing to renegotiate post-connect.
       if (this.mainStream) {
         newPeer.addStream(this.mainStream);
+        this.logger.logCustomMessage(
+          `addStream pre-SDP [${pubKey64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks (acceptor)`
+        );
       }
 
       const accept: PendingAccept = {
@@ -2600,6 +2759,7 @@ export class StreamsStore {
       agent: pubKey64,
       timestamp: Date.now(),
       event: 'InitAccept',
+      connectionId: connection_id,
     });
     /**
      * For normal video/audio connections
@@ -2646,6 +2806,9 @@ export class StreamsStore {
           // This prevents the need for post-connect renegotiation on the initiator side.
           if (this.mainStream) {
             newPeer.addStream(this.mainStream);
+            this.logger.logCustomMessage(
+              `addStream pre-SDP [${pubKey64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks (initiator)`
+            );
           }
 
           this._openConnections.update(currentValue => {
@@ -2770,6 +2933,7 @@ export class StreamsStore {
       agent: pubkeyB64,
       timestamp: Date.now(),
       event: 'SdpData',
+      connectionId: connection_id,
     });
 
     // Update connection status
@@ -2895,6 +3059,69 @@ export class StreamsStore {
           );
         }
       }
+    }
+  }
+
+  /**
+   * Handle a DiagnosticRequest signal — gather recent logs and send back.
+   */
+  async handleDiagnosticRequest(signal: Extract<RoomSignal, { type: 'Message' }>) {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    console.log(`#### GOT DiagnosticRequest from ${pubkeyB64.slice(0, 8)}`);
+
+    const allRecentEvents = this.logger.getRecentAgentEvents();
+    const flatEvents = Object.values(allRecentEvents).flat();
+    const recentCustomLogs = this.logger.getRecentCustomLogs();
+
+    const snapshot: DiagnosticSnapshot = {
+      fromAgent: this.myPubKeyB64,
+      sessionId: this.logger.sessionId,
+      agentEvents: flatEvents,
+      customLogs: recentCustomLogs,
+      generatedAt: Date.now(),
+    };
+
+    const payload = JSON.stringify(snapshot);
+    // Guard against signal size limits — truncate if too large
+    if (payload.length > 60_000) {
+      const truncated: DiagnosticSnapshot = {
+        ...snapshot,
+        agentEvents: flatEvents.slice(-200),
+        customLogs: recentCustomLogs.slice(-100),
+      };
+      await this.roomClient.sendMessage(
+        [signal.from_agent],
+        'DiagnosticResponse',
+        JSON.stringify(truncated),
+      );
+    } else {
+      await this.roomClient.sendMessage(
+        [signal.from_agent],
+        'DiagnosticResponse',
+        payload,
+      );
+    }
+  }
+
+  /**
+   * Handle a DiagnosticResponse signal — store the received logs.
+   */
+  handleDiagnosticResponse(signal: Extract<RoomSignal, { type: 'Message' }>) {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    console.log(`#### GOT DiagnosticResponse from ${pubkeyB64.slice(0, 8)}`);
+
+    try {
+      const snapshot: DiagnosticSnapshot = JSON.parse(signal.payload);
+      this._receivedDiagnosticLogs.update(current => {
+        current[pubkeyB64] = snapshot;
+        return current;
+      });
+      this._pendingDiagnosticRequests.delete(pubkeyB64);
+      this.logger.logCustomMessage(
+        `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs`
+      );
+    } catch (e) {
+      console.warn('Failed to parse DiagnosticResponse:', e);
     }
   }
 }

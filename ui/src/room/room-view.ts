@@ -28,6 +28,8 @@ import {
   mdiPencilCircleOutline,
   mdiPhoneRefresh,
   mdiHub,
+  mdiDownload,
+  mdiCloudDownloadOutline,
   mdiVideo,
   mdiVideoOff,
 } from '@mdi/js';
@@ -132,6 +134,12 @@ export class RoomView extends LitElement {
   _openConnections = new StoreSubscriber(
     this,
     () => this.streamsStore._openConnections,
+    () => [this.streamsStore]
+  );
+
+  _receivedDiagnosticLogs = new StoreSubscriber(
+    this,
+    () => this.streamsStore._receivedDiagnosticLogs,
     () => [this.streamsStore]
   );
 
@@ -797,6 +805,40 @@ export class RoomView extends LitElement {
           .src=${wrapPathInSvg(mdiVideo)}
         ></sl-icon>
       </sl-tooltip>
+
+      <!-- Diagnostic log request button -->
+      ${(() => {
+        const hasReceivedLogs = !!this._receivedDiagnosticLogs?.value?.[pubkeyB64];
+        const isPending = this.streamsStore._pendingDiagnosticRequests.has(pubkeyB64);
+        return html`
+          <sl-tooltip
+            hoist
+            class="tooltip-filled"
+            placement="top"
+            content="${hasReceivedLogs
+              ? 'Download merged diagnostic logs'
+              : isPending
+                ? 'Requesting logs...'
+                : 'Request peer diagnostic logs'}"
+          >
+            <sl-icon
+              style="font-size: 18px; color: ${hasReceivedLogs ? '#09b500' : isPending ? '#e7a008' : '#c3c9eb'}; cursor: pointer; margin-top: 2px;"
+              .src=${wrapPathInSvg(mdiCloudDownloadOutline)}
+              @click=${() => {
+                if (hasReceivedLogs) {
+                  downloadJson(
+                    `Presence_diagnostic_${pubkeyB64.slice(0, 8)}_${formattedDate()}.json`,
+                    JSON.stringify(this.streamsStore.exportMergedLogs(pubkeyB64), undefined, 2)
+                  );
+                } else {
+                  this.streamsStore.requestDiagnosticLogs(pubkeyB64);
+                  this.requestUpdate();
+                }
+              }}
+            ></sl-icon>
+          </sl-tooltip>
+        `;
+      })()}
     `;
   }
 
@@ -1041,6 +1083,26 @@ export class RoomView extends LitElement {
       <div class="toggles-panel">
         ${this._showConnectionDetails
           ? html`
+              <sl-tooltip content="${msg('Export Logs')}" hoist>
+                <div
+                  class="toggle-btn"
+                  style="position: absolute; left: -130px;"
+                  tabindex="0"
+                  @click=${(e: any) => {
+                    downloadJson(
+                      `Presence_${__APP_VERSION__}_logs_${formattedDate()}.json`,
+                      JSON.stringify(exportLogs(), undefined, 2)
+                    );
+                    e.stopPropagation();
+                  }}
+                  @keypress=${() => undefined}
+                >
+                  <sl-icon
+                    class="toggle-btn-icon"
+                    .src=${wrapPathInSvg(mdiDownload)}
+                  ></sl-icon>
+                </div>
+              </sl-tooltip>
               <sl-tooltip content="${msg('Log Custom Event')}" hoist>
                 <div
                   class="toggle-btn"

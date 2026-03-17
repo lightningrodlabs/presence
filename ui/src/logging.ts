@@ -62,13 +62,13 @@ type PongMetadataInfo = {
   metaData: PongMetaDataV1;
 };
 
-type CustomLog = {
+export type CustomLog = {
   timestamp: number;
   log: string;
 };
 
 export type SimpleEventType =
-  | 'Pong'
+  | 'Pong' // Retained for backward compat with old logs; no longer emitted (pong timing is in agentPongMetadataLogs)
   | 'SdpData'
   | 'InitAccept'
   | 'InitRequest'
@@ -94,12 +94,18 @@ export type SimpleEventType =
   | 'ChangeMyVideoInput'
   | 'TrackArrivedMuted'
   | 'TrackUnmuted'
-  | 'TrackUnmuteTimeout';
+  | 'TrackUnmuteTimeout'
+  | 'AddStream'
+  | 'StreamReceived'
+  | 'StaleCleanup'
+  | 'SdpTimeout'
+  | 'PeerLeave';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
   timestamp: number;
   event: SimpleEventType;
+  connectionId?: string;
 };
 
 export type PresenceLogEvent =
@@ -302,9 +308,9 @@ export class PresenceLogger {
    * Deletes any logs older than 1 week
    */
   _garbageCollect() {
-    const week_ms = 7 * 24 * 60 * 60 * 1000;
+    const day_ms = 24 * 60 * 60 * 1000;
     const now = Date.now();
-    const olderThanOneWeek = (timestamp: number) => now - timestamp > week_ms;
+    const olderThanOneDay = (timestamp: number) => now - timestamp > day_ms;
 
     const sessionInfos = readLocalStorage<Record<string, SessionInfo>>(
       'session_infos',
@@ -312,7 +318,7 @@ export class PresenceLogger {
     );
 
     Object.entries(sessionInfos).forEach(([id, info]) => {
-      if (info.start && olderThanOneWeek(info.start)) {
+      if (info.start && olderThanOneDay(info.start)) {
         console.log('Deleting old logs...');
         // Delete all logs for this session
         window.localStorage.removeItem(`log_my_stream_${id}`);
@@ -491,5 +497,28 @@ export class PresenceLogger {
     };
     this.customLogs.push(event);
     this.emit('custom-log', event);
+  }
+
+  /**
+   * Get all agent events from the current session newer than `sinceMs` milliseconds ago.
+   */
+  getRecentAgentEvents(sinceMs: number = 300_000): Record<AgentPubKeyB64, SimpleEvent[]> {
+    const cutoff = Date.now() - sinceMs;
+    const result: Record<AgentPubKeyB64, SimpleEvent[]> = {};
+    Object.entries(this.agentEvents).forEach(([agent, events]) => {
+      const recent = events.filter(e => e.timestamp >= cutoff);
+      if (recent.length > 0) {
+        result[agent] = recent;
+      }
+    });
+    return result;
+  }
+
+  /**
+   * Get all custom logs from the current session newer than `sinceMs` milliseconds ago.
+   */
+  getRecentCustomLogs(sinceMs: number = 300_000): CustomLog[] {
+    const cutoff = Date.now() - sinceMs;
+    return this.customLogs.filter(log => log.timestamp >= cutoff);
   }
 }
