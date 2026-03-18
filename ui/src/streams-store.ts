@@ -896,6 +896,12 @@ export class StreamsStore {
   _lastReconcileTime: Record<AgentPubKeyB64, number> = {};
 
   /**
+   * Tracks the timestamp of the last connection close/error per agent,
+   * used to log the retry gap when a new InitRequest is created.
+   */
+  _lastDisconnectTime: Record<AgentPubKeyB64, number> = {};
+
+  /**
    * Tracks how many consecutive reconciliation attempts have been made per agent,
    * for exponential backoff of the cooldown.
    */
@@ -1108,19 +1114,44 @@ export class StreamsStore {
         return;
       }
       pc.addEventListener('iceconnectionstatechange', () => {
+        const state = pc.iceConnectionState;
         this.logger.logCustomMessage(
-          `ICE [${pubKeyB64.slice(0, 8)}]: ${pc.iceConnectionState}`
+          `ICE [${pubKeyB64.slice(0, 8)}]: ${state} connId=${connectionId.slice(0, 8)}`
         );
+        // On terminal states, log the last selected candidate pair for post-mortem
+        if (state === 'failed' || state === 'disconnected') {
+          try {
+            const transport = (pc.getSenders()[0]?.transport as any)?.iceTransport;
+            const pair = transport?.getSelectedCandidatePair?.() as { local?: RTCIceCandidate; remote?: RTCIceCandidate } | undefined;
+            if (pair) {
+              this.logger.logCustomMessage(
+                `ICE failed pair [${pubKeyB64.slice(0, 8)}]: local=${(pair.local as any)?.address}:${(pair.local as any)?.port} (${pair.local?.type}) remote=${(pair.remote as any)?.address}:${(pair.remote as any)?.port} (${pair.remote?.type})`
+              );
+            }
+          } catch (_) {
+            // getSenders/iceTransport may not be available on all browsers
+          }
+        }
       });
       pc.addEventListener('icegatheringstatechange', () => {
         this.logger.logCustomMessage(
           `ICE gathering [${pubKeyB64.slice(0, 8)}]: ${pc.iceGatheringState}`
         );
+        // When gathering completes, log whether relay candidates were generated
+        if (pc.iceGatheringState === 'complete') {
+          const stats = (pc as any).localDescription?.sdp;
+          const hasRelay = stats ? stats.includes('typ relay') : false;
+          this.logger.logCustomMessage(
+            `ICE candidates summary [${pubKeyB64.slice(0, 8)}]: relay=${hasRelay}`
+          );
+        }
       });
       pc.addEventListener('icecandidate', (event: RTCPeerConnectionIceEvent) => {
         if (event.candidate) {
+          // Log full candidate including address:port for NAT analysis
+          const c = event.candidate;
           this.logger.logCustomMessage(
-            `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${event.candidate.type} ${event.candidate.protocol}`
+            `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${c.type} ${c.protocol} ${c.address}:${c.port}`
           );
         }
       });
@@ -1396,7 +1427,7 @@ export class StreamsStore {
                 isRelayed = true;
               }
               this.logger.logCustomMessage(
-                `ICE pair [${pubKeyB64.slice(0, 8)}]: local=${localCandidate?.candidateType} remote=${remoteCandidate?.candidateType} proto=${localCandidate?.protocol}`
+                `ICE pair [${pubKeyB64.slice(0, 8)}]: local=${localCandidate?.candidateType} ${localCandidate?.address}:${localCandidate?.port} remote=${remoteCandidate?.candidateType} ${remoteCandidate?.address}:${remoteCandidate?.port} proto=${localCandidate?.protocol}`
               );
             }
           });
@@ -1426,6 +1457,7 @@ export class StreamsStore {
         event: 'SimplePeerClose',
         connectionId,
       });
+      this._lastDisconnectTime[pubKeyB64] = Date.now();
 
       // Remove from existing streams
       const existingPeerStreams = this._videoStreams;
@@ -2519,6 +2551,13 @@ export class StreamsStore {
     if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
       if (!pendingInits) {
         console.log('#### SENDING FIRST INIT REQUEST.');
+        const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
+        if (lastDisconnect) {
+          const gap = Date.now() - lastDisconnect;
+          this.logger.logCustomMessage(
+            `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
+          );
+        }
         const newConnectionId = uuidv4();
         this._pendingInits[pubkeyB64] = [
           { connectionId: newConnectionId, t0: now },
@@ -2669,6 +2708,15 @@ export class StreamsStore {
         connection_type === 'screen' ? 'SCREEN SHARE ' : ''
       }INIT REQUEST.`
     );
+
+    // Log retry gap if this is a reconnection attempt
+    const lastDisconnect = this._lastDisconnectTime[pubKey64];
+    if (lastDisconnect) {
+      const gap = Date.now() - lastDisconnect;
+      this.logger.logCustomMessage(
+        `Retry gap [${pubKey64.slice(0, 8)}]: ${gap}ms since last disconnect`
+      );
+    }
 
     /**
      * InitRequests for normal audio/video stream
