@@ -68,6 +68,7 @@ export type CustomLog = {
 };
 
 export type SimpleEventType =
+  // Legacy events (retained for backward compatibility)
   | 'Pong' // Retained for backward compat with old logs; no longer emitted (pong timing is in agentPongMetadataLogs)
   | 'SdpData'
   | 'InitAccept'
@@ -99,7 +100,45 @@ export type SimpleEventType =
   | 'StreamReceived'
   | 'StaleCleanup'
   | 'SdpTimeout'
-  | 'PeerLeave';
+  | 'PeerLeave'
+  // FSM lifecycle events
+  | 'FSMTransition'           // state A → state B, with trigger reason
+  | 'FSMTransitionBlocked'    // attempted invalid transition (bug indicator)
+  | 'FSMTimerStart'           // timeout/retry timer started
+  | 'FSMTimerFire'            // timer fired
+  | 'FSMTimerCancel'          // timer cancelled by state exit
+  // Transport-level events (Layer 2)
+  | 'ICETransportState'       // ICE transport state change
+  | 'ICEGatheringState'       // ICE gathering state change
+  | 'ICECandidateLocal'       // local ICE candidate generated
+  | 'ICECandidateRemote'      // remote ICE candidate received
+  | 'DTLSTransportState'      // DTLS transport state change
+  | 'SignalingState'           // RTCPeerConnection signaling state change
+  | 'DataChannelState'        // data channel open/close/error
+  // Perfect Negotiation events
+  | 'NegotiationNeeded'       // negotiationneeded fired
+  | 'OfferCreated'            // local SDP offer created
+  | 'AnswerCreated'           // local SDP answer created
+  | 'OfferCollision'          // glare detected
+  | 'OfferIgnored'            // impolite peer ignored colliding offer
+  | 'OfferAccepted'           // polite peer yielded to colliding offer
+  | 'SDPApplied'              // remote description applied
+  // Reconnection events
+  | 'ICERestartInitiated'     // fast-path recovery started
+  | 'FullReconnectInitiated'  // slow-path recovery started
+  | 'ReconnectAttempt'        // retry attempt number, delay used
+  | 'ReconnectSuccess'        // recovery succeeded
+  | 'ReconnectFailed'         // recovery exhausted retries
+  // ConnectionManager integration events
+  | 'RemoteTrack'             // remote track received via ConnectionManager
+  | 'ConnectionState_idle'
+  | 'ConnectionState_signaling'
+  | 'ConnectionState_connecting'
+  | 'ConnectionState_connected'
+  | 'ConnectionState_reconnecting'
+  | 'ConnectionState_disconnected'
+  | 'ConnectionState_failed'
+  | 'ConnectionState_closed';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;

@@ -32,8 +32,10 @@ import {
 } from './types';
 import { RoomClient } from './room/room-client';
 import { RoomStore } from './room/room-store';
-import { PresenceLogger } from './logging';
+import { PresenceLogger, SimpleEventType } from './logging';
 import { getStreamInfo } from './utils';
+import { ConnectionManager, HolochainSignalingAdapter } from './connection';
+import type { ConnectionPhase } from './connection';
 
 declare const __APP_VERSION__: string;
 
@@ -43,14 +45,8 @@ const STUN_SERVERS: RTCIceServer[] = [
 ];
 
 /**
- * Timeout in ms for the SDP exchange phase. If a connection does not progress
- * from SdpExchange to Connected within this duration, the stale peer is destroyed
- * and the connection is reset to Disconnected so the next ping/pong cycle can retry.
- */
-const SDP_EXCHANGE_TIMEOUT = 15000;
-
-/**
- * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent
+ * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent.
+ * (Only used for screen share connections which still use the old SimplePeer protocol.)
  */
 const INIT_RETRY_THRESHOLD = 5000;
 
@@ -99,6 +95,14 @@ export class StreamsStore {
 
   private _processingSignal = false;
 
+  // ---------------------------------------------------------------------------
+  // ConnectionManager (replaces SimplePeer for video/audio connections)
+  // ---------------------------------------------------------------------------
+
+  connectionManager!: ConnectionManager;
+
+  private _signalingAdapter!: HolochainSignalingAdapter;
+
   constructor(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
@@ -110,6 +114,27 @@ export class StreamsStore {
     const roomClient = roomStore.client;
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
+
+    // Initialize ConnectionManager
+    this._signalingAdapter = new HolochainSignalingAdapter(this.roomClient);
+    this.connectionManager = new ConnectionManager({
+      myAgentId: this.myPubKeyB64,
+      signaling: this._signalingAdapter,
+      config: {
+        iceServers: this.iceConfig,
+        trickleICE: this.trickleICE,
+        connectionTimeoutMs: 15_000,
+        sdpExchangeTimeoutMs: 15_000,
+        role: 'mesh',
+      },
+      onTransition: (entry) => {
+        this.logger.logCustomMessage(
+          `FSM [${entry.remoteAgent.slice(0, 8)}]: ${entry.fromState} → ${entry.toState} (${entry.trigger})`
+        );
+      },
+    });
+    this._setupConnectionManagerEvents();
+
     // TODO potentially move this to a connect() method which also returns
     // the Unsubscribe function
     this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
@@ -133,6 +158,411 @@ export class StreamsStore {
     navigator.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
+  }
+
+  /**
+   * Wire ConnectionManager events to StreamsStore behavior.
+   * Replaces the old SimplePeer event handlers (peer.on('stream'), peer.on('track'), etc.)
+   */
+  private _setupConnectionManagerEvents() {
+    // Handle remote stream arrival
+    this.connectionManager.on('remote-stream', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const stream = event.data as MediaStream;
+
+      const trackDesc = stream.getTracks().map(t =>
+        `${t.kind}:muted=${t.muted},readyState=${t.readyState}`
+      ).join(', ');
+      this.logger.logCustomMessage(
+        `stream received [${pubKeyB64.slice(0, 8)}]: ${stream.getTracks().length} tracks [${trackDesc}]`
+      );
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: 'StreamReceived',
+        connectionId,
+      });
+      console.log(
+        '#### GOT STREAM with tracks from:',
+        pubKeyB64,
+        stream.getTracks()
+      );
+
+      // Store to existing streams
+      this._videoStreams[pubKeyB64] = stream;
+
+      const audioTracks = stream.getAudioTracks();
+      const videoTracks = stream.getVideoTracks();
+      this._openConnections.update(currentValue => {
+        const openConnections = currentValue;
+        const relevantConnection = openConnections[pubKeyB64];
+        if (relevantConnection) {
+          if (audioTracks.length > 0) {
+            relevantConnection.audio = true;
+          }
+          if (videoTracks.length > 0 && !videoTracks[0].muted) {
+            relevantConnection.video = true;
+          } else if (videoTracks.length > 0 && videoTracks[0].muted) {
+            relevantConnection.videoMuted = true;
+          }
+          openConnections[pubKeyB64] = relevantConnection;
+        }
+        return openConnections;
+      });
+      // Always fire peer-stream so srcObject gets assigned to the <video> element
+      this.eventCallback({
+        type: 'peer-stream',
+        pubKeyB64,
+        connectionId,
+        stream,
+      });
+    });
+
+    // Handle remote track arrival
+    this.connectionManager.on('remote-track', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const { track } = event.data;
+
+      console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: 'RemoteTrack',
+        connectionId,
+      });
+
+      if (!track.muted) {
+        this._setTrackReady(pubKeyB64, connectionId, track);
+      } else {
+        console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'TrackArrivedMuted',
+        });
+
+        if (track.kind === 'video') {
+          this._openConnections.update(current => {
+            const conn = current[pubKeyB64];
+            if (conn) {
+              conn.videoMuted = true;
+            }
+            return current;
+          });
+        }
+
+        const unmuteTimeout = setTimeout(() => {
+          if (track.muted) {
+            console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'TrackUnmuteTimeout',
+            });
+            this._setTrackReady(pubKeyB64, connectionId, track);
+          }
+        }, 5000);
+
+        track.onunmute = () => {
+          clearTimeout(unmuteTimeout);
+          console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
+          this.logger.logAgentEvent({
+            agent: pubKeyB64,
+            timestamp: Date.now(),
+            event: 'TrackUnmuted',
+          });
+          this._setTrackReady(pubKeyB64, connectionId, track);
+        };
+      }
+    });
+
+    // Handle data channel messages
+    this.connectionManager.on('data-channel-message', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const data = event.data;
+
+      try {
+        const msg: RTCMessage = JSON.parse(data);
+        if (msg.type === 'action') {
+          if (msg.message === 'video-off') {
+            this._openConnections.update(currentValue => {
+              const openConnections = currentValue;
+              const relevantConnection = openConnections[pubKeyB64];
+              if (relevantConnection) {
+                relevantConnection.video = false;
+                openConnections[pubKeyB64] = relevantConnection;
+              }
+              return openConnections;
+            });
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'PeerVideoOffSignal',
+            });
+          }
+          if (msg.message === 'video-on') {
+            this._openConnections.update(currentValue => {
+              const openConnections = currentValue;
+              const relevantConnection = openConnections[pubKeyB64];
+              if (relevantConnection) {
+                relevantConnection.video = true;
+                openConnections[pubKeyB64] = relevantConnection;
+              }
+              return openConnections;
+            });
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'PeerVideoOnSignal',
+            });
+          }
+          if (msg.message === 'audio-off') {
+            this._openConnections.update(currentValue => {
+              const openConnections = currentValue;
+              const relevantConnection = openConnections[pubKeyB64];
+              if (relevantConnection) {
+                relevantConnection.audio = false;
+                openConnections[pubKeyB64] = relevantConnection;
+              }
+              return openConnections;
+            });
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'PeerAudioOffSignal',
+            });
+          }
+          if (msg.message === 'audio-on') {
+            this._openConnections.update(currentValue => {
+              const openConnections = currentValue;
+              const relevantConnection = openConnections[pubKeyB64];
+              if (relevantConnection) {
+                relevantConnection.audio = true;
+                openConnections[pubKeyB64] = relevantConnection;
+              }
+              return openConnections;
+            });
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'PeerAudioOnSignal',
+            });
+          }
+          if (msg.message === 'change-audio-input') {
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'PeerChangeAudioInput',
+            });
+          }
+          if (msg.message === 'change-video-input') {
+            this.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: Date.now(),
+              event: 'PeerChangeVideoInput',
+            });
+          }
+          if (msg.message === 'request-track-refresh') {
+            console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
+            this.logger.logCustomMessage(
+              `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
+            );
+            this.refreshTracksForPeer(pubKeyB64);
+          }
+        }
+      } catch (e) {
+        console.warn(
+          `Failed to parse RTCMessage: ${JSON.stringify(
+            e
+          )}. Got message: ${data}}`
+        );
+      }
+    });
+
+    // Handle connection state changes
+    this.connectionManager.on('connection-state-changed', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const { toState, fromState } = event.data as { fromState: ConnectionPhase; toState: ConnectionPhase };
+
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: `ConnectionState_${toState}` as SimpleEventType,
+        connectionId,
+      });
+
+      if (toState === 'connected') {
+        console.log('#### CONNECTED with', pubKeyB64);
+
+        // Rebuild open connections entry
+        this._rebuildOpenConnections();
+
+        // Update connection status store
+        this._rebuildConnectionStatuses();
+
+        // Add mainStream if available
+        if (this.mainStream) {
+          try {
+            const fsm = this.connectionManager.getFSM(pubKeyB64);
+            if (fsm) {
+              fsm.addLocalStream(this.mainStream);
+              this.logger.logCustomMessage(
+                `addStream on-connect [${pubKeyB64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks`
+              );
+            }
+          } catch (e: any) {
+            // Tracks were already included — no action needed
+          }
+        }
+
+        this.eventCallback({
+          type: 'peer-connected',
+          pubKeyB64,
+          connectionId,
+        });
+
+        // Send immediate pong so peers see green rings
+        this._sendImmediatePongToAll();
+      } else if (toState === 'disconnected' || toState === 'closed' || toState === 'failed') {
+        console.log(`#### CONNECTION ${toState.toUpperCase()} with ${pubKeyB64.slice(0, 8)}`);
+
+        // Remove from existing streams
+        delete this._videoStreams[pubKeyB64];
+
+        // Rebuild open connections (this will remove the closed one)
+        this._rebuildOpenConnections();
+
+        // Clear stale perceivedStreamInfo
+        this._othersConnectionStatuses.update(statuses => {
+          if (statuses[pubKeyB64]) {
+            statuses[pubKeyB64] = {
+              ...statuses[pubKeyB64],
+              perceivedStreamInfo: undefined,
+            };
+          }
+          return statuses;
+        });
+
+        // Also tear down any outgoing screen share to this peer
+        const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
+        if (outgoingScreenShare) {
+          console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
+          outgoingScreenShare.peer.destroy();
+          this._screenShareConnectionsOutgoing.update(currentValue => {
+            delete currentValue[pubKeyB64];
+            return currentValue;
+          });
+          delete this._pendingScreenShareInits[pubKeyB64];
+        }
+
+        this._rebuildConnectionStatuses();
+        this.eventCallback({
+          type: 'peer-disconnected',
+          pubKeyB64,
+          connectionId,
+        });
+      } else {
+        // For signaling, connecting, reconnecting — just rebuild statuses
+        this._rebuildConnectionStatuses();
+      }
+    });
+  }
+
+  /**
+   * Rebuild _openConnections from ConnectionManager state.
+   * The `peer` field is set to `null as any` since UI components use
+   * StreamsStore methods rather than calling SimplePeer directly.
+   */
+  private _rebuildOpenConnections() {
+    const states = this.connectionManager.getAllStates();
+    const newOpenConnections: Record<AgentPubKeyB64, OpenConnectionInfo> = {};
+
+    // Preserve existing entries for connected peers (to keep audio/video/relayed flags)
+    const currentOpenConnections = get(this._openConnections);
+
+    for (const [agent, state] of states) {
+      if (state === 'connected' || state === 'signaling' || state === 'connecting' || state === 'reconnecting') {
+        const existing = currentOpenConnections[agent];
+        const fsm = this.connectionManager.getFSM(agent);
+        const vm = this.connectionManager.getViewModel(agent);
+        newOpenConnections[agent] = {
+          connectionId: fsm?.connectionId ?? '',
+          peer: null as any,
+          video: existing?.video ?? false,
+          audio: existing?.audio ?? false,
+          connected: state === 'connected',
+          relayed: vm?.quality?.relayed ?? existing?.relayed,
+          videoMuted: existing?.videoMuted,
+          direction: 'duplex',
+        };
+      }
+    }
+
+    this._openConnections.set(newOpenConnections);
+  }
+
+  /**
+   * Rebuild _connectionStatuses from ConnectionManager state.
+   * Maps ConnectionPhase to the legacy ConnectionStatus type.
+   */
+  private _rebuildConnectionStatuses() {
+    const states = this.connectionManager.getAllStates();
+    const currentStatuses = get(this._connectionStatuses);
+    const newStatuses: ConnectionStatuses = { ...currentStatuses };
+
+    for (const [agent, state] of states) {
+      // Don't override 'Blocked' status
+      if (newStatuses[agent]?.type === 'Blocked') continue;
+
+      newStatuses[agent] = this._phaseToConnectionStatus(state);
+    }
+
+    this._connectionStatuses.set(newStatuses);
+  }
+
+  /**
+   * Map a ConnectionPhase to the legacy ConnectionStatus type.
+   */
+  private _phaseToConnectionStatus(phase: ConnectionPhase): ConnectionStatus {
+    switch (phase) {
+      case 'idle':
+      case 'disconnected':
+      case 'failed':
+      case 'closed':
+        return { type: 'Disconnected' };
+      case 'signaling':
+        return { type: 'InitSent' };
+      case 'connecting':
+      case 'reconnecting':
+        return { type: 'SdpExchange' };
+      case 'connected':
+        return { type: 'Connected' };
+      default:
+        return { type: 'Disconnected' };
+    }
+  }
+
+  /**
+   * Send a message to all connected peers via data channel.
+   */
+  private _sendToAllConnected(message: RTCMessage) {
+    const states = this.connectionManager.getAllStates();
+    for (const [agent, state] of states) {
+      if (state === 'connected') {
+        const fsm = this.connectionManager.getFSM(agent);
+        if (fsm) {
+          try {
+            fsm.send(JSON.stringify(message));
+          } catch (e: any) {
+            console.warn(`Failed to send message to ${agent.slice(0, 8)}: ${e.toString()}`);
+          }
+        }
+      }
+    }
   }
 
   static async connect(
@@ -190,13 +620,18 @@ export class StreamsStore {
 
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this.signalUnsubscribe) this.signalUnsubscribe();
-    // Close all connections and stop all streams
-    Object.values(get(this._openConnections)).forEach(conn => {
-      conn.peer.destroy();
-    });
+
+    // Destroy ConnectionManager (handles all video/audio connections)
+    this.connectionManager.destroy();
+
+    // Close screen share connections (still using SimplePeer)
     Object.values(get(this._screenShareConnectionsIncoming)).forEach(conn => {
       conn.peer.destroy();
     });
+    Object.values(get(this._screenShareConnectionsOutgoing)).forEach(conn => {
+      conn.peer.destroy();
+    });
+
     this.videoOff();
     this.audioOff();
     this.screenShareOff();
@@ -205,8 +640,6 @@ export class StreamsStore {
     this._openConnections.set({});
     this._screenShareConnectionsOutgoing.set({});
     this._screenShareConnectionsIncoming.set({});
-    this._pendingAccepts = {};
-    this._pendingInits = {};
     this._pendingScreenShareInits = {};
     this._pendingScreenShareAccepts = {};
   }
@@ -315,23 +748,9 @@ export class StreamsStore {
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
 
-    // Cleanup stale pending accepts older than 20 seconds
+    // Cleanup stale pending screen share accepts older than 20 seconds
     const now = Date.now();
     const PENDING_ACCEPT_TTL = 20000;
-    for (const [agent, accepts] of Object.entries(this._pendingAccepts)) {
-      const stale = accepts.filter(a => now - a.createdAt > PENDING_ACCEPT_TTL);
-      if (stale.length > 0) {
-        stale.forEach(a => a.peer.destroy());
-        const remaining = accepts.filter(
-          a => now - a.createdAt <= PENDING_ACCEPT_TTL
-        );
-        if (remaining.length > 0) {
-          this._pendingAccepts[agent] = remaining;
-        } else {
-          delete this._pendingAccepts[agent];
-        }
-      }
-    }
     for (const [agent, accepts] of Object.entries(
       this._pendingScreenShareAccepts
     )) {
@@ -348,9 +767,6 @@ export class StreamsStore {
         }
       }
     }
-
-    // Health check for dead tracks (bytesReceived stall detection)
-    await this._checkTrackHealth();
   }
 
   async changeVideoInput(deviceId: string) {
@@ -360,19 +776,9 @@ export class StreamsStore {
       timestamp: Date.now(),
       event: 'ChangeMyVideoInput',
     });
-    Object.values(get(this._openConnections)).forEach(conn => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'change-video-input',
-      };
-      try {
-        conn.peer.send(JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          "Failed to send 'change-video-input' message to peer: ",
-          e.toString()
-        );
-      }
+    this._sendToAllConnected({
+      type: 'action',
+      message: 'change-video-input',
     });
     const videoTrack = this.mainStream?.getVideoTracks()[0];
     if (videoTrack && videoTrack.enabled) {
@@ -387,6 +793,9 @@ export class StreamsStore {
       if (this.mainStream.getVideoTracks()[0]) {
         console.log('### CASE A');
         this.mainStream.getVideoTracks()[0].enabled = true;
+        this.eventCallback({
+          type: 'my-video-on',
+        });
       } else {
         console.log('### CASE B');
         let videoStream: MediaStream | undefined;
@@ -426,10 +835,9 @@ export class StreamsStore {
         this.eventCallback({
           type: 'my-video-on',
         });
+        // Propagate stream update to all connections via ConnectionManager
         try {
-          Object.values(get(this._openConnections)).forEach(conn => {
-            conn.peer.addTrack(videoTrack, this.mainStream!);
-          });
+          this.connectionManager.updateLocalStream(this.mainStream);
         } catch (e: any) {
           console.error(`Failed to add video track: ${e.toString()}`);
         }
@@ -451,10 +859,9 @@ export class StreamsStore {
       this.eventCallback({
         type: 'my-video-on',
       });
+      // Propagate stream to all connections via ConnectionManager
       try {
-        Object.values(get(this._openConnections)).forEach(conn => {
-          conn.peer.addStream(this.mainStream!);
-        });
+        this.connectionManager.updateLocalStream(this.mainStream);
       } catch (e: any) {
         console.error(`Failed to add video track: ${e.toString()}`);
       }
@@ -468,45 +875,25 @@ export class StreamsStore {
     });
 
     // Send 'video-on' signal to peers
-    Object.values(get(this._openConnections)).forEach(conn => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'video-on',
-      };
-      try {
-        conn.peer.send(JSON.stringify(msg));
-      } catch (e) {
-        console.warn('Could not send video-on message to peer: ', e);
-      }
+    this._sendToAllConnected({
+      type: 'action',
+      message: 'video-on',
     });
   }
 
   videoOff() {
     if (this.mainStream) {
       this.mainStream.getVideoTracks().forEach(track => {
+        // Disable instead of stop — keeps camera allocated so videoOn()
+        // can re-enable without calling getUserMedia() (avoids re-prompting
+        // for permissions). This matches standard behavior in Zoom/Meet/Teams.
         // eslint-disable-next-line no-param-reassign
-        track.stop();
+        track.enabled = false;
       });
-      Object.values(get(this._openConnections)).forEach(conn => {
-        try {
-          this.mainStream!.getVideoTracks().forEach(track => {
-            conn.peer.removeTrack(track, this.mainStream!);
-          });
-        } catch (e) {
-          console.warn('Could not remove video track from peer: ', e);
-        }
-        const msg: RTCMessage = {
-          type: 'action',
-          message: 'video-off',
-        };
-        try {
-          conn.peer.send(JSON.stringify(msg));
-        } catch (e) {
-          console.warn('Could not send video-off message to peer: ', e);
-        }
-      });
-      this.mainStream.getVideoTracks().forEach(track => {
-        this.mainStream!.removeTrack(track);
+      // Send video-off message to all connected peers
+      this._sendToAllConnected({
+        type: 'action',
+        message: 'video-off',
       });
       this.logger.logAgentEvent({
         agent: encodeHashToBase64(this.roomClient.client.myPubKey),
@@ -535,9 +922,6 @@ export class StreamsStore {
         const enabled = audioTrack.enabled;
         audioTrack.stop();
         this.mainStream!.removeTrack(audioTrack);
-        // Object.values(get(this._openConnections)).forEach(conn => {
-        //   conn.peer.removeTrack(audioTrack, this.mainStream!);
-        // });
         const newAudioStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             noiseSuppression: true,
@@ -550,24 +934,25 @@ export class StreamsStore {
           newAudioTrack.enabled = false;
         }
         this.mainStream.addTrack(newAudioTrack);
-        Object.values(get(this._openConnections)).forEach(conn => {
-          conn.peer.replaceTrack(audioTrack, newAudioTrack, this.mainStream!);
-        });
+        // Replace track on all connected FSMs
+        const states = this.connectionManager.getAllStates();
+        for (const [agent, state] of states) {
+          if (state === 'connected') {
+            const fsm = this.connectionManager.getFSM(agent);
+            if (fsm) {
+              try {
+                await fsm.replaceTrack(audioTrack, newAudioTrack);
+              } catch (e: any) {
+                console.warn(`Failed to replace audio track for ${agent.slice(0, 8)}: ${e.toString()}`);
+              }
+            }
+          }
+        }
       }
     }
-    Object.values(get(this._openConnections)).forEach(conn => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'change-audio-input',
-      };
-      try {
-        conn.peer.send(JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          "Failed to send 'change-audio-input' message to peer: ",
-          e.toString()
-        );
-      }
+    this._sendToAllConnected({
+      type: 'action',
+      message: 'change-audio-input',
     });
   }
 
@@ -610,11 +995,10 @@ export class StreamsStore {
             audioTrack.enabled = false;
           }
           this.mainStream.addTrack(audioTrack);
-          Object.values(get(this._openConnections)).forEach(conn => {
-            conn.peer.addTrack(audioTrack, this.mainStream!);
-          });
+          // Propagate stream update via ConnectionManager
+          this.connectionManager.updateLocalStream(this.mainStream);
         } catch (e: any) {
-          console.error(`Failed to add video track: ${e.toString()}`);
+          console.error(`Failed to add audio track: ${e.toString()}`);
         }
       }
     } else {
@@ -642,26 +1026,16 @@ export class StreamsStore {
         });
         return;
       }
-      Object.values(get(this._openConnections)).forEach(conn => {
-        conn.peer.addStream(this.mainStream!);
-      });
+      // Propagate stream via ConnectionManager
+      this.connectionManager.updateLocalStream(this.mainStream);
     }
     this.eventCallback({
       type: 'my-audio-on',
     });
-    Object.values(get(this._openConnections)).forEach(conn => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'audio-on',
-      };
-      try {
-        conn.peer.send(JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          "Failed to send 'audio-on' message to peer: ",
-          e.toString()
-        );
-      }
+    // Send 'audio-on' signal to peers
+    this._sendToAllConnected({
+      type: 'action',
+      message: 'audio-on',
     });
   }
 
@@ -680,27 +1054,10 @@ export class StreamsStore {
         track.enabled = false;
         console.log('### DISABLED AUDIO TRACK: ', track);
       });
-      // Disable the audio tracks of all cloned streams as well
-      this.mainStreamClones.forEach(clonedStream => {
-        clonedStream.getAudioTracks().forEach(track => {
-          // eslint-disable-next-line no-param-reassign
-          track.enabled = false;
-          console.log('### DISABLED AUDIO TRACK: ', track);
-        });
-      });
-      Object.values(get(this._openConnections)).forEach(conn => {
-        const msg: RTCMessage = {
-          type: 'action',
-          message: 'audio-off',
-        };
-        try {
-          conn.peer.send(JSON.stringify(msg));
-        } catch (e: any) {
-          console.error(
-            'Failed to send audio-off message to peer: ',
-            e.toString()
-          );
-        }
+      // Send audio-off message to all connected peers
+      this._sendToAllConnected({
+        type: 'action',
+        message: 'audio-off',
       });
       this.eventCallback({
         type: 'my-audio-off',
@@ -769,8 +1126,7 @@ export class StreamsStore {
   }
 
   disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64) {
-    const relevantConnection = get(this._openConnections)[pubKeyB64];
-    if (relevantConnection) relevantConnection.peer.destroy();
+    this.connectionManager.closeConnection(pubKeyB64, 'manual disconnect');
   }
 
   disconnectFromPeerScreen(pubKeyB64: AgentPubKeyB64) {
@@ -794,7 +1150,7 @@ export class StreamsStore {
         'blockedAgents',
         JSON.stringify([...blockedAgents, pubKey64])
       );
-    this.disconnectFromPeerVideo(pubKey64);
+    this.connectionManager.closeConnection(pubKey64, 'blocked');
     this.disconnectFromPeerScreen(pubKey64);
     setTimeout(() => {
       this._connectionStatuses.update(currentValue => {
@@ -883,42 +1239,6 @@ export class StreamsStore {
   mainStream: MediaStream | undefined | null;
 
   /**
-   * Clones of the main stream. These are required in case a reconnection needs to be made for
-   * an individual peer because our audio and/or video track is non-functional from their
-   * perspective
-   */
-  mainStreamClones: MediaStream[] = [];
-
-  /**
-   * Tracks the last time reconcileVideoStreamState was triggered per agent,
-   * to avoid firing more than once per 30s interval.
-   */
-  _lastReconcileTime: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Tracks the timestamp of the last connection close/error per agent,
-   * used to log the retry gap when a new InitRequest is created.
-   */
-  _lastDisconnectTime: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Tracks how many consecutive reconciliation attempts have been made per agent,
-   * for exponential backoff of the cooldown.
-   */
-  _reconcileAttemptCount: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Tracks the last bytesReceived value per peer per track kind,
-   * for detecting dead tracks via getStats().
-   */
-  private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
-
-  /**
-   * Number of consecutive health check cycles where bytesReceived did not increase.
-   */
-  private _staleCycles: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
-
-  /**
    * Our own screen share stream
    */
   screenShareStream: MediaStream | undefined | null;
@@ -934,18 +1254,8 @@ export class StreamsStore {
   _screenShareStreams: Record<AgentPubKeyB64, MediaStream> = {};
 
   // ===========================================================================================
-  // CONNECTION ESTABLISHMENT
+  // CONNECTION ESTABLISHMENT (Screen share only — video uses ConnectionManager)
   // ===========================================================================================
-
-  /**
-   * Pending Init requests
-   */
-  _pendingInits: Record<AgentPubKeyB64, PendingInit[]> = {};
-
-  /**
-   * Pending Accepts
-   */
-  _pendingAccepts: Record<AgentPubKeyB64, PendingAccept[]> = {};
 
   /**
    * Pending Init requests for screen sharing
@@ -968,7 +1278,8 @@ export class StreamsStore {
   // ===========================================================================================
 
   /**
-   * Connections where the Init/Accept handshake succeeded and we have an active WebRTC connection
+   * Connections where we have an active WebRTC connection.
+   * For video connections, derived from ConnectionManager state.
    */
   _openConnections: Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> =
     writable({});
@@ -1045,7 +1356,7 @@ export class StreamsStore {
 
   // ********************************************************************************************
   //
-  //   S I M P L E   P E E R   H A N D L I N G
+  //   T R A C K   R E A D I N E S S
   //
   // ********************************************************************************************
 
@@ -1089,483 +1400,11 @@ export class StreamsStore {
     }
   }
 
-  createPeer(
-    connectingAgent: AgentPubKey,
-    connectionId: string,
-    initiator: boolean
-  ): SimplePeer.Instance {
-    const pubKeyB64 = encodeHashToBase64(connectingAgent);
-    const options: SimplePeer.Options = {
-      initiator,
-      config: {
-        iceServers: this.iceConfig,
-      },
-      objectMode: true,
-      trickle: this.trickleICE,
-    };
-    const peer = new SimplePeer(options);
-
-    // Monitor ICE connection state for diagnostics (uses addEventListener to
-    // avoid overwriting SimplePeer's own on* property handlers)
-    const monitorICE = () => {
-      const pc = (peer as any)._pc as RTCPeerConnection | undefined;
-      if (!pc) {
-        setTimeout(monitorICE, 100);
-        return;
-      }
-      pc.addEventListener('iceconnectionstatechange', () => {
-        const state = pc.iceConnectionState;
-        this.logger.logCustomMessage(
-          `ICE [${pubKeyB64.slice(0, 8)}]: ${state} connId=${connectionId.slice(0, 8)}`
-        );
-        // On terminal states, log the last selected candidate pair for post-mortem
-        if (state === 'failed' || state === 'disconnected') {
-          try {
-            const transport = (pc.getSenders()[0]?.transport as any)?.iceTransport;
-            const pair = transport?.getSelectedCandidatePair?.() as { local?: RTCIceCandidate; remote?: RTCIceCandidate } | undefined;
-            if (pair) {
-              this.logger.logCustomMessage(
-                `ICE failed pair [${pubKeyB64.slice(0, 8)}]: local=${(pair.local as any)?.address}:${(pair.local as any)?.port} (${pair.local?.type}) remote=${(pair.remote as any)?.address}:${(pair.remote as any)?.port} (${pair.remote?.type})`
-              );
-            }
-          } catch (_) {
-            // getSenders/iceTransport may not be available on all browsers
-          }
-        }
-      });
-      pc.addEventListener('icegatheringstatechange', () => {
-        this.logger.logCustomMessage(
-          `ICE gathering [${pubKeyB64.slice(0, 8)}]: ${pc.iceGatheringState}`
-        );
-        // When gathering completes, log whether relay candidates were generated
-        if (pc.iceGatheringState === 'complete') {
-          const stats = (pc as any).localDescription?.sdp;
-          const hasRelay = stats ? stats.includes('typ relay') : false;
-          this.logger.logCustomMessage(
-            `ICE candidates summary [${pubKeyB64.slice(0, 8)}]: relay=${hasRelay}`
-          );
-        }
-      });
-      pc.addEventListener('icecandidate', (event: RTCPeerConnectionIceEvent) => {
-        if (event.candidate) {
-          // Log full candidate including address:port for NAT analysis
-          const c = event.candidate;
-          this.logger.logCustomMessage(
-            `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${c.type} ${c.protocol} ${c.address}:${c.port}`
-          );
-        }
-      });
-    };
-    monitorICE();
-
-    peer.on('signal', async data => {
-      this.roomClient.sendMessage(
-        [connectingAgent],
-        'SdpData',
-        JSON.stringify({ connection_id: connectionId, data: JSON.stringify(data) }),
-      );
-    });
-    peer.on('data', data => {
-      try {
-        const msg: RTCMessage = JSON.parse(data);
-        if (msg.type === 'action') {
-          if (msg.message === 'video-off') {
-            this._openConnections.update(currentValue => {
-              const openConnections = currentValue;
-              const relevantConnection = openConnections[pubKeyB64];
-              relevantConnection.video = false;
-              openConnections[pubKeyB64] = relevantConnection;
-              return openConnections;
-            });
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'PeerVideoOffSignal',
-            });
-          }
-          if (msg.message === 'video-on') {
-            this._openConnections.update(currentValue => {
-              const openConnections = currentValue;
-              const relevantConnection = openConnections[pubKeyB64];
-              if (relevantConnection) {
-                relevantConnection.video = true;
-                openConnections[pubKeyB64] = relevantConnection;
-              }
-              return openConnections;
-            });
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'PeerVideoOnSignal',
-            });
-          }
-          if (msg.message === 'audio-off') {
-            this._openConnections.update(currentValue => {
-              const openConnections = currentValue;
-              const relevantConnection = openConnections[pubKeyB64];
-              relevantConnection.audio = false;
-              openConnections[pubKeyB64] = relevantConnection;
-              return openConnections;
-            });
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'PeerAudioOffSignal',
-            });
-          }
-          if (msg.message === 'audio-on') {
-            this._openConnections.update(currentValue => {
-              const openConnections = currentValue;
-              const relevantConnection = openConnections[pubKeyB64];
-              relevantConnection.audio = true;
-              openConnections[pubKeyB64] = relevantConnection;
-              return openConnections;
-            });
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'PeerAudioOnSignal',
-            });
-          }
-          if (msg.message === 'change-audio-input') {
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'PeerChangeAudioInput',
-            });
-          }
-          if (msg.message === 'change-video-input') {
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'PeerChangeVideoInput',
-            });
-          }
-          if (msg.message === 'request-track-refresh') {
-            console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
-            this.logger.logCustomMessage(
-              `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
-            );
-            this.refreshTracksForPeer(pubKeyB64);
-          }
-        }
-      } catch (e) {
-        console.warn(
-          `Failed to parse RTCMessage: ${JSON.stringify(
-            e
-          )}. Got message: ${data}}`
-        );
-      }
-    });
-    peer.on('stream', stream => {
-      const trackDesc = stream.getTracks().map(t =>
-        `${t.kind}:muted=${t.muted},readyState=${t.readyState}`
-      ).join(', ');
-      this.logger.logCustomMessage(
-        `stream received [${pubKeyB64.slice(0, 8)}]: ${stream.getTracks().length} tracks [${trackDesc}]`
-      );
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'StreamReceived',
-        connectionId,
-      });
-      console.log(
-        '#### GOT STREAM with tracks from:',
-        pubKeyB64,
-        stream.getTracks()
-      );
-      // Store to existing streams
-      const existingPeerStreams = this._videoStreams;
-      existingPeerStreams[pubKeyB64] = stream;
-      this._videoStreams = existingPeerStreams;
-
-      const audioTracks = stream.getAudioTracks();
-      const videoTracks = stream.getVideoTracks();
-      this._openConnections.update(currentValue => {
-        const openConnections = currentValue;
-        const relevantConnection = openConnections[pubKeyB64];
-        if (relevantConnection) {
-          // Audio: set immediately (audio muted state is less critical for UX)
-          if (audioTracks.length > 0) {
-            relevantConnection.audio = true;
-          }
-          // Video: only set if the track is not muted; the 'track' handler
-          // will handle muted tracks via the onunmute patience logic
-          if (videoTracks.length > 0 && !videoTracks[0].muted) {
-            relevantConnection.video = true;
-          } else if (videoTracks.length > 0 && videoTracks[0].muted) {
-            relevantConnection.videoMuted = true;
-          }
-          openConnections[pubKeyB64] = relevantConnection;
-        }
-        return openConnections;
-      });
-      // Always fire peer-stream so srcObject gets assigned to the <video> element
-      this.eventCallback({
-        type: 'peer-stream',
-        pubKeyB64,
-        connectionId,
-        stream,
-      });
-    });
-    peer.on('track', track => {
-      console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'SimplePeerTrack',
-        connectionId,
-      });
-
-      if (!track.muted) {
-        // Track is immediately usable — set flags and fire events right away
-        this._setTrackReady(pubKeyB64, connectionId, track);
-      } else {
-        // Track arrived muted — wait for onunmute with a 5-second timeout
-        console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: Date.now(),
-          event: 'TrackArrivedMuted',
-        });
-
-        // Mark as "connecting media" in the UI for video tracks
-        if (track.kind === 'video') {
-          this._openConnections.update(current => {
-            const conn = current[pubKeyB64];
-            if (conn) {
-              conn.videoMuted = true;
-            }
-            return current;
-          });
-        }
-
-        const unmuteTimeout = setTimeout(() => {
-          if (track.muted) {
-            console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
-            this.logger.logAgentEvent({
-              agent: pubKeyB64,
-              timestamp: Date.now(),
-              event: 'TrackUnmuteTimeout',
-            });
-            // Still set the flag so the tile shows something; the health check can request recovery later
-            this._setTrackReady(pubKeyB64, connectionId, track);
-          }
-        }, 5000);
-
-        track.onunmute = () => {
-          clearTimeout(unmuteTimeout);
-          console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
-          this.logger.logAgentEvent({
-            agent: pubKeyB64,
-            timestamp: Date.now(),
-            event: 'TrackUnmuted',
-          });
-          this._setTrackReady(pubKeyB64, connectionId, track);
-        };
-      }
-    });
-    peer.on('connect', async () => {
-      console.log('#### CONNECTED with', pubKeyB64);
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'Connected',
-        connectionId,
-      });
-
-      delete this._pendingInits[pubKeyB64];
-
-      const openConnections = get(this._openConnections);
-      const relevantConnection = openConnections[pubKeyB64];
-      relevantConnection.connected = true;
-
-      // Add stream if not already added before connect (e.g. mainStream was null at peer
-      // creation time but is available now). If already added, the try-catch silently
-      // ignores the duplicate-track error from RTCPeerConnection.addTrack.
-      if (this.mainStream) {
-        try {
-          relevantConnection.peer.addStream(this.mainStream);
-          this.logger.logCustomMessage(
-            `addStream on-connect [${pubKeyB64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks`
-          );
-        } catch (e: any) {
-          // Tracks were already included in the initial offer/answer — no action needed
-        }
-      }
-
-      this._openConnections.update(currentValue => {
-        const openConnections = currentValue;
-        openConnections[pubKeyB64] = relevantConnection;
-        return openConnections;
-      });
-
-      this.updateConnectionStatus(pubKeyB64, { type: 'Connected' });
-      this.eventCallback({
-        type: 'peer-connected',
-        pubKeyB64,
-        connectionId,
-      });
-
-      // Check whether connection is relayed (TURN) after ICE settles
-      setTimeout(async () => {
-        try {
-          const pc = (peer as any)._pc as RTCPeerConnection | undefined;
-          if (!pc) return;
-          const stats = await pc.getStats();
-          let isRelayed = false;
-          const reportsById: Record<string, any> = {};
-          stats.forEach((report: any) => {
-            reportsById[report.id] = report;
-          });
-          Object.values(reportsById).forEach((report: any) => {
-            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-              const localCandidate = reportsById[report.localCandidateId];
-              const remoteCandidate = reportsById[report.remoteCandidateId];
-              if (localCandidate?.candidateType === 'relay') {
-                isRelayed = true;
-              }
-              this.logger.logCustomMessage(
-                `ICE pair [${pubKeyB64.slice(0, 8)}]: local=${localCandidate?.candidateType} ${localCandidate?.address}:${localCandidate?.port} remote=${remoteCandidate?.candidateType} ${remoteCandidate?.address}:${remoteCandidate?.port} proto=${localCandidate?.protocol}`
-              );
-            }
-          });
-          this._openConnections.update(current => {
-            const conn = current[pubKeyB64];
-            if (conn) {
-              conn.relayed = isRelayed;
-            }
-            return current;
-          });
-          if (isRelayed) {
-            this.logger.logCustomMessage(
-              `Connection [${pubKeyB64.slice(0, 8)}]: relayed via TURN`
-            );
-          }
-        } catch (e) {
-          // getStats may fail if connection was already closed
-        }
-      }, 2000);
-    });
-    peer.on('close', async () => {
-      console.log('#### GOT CLOSE EVENT ####');
-
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'SimplePeerClose',
-        connectionId,
-      });
-      this._lastDisconnectTime[pubKeyB64] = Date.now();
-
-      // Remove from existing streams
-      const existingPeerStreams = this._videoStreams;
-      delete existingPeerStreams[pubKeyB64];
-      this._videoStreams = existingPeerStreams;
-
-      peer.destroy();
-
-      this._openConnections.update(currentValue => {
-        const openConnections = currentValue;
-        delete openConnections[pubKeyB64];
-        return openConnections;
-      });
-
-      // Clear stale perceivedStreamInfo so icons don't show stale state during reconnection
-      this._othersConnectionStatuses.update(statuses => {
-        if (statuses[pubKeyB64]) {
-          statuses[pubKeyB64] = {
-            ...statuses[pubKeyB64],
-            perceivedStreamInfo: undefined,
-          };
-        }
-        return statuses;
-      });
-
-      // Clean up health check state for this peer
-      delete this._lastBytesReceived[pubKeyB64];
-      delete this._staleCycles[pubKeyB64];
-      delete this._reconcileAttemptCount[pubKeyB64];
-
-      // Also tear down any outgoing screen share to this peer since they
-      // have disconnected. Without this, the stale WebRTC connection may
-      // linger and block re-initiation when the peer rejoins.
-      const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-      if (outgoingScreenShare) {
-        console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
-        outgoingScreenShare.peer.destroy();
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          delete currentValue[pubKeyB64];
-          return currentValue;
-        });
-        delete this._pendingScreenShareInits[pubKeyB64];
-      }
-
-      this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
-      this.eventCallback({
-        type: 'peer-disconnected',
-        pubKeyB64,
-        connectionId,
-      });
-    });
-    peer.on('error', e => {
-      console.log('#### GOT ERROR EVENT ####: ', e);
-      peer.destroy();
-
-      this.logger.logCustomMessage(
-        `SimplePeerError [${pubKeyB64.slice(0, 8)}]: ${e.message || e}`
-      );
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'SimplePeerError',
-        connectionId,
-      });
-
-      // Remove from existing streams
-      const existingPeerStreams = this._videoStreams;
-      delete existingPeerStreams[pubKeyB64];
-      this._videoStreams = existingPeerStreams;
-
-      this._openConnections.update(currentValue => {
-        const openConnections = currentValue;
-        delete openConnections[pubKeyB64];
-        return openConnections;
-      });
-
-      // Clear stale perceivedStreamInfo so icons don't show stale state during reconnection
-      this._othersConnectionStatuses.update(statuses => {
-        if (statuses[pubKeyB64]) {
-          statuses[pubKeyB64] = {
-            ...statuses[pubKeyB64],
-            perceivedStreamInfo: undefined,
-          };
-        }
-        return statuses;
-      });
-
-      // Also tear down any outgoing screen share to this peer
-      const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-      if (outgoingScreenShare) {
-        outgoingScreenShare.peer.destroy();
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          delete currentValue[pubKeyB64];
-          return currentValue;
-        });
-        delete this._pendingScreenShareInits[pubKeyB64];
-      }
-
-      this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
-      this.eventCallback({
-        type: 'peer-disconnected',
-        pubKeyB64,
-        connectionId,
-      });
-    });
-
-    return peer;
-  }
+  // ********************************************************************************************
+  //
+  //   S C R E E N   S H A R E   P E E R   ( S T I L L   U S I N G   S I M P L E P E E R )
+  //
+  // ********************************************************************************************
 
   createScreenSharePeer(
     connectingAgent: AgentPubKey,
@@ -1745,68 +1584,6 @@ export class StreamsStore {
   //
   // ********************************************************************************************
 
-  updateConnectionStatus(pubKey: AgentPubKeyB64, status: ConnectionStatus) {
-    this._connectionStatuses.update(currentValue => {
-      const connectionStatuses = currentValue;
-      if (status.type === 'InitSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'InitSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-
-      if (status.type === 'AcceptSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'AcceptSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-
-      if (status.type === 'SdpExchange') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus.type === 'Connected') {
-          // If already connected, don't change anything. SdpExchange
-          // is also expected to occur when turning on video when
-          // already connected.
-          return connectionStatuses;
-        }
-      }
-
-      connectionStatuses[pubKey] = status;
-      return connectionStatuses;
-    });
-
-    // When transitioning to Connected, send an immediate Pong to all known agents
-    // so their UI updates within milliseconds rather than waiting for the next ping cycle
-    if (status.type === 'Connected') {
-      this._sendImmediatePongToAll();
-    }
-  }
-
   /**
    * Send an immediate PongUi to all known agents. Used when connection status
    * changes to Connected so other peers see green rings right away.
@@ -1891,174 +1668,21 @@ export class StreamsStore {
   }
 
   /**
-   * Compares how the other peer sees our stream and if this mismatches our expectations,
-   * reset streams accordingly. Uses exponential backoff (10s, 20s, 40s...) and tries
-   * lightweight replaceTrack first before falling back to the heavier clone approach.
-   *
-   * @param pubkey
-   * @param streamAndTrackInfo
-   */
-  reconcileVideoStreamState(
-    pubkey: AgentPubKeyB64,
-    streamAndTrackInfo: StreamAndTrackInfo
-  ) {
-    // Exponential backoff: 10s, 20s, 40s, 80s, 160s (capped)
-    const BASE_COOLDOWN_MS = 10_000;
-    const reconcileCount = this._reconcileAttemptCount[pubkey] || 0;
-    const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
-    const lastReconcile = this._lastReconcileTime[pubkey] || 0;
-    if (Date.now() - lastReconcile < cooldown) return;
-
-    if (!this.mainStream) return;
-
-    // Case 1: Peer doesn't see our stream at all — re-add the whole stream
-    if (!streamAndTrackInfo.stream) {
-      console.warn(
-        'Peer does not seem to see our own stream. Re-adding it to their peer object...'
-      );
-      this.logger.logAgentEvent({
-        agent: pubkey,
-        timestamp: Date.now(),
-        event: 'ReconcileStream',
-      });
-      const peer = get(this._openConnections)[pubkey];
-      if (peer) {
-        try {
-          peer.peer.addStream(this.mainStream);
-          this._lastReconcileTime[pubkey] = Date.now();
-          this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
-        } catch (e: any) {
-          console.warn('Failed to re-add stream during reconcile:', e.message);
-        }
-      }
-      return;
-    }
-
-    const connInfo = get(this._openConnections)[pubkey];
-    if (!connInfo) return;
-
-    const myAudioTrack = this.mainStream.getAudioTracks()[0];
-    const myVideoTrack = this.mainStream.getVideoTracks()[0];
-
-    let needsRecovery = false;
-
-    // Check audio track
-    if (myAudioTrack) {
-      const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'audio');
-      if (!perceived || perceived.muted) {
-        needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileAudio' });
-      }
-    }
-
-    // Check video track
-    if (myVideoTrack) {
-      const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'video');
-      if (!perceived || perceived.muted) {
-        needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileVideo' });
-      }
-    }
-
-    if (!needsRecovery) {
-      // Tracks are healthy — reset attempt count
-      this._reconcileAttemptCount[pubkey] = 0;
-      return;
-    }
-
-    console.warn(`Reconciling tracks for ${pubkey.slice(0, 8)} (attempt ${reconcileCount + 1})`);
-
-    // Try lightweight replaceTrack first
-    const success = this._tryReplaceTrackRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
-
-    if (!success) {
-      // Fall back to heavier clone approach
-      this._cloneStreamRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
-    }
-
-    this._lastReconcileTime[pubkey] = Date.now();
-    this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
-  }
-
-  /**
-   * Attempt lightweight track recovery using replaceTrack on the RTCRtpSender.
-   * This avoids renegotiation and stream cloning.
-   * Returns true if replaceTrack was possible, false if fallback is needed.
-   */
-  private _tryReplaceTrackRecovery(
-    pubkey: AgentPubKeyB64,
-    connInfo: OpenConnectionInfo,
-    audioTrack: MediaStreamTrack | undefined,
-    videoTrack: MediaStreamTrack | undefined
-  ): boolean {
-    try {
-      const pc = (connInfo.peer as any)._pc as RTCPeerConnection | undefined;
-      if (!pc) return false;
-
-      const senders = pc.getSenders();
-      let success = true;
-
-      if (audioTrack) {
-        const audioSender = senders.find(s => s.track?.kind === 'audio');
-        if (audioSender) {
-          connInfo.peer.replaceTrack(audioSender.track!, audioTrack, this.mainStream!);
-          this.logger.logCustomMessage(`replaceTrack audio [${pubkey.slice(0, 8)}]: success`);
-        } else {
-          success = false;
-        }
-      }
-
-      if (videoTrack) {
-        const videoSender = senders.find(s => s.track?.kind === 'video');
-        if (videoSender) {
-          connInfo.peer.replaceTrack(videoSender.track!, videoTrack, this.mainStream!);
-          this.logger.logCustomMessage(`replaceTrack video [${pubkey.slice(0, 8)}]: success`);
-        } else {
-          success = false;
-        }
-      }
-
-      return success;
-    } catch (e: any) {
-      console.warn(`replaceTrack recovery failed for ${pubkey.slice(0, 8)}:`, e.message);
-      this.logger.logCustomMessage(`replaceTrack [${pubkey.slice(0, 8)}]: failed -- ${e.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Heavier track recovery: removes the stream, clones it, and re-adds tracks.
-   * This triggers renegotiation but is more reliable than replaceTrack for some edge cases.
-   *
-   * NOTE: It is important that cloned streams are stored in mainStreamClones so that
-   * audioOff() can disable audio tracks on them too. See simple-peer issue #606.
-   */
-  private _cloneStreamRecovery(
-    pubkey: AgentPubKeyB64,
-    connInfo: OpenConnectionInfo,
-    audioTrack: MediaStreamTrack | undefined,
-    videoTrack: MediaStreamTrack | undefined
-  ) {
-    if (!this.mainStream) return;
-    console.warn(`Falling back to clone-based recovery for ${pubkey.slice(0, 8)}`);
-    this.logger.logCustomMessage(`Clone recovery [${pubkey.slice(0, 8)}]`);
-    connInfo.peer.removeStream(this.mainStream);
-    const clonedStream = this.mainStream.clone();
-    this.mainStreamClones = [...this.mainStreamClones, clonedStream];
-    if (audioTrack) connInfo.peer.addTrack(audioTrack, clonedStream);
-    if (videoTrack) connInfo.peer.addTrack(videoTrack, clonedStream);
-  }
-
-  /**
-   * Public method for manual track recovery. Tries replaceTrack first,
-   * falls back to clone approach. Does not tear down the WebRTC connection.
+   * Public method for manual track recovery. Sends a request-track-refresh
+   * message via the data channel asking the peer to re-send their tracks.
    */
   refreshTracksForPeer(pubKeyB64: AgentPubKeyB64) {
-    const connInfo = get(this._openConnections)[pubKeyB64];
-    if (!connInfo || !this.mainStream) {
-      console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no connection or stream`);
+    if (!this.mainStream) {
+      console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no stream`);
       return;
     }
+
+    const fsm = this.connectionManager.getFSM(pubKeyB64);
+    if (!fsm) {
+      console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no FSM`);
+      return;
+    }
+
     const myAudioTrack = this.mainStream.getAudioTracks()[0];
     const myVideoTrack = this.mainStream.getVideoTracks()[0];
 
@@ -2066,13 +1690,15 @@ export class StreamsStore {
       `Track refresh [${pubKeyB64.slice(0, 8)}]: audio=${myAudioTrack ? `${myAudioTrack.enabled ? 'enabled' : 'disabled'},${myAudioTrack.muted ? 'muted' : 'unmuted'},${myAudioTrack.readyState}` : 'none'} video=${myVideoTrack ? `${myVideoTrack.enabled ? 'enabled' : 'disabled'},${myVideoTrack.muted ? 'muted' : 'unmuted'},${myVideoTrack.readyState}` : 'none'}`
     );
 
-    const success = this._tryReplaceTrackRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
-    if (!success) {
-      this._cloneStreamRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
+    // Re-add the local stream to trigger renegotiation
+    try {
+      fsm.addLocalStream(this.mainStream);
+      this.logger.logCustomMessage(
+        `Manual track refresh [${pubKeyB64.slice(0, 8)}]: re-added local stream`
+      );
+    } catch (e: any) {
+      console.warn(`Track refresh failed for ${pubKeyB64.slice(0, 8)}: ${e.toString()}`);
     }
-    this.logger.logCustomMessage(
-      `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
-    );
   }
 
   /**
@@ -2178,87 +1804,6 @@ export class StreamsStore {
     };
   }
 
-  /**
-   * Checks inbound RTP bytesReceived for each open connection.
-   * If bytes haven't increased for 2+ consecutive cycles (4+ seconds at 2s ping interval),
-   * the track is considered dead and we request the sender to refresh via data channel.
-   */
-  private async _checkTrackHealth() {
-    const openConnections = get(this._openConnections);
-    for (const [pubKeyB64, connInfo] of Object.entries(openConnections)) {
-      if (!connInfo.connected) continue;
-      if (!connInfo.video && !connInfo.audio) continue;
-
-      const pc = (connInfo.peer as any)._pc as RTCPeerConnection | undefined;
-      if (!pc) continue;
-
-      try {
-        const stats = await pc.getStats();
-        let audioBytes = 0;
-        let videoBytes = 0;
-
-        stats.forEach((report: any) => {
-          if (report.type === 'inbound-rtp') {
-            if (report.kind === 'audio' || report.mediaType === 'audio') {
-              audioBytes = report.bytesReceived || 0;
-            }
-            if (report.kind === 'video' || report.mediaType === 'video') {
-              videoBytes = report.bytesReceived || 0;
-            }
-          }
-        });
-
-        const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
-        const stale = this._staleCycles[pubKeyB64] || { audio: 0, video: 0 };
-
-        // Check video
-        if (connInfo.video && videoBytes > 0) {
-          if (videoBytes === lastBytes.video) {
-            stale.video++;
-          } else {
-            stale.video = 0;
-          }
-        }
-
-        // Check audio
-        if (connInfo.audio && audioBytes > 0) {
-          if (audioBytes === lastBytes.audio) {
-            stale.audio++;
-          } else {
-            stale.audio = 0;
-          }
-        }
-
-        this._lastBytesReceived[pubKeyB64] = { audio: audioBytes, video: videoBytes };
-        this._staleCycles[pubKeyB64] = stale;
-
-        // If 2+ consecutive stale cycles (4+ seconds), request track refresh
-        if (stale.video >= 2 || stale.audio >= 2) {
-          console.warn(
-            `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
-          );
-          this.logger.logCustomMessage(
-            `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
-          );
-
-          const msg: RTCMessage = {
-            type: 'action',
-            message: 'request-track-refresh',
-          };
-          try {
-            connInfo.peer.send(JSON.stringify(msg));
-            // Reset stale count to avoid spamming
-            this._staleCycles[pubKeyB64] = { audio: 0, video: 0 };
-          } catch (e: any) {
-            console.error('Failed to send request-track-refresh:', e.toString());
-          }
-        }
-      } catch (e) {
-        // getStats may fail if connection was already closed
-      }
-    }
-  }
-
   // ********************************************************************************************
   //
   //   S I G N A L   H A N D L E R S
@@ -2291,13 +1836,20 @@ export class StreamsStore {
           case 'PongUi':
             await this.handlePongUi(signal);
             break;
+          case 'Sdp':
+            // Route to ConnectionManager via the signaling adapter
+            this._signalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
+            break;
           case 'InitRequest':
+            // Only handle screen share InitRequests now
             await this.handleInitRequest(signal);
             break;
           case 'InitAccept':
+            // Only handle screen share InitAccepts now
             await this.handleInitAccept(signal);
             break;
           case 'SdpData':
+            // Only handle screen share SDP data now
             await this.handleSdpData(signal);
             break;
           case 'LeaveUi':
@@ -2407,12 +1959,8 @@ export class StreamsStore {
       event: 'PeerLeave',
     });
 
-    // Destroy video connection
-    const openConn = get(this._openConnections)[pubkeyB64];
-    if (openConn) {
-      openConn.peer.destroy();
-      this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
-    }
+    // Close video connection via ConnectionManager
+    this.connectionManager.closeConnection(pubkeyB64, 'peer left');
 
     // Destroy incoming screen share
     const inSS = get(this._screenShareConnectionsIncoming)[pubkeyB64];
@@ -2430,13 +1978,14 @@ export class StreamsStore {
 
     // Clean up video streams and pending state
     delete this._videoStreams[pubkeyB64];
-    delete this._pendingInits[pubkeyB64];
-    delete this._pendingAccepts[pubkeyB64];
     delete this._pendingScreenShareInits[pubkeyB64];
     delete this._pendingScreenShareAccepts[pubkeyB64];
 
     // Mark as disconnected
-    this.updateConnectionStatus(pubkeyB64, { type: 'Disconnected' });
+    this._connectionStatuses.update(v => {
+      v[pubkeyB64] = { type: 'Disconnected' };
+      return v;
+    });
     this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
 
     // Fire event so UI updates
@@ -2447,7 +1996,7 @@ export class StreamsStore {
    * If we get a PongUI we do the following:
    *
    * - Update our stored metadata for this agent
-   * - Send a video InitRequest if necessary
+   * - Ensure a video connection via ConnectionManager if necessary
    * - Send a screen share InitRequest if necessary
    * - Check whether the stream that they see of us matches what we
    *   expect and if not, try to reconcile
@@ -2515,100 +2064,39 @@ export class StreamsStore {
     }
 
     /**
-     * Normal video/audio stream
+     * Normal video/audio stream — use ConnectionManager
      *
-     * If our agent puglic key is alphabetically "higher" than the agent public key
-     * sending the pong and there is no open connection yet with this agent and there is
-     * no pending InitRequest from less than 5 seconds ago (and we therefore have to
-     * assume that a remote signal got lost), send an InitRequest.
+     * If there is no connection yet with this agent and the agent is not
+     * blocked, ask ConnectionManager to ensure a connection. Perfect Negotiation
+     * handles role assignment (polite/impolite) — no alphabetical pubkey
+     * comparison needed.
      */
-    // Clean up stale video connection if the underlying WebRTC is dead.
-    // This allows the normal initiation flow to proceed for a re-joining peer.
-    const existingConn = get(this._openConnections)[pubkeyB64];
-    if (existingConn) {
-      const pc = (existingConn.peer as any)._pc as RTCPeerConnection | undefined;
-      const iceState = pc?.iceConnectionState;
-      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
-        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
-        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState}`);
-        this.logger.logAgentEvent({
-          agent: pubkeyB64,
-          timestamp: Date.now(),
-          event: 'StaleCleanup',
-          connectionId: existingConn.connectionId,
-        });
-        existingConn.peer.destroy();
-        this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
-        delete this._pendingInits[pubkeyB64];
-        delete this._videoStreams[pubkeyB64];
-      }
-    }
+    const isBlocked = get(this.blockedAgents).includes(pubkeyB64);
+    const alreadyOpen = this.connectionManager.getState(pubkeyB64);
+    const hasActiveConnection = alreadyOpen && alreadyOpen !== 'closed' && alreadyOpen !== 'failed' && alreadyOpen !== 'idle' && alreadyOpen !== 'disconnected';
 
-    // alreadyOpen here does not include the case where SDP exchange is already ongoing
-    // but no actual connection has happened yet
-    const alreadyOpen = get(this._openConnections)[pubkeyB64];
-    const pendingInits = this._pendingInits[pubkeyB64];
-    if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
-      if (!pendingInits) {
-        console.log('#### SENDING FIRST INIT REQUEST.');
-        const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
-        if (lastDisconnect) {
-          const gap = Date.now() - lastDisconnect;
-          this.logger.logCustomMessage(
-            `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
-          );
-        }
-        const newConnectionId = uuidv4();
-        this._pendingInits[pubkeyB64] = [
-          { connectionId: newConnectionId, t0: now },
-        ];
-        await this.roomClient.sendMessage(
-          [signal.from_agent],
-          'InitRequest',
-          JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-        );
-        this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-      } else {
-        console.log(
-          `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
-        );
-        const latestInit = pendingInits.sort(
-          (init_a, init_b) => init_b.t0 - init_a.t0
-        )[0];
-        if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
-          const newConnectionId = uuidv4();
-          pendingInits.push({ connectionId: newConnectionId, t0: now });
-          this._pendingInits[pubkeyB64] = pendingInits;
-          await this.roomClient.sendMessage(
-            [signal.from_agent],
-            'InitRequest',
-            JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-          );
-          this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-        }
-      }
-    } else if (!alreadyOpen && !pendingInits) {
-      this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
-    } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
-      // If the connection is already open, reconcile with our expected stream state
-      this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
+    if (!hasActiveConnection && !isBlocked) {
+      this.connectionManager.ensureConnection(pubkeyB64);
     }
 
     // Check whether they have the right expectation of our audio state and if not,
     // send an audio-off signal
-    if (alreadyOpen && metaDataExt?.data.audio) {
+    if (hasActiveConnection && alreadyOpen === 'connected' && metaDataExt?.data.audio) {
       if (!this.mainStream?.getAudioTracks()[0]?.enabled) {
-        const msg: RTCMessage = {
-          type: 'action',
-          message: 'audio-off',
-        };
-        try {
-          alreadyOpen.peer.send(JSON.stringify(msg));
-        } catch (e: any) {
-          console.error(
-            'Failed to send audio-off message to peer: ',
-            e.toString()
-          );
+        const fsm = this.connectionManager.getFSM(pubkeyB64);
+        if (fsm) {
+          const msg: RTCMessage = {
+            type: 'action',
+            message: 'audio-off',
+          };
+          try {
+            fsm.send(JSON.stringify(msg));
+          } catch (e: any) {
+            console.error(
+              'Failed to send audio-off message to peer: ',
+              e.toString()
+            );
+          }
         }
       }
     }
@@ -2688,359 +2176,131 @@ export class StreamsStore {
   }
 
   /**
-   * Handle an InitRequest signal
-   *
-   * @param signal
+   * Handle an InitRequest signal — ONLY for screen share connections.
+   * Video connections use ConnectionManager + Perfect Negotiation.
    */
   async handleInitRequest(
     signal: Extract<RoomSignal, { type: 'Message' }>
   ) {
     const pubKey64 = encodeHashToBase64(signal.from_agent);
     const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
+
+    // Only handle screen share InitRequests
+    if (connection_type !== 'screen') {
+      // Video InitRequests are no longer used — ConnectionManager handles
+      // connection establishment via Perfect Negotiation + Sdp signals.
+      return;
+    }
+
     this.logger.logAgentEvent({
       agent: pubKey64,
       timestamp: Date.now(),
       event: 'InitRequest',
       connectionId: connection_id,
     });
-    console.log(
-      `#### GOT ${
-        connection_type === 'screen' ? 'SCREEN SHARE ' : ''
-      }INIT REQUEST.`
+    console.log('#### GOT SCREEN SHARE INIT REQUEST.');
+
+    const newPeer = this.createScreenSharePeer(
+      signal.from_agent,
+      connection_id,
+      false
     );
-
-    // Log retry gap if this is a reconnection attempt
-    const lastDisconnect = this._lastDisconnectTime[pubKey64];
-    if (lastDisconnect) {
-      const gap = Date.now() - lastDisconnect;
-      this.logger.logCustomMessage(
-        `Retry gap [${pubKey64.slice(0, 8)}]: ${gap}ms since last disconnect`
-      );
-    }
-
-    /**
-     * InitRequests for normal audio/video stream
-     *
-     * Only accept init requests from agents who's pubkey is alphabetically  "higher" than ours
-     */
-    if (connection_type === 'video' && pubKey64 > this.myPubKeyB64) {
-      console.log(
-        '#### SENDING INIT ACCEPT. connection_type: ',
-        connection_type
-      );
-      console.log('#### Creating normal peer');
-      const newPeer = this.createPeer(
-        signal.from_agent,
-        connection_id,
-        false
-      );
-
-      // Add stream before processing the offer so our tracks are included in the answer.
-      // This prevents the non-initiator from needing to renegotiate post-connect.
-      if (this.mainStream) {
-        newPeer.addStream(this.mainStream);
-        this.logger.logCustomMessage(
-          `addStream pre-SDP [${pubKey64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks (acceptor)`
-        );
-      }
-
-      const accept: PendingAccept = {
-        connectionId: connection_id,
-        peer: newPeer,
-        createdAt: Date.now(),
-      };
-      const allPendingAccepts = this._pendingAccepts;
-      const pendingAcceptsForAgent = allPendingAccepts[pubKey64];
-      const newPendingAcceptsForAgent: PendingAccept[] = pendingAcceptsForAgent
-        ? [...pendingAcceptsForAgent, accept]
+    const accept: PendingAccept = {
+      connectionId: connection_id,
+      peer: newPeer,
+      createdAt: Date.now(),
+    };
+    const allPendingScreenShareAccepts = this._pendingScreenShareAccepts;
+    const pendingScreenShareAcceptsForAgent =
+      allPendingScreenShareAccepts[pubKey64];
+    const newPendingAcceptsForAgent: PendingAccept[] =
+      pendingScreenShareAcceptsForAgent
+        ? [...pendingScreenShareAcceptsForAgent, accept]
         : [accept];
-      allPendingAccepts[pubKey64] = newPendingAcceptsForAgent;
-      this._pendingAccepts = allPendingAccepts;
-      await this.roomClient.sendMessage(
-        [signal.from_agent],
-        'InitAccept',
-        JSON.stringify({ connection_id, connection_type }),
-      );
-      this.updateConnectionStatus(pubKey64, { type: 'AcceptSent' });
-    }
-
-    /**
-     * InitRequests for incoming screen shares
-     */
-    if (connection_type === 'screen') {
-      const newPeer = this.createScreenSharePeer(
-        signal.from_agent,
-        connection_id,
-        false
-      );
-      const accept: PendingAccept = {
-        connectionId: connection_id,
-        peer: newPeer,
-        createdAt: Date.now(),
-      };
-      const allPendingScreenShareAccepts = this._pendingScreenShareAccepts;
-      const pendingScreenShareAcceptsForAgent =
-        allPendingScreenShareAccepts[pubKey64];
-      const newPendingAcceptsForAgent: PendingAccept[] =
-        pendingScreenShareAcceptsForAgent
-          ? [...pendingScreenShareAcceptsForAgent, accept]
-          : [accept];
-      allPendingScreenShareAccepts[pubKey64] = newPendingAcceptsForAgent;
-      this._pendingScreenShareAccepts = allPendingScreenShareAccepts;
-      await this.roomClient.sendMessage(
-        [signal.from_agent],
-        'InitAccept',
-        JSON.stringify({ connection_id, connection_type }),
-      );
-    }
+    allPendingScreenShareAccepts[pubKey64] = newPendingAcceptsForAgent;
+    this._pendingScreenShareAccepts = allPendingScreenShareAccepts;
+    await this.roomClient.sendMessage(
+      [signal.from_agent],
+      'InitAccept',
+      JSON.stringify({ connection_id, connection_type }),
+    );
   }
 
   /**
-   * Handle an InitAccept signal
-   *
-   * @param signal
+   * Handle an InitAccept signal — ONLY for screen share connections.
+   * Video connections use ConnectionManager + Perfect Negotiation.
    */
   async handleInitAccept(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubKey64 = encodeHashToBase64(signal.from_agent);
     const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
+
+    // Only handle screen share InitAccepts
+    if (connection_type !== 'screen') {
+      return;
+    }
+
     this.logger.logAgentEvent({
       agent: pubKey64,
       timestamp: Date.now(),
       event: 'InitAccept',
       connectionId: connection_id,
     });
-    /**
-     * For normal video/audio connections
-     *
-     * If there is no open connection with this agent yet and the connectionId
-     * is one matching an InitRequest we sent earlier, create a Simple Peer
-     * Instance and add it to open connections, then delete all PendingInits
-     * for this agent.
-     *
-     */
-    if (connection_type === 'video') {
-      const agentPendingInits = this._pendingInits[pubKey64];
-      if (!Object.keys(get(this._openConnections)).includes(pubKey64)) {
-        if (!agentPendingInits) {
-          console.warn(
-            `Got a video InitAccept from an agent (${pubKey64}) for which we have no pending init stored.`
-          );
-          return;
-        }
-        if (
-          agentPendingInits
-            .map(pendingInit => pendingInit.connectionId)
-            .includes(connection_id)
-        ) {
-          // Measure signaling round-trip time
-          const matchingInit = agentPendingInits.find(
-            pi => pi.connectionId === connection_id
-          );
-          if (matchingInit) {
-            const rtt = Date.now() - matchingInit.t0;
-            this.logger.logCustomMessage(
-              `Signaling RTT [${pubKey64.slice(0, 8)}]: ${rtt}ms`
-            );
-          }
 
-          console.log('#### RECEIVED INIT ACCEPT AND CEATING INITIATING PEER.');
-          const newPeer = this.createPeer(
-            signal.from_agent,
-            connection_id,
-            true
-          );
-
-          // Add stream before SDP exchange so tracks are included in the initial offer.
-          // This prevents the need for post-connect renegotiation on the initiator side.
-          if (this.mainStream) {
-            newPeer.addStream(this.mainStream);
-            this.logger.logCustomMessage(
-              `addStream pre-SDP [${pubKey64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks (initiator)`
-            );
-          }
-
-          this._openConnections.update(currentValue => {
-            const openConnections = currentValue;
-            openConnections[pubKey64] = {
-              connectionId: connection_id,
-              peer: newPeer,
-              video: false,
-              audio: false,
-              connected: false,
-              direction: 'duplex',
-            };
-            return openConnections;
-          });
-
-          delete this._pendingInits[pubKey64];
-
-          this.updateConnectionStatus(pubKey64, { type: 'SdpExchange' });
-
-          // SDP exchange timeout: if still not connected after 15s, clean up and retry
-          setTimeout(() => {
-            const currentStatus = get(this._connectionStatuses)[pubKey64];
-            if (currentStatus && currentStatus.type === 'SdpExchange') {
-              this.logger.logCustomMessage(
-                `SDP timeout [${pubKey64.slice(0, 8)}]: destroying stale connection`
-              );
-              const conn = get(this._openConnections)[pubKey64];
-              if (conn && !conn.connected) {
-                conn.peer.destroy();
-                this._openConnections.update(current => {
-                  delete current[pubKey64];
-                  return current;
-                });
-              }
-              this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
-            }
-          }, SDP_EXCHANGE_TIMEOUT);
-        }
+    const agentPendingScreenShareInits =
+      this._pendingScreenShareInits[pubKey64];
+    if (
+      !Object.keys(this._screenShareConnectionsOutgoing).includes(pubKey64)
+    ) {
+      if (!agentPendingScreenShareInits) {
+        console.warn(
+          `Got a screen share InitAccept from an agent (${pubKey64}) for which we have no pending init stored.`
+        );
+        return;
       }
-    }
 
-    /**
-     * For screen share connections
-     *
-     * If there is no open connection with this agent yet and the connectionId
-     * is one matching an InitRequest we sent earlier, create a Simple Peer
-     * Instance and add it to open connections, then delete all PendingInits
-     * for this agent
-     */
-    if (connection_type === 'screen') {
-      const agentPendingScreenShareInits =
-        this._pendingScreenShareInits[pubKey64];
       if (
-        !Object.keys(this._screenShareConnectionsOutgoing).includes(pubKey64)
+        agentPendingScreenShareInits
+          .map(pendingInit => pendingInit.connectionId)
+          .includes(connection_id)
       ) {
-        if (!agentPendingScreenShareInits) {
-          console.warn(
-            `Got a screen share InitAccept from an agent (${pubKey64}) for which we have no pending init stored.`
-          );
-          return;
-        }
+        console.log(
+          '#### RECEIVED INIT ACCEPT FOR SCREEN SHARING AND INITIATING PEER.'
+        );
+        const newPeer = this.createScreenSharePeer(
+          signal.from_agent,
+          connection_id,
+          true
+        );
 
-        if (
-          agentPendingScreenShareInits
-            .map(pendingInit => pendingInit.connectionId)
-            .includes(connection_id)
-        ) {
-          console.log(
-            '#### RECEIVED INIT ACCEPT FOR SCREEN SHARING AND INITIATING PEER.'
-          );
-          const newPeer = this.createScreenSharePeer(
-            signal.from_agent,
-            connection_id,
-            true
-          );
+        this._screenShareConnectionsOutgoing.update(currentValue => {
+          const screenShareConnectionsOutgoing = currentValue;
+          screenShareConnectionsOutgoing[pubKey64] = {
+            connectionId: connection_id,
+            peer: newPeer,
+            video: true,
+            audio: false,
+            connected: false,
+            direction: 'outgoing', // if we initiated the request, we're the ones delivering the stream
+          };
+          return screenShareConnectionsOutgoing;
+        });
 
-          this._screenShareConnectionsOutgoing.update(currentValue => {
-            const screenShareConnectionsOutgoing = currentValue;
-            screenShareConnectionsOutgoing[pubKey64] = {
-              connectionId: connection_id,
-              peer: newPeer,
-              video: true,
-              audio: false,
-              connected: false,
-              direction: 'outgoing', // if we initiated the request, we're the ones delivering the stream
-            };
-            return screenShareConnectionsOutgoing;
-          });
+        delete this._pendingScreenShareInits[pubKey64];
 
-          delete this._pendingScreenShareInits[pubKey64];
-
-          this.updateScreenShareConnectionStatus(pubKey64, {
-            type: 'SdpExchange',
-          });
-        }
+        this.updateScreenShareConnectionStatus(pubKey64, {
+          type: 'SdpExchange',
+        });
       }
     }
   }
 
   /**
-   * Handle an SdpData signal
-   *
-   * @param signal
+   * Handle an SdpData signal — ONLY for screen share connections.
+   * Video connections use the 'Sdp' message type routed through ConnectionManager.
    */
   async handleSdpData(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     const { connection_id, data } = JSON.parse(signal.payload) as SdpPayload;
-    console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, data);
-
-    // Log the SDP sub-type for diagnostics
-    try {
-      const sdpContent = JSON.parse(data);
-      const sdpType = sdpContent.type || 'candidate';
-      this.logger.logCustomMessage(
-        `SDP ${sdpType} [${pubkeyB64.slice(0, 8)}] connId=${connection_id.slice(0, 8)}`
-      );
-    } catch {
-      // ignore parse errors for logging
-    }
-
-    this.logger.logAgentEvent({
-      agent: pubkeyB64,
-      timestamp: Date.now(),
-      event: 'SdpData',
-      connectionId: connection_id,
-    });
-
-    // Update connection status
-    this.updateConnectionStatus(pubkeyB64, { type: 'SdpExchange' });
-
-    /**
-     * Normal video/audio connections
-     */
-    const maybeOpenConnection = get(this._openConnections)[pubkeyB64];
-    if (
-      maybeOpenConnection &&
-      maybeOpenConnection.connectionId === connection_id
-    ) {
-      maybeOpenConnection.peer.signal(JSON.parse(data));
-    } else {
-      /**
-       * If there is no open connection yet but a PendingAccept then move that
-       * PendingAccept to the open connections and destroy all other
-       * Peer Instances for PendingAccepts of this agent and delete the
-       * PendingAccepts
-       */
-      const allPendingAccepts = this._pendingAccepts;
-      const pendingAcceptsForAgent = allPendingAccepts[pubkeyB64];
-      if (pendingAcceptsForAgent) {
-        const maybePendingAccept = pendingAcceptsForAgent.find(
-          pendingAccept => pendingAccept.connectionId === connection_id
-        );
-        if (maybePendingAccept) {
-          maybePendingAccept.peer.signal(JSON.parse(data));
-          console.log(
-            '#### FOUND PENDING ACCEPT! Moving to open connections...'
-          );
-          this._openConnections.update(currentValue => {
-            const openConnections = currentValue;
-            openConnections[pubkeyB64] = {
-              connectionId: connection_id,
-              peer: maybePendingAccept.peer,
-              video: false,
-              audio: false,
-              connected: false,
-              direction: 'duplex',
-            };
-            return openConnections;
-          });
-          const otherPendingAccepts = pendingAcceptsForAgent.filter(
-            pendingAccept => pendingAccept.connectionId !== connection_id
-          );
-          otherPendingAccepts.forEach(pendingAccept =>
-            pendingAccept.peer.destroy()
-          );
-
-          delete this._pendingAccepts[pubkeyB64];
-        }
-      } else {
-        console.warn(
-          `Got SDP data from agent (${pubkeyB64}) but no pending accepts exist for this agent. Discarding as stale.`
-        );
-      }
-    }
 
     /**
      * Outgoing Screen Share connections
