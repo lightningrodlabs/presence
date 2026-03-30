@@ -742,12 +742,59 @@ Vitest (aligned with Vite build). Add as dev dependency if not already present.
 - Clean up any remaining references
 - Verify all tests pass
 
-### Step 7: Connection role scaffolding
-- Add `ConnectionRole` type (already defined in Step 1 types)
-- Thread role through FSM and manager
-- All connections default to `mesh`
-- Add role-specific tests
-- Document SFU integration points for next phase
+### Step 7: Connection role scaffolding (deferred — do when SFU design is ready)
+
+**What already exists:**
+- `ConnectionRole` type defined in `ui/src/connection/types.ts`: `'mesh' | 'sfu-upstream' | 'sfu-downstream' | 'sfu-relay'`
+- `PeerConnectionFSM` accepts a `role` parameter and stores it as a readonly property
+- `ConnectionConfig` has a `role` field
+- All connections default to `'mesh'`
+
+**What remains — implement when the SFU volunteer protocol is designed:**
+
+1. **Track directionality per role** (`peer-connection-fsm.ts` `_addLocalStream`):
+   - `mesh`: bidirectional (current behavior, no change)
+   - `sfu-upstream`: configure transceivers as `sendonly` via `addTransceiver(track, { direction: 'sendonly' })`
+   - `sfu-downstream`: configure as `recvonly` via `addTransceiver('video', { direction: 'recvonly' })`
+   - `sfu-relay`: bidirectional (receives from upstream, forwards to downstream peers)
+
+2. **Role-specific health checks** (`peer-connection-fsm.ts`):
+   - `mesh`/`sfu-upstream`: monitor `bytesReceived` on inbound-rtp stats (detect dead incoming tracks)
+   - `sfu-downstream`: monitor `bytesSent` on outbound-rtp stats (detect forwarding stalls)
+   - `sfu-relay`: monitor BOTH inbound and outbound, plus forwarding latency (time between receiving a frame and forwarding it)
+   - Note: health checks were removed from `streams-store.ts` during migration — the FSM handles reconnection but not track-level health monitoring. This needs to be re-added, likely in the FSM or as a ConnectionManager-level polling loop.
+
+3. **Role-specific recovery** (`peer-connection-fsm.ts` `_handleTransportFailure`, `reconnect-policy.ts`):
+   - `mesh`: ICE restart → full reconnect (current behavior)
+   - `sfu-upstream`: same as mesh — reconnect to the relay
+   - `sfu-downstream`: same as mesh — reconnect to the relay
+   - `sfu-relay`: on failure, notify the room that this relay is no longer available so a new volunteer can be elected. This requires a **relay election protocol** (not yet designed) that is signaled via the data channel or Holochain signals.
+
+4. **Role-aware ConnectionManager** (`connection-manager.ts`):
+   - `ensureConnection(agent, role)` — accept a role parameter so the same agent can have different roles for different connection types
+   - Track which peers are relays vs. mesh peers
+   - When a relay peer disconnects, trigger re-election (future protocol)
+
+5. **Data channel control messages for relay coordination**:
+   - Relay nodes need a control channel for routing metadata (which downstream peers to forward to, quality/bitrate limits)
+   - Define `RTCMessage` types for relay control: `'relay-subscribe'`, `'relay-unsubscribe'`, `'relay-quality'`
+   - These are application-level messages over the existing data channel, not new WebRTC constructs
+
+6. **Tests** (`peer-connection-fsm.test.ts`, `connection-manager.test.ts`):
+   - `sfu-upstream` role adds sendonly transceivers
+   - `sfu-downstream` role adds recvonly transceivers
+   - Role is preserved across ICE restart reconnection
+   - Role is reset on full reconnect (new RTCPeerConnection)
+   - ConnectionManager can manage mixed-role connections to different peers
+
+7. **Documentation**: Describe the SFU volunteer election protocol, including:
+   - How a peer volunteers to be a relay (capacity advertisement via pong metadata?)
+   - How the room decides which volunteer to use (deterministic selection? load-based?)
+   - How peers transition from mesh → sfu-upstream/downstream when group size grows
+   - How peers transition back to mesh when group size shrinks
+   - Failure modes: what happens when the relay disappears mid-session
+
+**Why this is deferred:** The behavioral differences depend on the SFU volunteer protocol design, which doesn't exist yet. The type and property are in place — adding `switch(this.role)` in the relevant methods is a small change once the protocol is designed. Implementing now means guessing at requirements.
 
 ---
 
