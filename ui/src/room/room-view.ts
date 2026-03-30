@@ -1881,7 +1881,7 @@ export class RoomView extends LitElement {
                 @loadedmetadata=${this._onScreenShareResize}
               ></video>
               <div
-                style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
+                style="color: #b98484; ${conn.connected || conn.video ? 'display: none' : ''}"
               >
                 establishing connection...
               </div>
@@ -2068,7 +2068,7 @@ export class RoomView extends LitElement {
                 style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
               ></avatar-with-nickname>
               <div
-                style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
+                style="color: #b98484; ${conn.connected || conn.video ? 'display: none' : ''}"
               >
                 establishing connection...
               </div>

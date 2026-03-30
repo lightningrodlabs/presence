@@ -238,6 +238,7 @@ export class RTCPeer {
   // ---------------------------------------------------------------------------
 
   private async _handleRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+
     const readyForOffer = !this._makingOffer &&
       (this.pc.signalingState === 'stable' || this._isSettingRemoteAnswerPending);
     const offerCollision = description.type === 'offer' && !readyForOffer;
@@ -259,6 +260,17 @@ export class RTCPeer {
     this._isSettingRemoteAnswerPending = description.type === 'answer';
     try {
       await this.pc.setRemoteDescription(description);
+    } catch (e: any) {
+      // A stale/duplicate answer arriving in stable state is harmless — the
+      // exchange already completed. This can happen when Holochain delivers
+      // the same signal twice or when both peers call ensureConnection and
+      // signals cross. Log and continue rather than propagating the error,
+      // which would break the connection.
+      if (description.type === 'answer' && this.pc.signalingState === 'stable') {
+        // Silently ignore — the connection is already established
+      } else {
+        throw e;
+      }
     } finally {
       this._isSettingRemoteAnswerPending = false;
     }

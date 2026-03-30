@@ -128,7 +128,7 @@ export class ConnectionManager {
       return;
     }
 
-    this._routeSignalToFSM(from, signal);
+    this._routeSignalToFSM(from, '', '', signal);
   }
 
   /** Update the local media stream. Propagated to all active connections. */
@@ -242,11 +242,11 @@ export class ConnectionManager {
 
     // Route SDP/ICE signals to FSM
     if (message.type === 'offer' || message.type === 'answer' || message.type === 'candidate') {
-      this._routeSignalToFSM(from, message.data);
+      this._routeSignalToFSM(from, message.connectionId, message.type, message.data);
     }
   }
 
-  private async _routeSignalToFSM(from: string, signal: any): Promise<void> {
+  private async _routeSignalToFSM(from: string, _connectionId: string, _signalType: string, signal: any): Promise<void> {
     let fsm = this._connections.get(from);
 
     // Only replace a closed FSM — connected FSMs handle incoming offers as

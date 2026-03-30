@@ -646,11 +646,18 @@ export class StreamsStore {
         const existing = currentOpenConnections[agent];
         const fsm = this.connectionManager.getFSM(agent);
         const vm = this.connectionManager.getViewModel(agent);
+        // Check if we have an active video stream for this agent
+        const hasVideoStream = !!this._videoStreams[agent]?.getVideoTracks().some(
+          t => t.readyState === 'live'
+        );
+        const hasAudioStream = !!this._videoStreams[agent]?.getAudioTracks().some(
+          t => t.readyState === 'live'
+        );
         newOpenConnections[agent] = {
           connectionId: fsm?.connectionId ?? '',
           peer: null as any,
-          video: existing?.video ?? false,
-          audio: existing?.audio ?? false,
+          video: existing?.video || hasVideoStream,
+          audio: existing?.audio || hasAudioStream,
           connected: state === 'connected',
           relayed: vm?.quality?.relayed ?? existing?.relayed,
           videoMuted: existing?.videoMuted,
@@ -1804,11 +1811,23 @@ export class StreamsStore {
         JSON.stringify(metaData),
       );
 
-      // Start video connection immediately on ping — don't wait for pong cycle.
-      // This makes the peer tile appear sooner with "establishing connection..."
-      const isBlocked = get(this.blockedAgents).includes(pubkeyB64);
-      if (!isBlocked) {
-        this.connectionManager.ensureConnection(pubkeyB64);
+      // Show the peer tile immediately so the UI reflects their presence
+      // before the pong round-trip completes and ensureConnection is called.
+      // This does NOT start the WebRTC connection — just adds a UI placeholder.
+      if (!get(this.blockedAgents).includes(pubkeyB64)) {
+        this._openConnections.update(conns => {
+          if (!conns[pubkeyB64]) {
+            conns[pubkeyB64] = {
+              connectionId: '',
+              peer: null as any,
+              video: false,
+              audio: false,
+              connected: false,
+              direction: 'duplex',
+            };
+          }
+          return conns;
+        });
       }
 
       // If we have an active screen share, ensure a screen share connection to this peer
