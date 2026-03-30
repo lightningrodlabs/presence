@@ -12,10 +12,12 @@ import type { SignalingAdapter, SignalMessage, Unsubscribe } from './types';
 
 export class HolochainSignalingAdapter implements SignalingAdapter {
   private _roomClient: RoomClient;
+  private _messageType: string;
   private _handlers: ((from: string, message: SignalMessage) => void)[] = [];
 
-  constructor(roomClient: RoomClient) {
+  constructor(roomClient: RoomClient, messageType: string = 'Sdp') {
     this._roomClient = roomClient;
+    this._messageType = messageType;
   }
 
   sendSignal(to: AgentPubKeyB64, message: SignalMessage): void {
@@ -25,7 +27,7 @@ export class HolochainSignalingAdapter implements SignalingAdapter {
       type: message.type,
       data: message.data,
     });
-    this._roomClient.sendMessage([agentPubKey], 'Sdp', payload).catch(e => {
+    this._roomClient.sendMessage([agentPubKey], this._messageType, payload).catch(e => {
       console.error('Failed to send signal:', e);
     });
   }
@@ -38,7 +40,7 @@ export class HolochainSignalingAdapter implements SignalingAdapter {
   }
 
   /**
-   * Called by StreamsStore when an 'Sdp' signal arrives from Holochain.
+   * Called by StreamsStore when a signal of the matching message type arrives from Holochain.
    * Parses the payload and dispatches to registered handlers.
    */
   dispatchSignal(fromAgent: AgentPubKey, payload: string): void {

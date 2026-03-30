@@ -1,4 +1,3 @@
-import SimplePeer from 'simple-peer';
 import {
   AgentPubKey,
   AgentPubKeyB64,
@@ -12,21 +11,16 @@ import {
   writable,
   Writable,
 } from '@holochain-open-dev/stores';
-import { v4 as uuidv4 } from 'uuid';
 import {
   AgentInfo,
   ConnectionStatus,
   ConnectionStatuses,
   DiagnosticSnapshot,
-  InitPayload,
   OpenConnectionInfo,
-  PendingAccept,
-  PendingInit,
   PongMetaData,
   PongMetaDataV1,
   RoomSignal,
   RTCMessage,
-  SdpPayload,
   StoreEventPayload,
   StreamAndTrackInfo,
 } from './types';
@@ -43,12 +37,6 @@ const STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'stun:stun.l.google.com:19302' },
 ];
-
-/**
- * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent.
- * (Only used for screen share connections which still use the old SimplePeer protocol.)
- */
-const INIT_RETRY_THRESHOLD = 5000;
 
 export const PING_INTERVAL = 2000;
 
@@ -103,6 +91,14 @@ export class StreamsStore {
 
   private _signalingAdapter!: HolochainSignalingAdapter;
 
+  // ---------------------------------------------------------------------------
+  // Screen share ConnectionManager
+  // ---------------------------------------------------------------------------
+
+  screenShareConnectionManager!: ConnectionManager;
+
+  private _screenShareSignalingAdapter!: HolochainSignalingAdapter;
+
   constructor(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
@@ -134,6 +130,27 @@ export class StreamsStore {
       },
     });
     this._setupConnectionManagerEvents();
+
+    // Screen share ConnectionManager — uses 'ScreenSdp' message type to avoid
+    // colliding with the main connection's 'Sdp' messages
+    this._screenShareSignalingAdapter = new HolochainSignalingAdapter(this.roomClient, 'ScreenSdp');
+    this.screenShareConnectionManager = new ConnectionManager({
+      myAgentId: this.myPubKeyB64,
+      signaling: this._screenShareSignalingAdapter,
+      config: {
+        iceServers: this.iceConfig,
+        trickleICE: this.trickleICE,
+        connectionTimeoutMs: 15_000,
+        sdpExchangeTimeoutMs: 15_000,
+        role: 'mesh',
+      },
+      onTransition: (entry) => {
+        this.logger.logCustomMessage(
+          `ScreenFSM [${entry.remoteAgent.slice(0, 8)}]: ${entry.fromState} → ${entry.toState} (${entry.trigger})`
+        );
+      },
+    });
+    this._setupScreenShareConnectionManagerEvents();
 
     // TODO potentially move this to a connect() method which also returns
     // the Unsubscribe function
@@ -425,6 +442,11 @@ export class StreamsStore {
           connectionId,
         });
 
+        // If we have an active screen share, ensure a screen share connection
+        if (this.screenShareStream) {
+          this.screenShareConnectionManager.ensureConnection(pubKeyB64);
+        }
+
         // Send immediate pong so peers see green rings
         this._sendImmediatePongToAll();
       } else if (toState === 'disconnected' || toState === 'closed' || toState === 'failed') {
@@ -447,17 +469,8 @@ export class StreamsStore {
           return statuses;
         });
 
-        // Also tear down any outgoing screen share to this peer
-        const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-        if (outgoingScreenShare) {
-          console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
-          outgoingScreenShare.peer.destroy();
-          this._screenShareConnectionsOutgoing.update(currentValue => {
-            delete currentValue[pubKeyB64];
-            return currentValue;
-          });
-          delete this._pendingScreenShareInits[pubKeyB64];
-        }
+        // Also tear down any screen share connection to this peer
+        this.screenShareConnectionManager.closeConnection(pubKeyB64, 'video peer closed');
 
         this._rebuildConnectionStatuses();
         this.eventCallback({
@@ -466,8 +479,152 @@ export class StreamsStore {
           connectionId,
         });
       } else {
-        // For signaling, connecting, reconnecting — just rebuild statuses
+        // For signaling, connecting, reconnecting — rebuild both stores
+        // so UI shows "establishing connection..." overlay for in-progress connections
+        this._rebuildOpenConnections();
         this._rebuildConnectionStatuses();
+      }
+    });
+  }
+
+  /**
+   * Wire screen share ConnectionManager events to StreamsStore behavior.
+   * Mirrors _setupConnectionManagerEvents() but updates screen share stores.
+   */
+  private _setupScreenShareConnectionManagerEvents() {
+    // Handle remote screen share stream arrival
+    this.screenShareConnectionManager.on('remote-stream', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const stream = event.data as MediaStream;
+
+      console.log('#### GOT SCREEN SHARE STREAM with tracks from:', pubKeyB64, stream.getTracks());
+      this.logger.logCustomMessage(
+        `screen share stream received [${pubKeyB64.slice(0, 8)}]: ${stream.getTracks().length} tracks`
+      );
+
+      this._screenShareStreams[pubKeyB64] = stream;
+
+      this._screenShareConnectionsIncoming.update(currentValue => {
+        const conn = currentValue[pubKeyB64];
+        if (conn) {
+          if (stream.getAudioTracks().length > 0) conn.audio = true;
+          if (stream.getVideoTracks().length > 0) conn.video = true;
+        }
+        return currentValue;
+      });
+
+      this.eventCallback({
+        type: 'peer-screen-share-stream',
+        pubKeyB64,
+        connectionId,
+        stream,
+      });
+    });
+
+    // Handle remote screen share track arrival
+    this.screenShareConnectionManager.on('remote-track', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const { track } = event.data;
+
+      console.log('#### GOT SCREEN SHARE TRACK:', track);
+
+      this._screenShareConnectionsIncoming.update(currentValue => {
+        const conn = currentValue[pubKeyB64];
+        if (conn) {
+          if (track.kind === 'audio' && track.enabled) conn.audio = true;
+          if (track.kind === 'video' && track.enabled) conn.video = true;
+        }
+        return currentValue;
+      });
+
+      this.eventCallback({
+        type: 'peer-screen-share-track',
+        pubKeyB64,
+        connectionId,
+        track,
+      });
+    });
+
+    // Handle screen share connection state changes
+    this.screenShareConnectionManager.on('connection-state-changed', (event) => {
+      const pubKeyB64 = event.remoteAgent;
+      const connectionId = event.connectionId;
+      const { toState } = event.data as { fromState: string; toState: string };
+
+      if (toState === 'connected') {
+        console.log('#### SCREEN SHARE CONNECTED with', pubKeyB64);
+
+        // Determine direction based on whether we have a screen share stream
+        const direction = this.screenShareStream ? 'outgoing' : 'incoming';
+
+        if (direction === 'outgoing') {
+          this._screenShareConnectionsOutgoing.update(currentValue => {
+            currentValue[pubKeyB64] = {
+              connectionId,
+              peer: null as any,
+              video: true,
+              audio: false,
+              connected: true,
+              direction: 'outgoing',
+            };
+            return currentValue;
+          });
+
+          // Add screen share stream if available
+          if (this.screenShareStream) {
+            const fsm = this.screenShareConnectionManager.getFSM(pubKeyB64);
+            if (fsm) {
+              try {
+                fsm.addLocalStream(this.screenShareStream);
+              } catch (e: any) {
+                // Stream may already be added
+              }
+            }
+          }
+        } else {
+          this._screenShareConnectionsIncoming.update(currentValue => {
+            currentValue[pubKeyB64] = {
+              connectionId,
+              peer: null as any,
+              video: false,
+              audio: false,
+              connected: true,
+              direction: 'incoming',
+            };
+            return currentValue;
+          });
+
+          this.eventCallback({
+            type: 'peer-screen-share-connected',
+            pubKeyB64,
+            connectionId,
+          });
+        }
+
+        this._rebuildScreenShareConnectionStatuses();
+      } else if (toState === 'disconnected' || toState === 'closed' || toState === 'failed') {
+        console.log(`#### SCREEN SHARE ${toState.toUpperCase()} with ${pubKeyB64.slice(0, 8)}`);
+
+        delete this._screenShareStreams[pubKeyB64];
+
+        // Clean up from both outgoing and incoming stores
+        const wasOutgoing = !!get(this._screenShareConnectionsOutgoing)[pubKeyB64];
+        this._screenShareConnectionsOutgoing.update(v => { delete v[pubKeyB64]; return v; });
+        this._screenShareConnectionsIncoming.update(v => { delete v[pubKeyB64]; return v; });
+
+        if (!wasOutgoing) {
+          this.eventCallback({
+            type: 'peer-screen-share-disconnected',
+            pubKeyB64,
+            connectionId,
+          });
+        }
+
+        this._rebuildScreenShareConnectionStatuses();
+      } else {
+        this._rebuildScreenShareConnectionStatuses();
       }
     });
   }
@@ -475,7 +632,7 @@ export class StreamsStore {
   /**
    * Rebuild _openConnections from ConnectionManager state.
    * The `peer` field is set to `null as any` since UI components use
-   * StreamsStore methods rather than calling SimplePeer directly.
+   * StreamsStore methods rather than accessing peer connections directly.
    */
   private _rebuildOpenConnections() {
     const states = this.connectionManager.getAllStates();
@@ -522,6 +679,20 @@ export class StreamsStore {
     }
 
     this._connectionStatuses.set(newStatuses);
+  }
+
+  /**
+   * Rebuild _screenShareConnectionStatuses from screen share ConnectionManager state.
+   */
+  private _rebuildScreenShareConnectionStatuses() {
+    const states = this.screenShareConnectionManager.getAllStates();
+    const newStatuses: ConnectionStatuses = {};
+
+    for (const [agent, state] of states) {
+      newStatuses[agent] = this._phaseToConnectionStatus(state);
+    }
+
+    this._screenShareConnectionStatuses.set(newStatuses);
   }
 
   /**
@@ -624,13 +795,8 @@ export class StreamsStore {
     // Destroy ConnectionManager (handles all video/audio connections)
     this.connectionManager.destroy();
 
-    // Close screen share connections (still using SimplePeer)
-    Object.values(get(this._screenShareConnectionsIncoming)).forEach(conn => {
-      conn.peer.destroy();
-    });
-    Object.values(get(this._screenShareConnectionsOutgoing)).forEach(conn => {
-      conn.peer.destroy();
-    });
+    // Destroy screen share ConnectionManager
+    this.screenShareConnectionManager.destroy();
 
     this.videoOff();
     this.audioOff();
@@ -640,8 +806,6 @@ export class StreamsStore {
     this._openConnections.set({});
     this._screenShareConnectionsOutgoing.set({});
     this._screenShareConnectionsIncoming.set({});
-    this._pendingScreenShareInits = {};
-    this._pendingScreenShareAccepts = {};
   }
 
   enableTrickleICE() {
@@ -747,26 +911,6 @@ export class StreamsStore {
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
-
-    // Cleanup stale pending screen share accepts older than 20 seconds
-    const now = Date.now();
-    const PENDING_ACCEPT_TTL = 20000;
-    for (const [agent, accepts] of Object.entries(
-      this._pendingScreenShareAccepts
-    )) {
-      const stale = accepts.filter(a => now - a.createdAt > PENDING_ACCEPT_TTL);
-      if (stale.length > 0) {
-        stale.forEach(a => a.peer.destroy());
-        const remaining = accepts.filter(
-          a => now - a.createdAt <= PENDING_ACCEPT_TTL
-        );
-        if (remaining.length > 0) {
-          this._pendingScreenShareAccepts[agent] = remaining;
-        } else {
-          delete this._pendingScreenShareAccepts[agent];
-        }
-      }
-    }
   }
 
   async changeVideoInput(deviceId: string) {
@@ -1093,13 +1237,18 @@ export class StreamsStore {
           });
         }
       }
-      // If there's an error here it's potentially possible that 'my-screen-share-on' further
-      // down never gets emitted.
-      Object.values(get(this._screenShareConnectionsOutgoing)).forEach(conn => {
-        if (this.screenShareStream) {
-          conn.peer.addStream(this.screenShareStream);
+      // Propagate screen share stream to all existing screen share connections
+      if (this.screenShareStream) {
+        this.screenShareConnectionManager.updateLocalStream(this.screenShareStream);
+
+        // Ensure screen share connections to all video-connected peers
+        const states = this.connectionManager.getAllStates();
+        for (const [agent, state] of states) {
+          if (state === 'connected') {
+            this.screenShareConnectionManager.ensureConnection(agent);
+          }
         }
-      });
+      }
     }
     this.eventCallback({
       type: 'my-screen-share-on',
@@ -1107,7 +1256,7 @@ export class StreamsStore {
   }
 
   /**
-   * Turning screen sharing off is equivalent to closing the corresponding peer connection
+   * Turning screen sharing off closes all screen share connections.
    */
   screenShareOff() {
     if (this.screenShareStream) {
@@ -1115,10 +1264,12 @@ export class StreamsStore {
         // eslint-disable-next-line no-param-reassign
         track.stop();
       });
-      Object.values(get(this._screenShareConnectionsOutgoing)).forEach(conn => {
-        conn.peer.destroy();
-      });
+      // Close all screen share connections
+      for (const [agent] of this.screenShareConnectionManager.getAllStates()) {
+        this.screenShareConnectionManager.closeConnection(agent, 'screen share off');
+      }
       this.screenShareStream = null;
+      this._screenShareConnectionsOutgoing.set({});
       this.eventCallback({
         type: 'my-screen-share-off',
       });
@@ -1130,10 +1281,7 @@ export class StreamsStore {
   }
 
   disconnectFromPeerScreen(pubKeyB64: AgentPubKeyB64) {
-    const relevantConnection = get(this._screenShareConnectionsIncoming)[
-      pubKeyB64
-    ];
-    if (relevantConnection) relevantConnection.peer.destroy();
+    this.screenShareConnectionManager.closeConnection(pubKeyB64, 'manual disconnect');
   }
 
   blockAgent(pubKey64: AgentPubKeyB64) {
@@ -1252,20 +1400,6 @@ export class StreamsStore {
    * Screen share streams of others
    */
   _screenShareStreams: Record<AgentPubKeyB64, MediaStream> = {};
-
-  // ===========================================================================================
-  // CONNECTION ESTABLISHMENT (Screen share only — video uses ConnectionManager)
-  // ===========================================================================================
-
-  /**
-   * Pending Init requests for screen sharing
-   */
-  _pendingScreenShareInits: Record<AgentPubKeyB64, PendingInit[]> = {};
-
-  /**
-   * Pending Init Accepts for screen sharing
-   */
-  _pendingScreenShareAccepts: Record<AgentPubKeyB64, PendingAccept[]> = {};
 
   // ********************************************************************************************
   //
@@ -1402,184 +1536,6 @@ export class StreamsStore {
 
   // ********************************************************************************************
   //
-  //   S C R E E N   S H A R E   P E E R   ( S T I L L   U S I N G   S I M P L E P E E R )
-  //
-  // ********************************************************************************************
-
-  createScreenSharePeer(
-    connectingAgent: AgentPubKey,
-    connectionId: string,
-    initiator: boolean
-  ): SimplePeer.Instance {
-    const pubKeyB64 = encodeHashToBase64(connectingAgent);
-    const options: SimplePeer.Options = {
-      initiator,
-      config: { iceServers: this.iceConfig },
-      objectMode: true,
-      trickle: this.trickleICE,
-    };
-    const peer = new SimplePeer(options);
-    peer.on('signal', async data => {
-      this.roomStore.client.sendMessage(
-        [connectingAgent],
-        'SdpData',
-        JSON.stringify({ connection_id: connectionId, data: JSON.stringify(data) }),
-      );
-    });
-    peer.on('stream', stream => {
-      console.log(
-        '#### GOT SCREEN SHARE STREAM. With tracks: ',
-        stream.getTracks()
-      );
-      this._screenShareConnectionsIncoming.update(currentValue => {
-        const screenShareConnections = currentValue;
-        const relevantConnection = screenShareConnections[pubKeyB64];
-        if (relevantConnection) {
-          if (stream.getAudioTracks().length > 0) {
-            relevantConnection.audio = true;
-          }
-          if (stream.getVideoTracks().length > 0) {
-            relevantConnection.video = true;
-          }
-          screenShareConnections[pubKeyB64] = relevantConnection;
-        }
-        return screenShareConnections;
-      });
-
-      this.eventCallback({
-        type: 'peer-screen-share-stream',
-        pubKeyB64,
-        connectionId,
-        stream,
-      });
-    });
-    peer.on('track', track => {
-      console.log('#### GOT TRACK: ', track);
-      this._screenShareConnectionsIncoming.update(currentValue => {
-        const screenShareConnections = currentValue;
-        const relevantConnection = screenShareConnections[pubKeyB64];
-        if (track.kind === 'audio' && track.enabled) {
-          relevantConnection.audio = true;
-        }
-        if (track.kind === 'video' && track.enabled) {
-          relevantConnection.video = true;
-        }
-        screenShareConnections[pubKeyB64] = relevantConnection;
-        return screenShareConnections;
-      });
-      this.eventCallback({
-        type: 'peer-screen-share-track',
-        pubKeyB64,
-        connectionId,
-        track,
-      });
-    });
-    peer.on('connect', () => {
-      console.log('#### SCREEN SHARE CONNECTED');
-
-      const screenShareConnections = initiator
-        ? get(this._screenShareConnectionsOutgoing)
-        : get(this._screenShareConnectionsIncoming);
-
-      const relevantConnection = screenShareConnections[pubKeyB64];
-
-      relevantConnection.connected = true;
-
-      // if we are already sharing the screen, add the relevant stream
-      if (
-        this.screenShareStream &&
-        relevantConnection.direction === 'outgoing'
-      ) {
-        relevantConnection.peer.addStream(this.screenShareStream);
-      }
-
-      screenShareConnections[pubKeyB64] = relevantConnection;
-
-      if (initiator) {
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          const screenShareConnections = currentValue;
-          screenShareConnections[pubKeyB64] = relevantConnection;
-          return screenShareConnections;
-        });
-      } else {
-        this._screenShareConnectionsIncoming.update(currentValue => {
-          const screenShareConnections = currentValue;
-          screenShareConnections[pubKeyB64] = relevantConnection;
-          return screenShareConnections;
-        });
-        this.eventCallback({
-          type: 'peer-screen-share-connected',
-          pubKeyB64,
-          connectionId,
-        });
-      }
-
-      this.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Connected' });
-    });
-    peer.on('close', () => {
-      console.log('#### GOT SCREEN SHARE CLOSE EVENT ####');
-
-      peer.destroy();
-
-      if (initiator) {
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          const screenShareConnections = currentValue;
-          delete screenShareConnections[pubKeyB64];
-          return screenShareConnections;
-        });
-      } else {
-        this._screenShareConnectionsIncoming.update(currentValue => {
-          const screenShareConnections = currentValue;
-          delete screenShareConnections[pubKeyB64];
-          return screenShareConnections;
-        });
-        this.eventCallback({
-          type: 'peer-screen-share-disconnected',
-          pubKeyB64,
-          connectionId,
-        });
-      }
-
-      this.updateScreenShareConnectionStatus(pubKeyB64, {
-        type: 'Disconnected',
-      });
-    });
-    peer.on('error', e => {
-      console.log('#### GOT SCREEN SHARE ERROR EVENT ####: ', e);
-      this.logger.logCustomMessage(
-        `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${e.message || e}`
-      );
-      peer.destroy();
-
-      if (initiator) {
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          const screenShareConnections = currentValue;
-          delete screenShareConnections[pubKeyB64];
-          return screenShareConnections;
-        });
-      } else {
-        this._screenShareConnectionsIncoming.update(currentValue => {
-          const screenShareConnections = currentValue;
-          delete screenShareConnections[pubKeyB64];
-          return screenShareConnections;
-        });
-        this.eventCallback({
-          type: 'peer-screen-share-disconnected',
-          pubKeyB64,
-          connectionId,
-        });
-      }
-
-      this.updateScreenShareConnectionStatus(pubKeyB64, {
-        type: 'Disconnected',
-      });
-    });
-
-    return peer;
-  }
-
-  // ********************************************************************************************
-  //
   //   H E L P E R   M E T H O D S
   //
   // ********************************************************************************************
@@ -1618,53 +1574,6 @@ export class StreamsStore {
         // Best-effort; don't block on failure
       }
     }
-  }
-
-  updateScreenShareConnectionStatus(
-    pubKey: AgentPubKeyB64,
-    status: ConnectionStatus
-  ) {
-    this._screenShareConnectionStatuses.update(currentValue => {
-      const connectionStatuses = currentValue;
-      if (status.type === 'InitSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'InitSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-      if (status.type === 'AcceptSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'AcceptSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-      connectionStatuses[pubKey] = status;
-      return connectionStatuses;
-    });
   }
 
   /**
@@ -1840,17 +1749,9 @@ export class StreamsStore {
             // Route to ConnectionManager via the signaling adapter
             this._signalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
             break;
-          case 'InitRequest':
-            // Only handle screen share InitRequests now
-            await this.handleInitRequest(signal);
-            break;
-          case 'InitAccept':
-            // Only handle screen share InitAccepts now
-            await this.handleInitAccept(signal);
-            break;
-          case 'SdpData':
-            // Only handle screen share SDP data now
-            await this.handleSdpData(signal);
+          case 'ScreenSdp':
+            // Route to screen share ConnectionManager via its signaling adapter
+            this._screenShareSignalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
             break;
           case 'LeaveUi':
             await this.handleLeaveUi(signal);
@@ -1903,45 +1804,16 @@ export class StreamsStore {
         JSON.stringify(metaData),
       );
 
-      // If we have an active screen share, check whether we need to
-      // initiate a screen share connection to this peer. This handles
-      // the case where a peer re-joins and pings us — we can start the
-      // screen share connection immediately rather than waiting for
-      // the next Pong cycle.
+      // Start video connection immediately on ping — don't wait for pong cycle.
+      // This makes the peer tile appear sooner with "establishing connection..."
+      const isBlocked = get(this.blockedAgents).includes(pubkeyB64);
+      if (!isBlocked) {
+        this.connectionManager.ensureConnection(pubkeyB64);
+      }
+
+      // If we have an active screen share, ensure a screen share connection to this peer
       if (this.screenShareStream) {
-        // Clean up stale outgoing connection if WebRTC state is dead
-        const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
-        if (outgoing) {
-          const pc = (outgoing.peer as any)._pc as RTCPeerConnection | undefined;
-          const iceState = pc?.iceConnectionState;
-          if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
-            outgoing.peer.destroy();
-            this._screenShareConnectionsOutgoing.update(v => {
-              delete v[pubkeyB64];
-              return v;
-            });
-            delete this._pendingScreenShareInits[pubkeyB64];
-          }
-        }
-        const hasOutgoing = Object.keys(
-          get(this._screenShareConnectionsOutgoing)
-        ).includes(pubkeyB64);
-        const hasPending = this._pendingScreenShareInits[pubkeyB64];
-        if (!hasOutgoing && !hasPending) {
-          console.log(`#### SENDING SCREEN SHARE INIT REQUEST ON PING FROM ${pubkeyB64.slice(0, 8)}`);
-          const newConnectionId = uuidv4();
-          this._pendingScreenShareInits[pubkeyB64] = [
-            { connectionId: newConnectionId, t0: Date.now() },
-          ];
-          await this.roomClient.sendMessage(
-            [signal.from_agent],
-            'InitRequest',
-            JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
-          );
-          this.updateScreenShareConnectionStatus(pubkeyB64, {
-            type: 'InitSent',
-          });
-        }
+        this.screenShareConnectionManager.ensureConnection(pubkeyB64);
       }
     }
   }
@@ -1962,31 +1834,18 @@ export class StreamsStore {
     // Close video connection via ConnectionManager
     this.connectionManager.closeConnection(pubkeyB64, 'peer left');
 
-    // Destroy incoming screen share
-    const inSS = get(this._screenShareConnectionsIncoming)[pubkeyB64];
-    if (inSS) {
-      inSS.peer.destroy();
-      this._screenShareConnectionsIncoming.update(v => { delete v[pubkeyB64]; return v; });
-    }
+    // Close screen share connection via screen share ConnectionManager
+    this.screenShareConnectionManager.closeConnection(pubkeyB64, 'peer left');
 
-    // Destroy outgoing screen share
-    const outSS = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
-    if (outSS) {
-      outSS.peer.destroy();
-      this._screenShareConnectionsOutgoing.update(v => { delete v[pubkeyB64]; return v; });
-    }
-
-    // Clean up video streams and pending state
+    // Clean up video streams
     delete this._videoStreams[pubkeyB64];
-    delete this._pendingScreenShareInits[pubkeyB64];
-    delete this._pendingScreenShareAccepts[pubkeyB64];
 
     // Mark as disconnected
     this._connectionStatuses.update(v => {
       v[pubkeyB64] = { type: 'Disconnected' };
       return v;
     });
-    this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
+    this._rebuildScreenShareConnectionStatuses();
 
     // Fire event so UI updates
     this.eventCallback({ type: 'peer-disconnected', pubKeyB64: pubkeyB64, connectionId: '' });
@@ -2101,272 +1960,9 @@ export class StreamsStore {
       }
     }
 
-    /**
-     * Outgoing screen share stream
-     *
-     * If our screen share stream is active and there is no open outgoing
-     * screen share connection yet with this agent and there is no pending
-     * InitRequest from less than 5 seconds ago (and we therefore have to
-     * assume that a remote signal got lost), send an InitRequest.
-     *
-     * Also clean up stale outgoing screen share connections where the
-     * underlying WebRTC connection is no longer alive (e.g. peer left
-     * without a clean close event reaching us).
-     */
-    const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
-    if (outgoingScreenShare) {
-      const pc = (outgoingScreenShare.peer as any)._pc as RTCPeerConnection | undefined;
-      const iceState = pc?.iceConnectionState;
-      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
-        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
-        outgoingScreenShare.peer.destroy();
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          delete currentValue[pubkeyB64];
-          return currentValue;
-        });
-        delete this._pendingScreenShareInits[pubkeyB64];
-      }
-    }
-    const alreadyOpenScreenShareOutgoing = Object.keys(
-      get(this._screenShareConnectionsOutgoing)
-    ).includes(pubkeyB64);
-    const pendingScreenShareInits = this._pendingScreenShareInits[pubkeyB64];
-    if (!!this.screenShareStream && !alreadyOpenScreenShareOutgoing) {
-      if (!pendingScreenShareInits) {
-        console.log('#### SENDING FIRST SCREEN SHARE INIT REQUEST.');
-        const newConnectionId = uuidv4();
-        this._pendingScreenShareInits[pubkeyB64] = [
-          { connectionId: newConnectionId, t0: now },
-        ];
-        await this.roomClient.sendMessage(
-          [signal.from_agent],
-          'InitRequest',
-          JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
-        );
-        this.updateScreenShareConnectionStatus(pubkeyB64, {
-          type: 'InitSent',
-        });
-      } else {
-        console.log(
-          `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${
-            pendingScreenShareInits.length + 1
-          }.`
-        );
-        const latestInit = pendingScreenShareInits.sort(
-          (init_a, init_b) => init_b.t0 - init_a.t0
-        )[0];
-        if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
-          const newConnectionId = uuidv4();
-          pendingScreenShareInits.push({
-            connectionId: newConnectionId,
-            t0: now,
-          });
-          this._pendingScreenShareInits[pubkeyB64] = pendingScreenShareInits;
-          await this.roomClient.sendMessage(
-            [signal.from_agent],
-            'InitRequest',
-            JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
-          );
-        }
-        this.updateScreenShareConnectionStatus(pubkeyB64, {
-          type: 'InitSent',
-        });
-      }
-    }
-  }
-
-  /**
-   * Handle an InitRequest signal — ONLY for screen share connections.
-   * Video connections use ConnectionManager + Perfect Negotiation.
-   */
-  async handleInitRequest(
-    signal: Extract<RoomSignal, { type: 'Message' }>
-  ) {
-    const pubKey64 = encodeHashToBase64(signal.from_agent);
-    const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
-
-    // Only handle screen share InitRequests
-    if (connection_type !== 'screen') {
-      // Video InitRequests are no longer used — ConnectionManager handles
-      // connection establishment via Perfect Negotiation + Sdp signals.
-      return;
-    }
-
-    this.logger.logAgentEvent({
-      agent: pubKey64,
-      timestamp: Date.now(),
-      event: 'InitRequest',
-      connectionId: connection_id,
-    });
-    console.log('#### GOT SCREEN SHARE INIT REQUEST.');
-
-    const newPeer = this.createScreenSharePeer(
-      signal.from_agent,
-      connection_id,
-      false
-    );
-    const accept: PendingAccept = {
-      connectionId: connection_id,
-      peer: newPeer,
-      createdAt: Date.now(),
-    };
-    const allPendingScreenShareAccepts = this._pendingScreenShareAccepts;
-    const pendingScreenShareAcceptsForAgent =
-      allPendingScreenShareAccepts[pubKey64];
-    const newPendingAcceptsForAgent: PendingAccept[] =
-      pendingScreenShareAcceptsForAgent
-        ? [...pendingScreenShareAcceptsForAgent, accept]
-        : [accept];
-    allPendingScreenShareAccepts[pubKey64] = newPendingAcceptsForAgent;
-    this._pendingScreenShareAccepts = allPendingScreenShareAccepts;
-    await this.roomClient.sendMessage(
-      [signal.from_agent],
-      'InitAccept',
-      JSON.stringify({ connection_id, connection_type }),
-    );
-  }
-
-  /**
-   * Handle an InitAccept signal — ONLY for screen share connections.
-   * Video connections use ConnectionManager + Perfect Negotiation.
-   */
-  async handleInitAccept(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubKey64 = encodeHashToBase64(signal.from_agent);
-    const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
-
-    // Only handle screen share InitAccepts
-    if (connection_type !== 'screen') {
-      return;
-    }
-
-    this.logger.logAgentEvent({
-      agent: pubKey64,
-      timestamp: Date.now(),
-      event: 'InitAccept',
-      connectionId: connection_id,
-    });
-
-    const agentPendingScreenShareInits =
-      this._pendingScreenShareInits[pubKey64];
-    if (
-      !Object.keys(this._screenShareConnectionsOutgoing).includes(pubKey64)
-    ) {
-      if (!agentPendingScreenShareInits) {
-        console.warn(
-          `Got a screen share InitAccept from an agent (${pubKey64}) for which we have no pending init stored.`
-        );
-        return;
-      }
-
-      if (
-        agentPendingScreenShareInits
-          .map(pendingInit => pendingInit.connectionId)
-          .includes(connection_id)
-      ) {
-        console.log(
-          '#### RECEIVED INIT ACCEPT FOR SCREEN SHARING AND INITIATING PEER.'
-        );
-        const newPeer = this.createScreenSharePeer(
-          signal.from_agent,
-          connection_id,
-          true
-        );
-
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          const screenShareConnectionsOutgoing = currentValue;
-          screenShareConnectionsOutgoing[pubKey64] = {
-            connectionId: connection_id,
-            peer: newPeer,
-            video: true,
-            audio: false,
-            connected: false,
-            direction: 'outgoing', // if we initiated the request, we're the ones delivering the stream
-          };
-          return screenShareConnectionsOutgoing;
-        });
-
-        delete this._pendingScreenShareInits[pubKey64];
-
-        this.updateScreenShareConnectionStatus(pubKey64, {
-          type: 'SdpExchange',
-        });
-      }
-    }
-  }
-
-  /**
-   * Handle an SdpData signal — ONLY for screen share connections.
-   * Video connections use the 'Sdp' message type routed through ConnectionManager.
-   */
-  async handleSdpData(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const { connection_id, data } = JSON.parse(signal.payload) as SdpPayload;
-
-    /**
-     * Outgoing Screen Share connections
-     */
-    const maybeOutgoingScreenShareConnection = get(
-      this._screenShareConnectionsOutgoing
-    )[pubkeyB64];
-    if (
-      maybeOutgoingScreenShareConnection &&
-      maybeOutgoingScreenShareConnection.connectionId === connection_id
-    ) {
-      maybeOutgoingScreenShareConnection.peer.signal(JSON.parse(data));
-    }
-
-    /**
-     * Incoming Screen Share connections
-     */
-    const maybeIncomingScreenShareConnection = get(
-      this._screenShareConnectionsIncoming
-    )[pubkeyB64];
-    if (
-      maybeIncomingScreenShareConnection &&
-      maybeIncomingScreenShareConnection.connectionId === connection_id
-    ) {
-      maybeIncomingScreenShareConnection.peer.signal(JSON.parse(data));
-    } else {
-      /**
-       * If there's no open connection but a PendingAccept then move that
-       * PendingAccept to the open connections and destroy all other
-       * Peer Instances for PendingAccepts of this agent and delete the
-       * PendingAccepts
-       */
-      const pendingScreenShareAccepts =
-        this._pendingScreenShareAccepts[pubkeyB64];
-      if (pendingScreenShareAccepts) {
-        const maybePendingAccept = pendingScreenShareAccepts.find(
-          pendingAccept => pendingAccept.connectionId === connection_id
-        );
-        if (maybePendingAccept) {
-          maybePendingAccept.peer.signal(JSON.parse(data));
-          this._screenShareConnectionsIncoming.update(currentValue => {
-            const screenShareConnectionsIncoming = currentValue;
-            screenShareConnectionsIncoming[pubkeyB64] = {
-              connectionId: connection_id,
-              peer: maybePendingAccept.peer,
-              video: false,
-              audio: false,
-              connected: false,
-              direction: 'incoming',
-            };
-            return screenShareConnectionsIncoming;
-          });
-          const otherPendingAccepts = pendingScreenShareAccepts.filter(
-            pendingAccept => pendingAccept.connectionId !== connection_id
-          );
-          otherPendingAccepts.forEach(pendingAccept =>
-            pendingAccept.peer.destroy()
-          );
-
-          delete this._pendingScreenShareAccepts[pubkeyB64];
-        } else {
-          console.warn(
-            `Got SDP data from agent (${pubkeyB64}) for which we have pending screen share accepts but none with a matching connection id.`
-          );
-        }
-      }
+    // If we have an active screen share, ensure a screen share connection to this peer
+    if (this.screenShareStream) {
+      this.screenShareConnectionManager.ensureConnection(pubkeyB64);
     }
   }
 

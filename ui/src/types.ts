@@ -11,7 +11,6 @@ import {
 } from '@holochain/client';
 import { WeaveClient } from '@theweave/api';
 import { createContext } from '@lit/context';
-import SimplePeer from 'simple-peer';
 
 export const weaveClientContext = createContext<WeaveClient>('we_client');
 
@@ -34,41 +33,13 @@ export type RTCMessage =
 
 export type OpenConnectionInfo = {
   connectionId: ConnectionId;
-  peer: SimplePeer.Instance;
+  peer: any;
   video: boolean;
   audio: boolean;
   connected: boolean;
   relayed?: boolean; // true if the ICE candidate pair uses a TURN relay
   videoMuted?: boolean; // true when a video track arrived but is still muted (waiting for unmute)
   direction: 'outgoing' | 'incoming' | 'duplex'; // In which direction streams are expected
-};
-
-export type PendingInit = {
-  /**
-   * UUID to identify the connection
-   */
-  connectionId: ConnectionId;
-  /**
-   * Timestamp when init was sent. If InitAccept is not received within a certain duration
-   * after t0, a next InitRequest is sent.
-   */
-  t0: number;
-};
-
-export type PendingAccept = {
-  /**
-   * UUID to identify the connection
-   */
-  connectionId: ConnectionId;
-  /**
-   * Peer instance that was created with this accept. Gets destroyed if another Peer object makes it through
-   * to connected state instead for a connection with the same Agent.
-   */
-  peer: SimplePeer.Instance;
-  /**
-   * Timestamp when this PendingAccept was created, used for cleanup of stale entries.
-   */
-  createdAt: number;
 };
 
 export type StreamInfo = {
@@ -305,22 +276,6 @@ export type DescendentRoom = {
   name: string;
   icon_src: string | undefined;
   meta_data: string | undefined;
-};
-
-/**
- * Typed payload for InitRequest / InitAccept messages
- */
-export type InitPayload = {
-  connection_id: string;
-  connection_type?: string;
-};
-
-/**
- * Typed payload for SdpData messages
- */
-export type SdpPayload = {
-  connection_id: string;
-  data: string;
 };
 
 export type RoomSignal =
