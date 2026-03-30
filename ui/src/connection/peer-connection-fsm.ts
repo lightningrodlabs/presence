@@ -667,12 +667,15 @@ export class PeerConnectionFSM {
 
       // Check if there's an existing sender for this track kind with a
       // null/ended track — reuse it via replaceTrack to avoid creating
-      // a new transceiver (which causes track accumulation on renegotiation)
+      // a new transceiver (which causes track accumulation on renegotiation).
+      // Only reuse if the transceiver direction already permits sending
+      // (sendrecv or sendonly). If the direction is recvonly, we must use
+      // addTrack instead — it updates direction to sendrecv and fires
+      // negotiationneeded, which replaceTrack does not do.
       const reusableSender = senders.find(s =>
         (!s.track || s.track.readyState === 'ended') &&
-        // Match by kind: check the transceiver's receiver track kind
-        // since sender.track may be null
-        this._senderMatchesKind(s, track.kind)
+        this._senderMatchesKind(s, track.kind) &&
+        this._senderCanSend(s)
       );
 
       try {
@@ -691,6 +694,23 @@ export class PeerConnectionFSM {
       if (track.kind === 'audio') this._audioSending = true;
       if (track.kind === 'video') this._videoSending = true;
     }
+  }
+
+  /** Check if a sender's transceiver direction permits sending (sendrecv or sendonly) */
+  private _senderCanSend(sender: RTCRtpSender): boolean {
+    try {
+      const pc = this._peer?.pc;
+      if (pc) {
+        const transceiver = pc.getTransceivers().find(t => t.sender === sender);
+        if (transceiver) {
+          return transceiver.direction === 'sendrecv' || transceiver.direction === 'sendonly';
+        }
+      }
+    } catch (e) {
+      // getTransceivers not available
+    }
+    // If we can't determine direction, don't treat as reusable — safer to use addTrack
+    return false;
   }
 
   /** Check if a sender's transceiver matches a given track kind */
