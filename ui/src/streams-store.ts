@@ -335,6 +335,19 @@ export class StreamsStore {
               timestamp: Date.now(),
               event: 'PeerVideoOnSignal',
             });
+            // If we got a video-on signal but have no video track from this
+            // peer, their renegotiation offer may have been lost (stale answer).
+            // Request they re-send their tracks.
+            const hasVideoTrack = this._videoStreams[pubKeyB64]?.getVideoTracks().some(
+              t => t.readyState === 'live'
+            );
+            if (!hasVideoTrack) {
+              const fsm = this.connectionManager.getFSM(pubKeyB64);
+              if (fsm) {
+                const refreshMsg: RTCMessage = { type: 'action', message: 'request-track-refresh' };
+                fsm.send(JSON.stringify(refreshMsg));
+              }
+            }
           }
           if (msg.message === 'audio-off') {
             this._openConnections.update(currentValue => {
