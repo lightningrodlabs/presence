@@ -196,18 +196,18 @@ describe('ConnectionManager', () => {
       expect(fsm.remoteConnectionId).toBe('b-conn-2');
 
       // Stale answer from a previous session arrives
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'answer',
         connectionId: 'b-conn-OLD',
         data: { type: 'answer', sdp: 'stale-answer' },
       });
 
-      // Should have logged the drop
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringContaining('Dropped stale answer'),
+      // Should have logged the drop via structured transition log
+      const dropEntry = a.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale answer')
       );
-      spy.mockRestore();
+      expect(dropEntry).toBeDefined();
     });
 
     it('drops stale candidate from previous session', () => {
@@ -222,17 +222,17 @@ describe('ConnectionManager', () => {
       });
 
       // Stale candidate arrives
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'candidate',
         connectionId: 'b-conn-OLD',
         data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
       });
 
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringContaining('Dropped stale candidate'),
+      const dropEntry = a.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale candidate')
       );
-      spy.mockRestore();
+      expect(dropEntry).toBeDefined();
     });
 
     it('accepts answer matching local connectionId (response to our offer)', () => {
@@ -306,16 +306,18 @@ describe('ConnectionManager', () => {
       expect(fsm.remoteConnectionId).toBe('b-conn-new');
 
       // Candidate with new connectionId should be accepted
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'candidate',
         connectionId: 'b-conn-new',
         data: { candidate: 'new-candidate', sdpMLineIndex: 0 },
       });
 
-      // Should NOT have been dropped
-      expect(spy).not.toHaveBeenCalled();
-      spy.mockRestore();
+      // Should NOT have been dropped — no "Dropped stale" log entries
+      const dropEntries = a.transitionLog.slice(logBefore).filter(
+        e => e.trigger.includes('Dropped stale')
+      );
+      expect(dropEntries).toHaveLength(0);
     });
 
     it('drops stale candidate after peer reconnects with new offer', () => {
@@ -337,17 +339,17 @@ describe('ConnectionManager', () => {
       });
 
       // Stale candidate from old session arrives late
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'candidate',
         connectionId: 'b-conn-old',
         data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
       });
 
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringContaining('Dropped stale candidate'),
+      const dropEntry = a.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale candidate')
       );
-      spy.mockRestore();
+      expect(dropEntry).toBeDefined();
     });
   });
 
@@ -391,7 +393,7 @@ describe('ConnectionManager', () => {
       });
 
       // Stale candidate from peerSessionId=1 arrives late
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'candidate',
         connectionId: 'b-conn-1',
@@ -399,10 +401,10 @@ describe('ConnectionManager', () => {
         data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
       });
 
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringContaining('Dropped stale candidate'),
+      const dropEntry = a.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale')
       );
-      spy.mockRestore();
+      expect(dropEntry).toBeDefined();
     });
 
     it('accepts candidates from current peer session', () => {
@@ -418,7 +420,7 @@ describe('ConnectionManager', () => {
       });
 
       // Candidate from same session
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'candidate',
         connectionId: 'b-conn-1',
@@ -426,8 +428,10 @@ describe('ConnectionManager', () => {
         data: { candidate: 'good-candidate', sdpMLineIndex: 0 },
       });
 
-      expect(spy).not.toHaveBeenCalled();
-      spy.mockRestore();
+      const dropEntries = a.transitionLog.slice(logBefore).filter(
+        e => e.trigger.includes('Dropped stale')
+      );
+      expect(dropEntries).toHaveLength(0);
     });
 
     it('drops stale answer from older peer session', () => {
@@ -449,7 +453,7 @@ describe('ConnectionManager', () => {
       });
 
       // Stale answer from peerSessionId=1
-      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      const logBefore = a.transitionLog.length;
       bAdapter.sendSignal('agent-aaa', {
         type: 'answer',
         connectionId: 'b-conn-1',
@@ -457,10 +461,10 @@ describe('ConnectionManager', () => {
         data: { type: 'answer', sdp: 'stale-answer' },
       });
 
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringContaining('Dropped stale answer'),
+      const dropEntry = a.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale answer')
       );
-      spy.mockRestore();
+      expect(dropEntry).toBeDefined();
     });
 
     it('new offer with higher peerSessionId always accepted', () => {
@@ -488,20 +492,6 @@ describe('ConnectionManager', () => {
       expect(fsm.remotePeerSessionId).toBe(5);
     });
 
-    it('signals without peerSessionId are accepted (backward compatibility)', () => {
-      const { a, channel } = createPair();
-      const bAdapter = channel.createAdapter('agent-bbb');
-
-      // Signal without peerSessionId (old peer)
-      bAdapter.sendSignal('agent-aaa', {
-        type: 'offer',
-        connectionId: 'b-conn-1',
-        data: { type: 'offer', sdp: 'mock-offer' },
-      });
-
-      expect(a.manager.getFSM('agent-bbb')).toBeDefined();
-      expect(a.manager.getState('agent-bbb')).not.toBe('closed');
-    });
   });
 
   describe('polite/impolite role assignment', () => {

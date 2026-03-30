@@ -88,7 +88,8 @@ describe('PeerConnectionFSM', () => {
 
       expect(ctx.fsm.state).toBe('signaling');
       expect(ctx.fsm.peer).not.toBeNull();
-      expect(ctx.transitionLog).toHaveLength(1);
+      // Transition log: idle→signaling + "new peer session" entry
+      expect(ctx.transitionLog.length).toBeGreaterThanOrEqual(1);
       expect(ctx.transitionLog[0].fromState).toBe('idle');
       expect(ctx.transitionLog[0].toState).toBe('signaling');
     });
@@ -471,7 +472,8 @@ describe('PeerConnectionFSM', () => {
       const ctx = createFSM();
       ctx.fsm.connect();
 
-      expect(ctx.transitionLog).toHaveLength(1);
+      // First entry is the transition, second is the "new peer session" entry
+      expect(ctx.transitionLog.length).toBeGreaterThanOrEqual(1);
       expect(ctx.transitionLog[0]).toMatchObject({
         fromState: 'idle',
         toState: 'signaling',
@@ -481,6 +483,10 @@ describe('PeerConnectionFSM', () => {
       });
       expect(ctx.transitionLog[0].timestamp).toBeGreaterThan(0);
       expect(ctx.transitionLog[0].transportSnapshot).toBeDefined();
+      // Entry action log includes peerSessionId
+      const sessionEntry = ctx.transitionLog.find(e => e.trigger.includes('new peer session'));
+      expect(sessionEntry).toBeDefined();
+      expect(sessionEntry!.peerSessionId).toBe(1);
     });
 
     it('logs blocked transitions with BLOCKED prefix', () => {
@@ -583,6 +589,168 @@ describe('PeerConnectionFSM', () => {
       expect(policy.strategy({
         retryCount: 0, elapsedMs: 0, retryReason: 'dtls-failed', lastStrategy: 'ice-restart',
       })).toBe('full-reconnect');
+    });
+  });
+
+  describe('entry actions', () => {
+    it('entering signaling creates a peer (via connect)', () => {
+      const ctx = createFSM();
+      expect(ctx.fsm.peer).toBeNull();
+
+      ctx.fsm.connect();
+
+      expect(ctx.fsm.state).toBe('signaling');
+      expect(ctx.fsm.peer).not.toBeNull();
+      expect(ctx.fsm.peerSessionId).toBe(1);
+    });
+
+    it('entering signaling creates a peer (via remote signal on idle)', async () => {
+      const ctx = createFSM();
+      expect(ctx.fsm.peer).toBeNull();
+
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock' },
+        'remote-conn',
+        1,
+      );
+
+      // Mock processes the offer synchronously, so FSM may advance past signaling
+      expect(['signaling', 'connecting']).toContain(ctx.fsm.state);
+      expect(ctx.fsm.peer).not.toBeNull();
+      expect(ctx.fsm.peerSessionId).toBe(1);
+    });
+
+    it('connect(stream) attaches stream via entry action', () => {
+      const ctx = createFSM();
+      const stream = createMockStream(true, true);
+
+      ctx.fsm.connect(stream);
+
+      expect(ctx.fsm.state).toBe('signaling');
+      // Stream was attached — mock addTrack should have been called
+      expect(ctx.mockPc.addTrack).toHaveBeenCalled();
+    });
+
+    it('entering closed destroys the peer', () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      const peerBeforeClose = ctx.fsm.peer;
+      expect(peerBeforeClose).not.toBeNull();
+
+      ctx.fsm.close('test');
+
+      expect(ctx.fsm.state).toBe('closed');
+      // Entry action destroys peer and sets it to null
+      expect(ctx.fsm.peer).toBeNull();
+      expect(peerBeforeClose!.destroyed).toBe(true);
+    });
+
+    it('full reconnect increments peerSessionId via self-transition', async () => {
+      const ctx = await getConnectedFSM();
+      const sessionBefore = ctx.fsm.peerSessionId;
+
+      // Trigger transport failure → reconnecting
+      ctx.mockPc.simulateIceConnectionState('failed');
+      expect(ctx.fsm.state).toBe('reconnecting');
+
+      // Advance past reconnect policy delay (ICE restart first 3 attempts)
+      // Skip to attempt 3+ which uses full-reconnect strategy
+      for (let i = 0; i < 3; i++) {
+        vi.advanceTimersByTime(20_000);
+      }
+
+      // After full reconnect, session should have incremented
+      expect(ctx.fsm.peerSessionId).toBeGreaterThan(sessionBefore);
+    });
+  });
+
+  describe('signal session validation', () => {
+    it('drops stale non-offer signals', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      // Establish remote session = 5 via offer
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock' },
+        'remote-conn',
+        5,
+      );
+      expect(ctx.fsm.remotePeerSessionId).toBe(5);
+
+      // Stale candidate from session 3
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'stale', sdpMLineIndex: 0 } as any,
+        'remote-conn',
+        3,
+      );
+      // Should have logged the drop via structured transition log
+      const dropEntry = ctx.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale')
+      );
+      expect(dropEntry).toBeDefined();
+      expect(dropEntry!.trigger).toContain('remote session 3');
+    });
+
+    it('accepts current-session non-offer signals', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock' },
+        'remote-conn',
+        2,
+      );
+
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'good', sdpMLineIndex: 0 } as any,
+        'remote-conn',
+        2,
+      );
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('offers always accepted and update remote session', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      // Offer with session 1
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock-1' },
+        'remote-conn',
+        1,
+      );
+      expect(ctx.fsm.remotePeerSessionId).toBe(1);
+
+      // Offer with session 10 — accepted, updates remote
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock-10' },
+        'remote-conn',
+        10,
+      );
+      expect(ctx.fsm.remotePeerSessionId).toBe(10);
+    });
+
+    it('offer with lower session is accepted but does not downgrade', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock-5' },
+        'remote-conn',
+        5,
+      );
+      expect(ctx.fsm.remotePeerSessionId).toBe(5);
+
+      // Offer with session 3 — accepted (offers always pass) but remote stays at 5
+      await ctx.fsm.handleRemoteSignal(
+        { type: 'offer', sdp: 'mock-3' },
+        'remote-conn',
+        3,
+      );
+      expect(ctx.fsm.remotePeerSessionId).toBe(5);
     });
   });
 });

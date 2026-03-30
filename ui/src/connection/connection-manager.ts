@@ -277,12 +277,16 @@ export class ConnectionManager {
       const matchesLocal = remoteConnectionId === fsm.connectionId;
       const matchesRemote = remoteConnectionId === fsm.remoteConnectionId;
       if (!matchesLocal && !matchesRemote) {
-        console.debug(
-          `[ConnectionManager] Dropped stale ${signalType} from ${from}: ` +
-          `signal.connectionId=${remoteConnectionId}, ` +
-          `fsm.connectionId=${fsm.connectionId}, ` +
-          `fsm.remoteConnectionId=${fsm.remoteConnectionId}`
-        );
+        this._onTransition?.({
+          timestamp: Date.now(),
+          connectionId: fsm.connectionId,
+          remoteAgent: from,
+          fromState: fsm.state,
+          toState: fsm.state,
+          trigger: `Dropped stale ${signalType}: signal.connectionId=${remoteConnectionId}, ` +
+            `fsm.connectionId=${fsm.connectionId}, fsm.remoteConnectionId=${fsm.remoteConnectionId}`,
+          peerSessionId: fsm.peerSessionId,
+        });
         return;
       }
     }

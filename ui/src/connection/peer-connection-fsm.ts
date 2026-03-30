@@ -54,6 +54,14 @@ type Timer = {
   name: string;
 };
 
+/** Context passed to _transition, used by entry actions. */
+type TransitionContext = {
+  trigger: string;
+  metadata?: Record<string, any>;
+  /** Stream to attach after peer creation (only relevant for signaling entry). */
+  localStream?: MediaStream;
+};
+
 // ---------------------------------------------------------------------------
 // FSM Implementation
 // ---------------------------------------------------------------------------
@@ -110,10 +118,10 @@ export class PeerConnectionFSM {
   // Used by ConnectionManager to filter stale signals from previous sessions.
   private _remoteConnectionId: string | null = null;
 
-  // Monotonic counter — incremented each time _createPeer() is called.
-  // Stamps outgoing signals; incoming signals with a lower value are stale.
-  private _peerSessionId = 0;
-  private _remotePeerSessionId = 0;
+  // Peer session identity — managed by the FSM's transition logic.
+  // local: incremented each time a new RTCPeerConnection is created (entry action for signaling, full reconnect).
+  // remote: updated when accepting an offer/answer with a higher session ID.
+  private _session = { local: 0, remote: 0 };
 
   // View model — reactive store (simple callback-based for now, will be wrapped in Writable by ConnectionManager)
   private _viewModelListeners: Set<(vm: ConnectionViewModel) => void> = new Set();
@@ -155,12 +163,12 @@ export class PeerConnectionFSM {
 
   /** Current peer session counter — increments on each new RTCPeerConnection. */
   get peerSessionId(): number {
-    return this._peerSessionId;
+    return this._session.local;
   }
 
   /** Remote peer's session counter — learned from their signals. */
   get remotePeerSessionId(): number {
-    return this._remotePeerSessionId;
+    return this._session.remote;
   }
 
   get transportSnapshot(): TransportSnapshot {
@@ -192,11 +200,7 @@ export class PeerConnectionFSM {
    */
   connect(localStream?: MediaStream): void {
     if (this._destroyed) return;
-    this._transition('signaling', 'connect() called');
-    this._createPeer();
-    if (localStream) {
-      this._addLocalStream(localStream);
-    }
+    this._transition('signaling', { trigger: 'connect() called', localStream });
   }
 
   /**
@@ -210,30 +214,20 @@ export class PeerConnectionFSM {
   async handleRemoteSignal(signal: RTCSessionDescriptionInit | RTCIceCandidateInit, remoteConnectionId?: string, remotePeerSessionId?: number): Promise<void> {
     if (this._destroyed) return;
 
-    // Filter stale signals from the remote peer's previous RTCPeerConnection sessions.
-    // Offers always pass — they indicate the remote created a new peer session.
-    const isOffer = 'type' in signal && signal.type === 'offer';
-    if (!isOffer && remotePeerSessionId !== undefined && remotePeerSessionId < this._remotePeerSessionId) {
-      console.debug(
-        `[FSM ${this.remoteAgent.slice(5, 13)}] Dropped stale ${('type' in signal) ? signal.type : 'candidate'}: ` +
-        `remote session ${remotePeerSessionId} < current ${this._remotePeerSessionId}`
-      );
-      return;
-    }
-
-    // Update remote peer session tracking from offers/answers.
-    if (remotePeerSessionId !== undefined && remotePeerSessionId > this._remotePeerSessionId) {
-      this._remotePeerSessionId = remotePeerSessionId;
+    // Validate signal session — part of the FSM's contract
+    const validation = this._validateSignalSession(signal, remotePeerSessionId);
+    if (validation === 'drop') return;
+    if (validation === 'update') {
+      this._session.remote = remotePeerSessionId ?? 0;
     }
 
     // If we're idle and receive a signal, auto-transition to signaling
     if (this._state === 'idle') {
-      this._transition('signaling', 'remote signal received');
-      this._createPeer();
+      this._transition('signaling', { trigger: 'remote signal received' });
     }
 
     // Record the remote peer's connectionId from offer/answer signals.
-    // Must happen after _createPeer() which resets _remoteConnectionId.
+    // Must happen after entry action which resets _remoteConnectionId.
     if (remoteConnectionId && 'type' in signal && (signal.type === 'offer' || signal.type === 'answer')) {
       this._remoteConnectionId = remoteConnectionId;
     }
@@ -320,8 +314,7 @@ export class PeerConnectionFSM {
   close(reason: string): void {
     if (this._destroyed) return;
     if (this._state === 'closed') return;
-    this._transition('closed', reason);
-    this._destroyPeer();
+    this._transition('closed', { trigger: reason });
   }
 
   /** Destroy the FSM entirely — no further operations possible */
@@ -352,7 +345,7 @@ export class PeerConnectionFSM {
   // State Machine Core
   // ---------------------------------------------------------------------------
 
-  private _transition(newState: ConnectionPhase, trigger: string, metadata?: Record<string, any>): void {
+  private _transition(newState: ConnectionPhase, ctx: TransitionContext): void {
     const oldState = this._state;
 
     // Guard: check if transition is valid
@@ -365,16 +358,17 @@ export class PeerConnectionFSM {
         remoteAgent: this.remoteAgent,
         fromState: oldState,
         toState: newState,
-        trigger: `BLOCKED: ${trigger}`,
+        trigger: `BLOCKED: ${ctx.trigger}`,
+        peerSessionId: this._session.local,
         transportSnapshot: this.transportSnapshot,
-        metadata,
+        metadata: ctx.metadata,
       };
       this._onTransition?.(entry);
       this._emitEvent({
         type: 'error',
         connectionId: this.connectionId,
         remoteAgent: this.remoteAgent,
-        data: { blocked: true, fromState: oldState, toState: newState, trigger },
+        data: { blocked: true, fromState: oldState, toState: newState, trigger: ctx.trigger },
       });
       return;
     }
@@ -393,14 +387,18 @@ export class PeerConnectionFSM {
       remoteAgent: this.remoteAgent,
       fromState: oldState,
       toState: newState,
-      trigger,
+      trigger: ctx.trigger,
+      peerSessionId: this._session.local,
       transportSnapshot: this.transportSnapshot,
-      metadata,
+      metadata: ctx.metadata,
     };
     this._onTransition?.(entry);
 
+    // Entry actions — side effects of entering the new state
+    this._onEnterState(newState, oldState, ctx);
+
     // Start timers for the new state
-    this._startTimersForState(newState);
+    this._startTimersForState(newState, oldState);
 
     // Reset reconnection state on successful connection
     if (newState === 'connected') {
@@ -413,20 +411,20 @@ export class PeerConnectionFSM {
       type: 'state-changed',
       connectionId: this.connectionId,
       remoteAgent: this.remoteAgent,
-      data: { fromState: oldState, toState: newState, trigger },
+      data: { fromState: oldState, toState: newState, trigger: ctx.trigger },
     });
 
     // Update view model
     this._notifyViewModelChange();
   }
 
-  private _startTimersForState(state: ConnectionPhase): void {
+  private _startTimersForState(state: ConnectionPhase, oldState: ConnectionPhase): void {
     switch (state) {
       case 'signaling':
         // Timeout if SDP exchange takes too long
         this._startTimer('sdp-exchange-timeout', this._config.sdpExchangeTimeoutMs, () => {
           if (this._state === 'signaling') {
-            this._transition('disconnected', 'SDP exchange timeout');
+            this._transition('disconnected', { trigger: 'SDP exchange timeout' });
           }
         });
         break;
@@ -435,26 +433,130 @@ export class PeerConnectionFSM {
         // Timeout if connection doesn't complete
         this._startTimer('connection-timeout', this._config.connectionTimeoutMs, () => {
           if (this._state === 'connecting') {
-            this._transition('disconnected', 'connection timeout');
+            this._transition('disconnected', { trigger: 'connection timeout' });
           }
         });
         break;
 
       case 'reconnecting':
-        // Schedule reconnect attempt
-        this._scheduleReconnectAttempt();
+        // Self-transition (full reconnect): timeout is started by _onEnterState
+        // First entry: schedule reconnect attempt via policy
+        if (oldState !== 'reconnecting') {
+          this._scheduleReconnectAttempt();
+        }
         break;
 
       case 'failed':
         // Auto-transition to idle after a cleanup delay
         this._startTimer('failed-cleanup', 5000, () => {
           if (this._state === 'failed') {
-            this._destroyPeer();
-            this._transition('idle', 'cleanup after failure');
+            this._transition('idle', { trigger: 'cleanup after failure' });
           }
         });
         break;
     }
+  }
+
+  /**
+   * Entry actions — side effects triggered by entering a state.
+   * Peer creation/destruction happens here, not at scattered call sites.
+   */
+  private _onEnterState(newState: ConnectionPhase, oldState: ConnectionPhase, ctx: TransitionContext): void {
+    switch (newState) {
+      case 'signaling':
+        // Create a new RTCPeerConnection (new peer session)
+        this._newPeerSession();
+        this._onTransition?.({
+          timestamp: Date.now(),
+          connectionId: this.connectionId,
+          remoteAgent: this.remoteAgent,
+          fromState: newState,
+          toState: newState,
+          trigger: `new peer session ${this._session.local}`,
+          peerSessionId: this._session.local,
+        });
+        if (ctx.localStream) {
+          this._addLocalStream(ctx.localStream);
+        }
+        break;
+
+      case 'reconnecting':
+        // Self-transition (reconnecting → reconnecting): full reconnect with new peer session
+        if (oldState === 'reconnecting') {
+          this._destroyPeer();
+          this._resetReadinessFlags();
+          this._newPeerSession();
+          this._onTransition?.({
+            timestamp: Date.now(),
+            connectionId: this.connectionId,
+            remoteAgent: this.remoteAgent,
+            fromState: newState,
+            toState: newState,
+            trigger: `new peer session ${this._session.local} (full reconnect)`,
+            peerSessionId: this._session.local,
+          });
+          // Wait for the new peer to connect; if it doesn't, schedule another attempt
+          this._startTimer('full-reconnect-timeout', this._config.connectionTimeoutMs, () => {
+            if (this._state === 'reconnecting') {
+              this._scheduleReconnectAttempt();
+            }
+          });
+        }
+        // First entry (connected → reconnecting): ICE restart uses existing peer,
+        // handled by _scheduleReconnectAttempt via _startTimersForState.
+        break;
+
+      case 'idle':
+        // Clean up peer when returning to idle (e.g., from failed)
+        if (oldState === 'failed') {
+          this._destroyPeer();
+        }
+        break;
+
+      case 'closed':
+        this._destroyPeer();
+        break;
+    }
+  }
+
+  /**
+   * Signal session validation — part of the FSM's contract.
+   * Determines whether an incoming signal should be accepted, accepted with
+   * a remote session update, or dropped as stale.
+   *
+   * Rules:
+   * - Offers always pass (they establish a new remote session)
+   * - Non-offers with session < _session.remote → 'drop' (stale)
+   * - Non-offers with session >= _session.remote → 'accept' or 'update'
+   */
+  private _validateSignalSession(
+    signal: RTCSessionDescriptionInit | RTCIceCandidateInit,
+    remotePeerSessionId: number | undefined,
+  ): 'accept' | 'update' | 'drop' {
+    const sessionId = remotePeerSessionId ?? 0;
+    const isOffer = 'type' in signal && signal.type === 'offer';
+
+    // Offers always accepted — they indicate a new remote peer session
+    if (isOffer) {
+      return sessionId > this._session.remote ? 'update' : 'accept';
+    }
+
+    // Non-offers: reject if from older session
+    if (sessionId < this._session.remote) {
+      const signalType = ('type' in signal) ? signal.type : 'candidate';
+      this._onTransition?.({
+        timestamp: Date.now(),
+        connectionId: this.connectionId,
+        remoteAgent: this.remoteAgent,
+        fromState: this._state,
+        toState: this._state,
+        trigger: `Dropped stale ${signalType}: remote session ${sessionId} < current ${this._session.remote}`,
+        peerSessionId: this._session.local,
+      });
+      return 'drop';
+    }
+
+    return sessionId > this._session.remote ? 'update' : 'accept';
   }
 
   // ---------------------------------------------------------------------------
@@ -472,7 +574,7 @@ export class PeerConnectionFSM {
     const delayMs = this._reconnectPolicy.nextRetryDelayMs(context);
     if (delayMs === null) {
       // Retries exhausted
-      this._transition('disconnected', 'reconnect retries exhausted');
+      this._transition('disconnected', { trigger: 'reconnect retries exhausted' });
       return;
     }
 
@@ -511,24 +613,16 @@ export class PeerConnectionFSM {
   }
 
   private _attemptFullReconnect(): void {
-    // Destroy current peer and create a new one
-    this._destroyPeer();
-    this._resetReadinessFlags();
-    this._createPeer();
-
-    // Set a timeout for the full reconnect
-    this._startTimer('full-reconnect-timeout', this._config.connectionTimeoutMs, () => {
-      if (this._state === 'reconnecting') {
-        this._scheduleReconnectAttempt();
-      }
-    });
+    // Self-transition: reconnecting → reconnecting with a new peer session.
+    // The entry action handles peer destruction, readiness reset, and peer creation.
+    this._transition('reconnecting', { trigger: 'full reconnect (new peer session)' });
   }
 
   // ---------------------------------------------------------------------------
   // RTCPeer Management
   // ---------------------------------------------------------------------------
 
-  private _createPeer(): void {
+  private _newPeerSession(): void {
     if (this._peer && !this._peer.destroyed) {
       this._peer.destroy();
     }
@@ -536,7 +630,7 @@ export class PeerConnectionFSM {
     this._localCandidateCount = 0;
     this._remoteCandidateCount = 0;
     this._remoteConnectionId = null;
-    this._peerSessionId++;
+    this._session.local++;
 
     const options: RTCPeerOptions = {
       polite: this._polite,
@@ -631,6 +725,7 @@ export class PeerConnectionFSM {
         fromState: this._state,
         toState: this._state,
         trigger: `ICE: ${iceState} (local=${this._localCandidateCount} remote=${this._remoteCandidateCount})`,
+        peerSessionId: this._session.local,
       });
 
       if (iceState === 'connected' || iceState === 'completed') {
@@ -682,7 +777,7 @@ export class PeerConnectionFSM {
       const sigState = event.data as string;
       // When we return to stable after offer/answer exchange, we're connecting
       if (sigState === 'stable' && this._state === 'signaling') {
-        this._transition('connecting', 'SDP exchange complete (signaling stable)');
+        this._transition('connecting', { trigger: 'SDP exchange complete (signaling stable)' });
       }
     });
 
@@ -769,10 +864,10 @@ export class PeerConnectionFSM {
     }
 
     if (this._state === 'connecting') {
-      this._transition('connected', 'composite readiness achieved (ICE + DTLS + data channel)');
+      this._transition('connected', { trigger: 'composite readiness achieved (ICE + DTLS + data channel)' });
       this._detectRelayAfterConnect();
     } else if (this._state === 'reconnecting') {
-      this._transition('connected', 'reconnection succeeded');
+      this._transition('connected', { trigger: 'reconnection succeeded' });
       this._detectRelayAfterConnect();
     }
   }
@@ -796,13 +891,13 @@ export class PeerConnectionFSM {
 
       if (reason === 'dtls-failed') {
         // DTLS failure is terminal per W3C spec — go to failed, not reconnecting
-        this._transition('failed', 'DTLS transport failed (terminal)');
+        this._transition('failed', { trigger: 'DTLS transport failed (terminal)' });
       } else {
-        this._transition('reconnecting', `transport failure: ${reason}`);
+        this._transition('reconnecting', { trigger: `transport failure: ${reason}` });
       }
     } else if (this._state === 'connecting') {
       // Connection never completed — go to disconnected
-      this._transition('disconnected', `connection failed during setup: ${reason}`);
+      this._transition('disconnected', { trigger: `connection failed during setup: ${reason}` });
     }
     // If already reconnecting, the reconnect timer handles it
   }
