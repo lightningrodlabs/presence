@@ -226,6 +226,38 @@ export class PeerConnectionFSM {
       this._transition('signaling', { trigger: 'remote signal received' });
     }
 
+    // When in reconnecting state and receiving an offer from a new remote
+    // connection (the remote peer has refreshed/reconnected), the old
+    // RTCPeerConnection has m-lines from the previous session that won't
+    // match the fresh offer. Trying to setRemoteDescription on the old peer
+    // causes "The order of m-lines in subsequent offer doesn't match" errors.
+    // Fix: destroy the old peer and create a fresh one before processing.
+    if (this._state === 'reconnecting' &&
+        'type' in signal && signal.type === 'offer' &&
+        remoteConnectionId &&
+        this._remoteConnectionId !== null &&
+        remoteConnectionId !== this._remoteConnectionId) {
+      this._onTransition?.({
+        timestamp: Date.now(),
+        connectionId: this.connectionId,
+        remoteAgent: this.remoteAgent,
+        fromState: this._state,
+        toState: this._state,
+        trigger: `fresh peer for new remote connection ${remoteConnectionId.slice(0, 8)} (was ${this._remoteConnectionId.slice(0, 8)})`,
+        peerSessionId: this._session.local,
+      });
+      this._clearAllTimers();
+      this._destroyPeer();
+      this._resetReadinessFlags();
+      this._newPeerSession();
+      // Timeout in case the fresh peer doesn't connect
+      this._startTimer('fresh-peer-timeout', this._config.connectionTimeoutMs, () => {
+        if (this._state === 'reconnecting') {
+          this._scheduleReconnectAttempt();
+        }
+      });
+    }
+
     // Record the remote peer's connectionId from offer/answer signals.
     // Must happen after entry action which resets _remoteConnectionId.
     if (remoteConnectionId && 'type' in signal && (signal.type === 'offer' || signal.type === 'answer')) {
