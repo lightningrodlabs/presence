@@ -134,6 +134,12 @@ export type ConnectionStatus =
        * WebRTC connection is established
        */
       type: 'Connected';
+    }
+  | {
+      /**
+       * Connection was lost, attempting to reconnect
+       */
+      type: 'Reconnecting';
     };
 
 export type AgentInfo = {
@@ -236,6 +242,11 @@ export type StoreEventPayload =
     }
   | {
       type: 'peer-disconnected';
+      pubKeyB64: AgentPubKeyB64;
+      connectionId: ConnectionId;
+    }
+  | {
+      type: 'peer-reconnecting';
       pubKeyB64: AgentPubKeyB64;
       connectionId: ConnectionId;
     }

@@ -111,6 +111,8 @@ export class AgentConnectionStatusIcon extends LitElement {
         }...`;
       case 'SdpExchange':
         return 'exchanging SDP data...';
+      case 'Reconnecting':
+        return 'reconnecting...';
       case 'Blocked':
         return 'Blocked';
       default:

@@ -449,11 +449,15 @@ export class StreamsStore {
           }
         }
 
-        this.eventCallback({
-          type: 'peer-connected',
-          pubKeyB64,
-          connectionId,
-        });
+        // Only play join sound on genuine first connection — not reconnection
+        // recovery and not same-state ICE informational events
+        if (fromState !== 'reconnecting' && fromState !== 'connected') {
+          this.eventCallback({
+            type: 'peer-connected',
+            pubKeyB64,
+            connectionId,
+          });
+        }
 
         // If we have an active screen share, ensure a screen share connection
         if (this.screenShareStream) {
@@ -491,9 +495,25 @@ export class StreamsStore {
           pubKeyB64,
           connectionId,
         });
+      } else if (toState === 'reconnecting') {
+        // Clear frozen video and stale media flags — show avatar + "Reconnecting..." instead
+        delete this._videoStreams[pubKeyB64];
+        this._openConnections.update(current => {
+          if (current[pubKeyB64]) {
+            current[pubKeyB64] = { ...current[pubKeyB64], video: false, audio: false, videoMuted: false };
+          }
+          return current;
+        });
+        this._rebuildOpenConnections();
+        this._rebuildConnectionStatuses();
+        // Notify UI to clear the frozen video element
+        this.eventCallback({
+          type: 'peer-reconnecting',
+          pubKeyB64,
+          connectionId,
+        });
       } else {
-        // For signaling, connecting, reconnecting — rebuild both stores
-        // so UI shows "establishing connection..." overlay for in-progress connections
+        // For signaling, connecting — rebuild both stores
         this._rebuildOpenConnections();
         this._rebuildConnectionStatuses();
       }
@@ -728,8 +748,9 @@ export class StreamsStore {
       case 'signaling':
         return { type: 'InitSent' };
       case 'connecting':
-      case 'reconnecting':
         return { type: 'SdpExchange' };
+      case 'reconnecting':
+        return { type: 'Reconnecting' };
       case 'connected':
         return { type: 'Connected' };
       default:
@@ -928,6 +949,28 @@ export class StreamsStore {
       .filter(agent => !get(this.blockedAgents).includes(agent))
       .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
     await this.roomStore.client.sendMessage(agentsToPing, 'PingUi');
+
+    // Pong liveness check: close connections to peers that stopped responding.
+    // If a peer's process is killed (no LeaveUi signal), this is the only
+    // mechanism to detect their absence and clean up.
+    const PONG_TIMEOUT_MS = 10_000;
+    const now = Date.now();
+    const currentKnown = get(this._knownAgents);
+    for (const [agentB64, info] of Object.entries(currentKnown)) {
+      if (agentB64 === this.myPubKeyB64) continue;
+      const state = this.connectionManager.getState(agentB64);
+      const isActive = state && state !== 'idle' && state !== 'closed' && state !== 'failed' && state !== 'disconnected';
+      if (!isActive) continue;
+
+      if (info.lastSeen && (now - info.lastSeen) > PONG_TIMEOUT_MS) {
+        this.logger.logCustomMessage(`Pong timeout for ${agentB64.slice(5, 13)}: last pong ${now - info.lastSeen}ms ago, closing connection`);
+        this.connectionManager.closeConnection(agentB64, 'pong timeout');
+        this.screenShareConnectionManager.closeConnection(agentB64, 'pong timeout');
+        // Clean up video streams
+        delete this._videoStreams[agentB64];
+        this._rebuildConnectionStatuses();
+      }
+    }
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
@@ -1770,13 +1813,34 @@ export class StreamsStore {
             await this.handlePongUi(signal);
             break;
           case 'Sdp':
-            // Route to ConnectionManager via the signaling adapter
-            this._signalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
+          case 'ScreenSdp': {
+            // Don't create new connections to agents whose pongs have gone stale.
+            // Accepts signals from unknown agents (lastSeen undefined — genuinely new)
+            // and from agents with recent pongs. Rejects signals from agents we know
+            // about but who stopped responding — these are stale signals from dead peers.
+            const senderB64 = encodeHashToBase64(signal.from_agent);
+            const senderInfo = get(this._knownAgents)[senderB64];
+            const PONG_TIMEOUT_MS = 10_000;
+            if (senderInfo?.lastSeen && (Date.now() - senderInfo.lastSeen) > PONG_TIMEOUT_MS) {
+              const hasActiveFsm = signal.msg_type === 'Sdp'
+                ? this.connectionManager.getState(senderB64)
+                : this.screenShareConnectionManager.getState(senderB64);
+              // Only block if there's no active FSM — if there IS one, let the FSM's
+              // own signal validation handle it
+              if (!hasActiveFsm || hasActiveFsm === 'closed') {
+                this.logger.logCustomMessage(
+                  `Dropped SDP signal from stale agent ${senderB64.slice(5, 13)}: last pong ${Date.now() - senderInfo.lastSeen}ms ago`
+                );
+                break;
+              }
+            }
+            if (signal.msg_type === 'Sdp') {
+              this._signalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
+            } else {
+              this._screenShareSignalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
+            }
             break;
-          case 'ScreenSdp':
-            // Route to screen share ConnectionManager via its signaling adapter
-            this._screenShareSignalingAdapter.dispatchSignal(signal.from_agent, signal.payload);
-            break;
+          }
           case 'LeaveUi':
             await this.handleLeaveUi(signal);
             break;

@@ -360,6 +360,16 @@ export class RoomView extends LitElement {
           await this._joinAudio.play();
           break;
         }
+        case 'peer-reconnecting': {
+          // Clear frozen video frame — show avatar + "Reconnecting..." text instead
+          const reconnectVideoEl = this.shadowRoot?.getElementById(
+            event.connectionId
+          ) as HTMLVideoElement | undefined;
+          if (reconnectVideoEl) {
+            reconnectVideoEl.srcObject = null;
+          }
+          break;
+        }
         case 'peer-disconnected': {
           if (this._maximizedVideo === event.connectionId) {
             this._maximizedVideo = undefined;
@@ -2062,21 +2072,14 @@ export class RoomView extends LitElement {
                 id="${conn.connectionId}"
                 class="video-el"
               ></video>
-              <avatar-with-nickname
-                .hideNickname=${true}
-                .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
-              ></avatar-with-nickname>
-              <div
-                style="color: #b98484; ${conn.connected || conn.video ? 'display: none' : ''}"
-              >
-                establishing connection...
-              </div>
-              <div
-                style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
-              >
-                connecting media...
-              </div>
+              ${!conn.video ? html`
+              <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center;">
+                <avatar-with-nickname
+                  .hideNickname=${true}
+                  .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                  style="width: 100%;"
+                ></avatar-with-nickname>
+              </div>` : html``}
 
               <!-- Connection states indicators -->
               ${this._showConnectionDetails
@@ -2110,7 +2113,15 @@ export class RoomView extends LitElement {
                       class="tile-meta"
                       style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
                     >
-                      <div class="row" style="margin-bottom: 4px;">
+                      ${(() => {
+                        const status = this._connectionStatuses.value[pubkeyB64]?.type;
+                        if (status === 'Reconnecting')
+                          return html`<div style="color: #e7a008; margin-bottom: 4px;">Reconnecting...</div>`;
+                        if (!conn.connected && !conn.video)
+                          return html`<div style="color: #b98484; margin-bottom: 4px;">Connecting...</div>`;
+                        if (conn.connected && !conn.video && conn.videoMuted)
+                          return html`<div style="color: #b9a884; margin-bottom: 4px;">connecting media...</div>`;
+                        return html`<div class="row" style="margin-bottom: 4px;">
                         <sl-icon
                           title="${this._maximizedVideo === conn.connectionId
                             ? 'minimize'
@@ -2133,7 +2144,8 @@ export class RoomView extends LitElement {
                           style="color: red; height: 30px; width: 30px; margin-left: 8px;${conn.audio ? ' display: none;' : ''}"
                           .src=${wrapPathInSvg(mdiMicrophoneOff)}
                         ></sl-icon>
-                      </div>
+                      </div>`;
+                      })()}
                       <div class="row" style="align-items: center;">
                         <avatar-with-nickname
                           .size=${36}

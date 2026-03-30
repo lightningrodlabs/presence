@@ -57,6 +57,8 @@ export function connectionStatusToColor(
       return 'blue';
     case 'SdpExchange':
       return 'yellow';
+    case 'Reconnecting':
+      return 'orange';
     case 'Connected':
       return '#48e708';
     case 'Blocked':

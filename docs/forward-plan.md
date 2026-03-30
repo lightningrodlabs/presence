@@ -337,30 +337,132 @@ Create `__tests__/track-lifecycle.test.ts`:
 
 ---
 
+### Phase 1.5: Pong Liveness Detection and Peer Departure
+
+**Goal**: When a peer's process is killed (no LeaveUi signal), detect their absence within ~10 seconds and clean up the connection and UI tile. Stop wasting reconnect attempts against dead peers.
+
+**Why now**: The log from session 3 shows uhCAky-S entering `reconnecting` and cycling through full reconnects (sessions 2, 3, 4) for 90+ seconds against a dead peer. The peer stopped sending pongs at +18s but nobody noticed. This is more urgent than track health monitoring (Phase 2), because it affects every peer departure.
+
+#### 1.5a. Track last pong timestamp per agent in StreamsStore
+
+In `handlePongUi()`, record `Date.now()` for each agent that sends a pong:
+
+```typescript
+_lastPongTime: Map<AgentPubKeyB64, number>
+```
+
+Update on every pong received.
+
+**File**: `ui/src/streams-store.ts`
+
+#### 1.5b. Pong timeout check in pingAgents()
+
+In the existing `pingAgents()` cycle (runs every 2s), after sending pings, check each agent in `_lastPongTime`:
+
+```
+For each agent with an active connection (signaling/connecting/connected/reconnecting):
+  if (now - lastPongTime > PONG_TIMEOUT_MS):
+    connectionManager.closeConnection(agent, 'pong timeout')
+    clean up video streams, screen share connections
+    remove from _lastPongTime
+```
+
+`PONG_TIMEOUT_MS = 10_000` (5 missed pongs at 2s intervals). This is aggressive enough to catch killed processes but tolerant of occasional pong delays.
+
+Do NOT apply pong timeout to peers in `idle`/`disconnected`/`failed`/`closed` — they're not expected to be sending pongs.
+
+**File**: `ui/src/streams-store.ts`
+
+#### 1.5c. Tests
+
+- **Pong keeps connection alive**: Peer connects, pongs arrive every 2s, connection stays open after 10s
+- **Pong timeout closes connection**: Peer connects, pongs stop, after 10s the connection is closed
+- **Pong timeout only applies to active connections**: Peer in `idle` state is not closed by pong timeout
+
+### Phase 1.6: Connection State UI Visibility
+
+**Goal**: The user sees distinct visual states for "connected", "reconnecting", "connection lost", and "peer left" — not frozen/black video with no explanation.
+
+**Why now**: The FSM has 8 states but the UI only sees 4 (`Disconnected`, `InitSent`, `SdpExchange`, `Connected`) via `_phaseToConnectionStatus`. The `reconnecting` state maps to `SdpExchange`, making reconnection invisible. The user sees frozen video for 90 seconds with no feedback.
+
+#### 1.6a. Add `Reconnecting` to ConnectionStatus type
+
+In `ui/src/types.ts`, add a new status variant:
+
+```typescript
+type ConnectionStatus =
+  | { type: 'Disconnected' }
+  | { type: 'Connected' }
+  | { type: 'InitSent' }
+  | { type: 'AcceptSent' }
+  | { type: 'SdpExchange' }
+  | { type: 'Reconnecting' }   // NEW
+  | { type: 'Blocked' }
+```
+
+Update `_phaseToConnectionStatus`:
+```
+reconnecting → { type: 'Reconnecting' }
+```
+
+**Files**: `ui/src/types.ts`, `ui/src/streams-store.ts`
+
+#### 1.6b. Render reconnecting state in peer video tile
+
+In the room view's peer tile rendering, when status is `Reconnecting`:
+- Show overlay text "Reconnecting..." on the video tile
+- Dim the tile or add a visual indicator (e.g., pulsing border or opacity change)
+- Keep the tile visible (don't remove it — the peer may come back)
+
+When status transitions to `Disconnected` (from pong timeout or close):
+- Remove the video stream
+- Either remove the tile or show "Disconnected" briefly before removal
+
+**Files**: `ui/src/room/room-view.ts` or relevant tile component
+
+#### 1.6c. Show peer departure in agent list
+
+When a peer's connection closes (pong timeout, leave signal, or FSM failure):
+- Remove them from the video grid
+- Keep them in the "known agents" list briefly if they might rejoin (e.g., if pongs resume)
+
+**File**: `ui/src/streams-store.ts`, room view components
+
+---
+
 ## Implementation Order and Dependencies
 
 ```
-Phase 1 (connectionId filtering)  ←  no dependencies, fixes open root cause
+Phase 1 (connectionId + peerSessionId filtering)  ←  DONE
     │
-    ├── 1a: remoteConnectionId on FSM
-    ├── 1b: filter in _routeSignalToFSM  (depends on 1a)
-    ├── 1c: verify propagation
-    └── 1d: stale signal tests          (depends on 1a, 1b)
+    └── Refactored into FSM state with entry actions  ←  DONE
 
-Phase 5a (fix vitest)  ←  do early, all test phases need it
+Phase 5a (fix vitest)  ←  DONE (was nix develop issue, not config)
+
+Phase 1.5 (pong liveness detection)  ←  NEXT
     │
+    ├── 1.5a: track last pong timestamp
+    ├── 1.5b: pong timeout in pingAgents
+    └── 1.5c: tests
+
+Phase 1.6 (connection state UI visibility)  ←  after 1.5
+    │
+    ├── 1.6a: add Reconnecting status
+    ├── 1.6b: render reconnecting in tile
+    └── 1.6c: peer departure cleanup in UI
+
 Phase 2 (track health monitoring)  ←  depends on Phase 1 (clean signals)
     │
     ├── 2a: RTP stats polling in FSM
     ├── 2b: wire to ping cycle
     ├── 2c: getStats on RTCPeer
-    └── 2d: tests                       (depends on 5a)
+    └── 2d: tests
 
 Phase 3 (track recovery + reconciliation)  ←  depends on Phase 2 (detection)
     │
     ├── 3a: two-tier recovery
     ├── 3b: pong reconciliation
-    └── 3c: tests                       (depends on 5a)
+    └── 3c: tests
 
 Phase 4 (ICE diagnostics)  ←  independent, can parallel with 2/3
     │
@@ -371,9 +473,7 @@ Phase 4 (ICE diagnostics)  ←  independent, can parallel with 2/3
 Phase 5b-5e (test infrastructure + regression suite)  ←  depends on all above
 ```
 
-**Recommended actual order**: 5a → 1 → 2 → 3 → 4 → 5b-5e
-
-Phases 1-3 are sequential (each builds on the previous). Phase 4 can run in parallel with 2 or 3. Phase 5b-5e comes last to build regression tests against the finished code.
+**Recommended actual order**: 5a → 1 → 1.5 → 1.6 → 2 → 3 → 4 → 5b-5e
 
 ---
 
@@ -382,12 +482,14 @@ Phases 1-3 are sequential (each builds on the previous). Phase 4 can run in para
 After all phases:
 
 1. **Stale signals are provably dropped**: Test injects stale signals → they never reach RTCPeer
-2. **Dead tracks are detected within 2 poll cycles (4s)**: Test stalls bytesReceived → event fires
-3. **Recovery succeeds without full reconnect in >80% of cases**: replaceTrack recovery resolves most track issues
-4. **Pong metadata mismatches trigger reconciliation**: Test simulates mismatch → recovery initiated
-5. **All 8 transcript bugs have regression tests**: Each test named after its bug, each would fail without the fix
-6. **No test relies on setTimeout timing**: Tests use explicit state transitions and mock clocks
-7. **streams-store.ts does not grow**: Connection logic lives in the connection module; store is integration glue
+2. **Dead peers detected within 10s**: Pong timeout fires, connection closed, tile cleaned up
+3. **User sees reconnection state**: `Reconnecting` status renders as overlay on tile, not frozen video
+4. **Dead tracks are detected within 2 poll cycles (4s)**: Test stalls bytesReceived → event fires
+5. **Recovery succeeds without full reconnect in >80% of cases**: replaceTrack recovery resolves most track issues
+6. **Pong metadata mismatches trigger reconciliation**: Test simulates mismatch → recovery initiated
+7. **All 8 transcript bugs have regression tests**: Each test named after its bug, each would fail without the fix
+8. **No test relies on setTimeout timing**: Tests use explicit state transitions and mock clocks
+9. **streams-store.ts does not grow**: Connection logic lives in the connection module; store is integration glue
 
 ---
 
