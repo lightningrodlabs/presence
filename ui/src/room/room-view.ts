@@ -2156,7 +2156,7 @@ export class RoomView extends LitElement {
                                     @click=${() => {
                                       this.streamsStore.refreshTracksForPeer(pubkeyB64);
                                     }}
-                                  >Reset media</sl-menu-item>
+                                  >Refresh media</sl-menu-item>
                                   <sl-menu-item
                                     class="reconnect-menu-item"
                                     @click=${() => {
@@ -2272,28 +2272,16 @@ export class RoomView extends LitElement {
                       ></avatar-with-nickname>
                       ${conn.videoMuted || (conn.connected && !conn.video)
                         ? html`
-                            <sl-dropdown placement="top" distance="4" hoist>
+                            <sl-tooltip content="reconnect" class="tooltip-filled">
                               <sl-icon-button
-                                slot="trigger"
                                 class="phone-refresh"
                                 style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
                                 src=${wrapPathInSvg(mdiPhoneRefresh)}
+                                @click=${() => {
+                                  this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                                }}
                               ></sl-icon-button>
-                              <sl-menu class="reconnect-menu secondary-font">
-                                <sl-menu-item
-                                  class="reconnect-menu-item"
-                                  @click=${() => {
-                                    this.streamsStore.refreshTracksForPeer(pubkeyB64);
-                                  }}
-                                >Reset media</sl-menu-item>
-                                <sl-menu-item
-                                  class="reconnect-menu-item"
-                                  @click=${() => {
-                                    this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                                  }}
-                                >Full reconnect</sl-menu-item>
-                              </sl-menu>
-                            </sl-dropdown>
+                            </sl-tooltip>
                           `
                         : html`
                             <sl-tooltip content="reconnect" class="tooltip-filled">

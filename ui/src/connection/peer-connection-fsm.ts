@@ -224,6 +224,42 @@ export class PeerConnectionFSM {
     }
   }
 
+  /**
+   * Force-refresh media tracks without tearing down the connection.
+   * Replaces each sender's track with the corresponding fresh track from the
+   * stream, triggering re-encoding. If the stream has tracks that aren't on
+   * any sender, they're added. This is a lighter recovery than full reconnect
+   * — preserves the ICE/DTLS session.
+   */
+  refreshMedia(stream: MediaStream): void {
+    if (this._destroyed || !this._peer) return;
+    const senders = this._peer.getSenders();
+
+    for (const track of stream.getTracks()) {
+      // Find a sender for this track kind
+      const sender = senders.find(s =>
+        s.track?.kind === track.kind || this._senderMatchesKind(s, track.kind)
+      );
+
+      if (sender) {
+        // Replace the track even if it's the same object — forces re-encoding
+        this._peer.replaceTrack(sender, track).catch(e => {
+          console.warn(`refreshMedia: replaceTrack failed for ${track.kind}:`, e);
+        });
+      } else {
+        // No existing sender for this kind — add it (triggers renegotiation)
+        try {
+          this._peer.addTrack(track, stream);
+        } catch (e) {
+          console.warn(`refreshMedia: addTrack failed for ${track.kind}:`, e);
+        }
+      }
+
+      if (track.kind === 'audio') this._audioSending = true;
+      if (track.kind === 'video') this._videoSending = true;
+    }
+  }
+
   /** Send data via the data channel */
   send(data: string): void {
     if (this._destroyed || !this._peer) return;

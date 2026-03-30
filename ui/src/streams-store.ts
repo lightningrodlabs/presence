@@ -1580,6 +1580,11 @@ export class StreamsStore {
    * Public method for manual track recovery. Sends a request-track-refresh
    * message via the data channel asking the peer to re-send their tracks.
    */
+  /**
+   * Force-refresh media tracks for a peer without tearing down the connection.
+   * Replaces tracks on existing senders, triggering re-encoding while preserving
+   * the ICE/DTLS session. Lighter than full reconnect.
+   */
   refreshTracksForPeer(pubKeyB64: AgentPubKeyB64) {
     if (!this.mainStream) {
       console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no stream`);
@@ -1599,15 +1604,10 @@ export class StreamsStore {
       `Track refresh [${pubKeyB64.slice(0, 8)}]: audio=${myAudioTrack ? `${myAudioTrack.enabled ? 'enabled' : 'disabled'},${myAudioTrack.muted ? 'muted' : 'unmuted'},${myAudioTrack.readyState}` : 'none'} video=${myVideoTrack ? `${myVideoTrack.enabled ? 'enabled' : 'disabled'},${myVideoTrack.muted ? 'muted' : 'unmuted'},${myVideoTrack.readyState}` : 'none'}`
     );
 
-    // Re-add the local stream to trigger renegotiation
-    try {
-      fsm.addLocalStream(this.mainStream);
-      this.logger.logCustomMessage(
-        `Manual track refresh [${pubKeyB64.slice(0, 8)}]: re-added local stream`
-      );
-    } catch (e: any) {
-      console.warn(`Track refresh failed for ${pubKeyB64.slice(0, 8)}: ${e.toString()}`);
-    }
+    fsm.refreshMedia(this.mainStream);
+    this.logger.logCustomMessage(
+      `Media refresh [${pubKeyB64.slice(0, 8)}]: replaced tracks on existing senders`
+    );
   }
 
   /**
