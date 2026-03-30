@@ -35,6 +35,31 @@ import { StreamsStore } from '../streams-store';
 import { SimpleEventType, StreamInfoLog } from '../logging';
 import './elements/avatar-with-nickname';
 
+// ---------------------------------------------------------------------------
+// FSM phase → numeric level mapping for the state timeline
+// ---------------------------------------------------------------------------
+const FSM_PHASE_LEVEL: Record<string, number> = {
+  idle: 0,
+  signaling: 1,
+  connecting: 2,
+  connected: 3,
+  reconnecting: 1.5,
+  disconnected: -0.5,
+  failed: -1,
+  closed: 0,
+};
+
+const FSM_PHASE_COLOR: Record<string, string> = {
+  idle: '#999999',
+  signaling: '#5bc0eb',
+  connecting: '#fde74c',
+  connected: '#48e708',
+  reconnecting: '#e8900c',
+  disconnected: '#e84040',
+  failed: '#8b0000',
+  closed: '#333333',
+};
+
 @localized()
 @customElement('logs-graph')
 export class LogsGraph extends LitElement {
@@ -69,55 +94,156 @@ export class LogsGraph extends LitElement {
 
   eventUnsubscribers: Unsubscriber[] = [];
 
-  // updated(changedValues: PropertyValues) {
-  //   super.updated(changedValues);
-  //   if (changedValues.has('agent')) {
-  //     // this.firstUpdated();
-  //     // this.requestUpdate();
-  //   }
-  // }
-
   async firstUpdated() {
     const data: Data[] = [];
 
     /**
-     * Trace indices:
-     * 0 - Our own stream
-     * 1 - Our own video track
-     * 2 - Our own audio track
-     * 3 - How our peer perceives our stream state
-     * 4 - How our peer perceives our video track state
-     * 5 - How our peer perceives our audio track state
+     * Subplot layout:
+     *
+     * Row 1 (y3): FSM connection state timeline — colored step chart
+     * Row 2 (y):  Stream/track state — our own stream + how peer perceives it
+     * Row 3 (y2): Events — connection events, media signals, custom logs
      */
 
-    // Load inital data from the logger into the plot
+    // Row 2: Stream and track traces (indices 0-5)
     const myStreamData = this.myStreamTraces();
     data.push(...myStreamData);
 
     const agentStreamData = this.agentStreamTraces();
     data.push(...agentStreamData);
 
+    // Row 1: FSM state timeline (index 6)
+    const fsmTrace = this.fsmStateTrace();
+    data.push(fsmTrace);
+
+    // Shapes for events (Row 3)
     const shapes = this.eventShapes();
     this.shapes = shapes;
 
+    const now = Date.now();
     const layout: Partial<Layout> = {
-      showlegend: false,
+      showlegend: true,
+      legend: {
+        orientation: 'h',
+        y: -0.15,
+        font: { size: 10 },
+      },
       shapes,
       hovermode: 'closest',
       hoverlabel: {
         namelength: -1,
       },
+      // Main subplot layout with shared x-axis
+      grid: {
+        rows: 3,
+        columns: 1,
+        subplots: [['xy3'], ['xy'], ['xy2']] as any,
+        roworder: 'top to bottom' as any,
+      },
+      xaxis: {
+        type: 'date',
+        rangeslider: { visible: true, thickness: 0.08 },
+        range: [now - 60_000, now + 5_000],
+      },
+      // Row 2: Stream state
+      yaxis: {
+        title: { text: 'Stream State' } as any,
+        range: [-2.5, 2.5],
+        fixedrange: true,
+        tickvals: [-2, -1, 0, 1, 2],
+        ticktext: ['muted (peer)', 'on (peer)', 'off', 'on', 'muted'],
+      },
+      // Row 3: Events
+      yaxis2: {
+        title: { text: 'Events' } as any,
+        range: [-2, 2],
+        fixedrange: true,
+        showticklabels: false,
+      },
+      // Row 1: FSM state
+      yaxis3: {
+        title: { text: 'Connection' } as any,
+        range: [-1.5, 4],
+        fixedrange: true,
+        tickvals: [-1, -0.5, 0, 1, 1.5, 2, 3],
+        ticktext: ['failed', 'disconnected', 'idle', 'signaling', 'reconnecting', 'connecting', 'connected'],
+      },
+      height: 550,
+      margin: { t: 30, b: 60, l: 80, r: 20 },
+      // Plotly config for better zoom
+      dragmode: 'zoom',
     };
 
-    Plotly.newPlot(this.graph, data, layout);
+    const config = {
+      responsive: true,
+      scrollZoom: true,
+      displayModeBar: true,
+      modeBarButtonsToAdd: ['toggleSpikelines'] as any[],
+    };
 
-    // Register a handler to extend the traces based on new events
+    Plotly.newPlot(this.graph, data, layout, config);
+
+    // Register handlers for live updates
     this.registerEventHandlers();
   }
 
   disconnectedCallback(): void {
     this.eventUnsubscribers.forEach(unsubscribe => unsubscribe());
   }
+
+  // ---------------------------------------------------------------------------
+  // FSM State Timeline (Row 1)
+  // ---------------------------------------------------------------------------
+
+  fsmStateTrace(): Data {
+    const agentEvents = this.streamsStore.logger.agentEvents[this.agent] || [];
+
+    // Extract FSM state transitions
+    const fsmEvents = agentEvents
+      .filter(e => e.event.startsWith('ConnectionState_'))
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const x: Datum[] = [];
+    const y: Datum[] = [];
+    const text: string[] = [];
+    const colors: string[] = [];
+
+    for (const event of fsmEvents) {
+      const phase = event.event.replace('ConnectionState_', '');
+      const level = FSM_PHASE_LEVEL[phase] ?? 0;
+      const color = FSM_PHASE_COLOR[phase] ?? '#999';
+
+      x.push(event.timestamp);
+      y.push(level);
+      text.push(phase);
+      colors.push(color);
+    }
+
+    return {
+      x,
+      y,
+      text,
+      type: 'scatter',
+      mode: 'lines+markers',
+      name: 'FSM State',
+      yaxis: 'y3',
+      line: {
+        shape: 'hv', // step chart
+        width: 3,
+        color: '#5bc0eb',
+      },
+      marker: {
+        size: 8,
+        color: colors,
+        symbol: 'circle',
+      },
+      hovertemplate: '%{text}<br>%{x}<extra>FSM State</extra>',
+    } as Data;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stream/Track traces (Row 2)
+  // ---------------------------------------------------------------------------
 
   myStreamTraces(): Data[] {
     const myLogInfos = this.streamsStore.logger.myStreamStatusLog;
@@ -142,6 +268,10 @@ export class LogsGraph extends LitElement {
     return loadStreamAndTrackInfo(streamLogs, `perceived`, true);
   }
 
+  // ---------------------------------------------------------------------------
+  // Event shapes (Row 3)
+  // ---------------------------------------------------------------------------
+
   eventShapes(): Partial<Shape>[] {
     const shapes: Partial<Shape>[] = [];
 
@@ -152,15 +282,14 @@ export class LogsGraph extends LitElement {
     const agentEvents = allAgentEvents[this.agent] || [];
     const pongEvents = agentEvents.filter(event => event.event === 'Pong');
 
-    // Create rectangles for Pongs
+    // Create rectangles for Pongs (batched)
     let tempRect: (Partial<Shape> & { x1: number }) | undefined;
     pongEvents
       .sort((a, b) => a.timestamp - b.timestamp)
       .forEach(event => {
         if (tempRect && event.timestamp - tempRect.x1 < 3_500) {
-          tempRect.x1 = event.timestamp; // Update the right end of the rectangle
+          tempRect.x1 = event.timestamp;
         } else if (!tempRect) {
-          // start a new rectangle
           tempRect = {
             type: 'rect',
             name: 'Pong',
@@ -168,65 +297,71 @@ export class LogsGraph extends LitElement {
             x1: event.timestamp,
             y0: -0.5,
             y1: 0.5,
-            line: {
-              color: 'f2da0080',
-            },
+            yref: 'y2',
+            line: { color: 'f2da0080' },
             fillcolor: 'f2da0080',
           };
         } else {
-          // finish the rectangle and add it to the shapes array
           shapes.push(tempRect);
           tempRect = undefined;
         }
       });
-
-    // And push the last one too
     if (tempRect) shapes.push(tempRect);
 
+    // Non-pong events as vertical lines in the events subplot
     [
       ...myEvents,
-      ...agentEvents.filter(event => event.event !== 'Pong'), // Filter out Pong events
-    ].forEach(payload => {
-      const [color, dash] = simpleEventTypeToColor(payload.event);
-      const [y0, y1] = yEventType(payload.event);
-      shapes.push({
-        type: 'line',
-        x0: payload.timestamp,
-        y0,
-        x1: payload.timestamp,
-        y1,
-        line: {
-          color,
-          dash,
-        },
-        name: payload.event,
+      ...agentEvents.filter(event => event.event !== 'Pong'),
+    ]
+      .filter(event => !event.event.startsWith('ConnectionState_')) // FSM events shown in Row 1
+      .forEach(payload => {
+        const [color, dash] = simpleEventTypeToColor(payload.event);
+        const [y0, y1] = yEventType(payload.event);
+        shapes.push({
+          type: 'line',
+          x0: payload.timestamp,
+          y0,
+          x1: payload.timestamp,
+          y1,
+          yref: 'y2',
+          line: { color, dash, width: 1.5 },
+          name: payload.event,
+        });
       });
-    });
 
-    // Add custom events
+    // Custom logs as labeled vertical lines spanning the events subplot
     customEvents.forEach(event => {
+      // Skip FSM transition logs — they're shown in Row 1
+      if (event.log.startsWith('FSM [') || event.log.startsWith('ScreenFSM [')) return;
+
       shapes.push({
         type: 'line',
         x0: event.timestamp,
-        y0: -2,
+        y0: -1.5,
         x1: event.timestamp,
-        y1: 2,
+        y1: 1.5,
+        yref: 'y2',
         line: {
           color: '#e07f00',
-          width: 2,
+          width: 1.5,
         },
         name: event.log,
         label: {
-          text: event.log,
+          text: event.log.length > 60 ? event.log.slice(0, 57) + '...' : event.log,
           xanchor: 'left',
           textangle: -45,
           textposition: 'top right',
+          font: { size: 9 },
         },
       });
     });
 
     return shapes;
   }
+
+  // ---------------------------------------------------------------------------
+  // Live update handlers
+  // ---------------------------------------------------------------------------
 
   registerEventHandlers() {
     const unsubscriber1 = this.streamsStore.logger.on(
@@ -246,13 +381,23 @@ export class LogsGraph extends LitElement {
             return;
         } else if (payload.agent !== this.agent) return;
 
-        // If it's a Pong event, we want to use a rectanlge instead of lines in order
-        // not to overload the computational load of rendering as this otherwise
-        // freezes up Presence as a whole
+        // FSM state events → update Row 1 trace
+        if (payload.event.startsWith('ConnectionState_')) {
+          const phase = payload.event.replace('ConnectionState_', '');
+          const level = FSM_PHASE_LEVEL[phase] ?? 0;
+          Plotly.extendTraces(
+            this.graph,
+            {
+              x: [[payload.timestamp]],
+              y: [[level]],
+              text: [[phase]] as any,
+            },
+            [6] // FSM trace index
+          );
+        }
+
+        // Pong events → batch into rectangles
         if (payload.event === 'Pong') {
-          // Search all shapes for Pong rectangles with a timestamp less than 4.5 seconds ago
-          // which would correspond to < 2x ping frequency and indicate that no Pong had been
-          // lost. Otherwise we create a separate triangle to visualize gaps in Pongs.
           const matchingRectIdx = this.shapes.findIndex(
             shape =>
               shape.type === 'rect' &&
@@ -272,23 +417,25 @@ export class LogsGraph extends LitElement {
               x1: payload.timestamp,
               y0: -0.5,
               y1: 0.5,
-              line: {
-                color: 'f2da0080',
-              },
+              yref: 'y2',
+              line: { color: 'f2da0080' },
               fillcolor: 'f2da0080',
             });
           }
-        } else {
+        } else if (!payload.event.startsWith('ConnectionState_')) {
+          // Non-FSM, non-pong events → vertical line in events subplot
           const [color, dash] = simpleEventTypeToColor(payload.event);
           const [y0, y1] = yEventType(payload.event);
-          this.addVerticalLine(
-            payload.timestamp,
-            payload.event,
-            color,
-            dash,
+          this.shapes.push({
+            type: 'line',
+            x0: payload.timestamp,
             y0,
-            y1
-          );
+            x1: payload.timestamp,
+            y1,
+            yref: 'y2',
+            line: { color, dash, width: 1.5 },
+            name: payload.event,
+          });
         }
 
         Plotly.relayout(this.graph, {
@@ -308,7 +455,6 @@ export class LogsGraph extends LitElement {
     const unsubscriber2 = this.streamsStore.logger.on(
       'my-stream-info',
       payload => {
-        // Load the new traces to the plot
         const streamState = payload.info.stream ? 1 : 0;
         const videoTrack = payload.info.tracks.find(
           track => track.kind === 'video'
@@ -364,22 +510,27 @@ export class LogsGraph extends LitElement {
     );
 
     const unsubscriber4 = this.streamsStore.logger.on('custom-log', event => {
+      // Skip FSM transition logs
+      if (event.log.startsWith('FSM [') || event.log.startsWith('ScreenFSM [')) return;
+
       this.shapes.push({
         type: 'line',
         x0: event.timestamp,
-        y0: -2,
+        y0: -1.5,
         x1: event.timestamp,
-        y1: 2,
+        y1: 1.5,
+        yref: 'y2',
         line: {
           color: '#e07f00',
-          width: 2,
+          width: 1.5,
         },
         name: event.log,
         label: {
-          text: event.log,
+          text: event.log.length > 60 ? event.log.slice(0, 57) + '...' : event.log,
           xanchor: 'left',
           textangle: -45,
           textposition: 'top right',
+          font: { size: 9 },
         },
       });
     });
@@ -390,28 +541,6 @@ export class LogsGraph extends LitElement {
       unsubscriber3,
       unsubscriber4
     );
-  }
-
-  addVerticalLine(
-    x: number,
-    name: string,
-    color: string,
-    dash: Dash | undefined,
-    y0: number,
-    y1: number
-  ) {
-    this.shapes.push({
-      type: 'line',
-      x0: x,
-      y0,
-      x1: x,
-      y1,
-      line: {
-        color,
-        dash,
-      },
-      name,
-    });
   }
 
   render() {
@@ -432,17 +561,34 @@ export class LogsGraph extends LitElement {
           </div>
         </div>
         <div class="tweaks column items-center" style="padding-top: 5px;">
-          <div class="row" style="padding: 0 5px;">
-            <input
-              @change=${(e: Event) => {
-                const checkbox = e.target as HTMLInputElement;
-                this.autoFollow = checkbox.checked;
-                console.log('Changed autofollow value: ', this.autoFollow);
-              }}
-              type="checkbox"
-              checked
-            />
-            <span>${msg('auto-follow')}</span>
+          <div class="row" style="padding: 0 5px; gap: 15px;">
+            <label class="row" style="align-items: center; gap: 4px;">
+              <input
+                @change=${(e: Event) => {
+                  const checkbox = e.target as HTMLInputElement;
+                  this.autoFollow = checkbox.checked;
+                }}
+                type="checkbox"
+                checked
+              />
+              <span>${msg('auto-follow')}</span>
+            </label>
+            <button
+              @click=${() => this._zoomToLast(30_000)}
+              style="font-size: 12px; padding: 2px 8px; cursor: pointer;"
+            >30s</button>
+            <button
+              @click=${() => this._zoomToLast(60_000)}
+              style="font-size: 12px; padding: 2px 8px; cursor: pointer;"
+            >1m</button>
+            <button
+              @click=${() => this._zoomToLast(300_000)}
+              style="font-size: 12px; padding: 2px 8px; cursor: pointer;"
+            >5m</button>
+            <button
+              @click=${() => this._zoomToAll()}
+              style="font-size: 12px; padding: 2px 8px; cursor: pointer;"
+            >All</button>
           </div>
         </div>
         <div id="graph"></div>
@@ -450,7 +596,21 @@ export class LogsGraph extends LitElement {
     `;
   }
 
-  // plotly styles applied here
+  private _zoomToLast(ms: number) {
+    const now = Date.now();
+    Plotly.relayout(this.graph, {
+      'xaxis.range': [now - ms, now + 2_000],
+    });
+    this.autoFollow = false;
+  }
+
+  private _zoomToAll() {
+    Plotly.relayout(this.graph, {
+      'xaxis.autorange': true,
+    });
+    this.autoFollow = false;
+  }
+
   static styles = [
     sharedStyles,
     plotlyStyles,
@@ -458,12 +618,16 @@ export class LogsGraph extends LitElement {
       .tweaks {
         min-width: 1000px;
         background: white;
-        font-size: 18px;
+        font-size: 14px;
         color: black;
       }
     `,
   ];
 }
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
 
 function loadStreamAndTrackInfo(
   infoLog: StreamInfoLog[],
@@ -474,7 +638,7 @@ function loadStreamAndTrackInfo(
     x: [],
     y: [],
     type: 'scatter',
-    name: `[My Stream] ${name}`,
+    name: `Stream (${name})`,
     line: {
       dash: 'dash',
       color: 'black',
@@ -494,7 +658,7 @@ function loadStreamAndTrackInfo(
     x: [],
     y: [],
     type: 'scatter',
-    name: `[My Video Track State] ${name}`,
+    name: `Video (${name})`,
     line: {
       color: 'darkblue',
     },
@@ -513,7 +677,7 @@ function loadStreamAndTrackInfo(
     x: [],
     y: [],
     type: 'scatter',
-    name: `[My Audio Track State] ${name}`,
+    name: `Audio (${name})`,
     line: {
       color: 'darkred',
     },
@@ -536,9 +700,9 @@ function simpleEventTypeToColor(
 ): [string, Dash | undefined] {
   switch (event) {
     case 'Pong':
-      return ['#f2da0080', undefined]; // darker yellow
+      return ['#f2da0080', undefined];
 
-    // WebRTC Connection Events
+    // WebRTC Connection Events (legacy)
     case 'Connected':
       return ['green', undefined];
     case 'InitAccept':
@@ -556,7 +720,7 @@ function simpleEventTypeToColor(
     case 'SimplePeerTrack':
       return ['cyan', undefined];
 
-    // WebRTC data signals
+    // Media events
     case 'PeerAudioOnSignal':
       return ['darkred', undefined];
     case 'PeerAudioOffSignal':
@@ -569,8 +733,6 @@ function simpleEventTypeToColor(
       return ['darkred', 'dot'];
     case 'PeerChangeVideoInput':
       return ['darkblue', 'dot'];
-
-    // My own events
     case 'MyAudioOn':
       return ['darkred', undefined];
     case 'MyAudioOff':
@@ -584,7 +746,19 @@ function simpleEventTypeToColor(
     case 'ChangeMyVideoInput':
       return ['darkblue', 'dot'];
 
-    // Reconcile attempts
+    // Track events
+    case 'RemoteTrack':
+      return ['#0886e7', undefined];
+    case 'StreamReceived':
+      return ['#0886e7', 'dash'];
+    case 'TrackArrivedMuted':
+      return ['orange', 'dash'];
+    case 'TrackUnmuted':
+      return ['green', 'dot'];
+    case 'TrackUnmuteTimeout':
+      return ['red', 'dash'];
+
+    // Reconcile
     case 'ReconcileAudio':
       return ['darkred', undefined];
     case 'ReconcileStream':
@@ -592,13 +766,9 @@ function simpleEventTypeToColor(
     case 'ReconcileVideo':
       return ['darkblue', undefined];
 
-    // Track recovery events
-    case 'TrackArrivedMuted':
-      return ['orange', 'dash'];
-    case 'TrackUnmuted':
-      return ['green', 'dot'];
-    case 'TrackUnmuteTimeout':
-      return ['red', 'dash'];
+    // Peer lifecycle
+    case 'PeerLeave':
+      return ['#333', undefined];
 
     default:
       return ['pink', undefined];
@@ -610,67 +780,47 @@ function yEventType(event: SimpleEventType): [number, number] {
     case 'Pong':
       return [-0.5, 0.5];
 
-    // WebRTC Connection Events
+    // Connection lifecycle
     case 'Connected':
-      return [0, 1.5];
     case 'InitAccept':
-      return [0, 1.5];
     case 'InitRequest':
-      return [0, 1.5];
     case 'SdpData':
-      return [0, 1.5];
     case 'SimplePeerClose':
-      return [0, 1.5];
     case 'SimplePeerError':
-      return [0, 1.5];
     case 'SimplePeerStream':
-      return [0, 1.5];
     case 'SimplePeerTrack':
+    case 'PeerLeave':
       return [0, 1.5];
 
-    // WebRTC data signals
+    // Peer media signals
     case 'PeerAudioOnSignal':
-      return [0, -0.75];
     case 'PeerAudioOffSignal':
-      return [0, -0.75];
     case 'PeerVideoOnSignal':
-      return [0, -0.75];
     case 'PeerVideoOffSignal':
-      return [0, -0.75];
     case 'PeerChangeAudioInput':
-      return [0, -0.75];
     case 'PeerChangeVideoInput':
       return [0, -0.75];
 
-    // My own events
+    // My media events
     case 'MyAudioOn':
-      return [0, 0.75];
     case 'MyAudioOff':
-      return [0, 0.75];
     case 'MyVideoOn':
-      return [0, 0.75];
     case 'MyVideoOff':
-      return [0, 0.75];
     case 'ChangeMyAudioInput':
-      return [0, 0.75];
     case 'ChangeMyVideoInput':
       return [0, 0.75];
 
-    // Reconcile attempts
+    // Track events
+    case 'RemoteTrack':
+    case 'StreamReceived':
+    case 'TrackArrivedMuted':
+    case 'TrackUnmuted':
+    case 'TrackUnmuteTimeout':
     case 'ReconcileStream':
-      return [-1.2, 1.2];
     case 'ReconcileAudio':
-      return [-1.2, 1.2];
     case 'ReconcileVideo':
       return [-1.2, 1.2];
 
-    // Track recovery events
-    case 'TrackArrivedMuted':
-      return [-1.2, 1.2];
-    case 'TrackUnmuted':
-      return [-1.2, 1.2];
-    case 'TrackUnmuteTimeout':
-      return [-1.2, 1.2];
     default:
       return [0, 0.5];
   }
