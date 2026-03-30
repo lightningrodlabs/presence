@@ -106,6 +106,15 @@ export class PeerConnectionFSM {
   private _localCandidateCount = 0;
   private _remoteCandidateCount = 0;
 
+  // Remote peer's connectionId — set when we receive an offer or answer.
+  // Used by ConnectionManager to filter stale signals from previous sessions.
+  private _remoteConnectionId: string | null = null;
+
+  // Monotonic counter — incremented each time _createPeer() is called.
+  // Stamps outgoing signals; incoming signals with a lower value are stale.
+  private _peerSessionId = 0;
+  private _remotePeerSessionId = 0;
+
   // View model — reactive store (simple callback-based for now, will be wrapped in Writable by ConnectionManager)
   private _viewModelListeners: Set<(vm: ConnectionViewModel) => void> = new Set();
   private _currentViewModel: ConnectionViewModel;
@@ -137,6 +146,21 @@ export class PeerConnectionFSM {
 
   get viewModel(): ConnectionViewModel {
     return this._computeViewModel();
+  }
+
+  /** The remote peer's connectionId, learned from their offer/answer signals. */
+  get remoteConnectionId(): string | null {
+    return this._remoteConnectionId;
+  }
+
+  /** Current peer session counter — increments on each new RTCPeerConnection. */
+  get peerSessionId(): number {
+    return this._peerSessionId;
+  }
+
+  /** Remote peer's session counter — learned from their signals. */
+  get remotePeerSessionId(): number {
+    return this._remotePeerSessionId;
   }
 
   get transportSnapshot(): TransportSnapshot {
@@ -178,14 +202,40 @@ export class PeerConnectionFSM {
   /**
    * Handle a remote signal (SDP offer/answer or ICE candidate).
    * Can trigger Idle → Signaling if we receive a signal before connect() is called.
+   *
+   * @param signal — the SDP or ICE candidate data
+   * @param remoteConnectionId — the connectionId from the signal's sender,
+   *   used to track which remote session this signal belongs to.
    */
-  async handleRemoteSignal(signal: RTCSessionDescriptionInit | RTCIceCandidateInit): Promise<void> {
+  async handleRemoteSignal(signal: RTCSessionDescriptionInit | RTCIceCandidateInit, remoteConnectionId?: string, remotePeerSessionId?: number): Promise<void> {
     if (this._destroyed) return;
+
+    // Filter stale signals from the remote peer's previous RTCPeerConnection sessions.
+    // Offers always pass — they indicate the remote created a new peer session.
+    const isOffer = 'type' in signal && signal.type === 'offer';
+    if (!isOffer && remotePeerSessionId !== undefined && remotePeerSessionId < this._remotePeerSessionId) {
+      console.debug(
+        `[FSM ${this.remoteAgent.slice(5, 13)}] Dropped stale ${('type' in signal) ? signal.type : 'candidate'}: ` +
+        `remote session ${remotePeerSessionId} < current ${this._remotePeerSessionId}`
+      );
+      return;
+    }
+
+    // Update remote peer session tracking from offers/answers.
+    if (remotePeerSessionId !== undefined && remotePeerSessionId > this._remotePeerSessionId) {
+      this._remotePeerSessionId = remotePeerSessionId;
+    }
 
     // If we're idle and receive a signal, auto-transition to signaling
     if (this._state === 'idle') {
       this._transition('signaling', 'remote signal received');
       this._createPeer();
+    }
+
+    // Record the remote peer's connectionId from offer/answer signals.
+    // Must happen after _createPeer() which resets _remoteConnectionId.
+    if (remoteConnectionId && 'type' in signal && (signal.type === 'offer' || signal.type === 'answer')) {
+      this._remoteConnectionId = remoteConnectionId;
     }
 
     // Count remote candidates for diagnostics
@@ -485,6 +535,8 @@ export class PeerConnectionFSM {
 
     this._localCandidateCount = 0;
     this._remoteCandidateCount = 0;
+    this._remoteConnectionId = null;
+    this._peerSessionId++;
 
     const options: RTCPeerOptions = {
       polite: this._polite,

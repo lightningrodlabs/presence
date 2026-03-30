@@ -24,6 +24,7 @@ export class HolochainSignalingAdapter implements SignalingAdapter {
     const agentPubKey = decodeHashFromBase64(to);
     const payload = JSON.stringify({
       connection_id: message.connectionId,
+      peer_session_id: message.peerSessionId,
       type: message.type,
       data: message.data,
     });
@@ -56,6 +57,7 @@ export class HolochainSignalingAdapter implements SignalingAdapter {
     const message: SignalMessage = {
       type: parsed.type,
       connectionId: parsed.connection_id,
+      peerSessionId: parsed.peer_session_id,
       data: parsed.data,
     };
 

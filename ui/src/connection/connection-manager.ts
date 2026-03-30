@@ -242,11 +242,11 @@ export class ConnectionManager {
 
     // Route SDP/ICE signals to FSM
     if (message.type === 'offer' || message.type === 'answer' || message.type === 'candidate') {
-      this._routeSignalToFSM(from, message.connectionId, message.type, message.data);
+      this._routeSignalToFSM(from, message.connectionId, message.type, message.data, message.peerSessionId);
     }
   }
 
-  private async _routeSignalToFSM(from: string, _connectionId: string, _signalType: string, signal: any): Promise<void> {
+  private async _routeSignalToFSM(from: string, remoteConnectionId: string, signalType: string, signal: any, remotePeerSessionId?: number): Promise<void> {
     let fsm = this._connections.get(from);
 
     // Only replace a closed FSM — connected FSMs handle incoming offers as
@@ -268,7 +268,26 @@ export class ConnectionManager {
       });
     }
 
-    await fsm.handleRemoteSignal(signal);
+    // Connection-scoped signal filtering:
+    // Offers always pass — they establish or reset the remote session identity.
+    // Answers and candidates must match either our connectionId (response to
+    // our offer) or the remoteConnectionId (from the session we accepted).
+    // Stale signals from previous sessions are dropped.
+    if (signalType !== 'offer' && fsm.remoteConnectionId !== null) {
+      const matchesLocal = remoteConnectionId === fsm.connectionId;
+      const matchesRemote = remoteConnectionId === fsm.remoteConnectionId;
+      if (!matchesLocal && !matchesRemote) {
+        console.debug(
+          `[ConnectionManager] Dropped stale ${signalType} from ${from}: ` +
+          `signal.connectionId=${remoteConnectionId}, ` +
+          `fsm.connectionId=${fsm.connectionId}, ` +
+          `fsm.remoteConnectionId=${fsm.remoteConnectionId}`
+        );
+        return;
+      }
+    }
+
+    await fsm.handleRemoteSignal(signal, remoteConnectionId, remotePeerSessionId);
     this._notifyViewModelChange();
   }
 
@@ -301,6 +320,7 @@ export class ConnectionManager {
         this._signaling.sendSignal(remoteAgent, {
           type,
           connectionId,
+          peerSessionId: fsm.peerSessionId,
           data,
         });
       },

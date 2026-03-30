@@ -142,6 +142,368 @@ describe('ConnectionManager', () => {
     });
   });
 
+  describe('connection-scoped signal filtering', () => {
+    it('accepts first offer and establishes remoteConnectionId', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // B sends an offer with its connectionId
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      const fsm = a.manager.getFSM('agent-bbb')!;
+      expect(fsm).toBeDefined();
+      expect(fsm.remoteConnectionId).toBe('b-conn-1');
+    });
+
+    it('accepts answer/candidate matching remoteConnectionId', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // B sends offer to establish session
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      // B sends candidate with same connectionId — should be accepted
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-conn-1',
+        data: { candidate: 'mock-candidate', sdpMLineIndex: 0 },
+      });
+
+      // No error thrown, FSM still active
+      expect(a.manager.getState('agent-bbb')).not.toBe('closed');
+    });
+
+    it('drops stale answer from previous session', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // B sends offer to establish session
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-2',
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      const fsm = a.manager.getFSM('agent-bbb')!;
+      expect(fsm.remoteConnectionId).toBe('b-conn-2');
+
+      // Stale answer from a previous session arrives
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'b-conn-OLD',
+        data: { type: 'answer', sdp: 'stale-answer' },
+      });
+
+      // Should have logged the drop
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringContaining('Dropped stale answer'),
+      );
+      spy.mockRestore();
+    });
+
+    it('drops stale candidate from previous session', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // Establish session
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-3',
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      // Stale candidate arrives
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-conn-OLD',
+        data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringContaining('Dropped stale candidate'),
+      );
+      spy.mockRestore();
+    });
+
+    it('accepts answer matching local connectionId (response to our offer)', () => {
+      const { manager, channel } = createManager();
+
+      // We initiate connection — our FSM gets a connectionId
+      manager.ensureConnection('agent-bbb');
+      const fsm = manager.getFSM('agent-bbb')!;
+      const ourConnectionId = fsm.connectionId;
+
+      // First, B sends an offer to establish remoteConnectionId
+      channel.createAdapter('agent-bbb').sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-x',
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      // Then B sends an answer carrying OUR connectionId (response to our offer)
+      channel.createAdapter('agent-bbb').sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: ourConnectionId,
+        data: { type: 'answer', sdp: 'mock-answer' },
+      });
+
+      // Should not have been dropped — FSM still active
+      expect(manager.getState('agent-bbb')).not.toBe('closed');
+    });
+
+    it('allows answer through before remoteConnectionId is set (bootstrap)', () => {
+      const { manager, channel } = createManager();
+
+      // We initiate — no offer received yet, so remoteConnectionId is null
+      manager.ensureConnection('agent-bbb');
+      const fsm = manager.getFSM('agent-bbb')!;
+      expect(fsm.remoteConnectionId).toBeNull();
+
+      // Answer arrives with any connectionId — should pass through
+      // because remoteConnectionId is null (filter not yet armed)
+      channel.createAdapter('agent-bbb').sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'any-conn-id',
+        data: { type: 'answer', sdp: 'mock-answer' },
+      });
+
+      // No drop — FSM processed it
+      expect(manager.getState('agent-bbb')).not.toBe('closed');
+    });
+
+    it('new offer from reconnected peer updates remoteConnectionId', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // First session
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-old',
+        data: { type: 'offer', sdp: 'mock-offer-1' },
+      });
+
+      const fsm = a.manager.getFSM('agent-bbb')!;
+      expect(fsm.remoteConnectionId).toBe('b-conn-old');
+
+      // Peer B reconnects with new connectionId — sends new offer
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-new',
+        data: { type: 'offer', sdp: 'mock-offer-2' },
+      });
+
+      // remoteConnectionId should be updated
+      expect(fsm.remoteConnectionId).toBe('b-conn-new');
+
+      // Candidate with new connectionId should be accepted
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-conn-new',
+        data: { candidate: 'new-candidate', sdpMLineIndex: 0 },
+      });
+
+      // Should NOT have been dropped
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('drops stale candidate after peer reconnects with new offer', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // First session
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-old',
+        data: { type: 'offer', sdp: 'mock-offer-1' },
+      });
+
+      // Peer B reconnects — new offer
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-new',
+        data: { type: 'offer', sdp: 'mock-offer-2' },
+      });
+
+      // Stale candidate from old session arrives late
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-conn-old',
+        data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringContaining('Dropped stale candidate'),
+      );
+      spy.mockRestore();
+    });
+  });
+
+  describe('peerSessionId filtering (intra-FSM stale signals)', () => {
+    it('stamps peerSessionId on outgoing signals', async () => {
+      const channel = new FakeSignalingChannel();
+      const { manager } = createManager({ agentId: 'agent-aaa', signalingChannel: channel });
+
+      manager.ensureConnection('agent-bbb');
+
+      // negotiationneeded fires via queueMicrotask — flush it
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Check that outgoing signals have peerSessionId
+      const outgoing = channel.messageLog.filter(e => e.from === 'agent-aaa');
+      expect(outgoing.length).toBeGreaterThan(0);
+      for (const entry of outgoing) {
+        expect(entry.message.peerSessionId).toBeDefined();
+        expect(typeof entry.message.peerSessionId).toBe('number');
+      }
+    });
+
+    it('drops candidates from older peer session after reconnect', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // B sends offer with peerSessionId=1
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 1,
+        data: { type: 'offer', sdp: 'mock-offer-1' },
+      });
+
+      // B reconnects (new RTCPeerConnection) — sends offer with peerSessionId=2
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 2,
+        data: { type: 'offer', sdp: 'mock-offer-2' },
+      });
+
+      // Stale candidate from peerSessionId=1 arrives late
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-conn-1',
+        peerSessionId: 1,
+        data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringContaining('Dropped stale candidate'),
+      );
+      spy.mockRestore();
+    });
+
+    it('accepts candidates from current peer session', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // B sends offer with peerSessionId=3
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 3,
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      // Candidate from same session
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-conn-1',
+        peerSessionId: 3,
+        data: { candidate: 'good-candidate', sdpMLineIndex: 0 },
+      });
+
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('drops stale answer from older peer session', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // B sends offer peerSessionId=1, then peerSessionId=2
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 1,
+        data: { type: 'offer', sdp: 'mock-offer-1' },
+      });
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 2,
+        data: { type: 'offer', sdp: 'mock-offer-2' },
+      });
+
+      // Stale answer from peerSessionId=1
+      const spy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 1,
+        data: { type: 'answer', sdp: 'stale-answer' },
+      });
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringContaining('Dropped stale answer'),
+      );
+      spy.mockRestore();
+    });
+
+    it('new offer with higher peerSessionId always accepted', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 1,
+        data: { type: 'offer', sdp: 'mock-offer-1' },
+      });
+
+      const fsm = a.manager.getFSM('agent-bbb')!;
+      expect(fsm.remotePeerSessionId).toBe(1);
+
+      // New offer with higher session — always passes
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        peerSessionId: 5,
+        data: { type: 'offer', sdp: 'mock-offer-5' },
+      });
+
+      expect(fsm.remotePeerSessionId).toBe(5);
+    });
+
+    it('signals without peerSessionId are accepted (backward compatibility)', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // Signal without peerSessionId (old peer)
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-conn-1',
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+
+      expect(a.manager.getFSM('agent-bbb')).toBeDefined();
+      expect(a.manager.getState('agent-bbb')).not.toBe('closed');
+    });
+  });
+
   describe('polite/impolite role assignment', () => {
     it('lower agent ID is polite', () => {
       const { a } = createPair();

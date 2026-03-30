@@ -218,6 +218,9 @@ export type ManagerEventHandler = (event: ManagerEvent) => void;
 export type SignalMessage = {
   type: 'offer' | 'answer' | 'candidate' | 'leave';
   connectionId: string;
+  /** Monotonic counter incremented each time a new RTCPeerConnection is created.
+   *  Used to discard stale signals from previous peer sessions within the same FSM. */
+  peerSessionId?: number;
   data?: any;
 };
 
