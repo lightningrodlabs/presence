@@ -1593,6 +1593,19 @@ export class StreamsStore {
       });
     }
     if (track.kind === 'video') {
+      // Re-fire peer-stream so the video element gets srcObject assigned
+      // after it becomes visible. The initial peer-stream may have set srcObject
+      // while the element had display:none (track arrived muted), and some browsers
+      // don't start decoding until the element is visible.
+      const stream = this._videoStreams[pubKeyB64];
+      if (stream) {
+        this.eventCallback({
+          type: 'peer-stream',
+          pubKeyB64,
+          connectionId,
+          stream,
+        });
+      }
       this.eventCallback({
         type: 'peer-video-on',
         pubKeyB64,
