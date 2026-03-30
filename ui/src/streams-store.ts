@@ -947,6 +947,10 @@ export class StreamsStore {
         this.eventCallback({
           type: 'my-video-on',
         });
+        // Ensure the track is on all connections — if a previous renegotiation
+        // failed (e.g., stale answer), the track may not have been delivered
+        // to some peers. updateLocalStream checks for missing tracks.
+        this.connectionManager.updateLocalStream(this.mainStream);
       } else {
         console.log('### CASE B');
         let videoStream: MediaStream | undefined;
