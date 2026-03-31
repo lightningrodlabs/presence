@@ -1048,7 +1048,7 @@ export class PeerConnectionFSM {
       peerSessionId: this._session.local,
     });
 
-    this._dtlsWatchdogId = setTimeout(async () => {
+    this._dtlsWatchdogId = setTimeout(() => {
       this._dtlsWatchdogId = null;
       if (this._destroyed) return;
       // Only fire if ICE is still connected but DTLS hasn't completed
@@ -1067,72 +1067,13 @@ export class PeerConnectionFSM {
 
       const stallMs = this._iceConnectedAt ? Date.now() - this._iceConnectedAt : 0;
       const snapshot = this.transportSnapshot;
-
-      // Attempt to get the selected candidate pair type for the diagnostic
-      let selectedCandidateType: string = 'unknown';
-      let selectedRemoteCandidateType: string = 'unknown';
-      let localAddress = '';
-      let remoteAddress = '';
-      try {
-        if (this._peer && !this._peer.destroyed) {
-          const stats = await this._peer.getStats();
-          stats.forEach((report: any) => {
-            if (report.type === 'candidate-pair' && (report.state === 'in-progress' || report.state === 'succeeded')) {
-              stats.forEach((r: any) => {
-                if (r.id === report.localCandidateId) {
-                  selectedCandidateType = r.candidateType || 'unknown';
-                  localAddress = `${r.address || r.ip || '?'}:${r.port || '?'}`;
-                }
-                if (r.id === report.remoteCandidateId) {
-                  selectedRemoteCandidateType = r.candidateType || 'unknown';
-                  remoteAddress = `${r.address || r.ip || '?'}:${r.port || '?'}`;
-                }
-              });
-            }
-          });
-        }
-      } catch {
-        // Stats unavailable — proceed with unknown
-      }
-
       this._dtlsStallCount++;
 
-      const agentShort = this.remoteAgent.slice(0, 8);
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
-        trigger: `DTLS stall detected (ICE connected ${stallMs}ms ago, DTLS: ${snapshot.dtls}, DC: ${snapshot.dataChannel ?? 'null'}, candidate: ${selectedCandidateType}, stall #${this._dtlsStallCount})`,
-        peerSessionId: this._session.local,
-        transportSnapshot: snapshot,
-        metadata: {
-          diagnostic: 'dtls-stall',
-          stallMs,
-          dtlsStallCount: this._dtlsStallCount,
-          localCandidateType: selectedCandidateType,
-          remoteCandidateType: selectedRemoteCandidateType,
-          localAddress,
-          remoteAddress,
-          localCandidateCount: this._localCandidateCount,
-          remoteCandidateCount: this._remoteCandidateCount,
-          peerSession: this._session.local,
-        },
-      });
-
-      // Act on the stall: transition to disconnected to trigger retry with fresh peer
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
-        trigger: `DIAG: watchdog acting (state=${this._state}, stallMs=${stallMs}, candidate=${selectedCandidateType}, stall#=${this._dtlsStallCount})`,
-        peerSessionId: this._session.local,
-      });
+      // Act FIRST — transition to disconnected before any async work.
+      // The getStats() call below can hang on a stalled peer connection,
+      // which would block the retry if we awaited it before transitioning.
       if (this._state === 'connecting') {
-        this._transition('disconnected', { trigger: `DTLS stall after ${stallMs}ms (candidate: ${selectedCandidateType}, stall #${this._dtlsStallCount})` });
+        this._transition('disconnected', { trigger: `DTLS stall after ${stallMs}ms (stall #${this._dtlsStallCount})` });
       } else if (this._state === 'reconnecting') {
         this._transition('disconnected', { trigger: `DTLS stall during reconnect after ${stallMs}ms (stall #${this._dtlsStallCount})` });
       }
