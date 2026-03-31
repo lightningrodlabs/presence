@@ -110,10 +110,10 @@ export class PeerConnectionFSM {
   private _dtlsConnected = false;
   private _dataChannelOpen = false;
 
-  // DTLS watchdog diagnostic — tracks when ICE connects but DTLS hasn't completed
+  // DTLS watchdog — tracks when ICE connects but DTLS hasn't completed
   private _iceConnectedAt: number | null = null;
   private _dtlsWatchdogId: ReturnType<typeof setTimeout> | null = null;
-  private static readonly DTLS_WATCHDOG_MS = 5000;
+  private _dtlsStallCount = 0;
 
   // Diagnostic counters
   private _localCandidateCount = 0;
@@ -515,6 +515,7 @@ export class PeerConnectionFSM {
     switch (newState) {
       case 'signaling':
         // Create a new RTCPeerConnection (new peer session)
+        this._resetReadinessFlags();
         this._newPeerSession();
         this._onTransition?.({
           timestamp: Date.now(),
@@ -802,6 +803,10 @@ export class PeerConnectionFSM {
       if (iceState === 'connected' || iceState === 'completed') {
         this._iceConnected = true;
         this._iceConnectedAt = Date.now();
+        // ICE connected — DTLS watchdog takes over from the flat connection-timeout
+        if (this._state === 'connecting') {
+          this._clearTimer('connection-timeout');
+        }
         this._startDtlsWatchdog();
         this._checkCompositeReadiness();
       } else if (iceState === 'disconnected' || iceState === 'failed') {
@@ -940,9 +945,11 @@ export class PeerConnectionFSM {
     }
 
     if (this._state === 'connecting') {
+      this._dtlsStallCount = 0;
       this._transition('connected', { trigger: 'composite readiness achieved (ICE + DTLS + data channel)' });
       this._detectRelayAfterConnect();
     } else if (this._state === 'reconnecting') {
+      this._dtlsStallCount = 0;
       this._transition('connected', { trigger: 'reconnection succeeded' });
       this._detectRelayAfterConnect();
     }
@@ -962,10 +969,10 @@ export class PeerConnectionFSM {
 
   /**
    * Start the DTLS watchdog: if ICE is connected but DTLS hasn't completed
-   * within DTLS_WATCHDOG_MS, emit a diagnostic log with transport snapshot
-   * and candidate stats. This detects the pattern where srflx STUN checks
-   * pass but the path can't sustain DTLS handshake traffic (common on
-   * Starlink and other aggressive-NAT environments).
+   * within dtlsStallTimeoutMs, log a diagnostic and transition to disconnected
+   * to trigger a retry with a fresh peer session. Detects the pattern where
+   * srflx STUN checks pass but the path can't sustain DTLS handshake traffic
+   * (common on Starlink and other aggressive-NAT environments).
    */
   private _startDtlsWatchdog(): void {
     // Only watch during connecting/reconnecting phases
@@ -1011,6 +1018,8 @@ export class PeerConnectionFSM {
         // Stats unavailable — proceed with unknown
       }
 
+      this._dtlsStallCount++;
+
       const agentShort = this.remoteAgent.slice(0, 8);
       this._onTransition?.({
         timestamp: Date.now(),
@@ -1018,12 +1027,13 @@ export class PeerConnectionFSM {
         remoteAgent: this.remoteAgent,
         fromState: this._state,
         toState: this._state,
-        trigger: `DTLS stall detected (ICE connected ${stallMs}ms ago, DTLS: ${snapshot.dtls}, DC: ${snapshot.dataChannel ?? 'null'}, candidate: ${selectedCandidateType})`,
+        trigger: `DTLS stall detected (ICE connected ${stallMs}ms ago, DTLS: ${snapshot.dtls}, DC: ${snapshot.dataChannel ?? 'null'}, candidate: ${selectedCandidateType}, stall #${this._dtlsStallCount})`,
         peerSessionId: this._session.local,
         transportSnapshot: snapshot,
         metadata: {
           diagnostic: 'dtls-stall',
           stallMs,
+          dtlsStallCount: this._dtlsStallCount,
           localCandidateType: selectedCandidateType,
           remoteCandidateType: selectedRemoteCandidateType,
           localAddress,
@@ -1033,7 +1043,14 @@ export class PeerConnectionFSM {
           peerSession: this._session.local,
         },
       });
-    }, PeerConnectionFSM.DTLS_WATCHDOG_MS);
+
+      // Act on the stall: transition to disconnected to trigger retry with fresh peer
+      if (this._state === 'connecting') {
+        this._transition('disconnected', { trigger: `DTLS stall after ${stallMs}ms (candidate: ${selectedCandidateType}, stall #${this._dtlsStallCount})` });
+      } else if (this._state === 'reconnecting') {
+        this._transition('disconnected', { trigger: `DTLS stall during reconnect after ${stallMs}ms (stall #${this._dtlsStallCount})` });
+      }
+    }, this._config.dtlsStallTimeoutMs);
   }
 
   private _cancelDtlsWatchdog(): void {
@@ -1109,6 +1126,16 @@ export class PeerConnectionFSM {
       callback();
     }, delayMs);
     this._timers.push({ id, name });
+  }
+
+  private _clearTimer(name: string): void {
+    this._timers = this._timers.filter(t => {
+      if (t.name === name) {
+        clearTimeout(t.id);
+        return false;
+      }
+      return true;
+    });
   }
 
   private _clearAllTimers(): void {

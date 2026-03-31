@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PeerConnectionFSM } from '../peer-connection-fsm';
 import type { PeerConnectionFSMOptions } from '../peer-connection-fsm';
 import { DefaultReconnectPolicy } from '../reconnect-policy';
+import { DEFAULT_CONFIG } from '../types';
 import type { ConnectionPhase, FSMTransitionEntry } from '../types';
 import { MockRTCPeerConnection, createMockStream, createMockTrack } from './test-helpers';
 
@@ -751,6 +752,169 @@ describe('PeerConnectionFSM', () => {
         3,
       );
       expect(ctx.fsm.remotePeerSessionId).toBe(5);
+    });
+  });
+
+  describe('DTLS stall watchdog', () => {
+    it('Mode A: DTLS stall triggers transition to disconnected', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      // ICE connects, but DTLS/data-channel do NOT complete
+      ctx.mockPc.simulateIceConnectionState('connected');
+
+      // Advance past the DTLS stall timeout (5s) — async because watchdog uses await
+      await vi.advanceTimersByTimeAsync(5_001);
+
+      expect(ctx.fsm.state).toBe('disconnected');
+      const stallTransition = ctx.transitionLog.find(t =>
+        t.trigger.includes('DTLS stall after') && t.toState === 'disconnected'
+      );
+      expect(stallTransition).toBeDefined();
+      expect(stallTransition!.fromState).toBe('connecting');
+    });
+
+    it('Mode A: connection-timeout is cancelled when ICE connects', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      // ICE connects — should cancel the 15s connection-timeout
+      ctx.mockPc.simulateIceConnectionState('connected');
+
+      // DTLS watchdog fires at 5s → disconnected
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      // Verify it was the DTLS stall, not the connection timeout
+      const disconnectTransitions = ctx.transitionLog.filter(t => t.toState === 'disconnected');
+      const lastDisconnect = disconnectTransitions[disconnectTransitions.length - 1];
+      expect(lastDisconnect!.trigger).toContain('DTLS stall');
+      expect(lastDisconnect!.trigger).not.toContain('connection timeout');
+    });
+
+    it('Mode A: watchdog is cancelled on successful connection', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      // ICE connects — starts watchdog
+      ctx.mockPc.simulateIceConnectionState('connected');
+
+      // Full connection completes before watchdog fires
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+
+      // Advance past watchdog — should stay connected
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(ctx.fsm.state).toBe('connected');
+    });
+
+    it('Mode B: ICE never connects, connection-timeout fires at 15s', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      // Do NOT simulate ICE reaching connected — stays in checking
+      vi.advanceTimersByTime(15_001);
+
+      expect(ctx.fsm.state).toBe('disconnected');
+      const timeoutTransition = ctx.transitionLog.find(t =>
+        t.trigger.includes('connection timeout') && t.toState === 'disconnected'
+      );
+      expect(timeoutTransition).toBeDefined();
+    });
+
+    it('uses dtlsStallTimeoutMs config value', async () => {
+      const ctx = createFSM({ config: { ...DEFAULT_CONFIG, dtlsStallTimeoutMs: 2_000 } });
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      ctx.mockPc.simulateIceConnectionState('connected');
+
+      // Should NOT have fired yet at 1.5s
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(ctx.fsm.state).toBe('connecting');
+
+      // Should fire at 2s
+      await vi.advanceTimersByTimeAsync(501);
+      expect(ctx.fsm.state).toBe('disconnected');
+    });
+
+    it('dtlsStallCount increments across retries', async () => {
+      const ctx = createFSM();
+
+      // First connection attempt — DTLS stall
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateIceConnectionState('connected');
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      const stall1 = ctx.transitionLog.find(t =>
+        t.trigger.includes('stall #1') && t.toState === 'disconnected'
+      );
+      expect(stall1).toBeDefined();
+
+      // Second connection attempt — another DTLS stall
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateIceConnectionState('connected');
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      const stall2 = ctx.transitionLog.find(t =>
+        t.trigger.includes('stall #2') && t.toState === 'disconnected'
+      );
+      expect(stall2).toBeDefined();
+    });
+
+    it('dtlsStallCount resets on successful connection', async () => {
+      const ctx = createFSM();
+
+      // First attempt — DTLS stall (stall #1)
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateIceConnectionState('connected');
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      // Second attempt — succeeds, resetting the counter
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateIceConnectionState('connected');
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+
+      // Force disconnect: connected → disconnected
+      ctx.mockPc.simulateConnectionState('failed');
+      // dtls-failed from connected → failed → (cleanup) → idle
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(ctx.fsm.state).toBe('idle');
+
+      // Third attempt — DTLS stall again: should be stall #1, not #2
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateIceConnectionState('connected');
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      // Find stall #1 that occurred AFTER the successful connection
+      const allStall1s = ctx.transitionLog.filter(t =>
+        t.trigger.includes('stall #1') && t.toState === 'disconnected'
+      );
+      // Should have two "stall #1" entries: one before success, one after reset
+      expect(allStall1s.length).toBe(2);
     });
   });
 });

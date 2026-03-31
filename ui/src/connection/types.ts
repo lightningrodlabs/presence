@@ -238,6 +238,7 @@ export type ConnectionConfig = {
   trickleICE: boolean;
   connectionTimeoutMs: number;
   sdpExchangeTimeoutMs: number;
+  dtlsStallTimeoutMs: number;
   role: ConnectionRole;
 };
 
@@ -249,6 +250,7 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
   trickleICE: true,
   connectionTimeoutMs: 15_000,
   sdpExchangeTimeoutMs: 15_000,
+  dtlsStallTimeoutMs: 5_000,
   role: 'mesh',
 };
 
@@ -259,7 +261,7 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
 export type ReconnectContext = {
   retryCount: number;
   elapsedMs: number;
-  retryReason: 'ice-failed' | 'ice-disconnected' | 'dtls-failed' | 'timeout' | 'error';
+  retryReason: 'ice-failed' | 'ice-disconnected' | 'dtls-failed' | 'dtls-stall' | 'timeout' | 'error';
   lastStrategy: 'ice-restart' | 'full-reconnect';
 };
 
