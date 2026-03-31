@@ -15,7 +15,6 @@ import {
   mdiChartLine,
   mdiChevronUp,
   mdiClose,
-  mdiCog,
   mdiFullscreen,
   mdiFullscreenExit,
   mdiLock,
@@ -231,7 +230,7 @@ export class RoomView extends LitElement {
   _circleView = true;
 
   @state()
-  _panelMode: 'assets' | 'people' | 'settings' = 'assets';
+  _panelMode: 'assets' | 'people' = 'assets';
 
   @state()
   _showConnectionDetails = false;
@@ -910,27 +909,6 @@ export class RoomView extends LitElement {
               people
             </div>
           </div>
-          <div
-            class="sidepanel-tab ${this._panelMode === 'settings'
-              ? 'tab-selected'
-              : ''}"
-            tabindex="0"
-            @click=${() => {
-              this._panelMode = 'settings';
-            }}
-            @keypress=${(e: KeyboardEvent) => {
-              if (e.key === 'Enter' || e.key === ' ')
-                this._panelMode = 'settings';
-            }}
-          >
-            <div class="row center-content">
-              <sl-icon
-                .src=${wrapPathInSvg(mdiCog)}
-                style="transform: rotate(2deg); margin-right: 2px;"
-              ></sl-icon>
-              settings
-            </div>
-          </div>
         </div>
         ${this.renderAttachmentPanelContent()}
       </div>
@@ -962,117 +940,6 @@ export class RoomView extends LitElement {
         `;
       case 'people':
         return this.renderConnectionStatuses();
-      case 'settings':
-        return html`
-          <div
-            class="column"
-            style="margin-top: 18px; padding: 0 20px; align-items: flex-start; position: relative;"
-          >
-            <div class="row items-center">
-              <toggle-switch
-                class="toggle-switch ${this.streamsStore.trickleICE
-                  ? 'active'
-                  : ''}"
-                .toggleState=${this.streamsStore.trickleICE}
-                @toggle-on=${() => {
-                  this.streamsStore.enableTrickleICE();
-                }}
-                @toggle-off=${() => {
-                  this.streamsStore.disableTrickleICE();
-                }}
-              ></toggle-switch>
-              <span
-                class="secondary-font"
-                style="color: #c3c9eb; margin-left: 10px; font-size: 23px;"
-                >trickle ICE (ON by default)</span
-              >
-            </div>
-            <div style="margin-top: 24px; width: 100%;">
-              <span
-                class="secondary-font"
-                style="color: #c3c9eb; font-size: 23px;"
-                >TURN Server</span
-              >
-              <div style="margin-top: 8px;">
-                <input
-                  type="text"
-                  placeholder="turn:host:port"
-                  .value=${this.streamsStore.turnUrl}
-                  @input=${(e: InputEvent) => {
-                    this.streamsStore.setTurnUrl(
-                      (e.target as HTMLInputElement).value
-                    );
-                  }}
-                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px; margin-bottom: 6px;"
-                />
-                <input
-                  type="text"
-                  placeholder="Username"
-                  .value=${this.streamsStore.turnUsername}
-                  @input=${(e: InputEvent) => {
-                    this.streamsStore.setTurnUsername(
-                      (e.target as HTMLInputElement).value
-                    );
-                  }}
-                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px; margin-bottom: 6px;"
-                />
-                <input
-                  type="password"
-                  placeholder="Credential"
-                  .value=${this.streamsStore.turnCredential}
-                  @input=${(e: InputEvent) => {
-                    this.streamsStore.setTurnCredential(
-                      (e.target as HTMLInputElement).value
-                    );
-                  }}
-                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px;"
-                />
-              </div>
-            </div>
-            <div style="margin-top: 24px; width: 100%;">
-              <span
-                class="secondary-font"
-                style="color: #c3c9eb; font-size: 23px;"
-                >Signal Delay (ms)</span
-              >
-              <div style="margin-top: 8px;">
-                <input
-                  type="number"
-                  min="0"
-                  step="100"
-                  placeholder="0"
-                  .value=${String(this.streamsStore.signalDelayMs)}
-                  @input=${(e: InputEvent) => {
-                    const val = parseInt(
-                      (e.target as HTMLInputElement).value,
-                      10
-                    );
-                    this.streamsStore.setSignalDelay(
-                      isNaN(val) ? 0 : Math.max(0, val)
-                    );
-                  }}
-                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 16px;"
-                />
-                <span
-                  class="secondary-font"
-                  style="color: #888ea8; font-size: 14px; margin-top: 4px; display: block;"
-                  >Random 0-N ms delay per signal. For testing only.</span
-                >
-              </div>
-            </div>
-            <button
-              style="margin-top: 30px;"
-              @click=${() => {
-                downloadJson(
-                  `Presence_${__APP_VERSION__}_logs_${formattedDate()}.json`,
-                  JSON.stringify(exportLogs(), undefined, 2)
-                );
-              }}
-            >
-              Export Logs
-            </button>
-          </div>
-        `;
       default:
         return html`unknown tab`;
     }

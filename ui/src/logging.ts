@@ -141,6 +141,23 @@ export type FullLogExport = Array<{
   };
 }>;
 
+/**
+ * Clear all log data from localStorage across all sessions.
+ */
+export function clearAllLogs(): void {
+  const sessionInfos = readLocalStorage<Record<string, SessionInfo>>(
+    'session_infos',
+    {}
+  );
+  Object.keys(sessionInfos).forEach(id => {
+    window.localStorage.removeItem(`log_my_stream_${id}`);
+    window.localStorage.removeItem(`log_pong_metadata_${id}`);
+    window.localStorage.removeItem(`agent_events_${id}`);
+    window.localStorage.removeItem(`custom_logs_${id}`);
+  });
+  window.localStorage.removeItem('session_infos');
+}
+
 export function exportLogs(): FullLogExport | void {
   const fullExport: FullLogExport = [];
   const sessionInfos = readLocalStorage<Record<string, SessionInfo>>(
@@ -288,20 +305,19 @@ export class PresenceLogger {
   }
 
   deleteAllLogs() {
-    const sessionInfos = readLocalStorage<Record<string, SessionInfo>>(
-      'session_infos',
-      {}
-    );
+    clearAllLogs();
 
-    Object.entries(sessionInfos).forEach(([id, _info]) => {
-      console.log('Deleting old logs...');
-      // Delete all logs for this session
-      window.localStorage.removeItem(`log_my_stream_${id}`);
-      window.localStorage.removeItem(`log_pong_metadata_${id}`);
-      window.localStorage.removeItem(`agent_events_${id}`);
-      window.localStorage.removeItem(`custom_logs_${id}`);
-    });
-    this._read();
+    // Re-register the current session
+    const freshSessionInfos: Record<string, SessionInfo> = {
+      [this.sessionId]: { start: Date.now() },
+    };
+    writeLocalStorage('session_infos', freshSessionInfos);
+
+    // Reset in-memory state
+    this.myStreamStatusLog = [];
+    this.agentPongMetadataLogs = {};
+    this.agentEvents = {};
+    this.customLogs = [];
   }
 
   /**

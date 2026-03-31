@@ -46,6 +46,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import {
   mdiAccountGroup,
+  mdiClose,
+  mdiCog,
   mdiDoor,
   mdiLock,
   mdiLockOpenOutline,
@@ -58,11 +60,14 @@ import '@shoelace-style/shoelace/dist/components/icon/icon';
 import { clientContext } from './contexts';
 
 import './room/room-container';
+import './room/elements/toggle-switch';
 import './lobby/private-room-card';
 import './lobby/shared-room-card';
 import './lobby/list-online-agents';
 import { sharedStyles } from './sharedStyles';
 import { RoomClient } from './room/room-client';
+import { exportLogs, clearAllLogs } from './logging';
+import { downloadJson, formattedDate } from './utils';
 import { DescendentRoom, weaveClientContext } from './types';
 import { RoomStore } from './room/room-store';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
@@ -139,6 +144,30 @@ export class PresenceApp extends LitElement {
 
   @state()
   _refreshing = false;
+
+  @state()
+  _showSettings = false;
+
+  @state()
+  _showAdvancedSettings = false;
+
+  @state()
+  _trickleICE = JSON.parse(window.localStorage.getItem('trickleICE') ?? 'true');
+
+  @state()
+  _turnUrl = window.localStorage.getItem('turnUrl') ?? '';
+
+  @state()
+  _turnUsername = window.localStorage.getItem('turnUsername') ?? '';
+
+  @state()
+  _turnCredential = window.localStorage.getItem('turnCredential') ?? '';
+
+  @state()
+  _signalDelayMs = parseInt(window.localStorage.getItem('signalDelayMs') ?? '0', 10) || 0;
+
+  @state()
+  _showCreateForm = false;
 
   @state()
   _creatingRoom = false;
@@ -516,57 +545,64 @@ export class PresenceApp extends LitElement {
         class="column"
         style="flex-wrap: wrap; justify-content: center; align-items: center; margin-top: 30px;"
       >
-        <div
-          class="column"
-          style="margin: 0 10px; align-items: flex-start; color: #e1e5fc;"
-        >
-          <div class="secondary-font" style="margin-left: 5px;">
-            ${msg('+ Create New Private Room')}
-          </div>
-          <div class="row" style="align-items: center;">
-            <input
-              id="private-room-name-input"
-              class="input-field"
-              placeholder="room name"
-              type="text"
-            />
-            <button
-              class="btn"
-              style="margin-left: 10px;"
-              ?disabled=${this._creatingRoom}
-              @click=${async () => this.createPrivateRoom()}
+        ${this._showCreateForm
+          ? html`<div
+              class="column"
+              style="margin: 0 10px; align-items: flex-start; color: #e1e5fc;"
             >
-              ${this._creatingRoom ? msg('...') : msg('Create')}
-            </button>
-          </div>
-        </div>
-        <div
-          class="column"
-          style="margin: 0 10px; align-items: flex-start; color: #e1e5fc; margin-top: 12px;"
-        >
-          <div class="row" style="align-items: center;">
-            <sl-icon
-              .src=${wrapPathInSvg(mdiLockOpenOutline)}
-              style="margin-right: 3px; margin-bottom: 4px; margin-left: 5px;"
-            ></sl-icon>
-            <div class="secondary-font">${msg('Join Private Room')}</div>
-          </div>
-          <div class="row" style="align-items: center;">
-            <input
-              id="secret-words-input"
-              class="input-field"
-              placeholder="secret words"
-              type="text"
-            />
-            <button
-              class="btn"
-              style="margin-left: 10px;"
-              @click=${async () => this.joinRoom()}
+              <div class="secondary-font" style="margin-left: 5px;">
+                ${msg('+ Create New Private Room')}
+              </div>
+              <div class="row" style="align-items: center;">
+                <input
+                  id="private-room-name-input"
+                  class="input-field"
+                  placeholder="room name"
+                  type="text"
+                />
+                <button
+                  class="btn"
+                  style="margin-left: 10px;"
+                  ?disabled=${this._creatingRoom}
+                  @click=${async () => this.createPrivateRoom()}
+                >
+                  ${this._creatingRoom ? msg('...') : msg('Create')}
+                </button>
+              </div>
+            </div>
+            <div
+              class="column"
+              style="margin: 0 10px; align-items: flex-start; color: #e1e5fc; margin-top: 12px;"
             >
-              ${msg('Join')}
-            </button>
-          </div>
-        </div>
+              <div class="row" style="align-items: center;">
+                <sl-icon
+                  .src=${wrapPathInSvg(mdiLockOpenOutline)}
+                  style="margin-right: 3px; margin-bottom: 4px; margin-left: 5px;"
+                ></sl-icon>
+                <div class="secondary-font">${msg('Join Private Room')}</div>
+              </div>
+              <div class="row" style="align-items: center;">
+                <input
+                  id="secret-words-input"
+                  class="input-field"
+                  placeholder="secret words"
+                  type="text"
+                />
+                <button
+                  class="btn"
+                  style="margin-left: 10px;"
+                  @click=${async () => this.joinRoom()}
+                >
+                  ${msg('Join')}
+                </button>
+              </div>
+            </div>`
+          : html`<button
+              class="create-toggle-btn"
+              @click=${() => { this._showCreateForm = true; }}
+            >
+              ${msg('+ Create or Join Private Room')}
+            </button>`}
       </div>
       <div
         class="column"
@@ -644,30 +680,37 @@ export class PresenceApp extends LitElement {
         class="row"
         style="flex-wrap: wrap; justify-content: center; align-items: center; margin-top: 30px;"
       >
-        <div
-          class="column"
-          style="margin: 0 10px; align-items: flex-start; color: #e1e5fc;"
-        >
-          <div class="secondary-font" style="margin-left: 5px;">
-            ${msg('+ Create New Shared Room')}
-          </div>
-          <div class="row" style="align-items: center;">
-            <input
-              id="group-room-name-input"
-              class="input-field"
-              placeholder="room name"
-              type="text"
-            />
-            <button
-              class="btn"
-              style="margin-left: 10px;"
-              ?disabled=${this._creatingRoom}
-              @click=${async () => this.createGroupRoom()}
+        ${this._showCreateForm
+          ? html`<div
+              class="column"
+              style="margin: 0 10px; align-items: flex-start; color: #e1e5fc;"
             >
-              ${this._creatingRoom ? msg('...') : msg('Create')}
-            </button>
-          </div>
-        </div>
+              <div class="secondary-font" style="margin-left: 5px;">
+                ${msg('+ Create New Shared Room')}
+              </div>
+              <div class="row" style="align-items: center;">
+                <input
+                  id="group-room-name-input"
+                  class="input-field"
+                  placeholder="room name"
+                  type="text"
+                />
+                <button
+                  class="btn"
+                  style="margin-left: 10px;"
+                  ?disabled=${this._creatingRoom}
+                  @click=${async () => this.createGroupRoom()}
+                >
+                  ${this._creatingRoom ? msg('...') : msg('Create')}
+                </button>
+              </div>
+            </div>`
+          : html`<button
+              class="create-toggle-btn"
+              @click=${() => { this._showCreateForm = true; }}
+            >
+              ${msg('+ Create New Shared Room')}
+            </button>`}
       </div>
       <div
         class="column"
@@ -676,6 +719,144 @@ export class PresenceApp extends LitElement {
         ${this.renderSharedRoomCards(this._groupRooms)}
       </div>
       <span style="display: flex; flex: 1;"></span>
+    `;
+  }
+
+  renderSettingsPanel() {
+    return html`
+      <div class="settings-panel">
+        <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <span class="secondary-font" style="color: #c3c9eb; font-size: 20px;">Settings</span>
+          <sl-icon
+            .src=${wrapPathInSvg(mdiClose)}
+            class="settings-close-btn"
+            @click=${() => { this._showSettings = false; }}
+          ></sl-icon>
+        </div>
+        <div class="row items-center">
+          <toggle-switch
+            class="toggle-switch ${this._trickleICE ? 'active' : ''}"
+            .toggleState=${this._trickleICE}
+            @toggle-on=${() => {
+              this._trickleICE = true;
+              window.localStorage.setItem('trickleICE', 'true');
+            }}
+            @toggle-off=${() => {
+              this._trickleICE = false;
+              window.localStorage.setItem('trickleICE', 'false');
+            }}
+          ></toggle-switch>
+          <span
+            class="secondary-font"
+            style="color: #c3c9eb; margin-left: 10px; font-size: 18px;"
+            >trickle ICE (ON by default)</span
+          >
+        </div>
+        <div style="margin-top: 16px; width: 100%;">
+          <span
+            class="secondary-font"
+            style="color: #c3c9eb; font-size: 18px;"
+            >TURN Server</span
+          >
+          <div style="margin-top: 6px;">
+            <input
+              type="text"
+              placeholder="turn:host:port"
+              .value=${this._turnUrl}
+              @input=${(e: InputEvent) => {
+                const val = (e.target as HTMLInputElement).value;
+                this._turnUrl = val;
+                window.localStorage.setItem('turnUrl', val);
+              }}
+              style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px; margin-bottom: 6px;"
+            />
+            <input
+              type="text"
+              placeholder="Username"
+              .value=${this._turnUsername}
+              @input=${(e: InputEvent) => {
+                const val = (e.target as HTMLInputElement).value;
+                this._turnUsername = val;
+                window.localStorage.setItem('turnUsername', val);
+              }}
+              style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px; margin-bottom: 6px;"
+            />
+            <input
+              type="password"
+              placeholder="Credential"
+              .value=${this._turnCredential}
+              @input=${(e: InputEvent) => {
+                const val = (e.target as HTMLInputElement).value;
+                this._turnCredential = val;
+                window.localStorage.setItem('turnCredential', val);
+              }}
+              style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
+            />
+          </div>
+        </div>
+        <div class="row" style="margin-top: 20px; gap: 10px;">
+          <button
+            class="btn"
+            style="width: auto; padding: 5px 12px; font-size: 16px;"
+            @click=${() => {
+              downloadJson(
+                `Presence_${__APP_VERSION__}_logs_${formattedDate()}.json`,
+                JSON.stringify(exportLogs(), undefined, 2)
+              );
+            }}
+          >
+            Export Logs
+          </button>
+          <button
+            class="btn"
+            style="width: auto; padding: 5px 12px; font-size: 16px; background: linear-gradient(#5a2a2a, #3a1a1a); color: #f8c7c7;"
+            @click=${() => {
+              clearAllLogs();
+            }}
+          >
+            Clear Logs
+          </button>
+        </div>
+        <div style="margin-top: 16px; border-top: 1px solid #444a6e; padding-top: 12px;">
+          <button
+            class="create-toggle-btn"
+            style="font-size: 14px; padding: 4px 14px;"
+            @click=${() => { this._showAdvancedSettings = !this._showAdvancedSettings; }}
+          >
+            ${this._showAdvancedSettings ? msg('Hide Advanced') : msg('Advanced Settings')}
+          </button>
+          ${this._showAdvancedSettings ? html`
+            <div style="margin-top: 12px; width: 100%;">
+              <span
+                class="secondary-font"
+                style="color: #c3c9eb; font-size: 18px;"
+                >Signal Delay (ms)</span
+              >
+              <div style="margin-top: 6px;">
+                <input
+                  type="number"
+                  min="0"
+                  step="100"
+                  placeholder="0"
+                  .value=${String(this._signalDelayMs)}
+                  @input=${(e: InputEvent) => {
+                    const val = parseInt((e.target as HTMLInputElement).value, 10);
+                    const ms = isNaN(val) ? 0 : Math.max(0, val);
+                    this._signalDelayMs = ms;
+                    window.localStorage.setItem('signalDelayMs', String(ms));
+                  }}
+                  style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
+                />
+                <span
+                  class="secondary-font"
+                  style="color: #888ea8; font-size: 12px; margin-top: 4px; display: block;"
+                  >Random 0-N ms delay per signal. For testing only.</span
+                >
+              </div>
+            </div>
+          ` : ''}
+        </div>
+      </div>
     `;
   }
 
@@ -707,9 +888,15 @@ export class PresenceApp extends LitElement {
               >${__APP_VERSION__}</span
             >
             <div class="column top-panel">
-              <div style="position: absolute; top: 0; right: 20px;">
-                presence.
+              <div class="row" style="position: absolute; top: 0; right: 20px; align-items: center; gap: 10px;">
+                presence.e
+                <sl-icon
+                  .src=${wrapPathInSvg(mdiCog)}
+                  style="font-size: 22px; cursor: pointer; opacity: 0.8;"
+                  @click=${() => { this._showSettings = true; }}
+                ></sl-icon>
               </div>
+              ${this._showSettings ? this.renderSettingsPanel() : ''}
               <div style="margin-top: 120px; margin-bottom: 20px;">
                 <button
                   class="enter-main-room-btn"
@@ -736,8 +923,8 @@ export class PresenceApp extends LitElement {
               </div>
               ${this._profilesStore
                 ? this._activeMainRoomParticipants.length === 0
-                  ? html`<span class="blue-dark"
-                      >${msg('The main room is empty.')}</span
+                  ? html`<span class="blue-dark secondary-font" style="font-size: 20px;"
+                      >${msg('Be the first one here — others will see you when they arrive.')}</span
                     >`
                   : html`<div
                       class="row blue-dark"
@@ -781,10 +968,12 @@ export class PresenceApp extends LitElement {
                     : ''}"
                   @click=${() => {
                     this._showGroupRooms = true;
+                    this._showCreateForm = false;
                   }}
                   @keypress=${(e: KeyboardEvent) => {
                     if (e.key === 'Enter') {
                       this._showGroupRooms = true;
+                      this._showCreateForm = false;
                     }
                   }}
                 >
@@ -802,10 +991,12 @@ export class PresenceApp extends LitElement {
                   style="border-radius: 3px 25px 25px 3px;"
                   @click=${() => {
                     this._showGroupRooms = false;
+                    this._showCreateForm = false;
                   }}
                   @keypress=${(e: KeyboardEvent) => {
                     if (e.key === 'Enter') {
                       this._showGroupRooms = false;
+                      this._showCreateForm = false;
                     }
                   }}
                 >
@@ -912,31 +1103,48 @@ export class PresenceApp extends LitElement {
       }
 
       .enter-main-room-btn {
-        background: linear-gradient(#102a4d, #071931);
-        /* background: linear-gradient(#102a4d, #0d2646); */
+        background: linear-gradient(#2a4a8f, #1a3060);
         border-radius: 40px;
-        color: #fff0f0;
+        color: #ffffff;
         border: none;
         padding: 10px 15px;
         padding-right: 25px;
         font-family: 'Pacifico', sans-serif;
         font-size: 35px;
-        box-shadow: 1px 1px 4px 2px #03162f;
+        box-shadow: 0 0 25px 6px rgba(100, 140, 255, 0.3), 1px 1px 4px 2px #03162f;
         cursor: pointer;
       }
 
       .enter-main-room-btn:hover {
-        background: linear-gradient(#293c7f, #0c203a);
-        /* box-shadow: 0 0 1px 1px #102a4d; */
+        background: linear-gradient(#3558a0, #1f3870);
+        box-shadow: 0 0 30px 8px rgba(100, 140, 255, 0.4), 1px 1px 4px 2px #03162f;
       }
 
       .enter-main-room-btn:focus-visible {
-        background: linear-gradient(#2c477f, #0c203a);
-        /* box-shadow: 0 0 1px 1px #102a4d; */
+        background: linear-gradient(#3558a0, #1f3870);
+        box-shadow: 0 0 30px 8px rgba(100, 140, 255, 0.4), 1px 1px 4px 2px #03162f;
       }
 
       .blue-dark {
         color: #0a1c35;
+      }
+
+      .create-toggle-btn {
+        background: none;
+        border: 1px solid #5a6199;
+        border-radius: 20px;
+        color: #9da3d0;
+        padding: 8px 20px;
+        font-size: 17px;
+        cursor: pointer;
+        font-family: 'Baloo 2 Variable', sans-serif;
+        font-weight: 600;
+        transition: background 0.2s, color 0.2s;
+      }
+
+      .create-toggle-btn:hover {
+        background: #5a619930;
+        color: #c0c5ee;
       }
 
       .slider-button {
@@ -1032,6 +1240,33 @@ export class PresenceApp extends LitElement {
 
       .btn:focus {
         background: #ffffff;
+      }
+
+      .settings-panel {
+        position: absolute;
+        top: 0;
+        right: 0;
+        z-index: 100;
+        background: #1b1f35;
+        border: 1px solid #444a6e;
+        border-radius: 0 0 0 8px;
+        padding: 16px;
+        width: 320px;
+        text-align: left;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        font-family: 'Baloo 2 Variable', sans-serif;
+        font-size: 16px;
+      }
+
+      .settings-close-btn {
+        font-size: 22px;
+        cursor: pointer;
+        color: #888ea8;
+        transition: color 0.15s;
+      }
+
+      .settings-close-btn:hover {
+        color: #c3c9eb;
       }
 
       .room-container {
