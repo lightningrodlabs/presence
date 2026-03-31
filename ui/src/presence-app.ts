@@ -170,6 +170,15 @@ export class PresenceApp extends LitElement {
   _signalDelayMs = parseInt(window.localStorage.getItem('signalDelayMs') ?? '0', 10) || 0;
 
   @state()
+  _connectionTimeoutMs = parseInt(window.localStorage.getItem('connectionTimeoutMs') ?? '7000', 10);
+
+  @state()
+  _sdpExchangeTimeoutMs = parseInt(window.localStorage.getItem('sdpExchangeTimeoutMs') ?? '15000', 10);
+
+  @state()
+  _dtlsStallTimeoutMs = parseInt(window.localStorage.getItem('dtlsStallTimeoutMs') ?? '5000', 10);
+
+  @state()
   _showCreateForm = false;
 
   @state()
@@ -858,6 +867,68 @@ export class PresenceApp extends LitElement {
                   >Random 0-N ms delay per signal. For testing only.</span
                 >
               </div>
+            </div>
+            <div style="margin-top: 12px; width: 100%;">
+              <span
+                class="secondary-font"
+                style="color: #c3c9eb; font-size: 18px;"
+                >Connection Timeouts (ms)</span
+              >
+              <div style="margin-top: 6px; display: flex; gap: 8px;">
+                <div style="flex: 1;">
+                  <label class="secondary-font" style="color: #888ea8; font-size: 12px; display: block; margin-bottom: 2px;">ICE connect</label>
+                  <input
+                    type="number"
+                    min="1000"
+                    step="1000"
+                    .value=${String(this._connectionTimeoutMs)}
+                    @change=${(e: Event) => {
+                      const val = parseInt((e.target as HTMLInputElement).value, 10);
+                      const ms = isNaN(val) ? 7000 : Math.max(1000, val);
+                      this._connectionTimeoutMs = ms;
+                      window.localStorage.setItem('connectionTimeoutMs', String(ms));
+                    }}
+                    style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
+                  />
+                </div>
+                <div style="flex: 1;">
+                  <label class="secondary-font" style="color: #888ea8; font-size: 12px; display: block; margin-bottom: 2px;">SDP exchange</label>
+                  <input
+                    type="number"
+                    min="1000"
+                    step="1000"
+                    .value=${String(this._sdpExchangeTimeoutMs)}
+                    @change=${(e: Event) => {
+                      const val = parseInt((e.target as HTMLInputElement).value, 10);
+                      const ms = isNaN(val) ? 15000 : Math.max(1000, val);
+                      this._sdpExchangeTimeoutMs = ms;
+                      window.localStorage.setItem('sdpExchangeTimeoutMs', String(ms));
+                    }}
+                    style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
+                  />
+                </div>
+                <div style="flex: 1;">
+                  <label class="secondary-font" style="color: #888ea8; font-size: 12px; display: block; margin-bottom: 2px;">DTLS stall</label>
+                  <input
+                    type="number"
+                    min="1000"
+                    step="1000"
+                    .value=${String(this._dtlsStallTimeoutMs)}
+                    @change=${(e: Event) => {
+                      const val = parseInt((e.target as HTMLInputElement).value, 10);
+                      const ms = isNaN(val) ? 5000 : Math.max(1000, val);
+                      this._dtlsStallTimeoutMs = ms;
+                      window.localStorage.setItem('dtlsStallTimeoutMs', String(ms));
+                    }}
+                    style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
+                  />
+                </div>
+              </div>
+              <span
+                class="secondary-font"
+                style="color: #888ea8; font-size: 12px; margin-top: 4px; display: block;"
+                >ICE: max time for ICE checking (default 7000). SDP: max time for offer/answer exchange (default 15000). DTLS: watchdog after ICE connects (default 5000). Changes apply to next retry.</span
+              >
             </div>
           ` : ''}
         </div>

@@ -271,7 +271,7 @@ export class PeerConnectionFSM {
         if (this._state === 'reconnecting') {
           this._scheduleReconnectAttempt();
         } else if (this._state === 'connecting') {
-          this._transition('disconnected', { trigger: 'connection timeout' });
+          this._transition('disconnected', { trigger: `connection timeout (${this._config.connectionTimeoutMs}ms)` });
         }
       });
     }
@@ -372,6 +372,7 @@ export class PeerConnectionFSM {
     if (this._destroyed) return;
     this._destroyed = true;
     this._clearAllTimers();
+    this._cancelDtlsWatchdog();
     this._destroyPeer();
     this._handlers.clear();
     this._viewModelListeners.clear();
@@ -474,7 +475,7 @@ export class PeerConnectionFSM {
         // Timeout if SDP exchange takes too long
         this._startTimer('sdp-exchange-timeout', this._config.sdpExchangeTimeoutMs, () => {
           if (this._state === 'signaling') {
-            this._transition('disconnected', { trigger: 'SDP exchange timeout' });
+            this._transition('disconnected', { trigger: `SDP exchange timeout (${this._config.sdpExchangeTimeoutMs}ms)` });
           }
         });
         break;
@@ -483,7 +484,7 @@ export class PeerConnectionFSM {
         // Timeout if connection doesn't complete
         this._startTimer('connection-timeout', this._config.connectionTimeoutMs, () => {
           if (this._state === 'connecting') {
-            this._transition('disconnected', { trigger: 'connection timeout' });
+            this._transition('disconnected', { trigger: `connection timeout (${this._config.connectionTimeoutMs}ms)` });
           }
         });
         break;

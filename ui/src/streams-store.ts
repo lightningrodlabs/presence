@@ -65,6 +65,10 @@ export class StreamsStore {
 
   trickleICE = true;
 
+  connectionTimeoutMs = 7_000;
+  sdpExchangeTimeoutMs = 15_000;
+  dtlsStallTimeoutMs = 5_000;
+
   turnUrl = '';
 
   turnUsername = '';
@@ -119,9 +123,9 @@ export class StreamsStore {
       config: {
         iceServers: this.iceConfig,
         trickleICE: this.trickleICE,
-        connectionTimeoutMs: 7_000,
-        sdpExchangeTimeoutMs: 15_000,
-        dtlsStallTimeoutMs: 5_000,
+        connectionTimeoutMs: this.connectionTimeoutMs,
+        sdpExchangeTimeoutMs: this.sdpExchangeTimeoutMs,
+        dtlsStallTimeoutMs: this.dtlsStallTimeoutMs,
         role: 'mesh',
       },
       onTransition: (entry) => {
@@ -141,9 +145,9 @@ export class StreamsStore {
       config: {
         iceServers: this.iceConfig,
         trickleICE: this.trickleICE,
-        connectionTimeoutMs: 7_000,
-        sdpExchangeTimeoutMs: 15_000,
-        dtlsStallTimeoutMs: 5_000,
+        connectionTimeoutMs: this.connectionTimeoutMs,
+        sdpExchangeTimeoutMs: this.sdpExchangeTimeoutMs,
+        dtlsStallTimeoutMs: this.dtlsStallTimeoutMs,
         role: 'mesh',
       },
       onTransition: (entry) => {
@@ -167,6 +171,12 @@ export class StreamsStore {
     if (trickleICE) {
       this.trickleICE = JSON.parse(trickleICE);
     }
+    const connTimeout = window.localStorage.getItem('connectionTimeoutMs');
+    if (connTimeout) this.connectionTimeoutMs = parseInt(connTimeout, 10);
+    const sdpTimeout = window.localStorage.getItem('sdpExchangeTimeoutMs');
+    if (sdpTimeout) this.sdpExchangeTimeoutMs = parseInt(sdpTimeout, 10);
+    const dtlsTimeout = window.localStorage.getItem('dtlsStallTimeoutMs');
+    if (dtlsTimeout) this.dtlsStallTimeoutMs = parseInt(dtlsTimeout, 10);
     this.turnUrl = window.localStorage.getItem('turnUrl') || '';
     this.turnUsername = window.localStorage.getItem('turnUsername') || '';
     this.turnCredential = window.localStorage.getItem('turnCredential') || '';
@@ -865,6 +875,27 @@ export class StreamsStore {
   disableTrickleICE() {
     window.localStorage.setItem('trickleICE', 'false');
     this.trickleICE = false;
+  }
+
+  setConnectionTimeoutMs(ms: number) {
+    this.connectionTimeoutMs = ms;
+    window.localStorage.setItem('connectionTimeoutMs', String(ms));
+    this.connectionManager.updateConfig({ connectionTimeoutMs: ms });
+    this.screenShareConnectionManager.updateConfig({ connectionTimeoutMs: ms });
+  }
+
+  setSdpExchangeTimeoutMs(ms: number) {
+    this.sdpExchangeTimeoutMs = ms;
+    window.localStorage.setItem('sdpExchangeTimeoutMs', String(ms));
+    this.connectionManager.updateConfig({ sdpExchangeTimeoutMs: ms });
+    this.screenShareConnectionManager.updateConfig({ sdpExchangeTimeoutMs: ms });
+  }
+
+  setDtlsStallTimeoutMs(ms: number) {
+    this.dtlsStallTimeoutMs = ms;
+    window.localStorage.setItem('dtlsStallTimeoutMs', String(ms));
+    this.connectionManager.updateConfig({ dtlsStallTimeoutMs: ms });
+    this.screenShareConnectionManager.updateConfig({ dtlsStallTimeoutMs: ms });
   }
 
   get iceConfig(): RTCIceServer[] {

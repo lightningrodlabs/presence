@@ -79,6 +79,20 @@ export class ConnectionManager {
     });
   }
 
+  /** Get the current connection config (read-only view) */
+  get config(): Readonly<ConnectionConfig> {
+    return this._config;
+  }
+
+  /**
+   * Update connection config in-place. Since the config object is shared by
+   * reference with all active FSMs, changes take effect on the next timer
+   * started (e.g., next retry attempt).
+   */
+  updateConfig(partial: Partial<ConnectionConfig>): void {
+    Object.assign(this._config, partial);
+  }
+
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
