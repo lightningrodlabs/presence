@@ -13,6 +13,7 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   trickleICE: true,
   connectionTimeoutMs: 15000,
   sdpExchangeTimeoutMs: 15000,
+  dtlsStallTimeoutMs: 5000,
   role: 'mesh',
 };
 

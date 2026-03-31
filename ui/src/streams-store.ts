@@ -121,6 +121,7 @@ export class StreamsStore {
         trickleICE: this.trickleICE,
         connectionTimeoutMs: 15_000,
         sdpExchangeTimeoutMs: 15_000,
+        dtlsStallTimeoutMs: 5_000,
         role: 'mesh',
       },
       onTransition: (entry) => {
@@ -142,6 +143,7 @@ export class StreamsStore {
         trickleICE: this.trickleICE,
         connectionTimeoutMs: 15_000,
         sdpExchangeTimeoutMs: 15_000,
+        dtlsStallTimeoutMs: 5_000,
         role: 'mesh',
       },
       onTransition: (entry) => {

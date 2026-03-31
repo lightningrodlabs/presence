@@ -708,7 +708,7 @@ export class PresenceApp extends LitElement {
             >
             <div class="column top-panel">
               <div style="position: absolute; top: 0; right: 20px;">
-                presence.b
+                presence.c
               </div>
               <div style="margin-top: 120px; margin-bottom: 20px;">
                 <button
