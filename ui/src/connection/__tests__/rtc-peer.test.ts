@@ -11,7 +11,7 @@ import {
 const DEFAULT_CONFIG: ConnectionConfig = {
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   trickleICE: true,
-  connectionTimeoutMs: 15000,
+  connectionTimeoutMs: 7000,
   sdpExchangeTimeoutMs: 15000,
   dtlsStallTimeoutMs: 5000,
   role: 'mesh',

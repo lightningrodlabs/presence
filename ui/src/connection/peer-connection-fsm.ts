@@ -488,6 +488,19 @@ export class PeerConnectionFSM {
         });
         break;
 
+      case 'disconnected': {
+        // Auto-retry with jitter to desynchronize both peers' retry cadence.
+        // Without jitter, both sides create new NAT mappings simultaneously,
+        // invalidating each other's previous STUN bindings.
+        const jitterMs = 500 + Math.floor(Math.random() * 1500); // 500-2000ms
+        this._startTimer('retry-jitter', jitterMs, () => {
+          if (this._state === 'disconnected') {
+            this.connect();
+          }
+        });
+        break;
+      }
+
       case 'reconnecting':
         // Self-transition (full reconnect): timeout is started by _onEnterState
         // First entry: schedule reconnect attempt via policy

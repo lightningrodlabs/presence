@@ -119,7 +119,7 @@ export class StreamsStore {
       config: {
         iceServers: this.iceConfig,
         trickleICE: this.trickleICE,
-        connectionTimeoutMs: 15_000,
+        connectionTimeoutMs: 7_000,
         sdpExchangeTimeoutMs: 15_000,
         dtlsStallTimeoutMs: 5_000,
         role: 'mesh',
@@ -141,7 +141,7 @@ export class StreamsStore {
       config: {
         iceServers: this.iceConfig,
         trickleICE: this.trickleICE,
-        connectionTimeoutMs: 15_000,
+        connectionTimeoutMs: 7_000,
         sdpExchangeTimeoutMs: 15_000,
         dtlsStallTimeoutMs: 5_000,
         role: 'mesh',

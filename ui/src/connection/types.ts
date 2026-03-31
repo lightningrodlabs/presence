@@ -248,7 +248,7 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
     { urls: 'stun:stun.l.google.com:19302' },
   ],
   trickleICE: true,
-  connectionTimeoutMs: 15_000,
+  connectionTimeoutMs: 7_000,
   sdpExchangeTimeoutMs: 15_000,
   dtlsStallTimeoutMs: 5_000,
   role: 'mesh',

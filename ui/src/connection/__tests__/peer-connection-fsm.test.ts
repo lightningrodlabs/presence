@@ -195,7 +195,7 @@ describe('PeerConnectionFSM', () => {
       await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
       expect(ctx.fsm.state).toBe('connecting');
 
-      vi.advanceTimersByTime(15_001);
+      vi.advanceTimersByTime(7_001);
 
       expect(ctx.fsm.state).toBe('disconnected');
     });
@@ -208,6 +208,22 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('disconnected');
 
       ctx.fsm.connect();
+      expect(ctx.fsm.state).toBe('signaling');
+    });
+
+    it('disconnected auto-retries with jitter (500-2000ms)', () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      // SDP timeout → disconnected
+      vi.advanceTimersByTime(15_001);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      // Jitter hasn't fired yet at 499ms
+      vi.advanceTimersByTime(499);
+      expect(ctx.fsm.state).toBe('disconnected');
+
+      // By 2001ms the jitter must have fired (max jitter is 2000ms)
+      vi.advanceTimersByTime(1502);
       expect(ctx.fsm.state).toBe('signaling');
     });
 
@@ -257,9 +273,9 @@ describe('PeerConnectionFSM', () => {
       await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
       expect(ctx.fsm.state).toBe('connecting');
 
-      // Advance past original SDP timeout — should NOT go to disconnected
-      // (connecting has its own timeout, but should not revert to signaling's timeout)
-      vi.advanceTimersByTime(15_001);
+      // Advance past original SDP timeout — should NOT go to disconnected from signaling
+      // (connecting has its own 7s timeout)
+      vi.advanceTimersByTime(7_001);
       // It should have gone to disconnected from the connecting timeout, not the signaling one
       // The key point is the SDP timeout was cancelled
       expect(ctx.fsm.state).toBe('disconnected');
@@ -341,11 +357,11 @@ describe('PeerConnectionFSM', () => {
 
       // Attempt 0 (ICE restart, delay=0)
       vi.advanceTimersByTime(1);
-      vi.advanceTimersByTime(15_001); // ICE restart timeout
+      vi.advanceTimersByTime(7_001); // ICE restart timeout
 
       // Attempt 1 (ICE restart, delay=300+jitter)
       vi.advanceTimersByTime(2000);
-      vi.advanceTimersByTime(15_001);
+      vi.advanceTimersByTime(7_001);
 
       // Attempt 2 should be full reconnect (delay=1200+jitter)
       vi.advanceTimersByTime(5000);
@@ -370,7 +386,7 @@ describe('PeerConnectionFSM', () => {
       // Attempt 0 (ICE restart)
       vi.advanceTimersByTime(1);
       // ICE restart timeout
-      vi.advanceTimersByTime(15_001);
+      vi.advanceTimersByTime(7_001);
 
       // Retries exhausted
       expect(ctx.fsm.state).toBe('disconnected');
@@ -816,14 +832,14 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('connected');
     });
 
-    it('Mode B: ICE never connects, connection-timeout fires at 15s', async () => {
+    it('Mode B: ICE never connects, connection-timeout fires at 7s', async () => {
       const ctx = createFSM();
       ctx.fsm.connect();
       await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
       expect(ctx.fsm.state).toBe('connecting');
 
       // Do NOT simulate ICE reaching connected — stays in checking
-      vi.advanceTimersByTime(15_001);
+      vi.advanceTimersByTime(7_001);
 
       expect(ctx.fsm.state).toBe('disconnected');
       const timeoutTransition = ctx.transitionLog.find(t =>
