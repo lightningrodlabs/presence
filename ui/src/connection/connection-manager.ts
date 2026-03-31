@@ -107,7 +107,19 @@ export class ConnectionManager {
     }
 
     const state = fsm.state;
-    if (state === 'idle' || state === 'disconnected') {
+    if (state === 'closed') {
+      // Closed FSM is terminal — destroy and replace with a fresh one
+      fsm.destroy();
+      fsm = this._createFSM(agent);
+      this._connections.set(agent, fsm);
+      fsm.connect(this._localStream ?? undefined);
+      this._emitManagerEvent({
+        type: 'connection-created',
+        remoteAgent: agent,
+        connectionId: fsm.connectionId,
+      });
+      this._notifyViewModelChange();
+    } else if (state === 'idle' || state === 'disconnected') {
       fsm.connect(this._localStream ?? undefined);
     }
     // If already signaling/connecting/connected/reconnecting, do nothing
@@ -249,12 +261,22 @@ export class ConnectionManager {
   private async _routeSignalToFSM(from: string, remoteConnectionId: string, signalType: string, signal: any, remotePeerSessionId?: number): Promise<void> {
     let fsm = this._connections.get(from);
 
-    // Only replace a closed FSM — connected FSMs handle incoming offers as
-    // renegotiation via Perfect Negotiation (e.g., when remote adds a track).
-    if (fsm && fsm.state === 'closed') {
-      fsm.destroy();
-      fsm = undefined;
-      this._connections.delete(from);
+    // Replace FSMs that can't handle a new remote session's SDP.
+    // When the remote peer closed their window and re-opened, their new
+    // RTCPeerConnection generates offers with different m-line ordering.
+    // Our existing RTCPeerConnection will reject these with:
+    //   "The order of m-lines in subsequent offer doesn't match"
+    // Detect this via remoteConnectionId mismatch and replace the FSM.
+    // Renegotiation offers from the SAME remote session (e.g., adding a track)
+    // still go through Perfect Negotiation on the existing peer.
+    if (fsm) {
+      const isNewRemoteSession = signalType === 'offer' && remoteConnectionId &&
+        fsm.remoteConnectionId !== null && remoteConnectionId !== fsm.remoteConnectionId;
+      if (fsm.state === 'closed' || isNewRemoteSession) {
+        fsm.destroy();
+        fsm = undefined;
+        this._connections.delete(from);
+      }
     }
 
     if (!fsm) {
