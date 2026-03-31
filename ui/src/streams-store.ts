@@ -51,6 +51,8 @@ export class StreamsStore {
 
   private signalUnsubscribe: () => void;
 
+  private allAgentsUnsubscribe: (() => void) | undefined;
+
   private pingInterval: number | undefined;
 
   private roomStore: RoomStore;
@@ -86,6 +88,12 @@ export class StreamsStore {
   private _signalQueue: RoomSignal[] = [];
 
   private _processingSignal = false;
+
+  /** Per-agent unmute timeout IDs, cleared on peer disconnect */
+  private _unmuteTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+  /** Unsubscribers for ConnectionManager event handlers */
+  private _managerEventUnsubs: (() => void)[] = [];
 
   // ---------------------------------------------------------------------------
   // ConnectionManager (replaces SimplePeer for video/audio connections)
@@ -195,7 +203,7 @@ export class StreamsStore {
    */
   private _setupConnectionManagerEvents() {
     // Handle remote stream arrival
-    this.connectionManager.on('remote-stream', (event) => {
+    this._managerEventUnsubs.push(this.connectionManager.on('remote-stream', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const stream = event.data as MediaStream;
@@ -246,15 +254,14 @@ export class StreamsStore {
         connectionId,
         stream,
       });
-    });
+    }));
 
     // Handle remote track arrival
-    this.connectionManager.on('remote-track', (event) => {
+    this._managerEventUnsubs.push(this.connectionManager.on('remote-track', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const { track } = event.data;
 
-      console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
@@ -265,7 +272,6 @@ export class StreamsStore {
       if (!track.muted) {
         this._setTrackReady(pubKeyB64, connectionId, track);
       } else {
-        console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
         this.logger.logAgentEvent({
           agent: pubKeyB64,
           timestamp: Date.now(),
@@ -283,8 +289,8 @@ export class StreamsStore {
         }
 
         const unmuteTimeout = setTimeout(() => {
+          this._unmuteTimeouts.delete(pubKeyB64);
           if (track.muted) {
-            console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
             this.logger.logAgentEvent({
               agent: pubKeyB64,
               timestamp: Date.now(),
@@ -293,10 +299,11 @@ export class StreamsStore {
             this._setTrackReady(pubKeyB64, connectionId, track);
           }
         }, 5000);
+        this._unmuteTimeouts.set(pubKeyB64, unmuteTimeout);
 
         track.onunmute = () => {
           clearTimeout(unmuteTimeout);
-          console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
+          this._unmuteTimeouts.delete(pubKeyB64);
           this.logger.logAgentEvent({
             agent: pubKeyB64,
             timestamp: Date.now(),
@@ -305,10 +312,10 @@ export class StreamsStore {
           this._setTrackReady(pubKeyB64, connectionId, track);
         };
       }
-    });
+    }));
 
     // Handle data channel messages
-    this.connectionManager.on('data-channel-message', (event) => {
+    this._managerEventUnsubs.push(this.connectionManager.on('data-channel-message', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const data = event.data;
@@ -408,7 +415,6 @@ export class StreamsStore {
             });
           }
           if (msg.message === 'request-track-refresh') {
-            console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
             this.logger.logCustomMessage(
               `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
             );
@@ -422,10 +428,10 @@ export class StreamsStore {
           )}. Got message: ${data}}`
         );
       }
-    });
+    }));
 
     // Handle connection state changes
-    this.connectionManager.on('connection-state-changed', (event) => {
+    this._managerEventUnsubs.push(this.connectionManager.on('connection-state-changed', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const { toState, fromState } = event.data as { fromState: ConnectionPhase; toState: ConnectionPhase };
@@ -438,8 +444,6 @@ export class StreamsStore {
       });
 
       if (toState === 'connected') {
-        console.log('#### CONNECTED with', pubKeyB64);
-
         // Rebuild open connections entry
         this._rebuildOpenConnections();
 
@@ -479,7 +483,12 @@ export class StreamsStore {
         // Send immediate pong so peers see green rings
         this._sendImmediatePongToAll();
       } else if (toState === 'disconnected' || toState === 'closed' || toState === 'failed') {
-        console.log(`#### CONNECTION ${toState.toUpperCase()} with ${pubKeyB64.slice(0, 8)}`);
+        // Clear any pending unmute timeout for this peer
+        const pendingUnmute = this._unmuteTimeouts.get(pubKeyB64);
+        if (pendingUnmute) {
+          clearTimeout(pendingUnmute);
+          this._unmuteTimeouts.delete(pubKeyB64);
+        }
 
         // Remove from existing streams
         delete this._videoStreams[pubKeyB64];
@@ -529,7 +538,7 @@ export class StreamsStore {
         this._rebuildOpenConnections();
         this._rebuildConnectionStatuses();
       }
-    });
+    }));
   }
 
   /**
@@ -538,12 +547,11 @@ export class StreamsStore {
    */
   private _setupScreenShareConnectionManagerEvents() {
     // Handle remote screen share stream arrival
-    this.screenShareConnectionManager.on('remote-stream', (event) => {
+    this._managerEventUnsubs.push(this.screenShareConnectionManager.on('remote-stream', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const stream = event.data as MediaStream;
 
-      console.log('#### GOT SCREEN SHARE STREAM with tracks from:', pubKeyB64, stream.getTracks());
       this.logger.logCustomMessage(
         `screen share stream received [${pubKeyB64.slice(0, 8)}]: ${stream.getTracks().length} tracks`
       );
@@ -565,15 +573,13 @@ export class StreamsStore {
         connectionId,
         stream,
       });
-    });
+    }));
 
     // Handle remote screen share track arrival
-    this.screenShareConnectionManager.on('remote-track', (event) => {
+    this._managerEventUnsubs.push(this.screenShareConnectionManager.on('remote-track', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const { track } = event.data;
-
-      console.log('#### GOT SCREEN SHARE TRACK:', track);
 
       this._screenShareConnectionsIncoming.update(currentValue => {
         const conn = currentValue[pubKeyB64];
@@ -590,17 +596,15 @@ export class StreamsStore {
         connectionId,
         track,
       });
-    });
+    }));
 
     // Handle screen share connection state changes
-    this.screenShareConnectionManager.on('connection-state-changed', (event) => {
+    this._managerEventUnsubs.push(this.screenShareConnectionManager.on('connection-state-changed', (event) => {
       const pubKeyB64 = event.remoteAgent;
       const connectionId = event.connectionId;
       const { toState } = event.data as { fromState: string; toState: string };
 
       if (toState === 'connected') {
-        console.log('#### SCREEN SHARE CONNECTED with', pubKeyB64);
-
         // Determine direction based on whether we have a screen share stream
         const direction = this.screenShareStream ? 'outgoing' : 'incoming';
 
@@ -650,8 +654,6 @@ export class StreamsStore {
 
         this._rebuildScreenShareConnectionStatuses();
       } else if (toState === 'disconnected' || toState === 'closed' || toState === 'failed') {
-        console.log(`#### SCREEN SHARE ${toState.toUpperCase()} with ${pubKeyB64.slice(0, 8)}`);
-
         delete this._screenShareStreams[pubKeyB64];
 
         // Clean up from both outgoing and incoming stores
@@ -671,7 +673,7 @@ export class StreamsStore {
       } else {
         this._rebuildScreenShareConnectionStatuses();
       }
-    });
+    }));
   }
 
   /**
@@ -829,7 +831,7 @@ export class StreamsStore {
     });
 
     // Keep subscribing for ongoing updates
-    roomStore.allAgents.subscribe(val => {
+    streamsStore.allAgentsUnsubscribe = roomStore.allAgents.subscribe(val => {
       if (val.status === 'complete') {
         streamsStore.allAgents = val.value;
       }
@@ -859,6 +861,11 @@ export class StreamsStore {
 
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this.signalUnsubscribe) this.signalUnsubscribe();
+    if (this.allAgentsUnsubscribe) this.allAgentsUnsubscribe();
+    for (const timeout of this._unmuteTimeouts.values()) clearTimeout(timeout);
+    this._unmuteTimeouts.clear();
+    for (const unsub of this._managerEventUnsubs) unsub();
+    this._managerEventUnsubs.length = 0;
 
     // Destroy ConnectionManager (handles all video/audio connections)
     this.connectionManager.destroy();
@@ -1985,7 +1992,6 @@ export class StreamsStore {
    */
   async handleLeaveUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`#### GOT LeaveUi FROM ${pubkeyB64.slice(0, 8)}`);
     this.logger.logAgentEvent({
       agent: pubkeyB64,
       timestamp: Date.now(),
@@ -2131,9 +2137,6 @@ export class StreamsStore {
    * Handle a DiagnosticRequest signal — gather recent logs and send back.
    */
   async handleDiagnosticRequest(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`#### GOT DiagnosticRequest from ${pubkeyB64.slice(0, 8)}`);
-
     const allRecentEvents = this.logger.getRecentAgentEvents();
     const flatEvents = Object.values(allRecentEvents).flat();
     const recentCustomLogs = this.logger.getRecentCustomLogs();
@@ -2173,8 +2176,6 @@ export class StreamsStore {
    */
   handleDiagnosticResponse(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`#### GOT DiagnosticResponse from ${pubkeyB64.slice(0, 8)}`);
-
     try {
       const snapshot: DiagnosticSnapshot = JSON.parse(signal.payload);
       this._receivedDiagnosticLogs.update(current => {

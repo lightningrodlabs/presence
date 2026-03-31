@@ -477,6 +477,12 @@ export class FakeSignalingChannel {
     return this._log;
   }
 
+  /** Clear accumulated log and queue to prevent unbounded memory growth across tests */
+  reset(): void {
+    this._log.length = 0;
+    this._queue.length = 0;
+  }
+
   /** Deliver all queued messages (use with fake timers) */
   flush() {
     const now = Date.now();
@@ -520,6 +526,10 @@ export class FakeSignalingChannel {
     };
 
     this._log.push(entry);
+    // Cap log to prevent unbounded memory growth in long-running tests
+    if (this._log.length > 10000) {
+      this._log.splice(0, this._log.length - 5000);
+    }
 
     if (delay === 0) {
       this._deliver(entry);

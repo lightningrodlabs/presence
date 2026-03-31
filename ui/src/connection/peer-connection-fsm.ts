@@ -118,6 +118,8 @@ export class PeerConnectionFSM {
   // Diagnostic counters
   private _localCandidateCount = 0;
   private _remoteCandidateCount = 0;
+  /** Stored local stream for re-addition after peer recreation (reconnect) */
+  private _localStream: MediaStream | null = null;
 
   // Remote peer's connectionId — set when we receive an offer or answer.
   // Used by ConnectionManager to filter stale signals from previous sessions.
@@ -288,13 +290,14 @@ export class PeerConnectionFSM {
     }
 
     // If we're in a state that can handle signals, forward to peer
-    if (this._peer && !this._peer.destroyed) {
+    if (this._peer && !this._peer.destroyed && !this._destroyed) {
       await this._peer.handleSignal(signal);
     }
   }
 
   /** Add a local media stream to the connection */
   addLocalStream(stream: MediaStream): void {
+    this._localStream = stream;
     if (this._destroyed || !this._peer) return;
     this._addLocalStream(stream);
   }
@@ -712,6 +715,11 @@ export class PeerConnectionFSM {
 
     this._peer = new RTCPeer(options);
     this._setupPeerEvents(this._peer);
+
+    // Re-add local stream so reconnected peer has media tracks
+    if (this._localStream) {
+      this._addLocalStream(this._localStream);
+    }
   }
 
   private _destroyPeer(): void {
@@ -902,12 +910,18 @@ export class PeerConnectionFSM {
       const { track } = event.data;
       if (track.kind === 'audio') this._audioReceiving = true;
       if (track.kind === 'video') {
-        if (track.muted) {
+        this._videoReceiving = true;
+        this._videoMuted = track.muted;
+        track.onmute = () => {
+          if (this._destroyed) return;
           this._videoMuted = true;
-        } else {
-          this._videoReceiving = true;
+          this._notifyViewModelChange();
+        };
+        track.onunmute = () => {
+          if (this._destroyed) return;
           this._videoMuted = false;
-        }
+          this._notifyViewModelChange();
+        };
       }
       this._emitEvent({
         type: 'remote-track',

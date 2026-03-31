@@ -139,23 +139,6 @@ export class ConnectionManager {
     // If already signaling/connecting/connected/reconnecting, do nothing
   }
 
-  /**
-   * Handle a signal from the signaling adapter.
-   * Routes to the correct FSM or creates one if needed.
-   */
-  handleSignal(from: string, type: string, payload: string): void {
-    if (this._destroyed) return;
-
-    // Parse the signal
-    let signal: any;
-    try {
-      signal = JSON.parse(payload);
-    } catch (e) {
-      return;
-    }
-
-    this._routeSignalToFSM(from, '', '', signal);
-  }
 
   /** Update the local media stream. Propagated to all active connections. */
   updateLocalStream(stream: MediaStream | null): void {
@@ -163,7 +146,7 @@ export class ConnectionManager {
     if (!stream) return;
 
     for (const [_agent, fsm] of this._connections) {
-      if (fsm.state === 'connected' || fsm.state === 'signaling' || fsm.state === 'connecting') {
+      if (fsm.state === 'connected' || fsm.state === 'signaling' || fsm.state === 'connecting' || fsm.state === 'reconnecting') {
         fsm.addLocalStream(stream);
       }
     }
