@@ -232,18 +232,21 @@ export class PeerConnectionFSM {
     // match the fresh offer. Trying to setRemoteDescription on the old peer
     // causes "The order of m-lines in subsequent offer doesn't match" errors.
     // Fix: destroy the old peer and create a fresh one before processing.
+    // We check: either remoteConnectionId changed (new remote session), or
+    // _remoteConnectionId was never set (local-initiated connection where
+    // the remote peer's connectionId was never recorded).
+    const isNewRemoteSession = remoteConnectionId &&
+      (this._remoteConnectionId === null || remoteConnectionId !== this._remoteConnectionId);
     if (this._state === 'reconnecting' &&
         'type' in signal && signal.type === 'offer' &&
-        remoteConnectionId &&
-        this._remoteConnectionId !== null &&
-        remoteConnectionId !== this._remoteConnectionId) {
+        isNewRemoteSession) {
       this._onTransition?.({
         timestamp: Date.now(),
         connectionId: this.connectionId,
         remoteAgent: this.remoteAgent,
         fromState: this._state,
         toState: this._state,
-        trigger: `fresh peer for new remote connection ${remoteConnectionId.slice(0, 8)} (was ${this._remoteConnectionId.slice(0, 8)})`,
+        trigger: `fresh peer for new remote connection ${remoteConnectionId!.slice(0, 8)} (was ${this._remoteConnectionId?.slice(0, 8) ?? 'null'})`,
         peerSessionId: this._session.local,
       });
       this._clearAllTimers();
