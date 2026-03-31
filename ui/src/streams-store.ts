@@ -686,14 +686,20 @@ export class StreamsStore {
         const hasAudioStream = !!this._videoStreams[agent]?.getAudioTracks().some(
           t => t.readyState === 'live'
         );
+        // Only inherit video/audio flags from the previous entry if the
+        // connection has progressed past the initial handshake. For signaling
+        // and connecting states, use only the actual stream state — otherwise
+        // a stale video:true from a destroyed-and-replaced FSM persists and
+        // shows a blank video rectangle instead of the avatar.
+        const canInheritMedia = state === 'connected' || state === 'reconnecting';
         newOpenConnections[agent] = {
           connectionId: fsm?.connectionId ?? '',
           peer: null as any,
-          video: existing?.video || hasVideoStream,
-          audio: existing?.audio || hasAudioStream,
+          video: (canInheritMedia && existing?.video) || hasVideoStream,
+          audio: (canInheritMedia && existing?.audio) || hasAudioStream,
           connected: state === 'connected',
           relayed: vm?.quality?.relayed ?? existing?.relayed,
-          videoMuted: existing?.videoMuted,
+          videoMuted: canInheritMedia ? existing?.videoMuted : undefined,
           direction: 'duplex',
         };
       }

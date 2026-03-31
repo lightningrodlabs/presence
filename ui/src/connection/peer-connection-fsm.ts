@@ -110,6 +110,11 @@ export class PeerConnectionFSM {
   private _dtlsConnected = false;
   private _dataChannelOpen = false;
 
+  // DTLS watchdog diagnostic — tracks when ICE connects but DTLS hasn't completed
+  private _iceConnectedAt: number | null = null;
+  private _dtlsWatchdogId: ReturnType<typeof setTimeout> | null = null;
+  private static readonly DTLS_WATCHDOG_MS = 5000;
+
   // Diagnostic counters
   private _localCandidateCount = 0;
   private _remoteCandidateCount = 0;
@@ -795,9 +800,13 @@ export class PeerConnectionFSM {
 
       if (iceState === 'connected' || iceState === 'completed') {
         this._iceConnected = true;
+        this._iceConnectedAt = Date.now();
+        this._startDtlsWatchdog();
         this._checkCompositeReadiness();
       } else if (iceState === 'disconnected' || iceState === 'failed') {
         this._iceConnected = false;
+        this._iceConnectedAt = null;
+        this._cancelDtlsWatchdog();
         this._handleTransportFailure(iceState === 'failed' ? 'ice-failed' : 'ice-disconnected');
       }
     });
@@ -809,6 +818,7 @@ export class PeerConnectionFSM {
       if (this._destroyed) return;
       this._iceConnected = true;
       this._dtlsConnected = true;
+      this._cancelDtlsWatchdog();
       this._checkCompositeReadiness();
     });
 
@@ -941,6 +951,95 @@ export class PeerConnectionFSM {
     this._iceConnected = false;
     this._dtlsConnected = false;
     this._dataChannelOpen = false;
+    this._iceConnectedAt = null;
+    this._cancelDtlsWatchdog();
+  }
+
+  // ---------------------------------------------------------------------------
+  // DTLS Watchdog Diagnostic
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start the DTLS watchdog: if ICE is connected but DTLS hasn't completed
+   * within DTLS_WATCHDOG_MS, emit a diagnostic log with transport snapshot
+   * and candidate stats. This detects the pattern where srflx STUN checks
+   * pass but the path can't sustain DTLS handshake traffic (common on
+   * Starlink and other aggressive-NAT environments).
+   */
+  private _startDtlsWatchdog(): void {
+    // Only watch during connecting/reconnecting phases
+    if (this._state !== 'connecting' && this._state !== 'reconnecting') return;
+    // Already connected — no need to watch
+    if (this._dtlsConnected && this._dataChannelOpen) return;
+    // Cancel any existing watchdog
+    this._cancelDtlsWatchdog();
+
+    this._dtlsWatchdogId = setTimeout(async () => {
+      this._dtlsWatchdogId = null;
+      if (this._destroyed) return;
+      // Only fire if ICE is still connected but DTLS hasn't completed
+      if (!this._iceConnected || this._dtlsConnected) return;
+
+      const stallMs = this._iceConnectedAt ? Date.now() - this._iceConnectedAt : 0;
+      const snapshot = this.transportSnapshot;
+
+      // Attempt to get the selected candidate pair type for the diagnostic
+      let selectedCandidateType: string = 'unknown';
+      let selectedRemoteCandidateType: string = 'unknown';
+      let localAddress = '';
+      let remoteAddress = '';
+      try {
+        if (this._peer && !this._peer.destroyed) {
+          const stats = await this._peer.getStats();
+          stats.forEach((report: any) => {
+            if (report.type === 'candidate-pair' && (report.state === 'in-progress' || report.state === 'succeeded')) {
+              stats.forEach((r: any) => {
+                if (r.id === report.localCandidateId) {
+                  selectedCandidateType = r.candidateType || 'unknown';
+                  localAddress = `${r.address || r.ip || '?'}:${r.port || '?'}`;
+                }
+                if (r.id === report.remoteCandidateId) {
+                  selectedRemoteCandidateType = r.candidateType || 'unknown';
+                  remoteAddress = `${r.address || r.ip || '?'}:${r.port || '?'}`;
+                }
+              });
+            }
+          });
+        }
+      } catch {
+        // Stats unavailable — proceed with unknown
+      }
+
+      const agentShort = this.remoteAgent.slice(0, 8);
+      this._onTransition?.({
+        timestamp: Date.now(),
+        connectionId: this.connectionId,
+        remoteAgent: this.remoteAgent,
+        fromState: this._state,
+        toState: this._state,
+        trigger: `DTLS stall detected (ICE connected ${stallMs}ms ago, DTLS: ${snapshot.dtls}, DC: ${snapshot.dataChannel ?? 'null'}, candidate: ${selectedCandidateType})`,
+        peerSessionId: this._session.local,
+        transportSnapshot: snapshot,
+        metadata: {
+          diagnostic: 'dtls-stall',
+          stallMs,
+          localCandidateType: selectedCandidateType,
+          remoteCandidateType: selectedRemoteCandidateType,
+          localAddress,
+          remoteAddress,
+          localCandidateCount: this._localCandidateCount,
+          remoteCandidateCount: this._remoteCandidateCount,
+          peerSession: this._session.local,
+        },
+      });
+    }, PeerConnectionFSM.DTLS_WATCHDOG_MS);
+  }
+
+  private _cancelDtlsWatchdog(): void {
+    if (this._dtlsWatchdogId !== null) {
+      clearTimeout(this._dtlsWatchdogId);
+      this._dtlsWatchdogId = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1016,6 +1115,7 @@ export class PeerConnectionFSM {
       clearTimeout(timer.id);
     }
     this._timers = [];
+    this._cancelDtlsWatchdog();
   }
 
   // ---------------------------------------------------------------------------
