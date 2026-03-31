@@ -149,6 +149,9 @@ export class PresenceApp extends LitElement {
   _showSettings = false;
 
   @state()
+  _logCleared = false;
+
+  @state()
   _showAdvancedSettings = false;
 
   @state()
@@ -808,13 +811,15 @@ export class PresenceApp extends LitElement {
             Export Logs
           </button>
           <button
-            class="btn"
-            style="width: auto; padding: 5px 12px; font-size: 16px; background: linear-gradient(#5a2a2a, #3a1a1a); color: #f8c7c7;"
+            class="btn btn-danger"
+            style="width: auto; padding: 5px 12px; font-size: 16px;"
             @click=${() => {
               clearAllLogs();
+              this._logCleared = true;
+              setTimeout(() => { this._logCleared = false; }, 2000);
             }}
           >
-            Clear Logs
+            ${this._logCleared ? 'Cleared' : 'Clear Logs'}
           </button>
         </div>
         <div style="margin-top: 16px; border-top: 1px solid #444a6e; padding-top: 12px;">
@@ -1240,6 +1245,16 @@ export class PresenceApp extends LitElement {
 
       .btn:focus {
         background: #ffffff;
+      }
+
+      .btn-danger {
+        background: linear-gradient(#5a2a2a, #3a1a1a);
+        color: #f8c7c7;
+        cursor: pointer;
+      }
+
+      .btn-danger:hover {
+        background: linear-gradient(#7a3a3a, #5a2a2a);
       }
 
       .settings-panel {
