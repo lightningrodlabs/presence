@@ -226,8 +226,16 @@ export class PeerConnectionFSM {
       this._transition('signaling', { trigger: 'remote signal received' });
     }
 
-    // When in reconnecting state and receiving an offer from a new remote
-    // connection (the remote peer has refreshed/reconnected), the old
+    // If we're disconnected and receive an offer, treat it as a fresh
+    // connection opportunity. The stale RTCPeerConnection's m-lines won't
+    // match the new offer (causes "order of m-lines doesn't match" error).
+    // Transition to signaling creates a fresh peer via _newPeerSession().
+    if (this._state === 'disconnected' && 'type' in signal && signal.type === 'offer') {
+      this._transition('signaling', { trigger: 'remote signal received' });
+    }
+
+    // When in reconnecting/connecting state and receiving an offer from a new
+    // remote connection (the remote peer has refreshed/reconnected), the old
     // RTCPeerConnection has m-lines from the previous session that won't
     // match the fresh offer. Trying to setRemoteDescription on the old peer
     // causes "The order of m-lines in subsequent offer doesn't match" errors.
@@ -237,7 +245,7 @@ export class PeerConnectionFSM {
     // the remote peer's connectionId was never recorded).
     const isNewRemoteSession = remoteConnectionId &&
       (this._remoteConnectionId === null || remoteConnectionId !== this._remoteConnectionId);
-    if (this._state === 'reconnecting' &&
+    if ((this._state === 'reconnecting' || this._state === 'connecting') &&
         'type' in signal && signal.type === 'offer' &&
         isNewRemoteSession) {
       this._onTransition?.({
@@ -257,6 +265,8 @@ export class PeerConnectionFSM {
       this._startTimer('fresh-peer-timeout', this._config.connectionTimeoutMs, () => {
         if (this._state === 'reconnecting') {
           this._scheduleReconnectAttempt();
+        } else if (this._state === 'connecting') {
+          this._transition('disconnected', { trigger: 'connection timeout' });
         }
       });
     }
