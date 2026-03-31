@@ -719,6 +719,15 @@ export class PeerConnectionFSM {
       this._peer.destroy();
       this._peer = null;
     }
+    // Reset track flags so they don't carry stale state into the next peer
+    this._audioSending = false;
+    this._audioReceiving = false;
+    this._videoSending = false;
+    this._videoReceiving = false;
+    this._videoMuted = false;
+    this._relayed = false;
+    this._candidateType = 'unknown';
+    this._roundTripMs = null;
   }
 
   private _addLocalStream(stream: MediaStream): void {

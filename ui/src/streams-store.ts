@@ -691,7 +691,10 @@ export class StreamsStore {
         const existing = currentOpenConnections[agent];
         const fsm = this.connectionManager.getFSM(agent);
         const vm = this.connectionManager.getViewModel(agent);
-        // Check if we have an active video stream for this agent
+        // Check if we have an active video/audio stream for this agent.
+        // Note: only used as a fallback when there's no inherited state —
+        // data channel messages (video-on/off, audio-on/off) are the
+        // authoritative source for the sender's media intent.
         const hasVideoStream = !!this._videoStreams[agent]?.getVideoTracks().some(
           t => t.readyState === 'live'
         );
@@ -704,14 +707,20 @@ export class StreamsStore {
         // a stale video:true from a destroyed-and-replaced FSM persists and
         // shows a blank video rectangle instead of the avatar.
         const canInheritMedia = state === 'connected' || state === 'reconnecting';
+        // When inheriting from an existing entry, trust its video/audio flags
+        // — they are maintained by data channel messages (video-on/off, audio-on/off)
+        // which reflect the sender's intent. Only fall back to raw stream checks
+        // when there is no existing entry (initial connection before any data
+        // channel messages have arrived).
+        const inheritVideo = canInheritMedia && existing != null;
         newOpenConnections[agent] = {
           connectionId: fsm?.connectionId ?? '',
           peer: null as any,
-          video: (canInheritMedia && existing?.video) || hasVideoStream,
-          audio: (canInheritMedia && existing?.audio) || hasAudioStream,
+          video: inheritVideo ? existing!.video : hasVideoStream,
+          audio: inheritVideo ? existing!.audio : hasAudioStream,
           connected: state === 'connected',
           relayed: vm?.quality?.relayed ?? existing?.relayed,
-          videoMuted: canInheritMedia ? existing?.videoMuted : undefined,
+          videoMuted: inheritVideo ? existing!.videoMuted : undefined,
           direction: 'duplex',
         };
       }
