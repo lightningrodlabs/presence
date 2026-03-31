@@ -805,7 +805,18 @@ export class PeerConnectionFSM {
         this._iceConnectedAt = Date.now();
         // ICE connected — DTLS watchdog takes over from the flat connection-timeout
         if (this._state === 'connecting') {
+          const timerCount = this._timers.filter(t => t.name === 'connection-timeout').length;
           this._clearTimer('connection-timeout');
+          const afterCount = this._timers.filter(t => t.name === 'connection-timeout').length;
+          this._onTransition?.({
+            timestamp: Date.now(),
+            connectionId: this.connectionId,
+            remoteAgent: this.remoteAgent,
+            fromState: this._state,
+            toState: this._state,
+            trigger: `DIAG: cancelled connection-timeout (had=${timerCount}, after=${afterCount}), starting DTLS watchdog (dtlsConnected=${this._dtlsConnected}, dcOpen=${this._dataChannelOpen}, timeoutMs=${this._config.dtlsStallTimeoutMs})`,
+            peerSessionId: this._session.local,
+          });
         }
         this._startDtlsWatchdog();
         this._checkCompositeReadiness();
@@ -976,17 +987,60 @@ export class PeerConnectionFSM {
    */
   private _startDtlsWatchdog(): void {
     // Only watch during connecting/reconnecting phases
-    if (this._state !== 'connecting' && this._state !== 'reconnecting') return;
+    if (this._state !== 'connecting' && this._state !== 'reconnecting') {
+      this._onTransition?.({
+        timestamp: Date.now(),
+        connectionId: this.connectionId,
+        remoteAgent: this.remoteAgent,
+        fromState: this._state,
+        toState: this._state,
+        trigger: `DIAG: watchdog skipped (state=${this._state}, expected connecting|reconnecting)`,
+        peerSessionId: this._session.local,
+      });
+      return;
+    }
     // Already connected — no need to watch
-    if (this._dtlsConnected && this._dataChannelOpen) return;
+    if (this._dtlsConnected && this._dataChannelOpen) {
+      this._onTransition?.({
+        timestamp: Date.now(),
+        connectionId: this.connectionId,
+        remoteAgent: this.remoteAgent,
+        fromState: this._state,
+        toState: this._state,
+        trigger: `DIAG: watchdog skipped (already connected: dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`,
+        peerSessionId: this._session.local,
+      });
+      return;
+    }
     // Cancel any existing watchdog
     this._cancelDtlsWatchdog();
+
+    this._onTransition?.({
+      timestamp: Date.now(),
+      connectionId: this.connectionId,
+      remoteAgent: this.remoteAgent,
+      fromState: this._state,
+      toState: this._state,
+      trigger: `DIAG: watchdog armed (${this._config.dtlsStallTimeoutMs}ms, ice=${this._iceConnected}, dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`,
+      peerSessionId: this._session.local,
+    });
 
     this._dtlsWatchdogId = setTimeout(async () => {
       this._dtlsWatchdogId = null;
       if (this._destroyed) return;
       // Only fire if ICE is still connected but DTLS hasn't completed
-      if (!this._iceConnected || this._dtlsConnected) return;
+      if (!this._iceConnected || this._dtlsConnected) {
+        this._onTransition?.({
+          timestamp: Date.now(),
+          connectionId: this.connectionId,
+          remoteAgent: this.remoteAgent,
+          fromState: this._state,
+          toState: this._state,
+          trigger: `DIAG: watchdog fired but conditions not met (ice=${this._iceConnected}, dtls=${this._dtlsConnected}, state=${this._state})`,
+          peerSessionId: this._session.local,
+        });
+        return;
+      }
 
       const stallMs = this._iceConnectedAt ? Date.now() - this._iceConnectedAt : 0;
       const snapshot = this.transportSnapshot;
@@ -1045,6 +1099,15 @@ export class PeerConnectionFSM {
       });
 
       // Act on the stall: transition to disconnected to trigger retry with fresh peer
+      this._onTransition?.({
+        timestamp: Date.now(),
+        connectionId: this.connectionId,
+        remoteAgent: this.remoteAgent,
+        fromState: this._state,
+        toState: this._state,
+        trigger: `DIAG: watchdog acting (state=${this._state}, stallMs=${stallMs}, candidate=${selectedCandidateType}, stall#=${this._dtlsStallCount})`,
+        peerSessionId: this._session.local,
+      });
       if (this._state === 'connecting') {
         this._transition('disconnected', { trigger: `DTLS stall after ${stallMs}ms (candidate: ${selectedCandidateType}, stall #${this._dtlsStallCount})` });
       } else if (this._state === 'reconnecting') {
