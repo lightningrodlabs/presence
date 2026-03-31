@@ -685,6 +685,7 @@ export class PeerConnectionFSM {
     const options: RTCPeerOptions = {
       polite: this._polite,
       config: this._config,
+      trickleICE: this._config.trickleICE,
       onSignal: (data) => {
         if ('candidate' in data && (data as any).candidate !== undefined) {
           this._localCandidateCount++;

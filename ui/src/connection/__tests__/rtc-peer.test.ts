@@ -19,6 +19,7 @@ const DEFAULT_CONFIG: ConnectionConfig = {
 function createPeer(options: {
   polite?: boolean;
   onSignal?: (data: any) => void;
+  trickleICE?: boolean;
 } = {}) {
   const onSignal = options.onSignal ?? vi.fn();
   let mockPc: MockRTCPeerConnection;
@@ -26,6 +27,7 @@ function createPeer(options: {
   const peer = new RTCPeer({
     polite: options.polite ?? true,
     config: DEFAULT_CONFIG,
+    trickleICE: options.trickleICE,
     onSignal,
     createPeerConnection: (config: RTCConfiguration) => {
       mockPc = new MockRTCPeerConnection(config);
@@ -431,6 +433,182 @@ describe('RTCPeer', () => {
       unsub();
       mockPc.simulateIceConnectionState('connected');
       expect(handler).toHaveBeenCalledTimes(1); // not called again
+    });
+  });
+
+  describe('trickle ICE mode (default)', () => {
+    it('sends ICE candidates immediately via onSignal', () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: true });
+
+      const candidate = { candidate: 'candidate:1 udp 123 192.168.1.1 5000 typ host', sdpMid: '0', sdpMLineIndex: 0 };
+      mockPc.simulateIceCandidate(candidate);
+
+      expect(onSignal).toHaveBeenCalledWith(candidate);
+    });
+
+    it('sends offer immediately without waiting for gathering', async () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: true });
+
+      // Trigger negotiationneeded (fires from data channel creation)
+      await vi.waitFor(() => expect(onSignal).toHaveBeenCalled());
+
+      // Offer sent before gathering completes
+      expect(onSignal).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'offer' }),
+      );
+      // Gathering state is still 'new' — offer was sent without waiting
+      expect(mockPc.iceGatheringState).toBe('new');
+    });
+  });
+
+  describe('non-trickle ICE mode', () => {
+    it('does not send individual ICE candidates', () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: false });
+
+      // Clear any signals from construction (data channel negotiation)
+      onSignal.mockClear();
+
+      const candidate = { candidate: 'candidate:1 udp 123 192.168.1.1 5000 typ host', sdpMid: '0', sdpMLineIndex: 0 };
+      mockPc.simulateIceCandidate(candidate);
+
+      // Individual candidate should NOT be sent
+      const candidateCalls = onSignal.mock.calls.filter(
+        (call: any[]) => call[0] && 'candidate' in call[0] && call[0].candidate !== undefined
+      );
+      expect(candidateCalls).toHaveLength(0);
+    });
+
+    it('waits for gathering complete before sending offer', async () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: false });
+
+      // Wait for negotiationneeded to be enqueued from data channel creation
+      await new Promise(r => setTimeout(r, 10));
+
+      // At this point, setLocalDescription was called but the offer should
+      // not have been sent yet (gathering hasn't completed)
+      const offerCalls = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.type === 'offer'
+      );
+      expect(offerCalls).toHaveLength(0);
+
+      // Simulate gathering complete via null candidate (per WebRTC spec)
+      mockPc.simulateIceCandidate(null);
+
+      // Now the offer should be sent
+      await vi.waitFor(() => {
+        const offers = onSignal.mock.calls.filter(
+          (call: any[]) => call[0]?.type === 'offer'
+        );
+        expect(offers).toHaveLength(1);
+      });
+    });
+
+    it('sends offer when gathering completes via icegatheringstatechange', async () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: false });
+
+      await new Promise(r => setTimeout(r, 10));
+
+      // No offer yet
+      const offersBefore = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.type === 'offer'
+      );
+      expect(offersBefore).toHaveLength(0);
+
+      // Simulate gathering complete via state change event (fallback path)
+      mockPc.simulateIceGatheringState('complete');
+
+      await vi.waitFor(() => {
+        const offers = onSignal.mock.calls.filter(
+          (call: any[]) => call[0]?.type === 'offer'
+        );
+        expect(offers).toHaveLength(1);
+      });
+    });
+
+    it('waits for gathering before sending answer to remote offer', async () => {
+      const onSignal = vi.fn();
+      const { peer, mockPc } = createPeer({ polite: true, onSignal, trickleICE: false });
+
+      // Clear signals from construction
+      onSignal.mockClear();
+
+      // Handle remote offer — this triggers answer creation
+      const handlePromise = peer.handleSignal({ type: 'offer', sdp: 'remote-offer-sdp' });
+
+      // Give the task queue a tick to process
+      await new Promise(r => setTimeout(r, 10));
+
+      // Answer should NOT be sent yet (gathering not complete)
+      const answersBefore = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.type === 'answer'
+      );
+      expect(answersBefore).toHaveLength(0);
+
+      // Complete gathering
+      mockPc.simulateIceCandidate(null);
+
+      await handlePromise;
+
+      // Now the answer should have been sent
+      const answersAfter = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.type === 'answer'
+      );
+      expect(answersAfter).toHaveLength(1);
+    });
+
+    it('sends immediately if gathering is already complete', async () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: false });
+
+      // Pre-set gathering to complete before negotiation fires
+      mockPc.iceGatheringState = 'complete';
+
+      // Wait for the data channel negotiationneeded to process
+      await vi.waitFor(() => {
+        const offers = onSignal.mock.calls.filter(
+          (call: any[]) => call[0]?.type === 'offer'
+        );
+        expect(offers).toHaveLength(1);
+      });
+    });
+
+    it('unblocks gathering wait on destroy', async () => {
+      const onSignal = vi.fn();
+      const { peer } = createPeer({ onSignal, trickleICE: false });
+
+      await new Promise(r => setTimeout(r, 10));
+
+      // Destroy while waiting for gathering — should not hang
+      peer.destroy();
+
+      // No offer should have been sent (gathering never completed)
+      const offers = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.type === 'offer'
+      );
+      expect(offers).toHaveLength(0);
+    });
+
+    it('still accepts incoming trickled candidates from remote peer', async () => {
+      const { peer, mockPc } = createPeer({ trickleICE: false });
+
+      // Even in non-trickle mode locally, remote peer may trickle candidates.
+      // We should still accept and process them.
+
+      // Complete gathering immediately so handleSignal for offer doesn't hang
+      // waiting for local gathering before sending answer
+      mockPc.iceGatheringState = 'complete';
+
+      await peer.handleSignal({ type: 'offer', sdp: 'remote-offer' });
+
+      const remoteCandidate = { candidate: 'candidate:1 udp 456 10.0.0.1 6000 typ host', sdpMid: '0', sdpMLineIndex: 0 };
+      await peer.handleSignal(remoteCandidate);
+
+      expect(mockPc.addIceCandidate).toHaveBeenCalledWith(remoteCandidate);
     });
   });
 });

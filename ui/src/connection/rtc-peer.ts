@@ -27,11 +27,15 @@ export type RTCPeerOptions = {
   onSignal: (data: RTCSessionDescriptionInit | RTCIceCandidateInit) => void;
   /** Optional: factory for RTCPeerConnection (for testing) */
   createPeerConnection?: (config: RTCConfiguration) => RTCPeerConnection;
+  /** If true, use trickle ICE (send candidates as discovered). If false, wait for
+   *  gathering to complete and send candidates bundled in the SDP description. */
+  trickleICE?: boolean;
 };
 
 export class RTCPeer {
   readonly pc: RTCPeerConnection;
   private _polite: boolean;
+  private _trickleICE: boolean;
   private _onSignal: (data: RTCSessionDescriptionInit | RTCIceCandidateInit) => void;
   private _handlers: Map<string, RTCPeerEventHandler[]> = new Map();
   private _dataChannel: RTCDataChannel | null = null;
@@ -46,6 +50,10 @@ export class RTCPeer {
   // ICE candidate queue (for candidates arriving before remote description)
   private _pendingCandidates: RTCIceCandidateInit[] = [];
 
+  // Non-trickle ICE: resolve when gathering completes so we can send the
+  // complete local description with all candidates bundled in the SDP.
+  private _gatheringCompleteResolve: (() => void) | null = null;
+
   // Negotiation task queue — serializes ALL signaling operations (incoming signals
   // AND outgoing offers from negotiationneeded) to prevent concurrent
   // setLocalDescription/setRemoteDescription from corrupting signaling state.
@@ -54,6 +62,7 @@ export class RTCPeer {
 
   constructor(options: RTCPeerOptions) {
     this._polite = options.polite;
+    this._trickleICE = options.trickleICE ?? true;
     this._onSignal = options.onSignal;
 
     const rtcConfig: RTCConfiguration = {
@@ -112,9 +121,7 @@ export class RTCPeer {
       try {
         this._makingOffer = true;
         await this.pc.setLocalDescription();
-        if (this.pc.localDescription) {
-          this._onSignal(this.pc.localDescription);
-        }
+        await this._sendLocalDescription();
       } catch (e) {
         this._emit({ type: 'error', data: e });
       } finally {
@@ -221,6 +228,11 @@ export class RTCPeer {
     this._destroying = false;
     this._pendingCandidates = [];
     this._taskQueue = [];
+    // Unblock any pending gathering wait so it doesn't leak
+    if (this._gatheringCompleteResolve) {
+      this._gatheringCompleteResolve();
+      this._gatheringCompleteResolve = null;
+    }
 
     try {
       if (this._dataChannel) {
@@ -230,6 +242,46 @@ export class RTCPeer {
       this.pc.close();
     } catch (e) {
       // Ignore errors during teardown
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Non-trickle ICE — wait for gathering then send complete SDP
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Send the local description to the remote peer. In trickle mode, sends
+   * immediately. In non-trickle mode, waits for ICE gathering to complete
+   * so the SDP contains all candidates, then sends the complete description.
+   */
+  private async _sendLocalDescription(): Promise<void> {
+    if (this._trickleICE) {
+      // Trickle: send SDP immediately; candidates trickle separately
+      if (this.pc.localDescription) {
+        this._onSignal(this.pc.localDescription);
+      }
+      return;
+    }
+
+    // Non-trickle: wait for gathering to complete before sending.
+    // After gathering, pc.localDescription contains all candidates in the SDP.
+    if (this.pc.iceGatheringState === 'complete') {
+      // Already gathered (can happen if reusing descriptions or no network)
+      if (this.pc.localDescription) {
+        this._onSignal(this.pc.localDescription);
+      }
+      return;
+    }
+
+    // Wait for gathering to finish
+    await new Promise<void>((resolve) => {
+      this._gatheringCompleteResolve = resolve;
+    });
+
+    if (this._destroyed) return;
+
+    if (this.pc.localDescription) {
+      this._onSignal(this.pc.localDescription);
     }
   }
 
@@ -282,9 +334,7 @@ export class RTCPeer {
 
     if (description.type === 'offer') {
       await this.pc.setLocalDescription();
-      if (this.pc.localDescription) {
-        this._onSignal(this.pc.localDescription);
-      }
+      await this._sendLocalDescription();
     }
   }
 
@@ -331,11 +381,22 @@ export class RTCPeer {
       this._enqueueNegotiation();
     });
 
-    // ICE candidates
+    // ICE candidates — only trickle individually when trickle ICE is enabled.
+    // In non-trickle mode, candidates are gathered and bundled into the SDP
+    // description, sent when gathering completes (see _sendLocalDescriptionWhenReady).
     this.pc.addEventListener('icecandidate', (event: any) => {
       if (this._destroyed) return;
       if (event.candidate) {
-        this._onSignal(event.candidate.toJSON ? event.candidate.toJSON() : event.candidate);
+        if (this._trickleICE) {
+          this._onSignal(event.candidate.toJSON ? event.candidate.toJSON() : event.candidate);
+        }
+        // Non-trickle: candidates accumulate in pc.localDescription automatically
+      } else {
+        // event.candidate === null means gathering is complete (per spec)
+        if (this._gatheringCompleteResolve) {
+          this._gatheringCompleteResolve();
+          this._gatheringCompleteResolve = null;
+        }
       }
     });
 
@@ -366,6 +427,13 @@ export class RTCPeer {
     this.pc.addEventListener('icegatheringstatechange', () => {
       if (this._destroyed) return;
       this._emit({ type: 'gathering-state-change', data: this.pc.iceGatheringState });
+      // Fallback for non-trickle: if gathering completes, resolve the pending promise.
+      // The primary mechanism is the null candidate in onicecandidate, but this
+      // ensures we don't hang if that event is missed.
+      if (this.pc.iceGatheringState === 'complete' && this._gatheringCompleteResolve) {
+        this._gatheringCompleteResolve();
+        this._gatheringCompleteResolve = null;
+      }
     });
 
     // Remote tracks
