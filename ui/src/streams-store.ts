@@ -123,6 +123,26 @@ export class StreamsStore {
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
 
+    // Read persisted settings BEFORE constructing managers so they get
+    // the user's saved config, not class-level defaults.
+    const trickleICE = window.localStorage.getItem('trickleICE');
+    if (trickleICE) {
+      this.trickleICE = JSON.parse(trickleICE);
+    }
+    const connTimeout = window.localStorage.getItem('connectionTimeoutMs');
+    if (connTimeout) this.connectionTimeoutMs = parseInt(connTimeout, 10);
+    const sdpTimeout = window.localStorage.getItem('sdpExchangeTimeoutMs');
+    if (sdpTimeout) this.sdpExchangeTimeoutMs = parseInt(sdpTimeout, 10);
+    const dtlsTimeout = window.localStorage.getItem('dtlsStallTimeoutMs');
+    if (dtlsTimeout) this.dtlsStallTimeoutMs = parseInt(dtlsTimeout, 10);
+    this.turnUrl = window.localStorage.getItem('turnUrl') || '';
+    this.turnUsername = window.localStorage.getItem('turnUsername') || '';
+    this.turnCredential = window.localStorage.getItem('turnCredential') || '';
+    const signalDelay = window.localStorage.getItem('signalDelayMs');
+    if (signalDelay) {
+      this.signalDelayMs = parseInt(signalDelay, 10) || 0;
+    }
+
     // Initialize ConnectionManager
     this._signalingAdapter = new HolochainSignalingAdapter(this.roomClient);
     this.connectionManager = new ConnectionManager({
@@ -175,23 +195,6 @@ export class StreamsStore {
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
     );
-    const trickleICE = window.localStorage.getItem('trickleICE');
-    if (trickleICE) {
-      this.trickleICE = JSON.parse(trickleICE);
-    }
-    const connTimeout = window.localStorage.getItem('connectionTimeoutMs');
-    if (connTimeout) this.connectionTimeoutMs = parseInt(connTimeout, 10);
-    const sdpTimeout = window.localStorage.getItem('sdpExchangeTimeoutMs');
-    if (sdpTimeout) this.sdpExchangeTimeoutMs = parseInt(sdpTimeout, 10);
-    const dtlsTimeout = window.localStorage.getItem('dtlsStallTimeoutMs');
-    if (dtlsTimeout) this.dtlsStallTimeoutMs = parseInt(dtlsTimeout, 10);
-    this.turnUrl = window.localStorage.getItem('turnUrl') || '';
-    this.turnUsername = window.localStorage.getItem('turnUsername') || '';
-    this.turnCredential = window.localStorage.getItem('turnCredential') || '';
-    const signalDelay = window.localStorage.getItem('signalDelayMs');
-    if (signalDelay) {
-      this.signalDelayMs = parseInt(signalDelay, 10) || 0;
-    }
     navigator.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
@@ -886,11 +889,15 @@ export class StreamsStore {
   enableTrickleICE() {
     window.localStorage.setItem('trickleICE', 'true');
     this.trickleICE = true;
+    this.connectionManager.updateConfig({ trickleICE: true });
+    this.screenShareConnectionManager.updateConfig({ trickleICE: true });
   }
 
   disableTrickleICE() {
     window.localStorage.setItem('trickleICE', 'false');
     this.trickleICE = false;
+    this.connectionManager.updateConfig({ trickleICE: false });
+    this.screenShareConnectionManager.updateConfig({ trickleICE: false });
   }
 
   setConnectionTimeoutMs(ms: number) {
@@ -929,16 +936,25 @@ export class StreamsStore {
   setTurnUrl(url: string) {
     this.turnUrl = url;
     window.localStorage.setItem('turnUrl', url);
+    this._propagateIceServers();
   }
 
   setTurnUsername(username: string) {
     this.turnUsername = username;
     window.localStorage.setItem('turnUsername', username);
+    this._propagateIceServers();
   }
 
   setTurnCredential(credential: string) {
     this.turnCredential = credential;
     window.localStorage.setItem('turnCredential', credential);
+    this._propagateIceServers();
+  }
+
+  private _propagateIceServers() {
+    const iceServers = this.iceConfig;
+    this.connectionManager.updateConfig({ iceServers });
+    this.screenShareConnectionManager.updateConfig({ iceServers });
   }
 
   setSignalDelay(ms: number) {

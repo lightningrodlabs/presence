@@ -291,7 +291,11 @@ export class PeerConnectionFSM {
 
     // If we're in a state that can handle signals, forward to peer
     if (this._peer && !this._peer.destroyed && !this._destroyed) {
-      await this._peer.handleSignal(signal);
+      try {
+        await this._peer.handleSignal(signal);
+      } catch (err) {
+        console.warn(`[FSM ${this.remoteAgent.slice(0, 8)}] handleSignal error:`, err);
+      }
     }
   }
 
@@ -304,6 +308,7 @@ export class PeerConnectionFSM {
 
   /** Remove a local media stream */
   removeLocalStream(stream: MediaStream): void {
+    this._localStream = null;
     if (this._destroyed || !this._peer) return;
     for (const sender of this._peer.getSenders()) {
       if (sender.track) {
@@ -641,8 +646,8 @@ export class PeerConnectionFSM {
 
     const delayMs = this._reconnectPolicy.nextRetryDelayMs(context);
     if (delayMs === null) {
-      // Retries exhausted
-      this._transition('disconnected', { trigger: 'reconnect retries exhausted' });
+      // Retries exhausted — transition to failed (not disconnected, which auto-retries)
+      this._transition('failed', { trigger: 'reconnect retries exhausted' });
       return;
     }
 
@@ -691,9 +696,7 @@ export class PeerConnectionFSM {
   // ---------------------------------------------------------------------------
 
   private _newPeerSession(): void {
-    if (this._peer && !this._peer.destroyed) {
-      this._peer.destroy();
-    }
+    this._destroyPeer();
 
     this._localCandidateCount = 0;
     this._remoteCandidateCount = 0;
@@ -1162,6 +1165,8 @@ export class PeerConnectionFSM {
   // ---------------------------------------------------------------------------
 
   private _startTimer(name: string, delayMs: number, callback: () => void): void {
+    // Clear any existing timer with the same name to prevent duplicates
+    this._clearTimer(name);
     const id = setTimeout(() => {
       this._timers = this._timers.filter(t => t.name !== name);
       callback();

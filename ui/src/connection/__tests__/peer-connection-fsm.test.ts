@@ -370,7 +370,7 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('reconnecting');
     });
 
-    it('goes to disconnected when retries are exhausted', async () => {
+    it('goes to failed when retries are exhausted', async () => {
       const ctx = createFSM({
         reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 1, iceRestartMaxAttempts: 1 }),
       });
@@ -388,8 +388,8 @@ describe('PeerConnectionFSM', () => {
       // ICE restart timeout
       vi.advanceTimersByTime(7_001);
 
-      // Retries exhausted
-      expect(ctx.fsm.state).toBe('disconnected');
+      // Retries exhausted — should go to failed, not disconnected (which auto-retries)
+      expect(ctx.fsm.state).toBe('failed');
     });
 
     it('resets reconnect count on successful reconnection', async () => {

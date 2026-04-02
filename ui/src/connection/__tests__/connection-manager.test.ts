@@ -8,6 +8,9 @@ import {
   createMockStream,
 } from './test-helpers';
 
+// Track managers for cleanup in afterEach
+const activeManagers: ConnectionManager[] = [];
+
 function createManager(options: {
   agentId?: string;
   signalingChannel?: FakeSignalingChannel;
@@ -24,6 +27,7 @@ function createManager(options: {
       return new MockRTCPeerConnection(config) as unknown as RTCPeerConnection;
     },
   });
+  activeManagers.push(manager);
 
   return { manager, channel, transitionLog, agentId };
 }
@@ -43,6 +47,12 @@ describe('ConnectionManager', () => {
   });
 
   afterEach(() => {
+    // Destroy all managers before restoring real timers to prevent
+    // auto-retry timers from cascading and causing OOM
+    for (const m of activeManagers) {
+      m.destroy();
+    }
+    activeManagers.length = 0;
     vi.useRealTimers();
   });
 
@@ -292,18 +302,21 @@ describe('ConnectionManager', () => {
         data: { type: 'offer', sdp: 'mock-offer-1' },
       });
 
-      const fsm = a.manager.getFSM('agent-bbb')!;
-      expect(fsm.remoteConnectionId).toBe('b-conn-old');
+      const oldFsm = a.manager.getFSM('agent-bbb')!;
+      expect(oldFsm.remoteConnectionId).toBe('b-conn-old');
 
-      // Peer B reconnects with new connectionId — sends new offer
+      // Peer B reconnects with new connectionId — sends new offer.
+      // ConnectionManager detects the remoteConnectionId mismatch, destroys
+      // the old FSM, and creates a fresh one. Re-fetch after.
       bAdapter.sendSignal('agent-aaa', {
         type: 'offer',
         connectionId: 'b-conn-new',
         data: { type: 'offer', sdp: 'mock-offer-2' },
       });
 
-      // remoteConnectionId should be updated
-      expect(fsm.remoteConnectionId).toBe('b-conn-new');
+      const newFsm = a.manager.getFSM('agent-bbb')!;
+      expect(newFsm).not.toBe(oldFsm);
+      expect(newFsm.remoteConnectionId).toBe('b-conn-new');
 
       // Candidate with new connectionId should be accepted
       const logBefore = a.transitionLog.length;

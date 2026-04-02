@@ -58,6 +58,7 @@ export class RTCPeer {
   // AND outgoing offers from negotiationneeded) to prevent concurrent
   // setLocalDescription/setRemoteDescription from corrupting signaling state.
   private _taskQueue: Array<() => Promise<void>> = [];
+  private _taskResolvers: Array<() => void> = [];
   private _processingTasks = false;
 
   constructor(options: RTCPeerOptions) {
@@ -133,6 +134,7 @@ export class RTCPeer {
   /** Enqueue a task and drain the queue serially */
   private async _enqueueTask(task: () => Promise<void>): Promise<void> {
     return new Promise<void>((resolve) => {
+      this._taskResolvers.push(resolve);
       this._taskQueue.push(async () => {
         await task();
         resolve();
@@ -227,6 +229,11 @@ export class RTCPeer {
     this._destroyed = true;
     this._destroying = false;
     this._pendingCandidates = [];
+    // Resolve any pending task promises so they don't hang
+    for (const resolve of this._taskResolvers) {
+      resolve();
+    }
+    this._taskResolvers = [];
     this._taskQueue = [];
     // Unblock any pending gathering wait so it doesn't leak
     if (this._gatheringCompleteResolve) {
