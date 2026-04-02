@@ -168,23 +168,25 @@ export class PrivateRoomCard extends LitElement {
       }
 
       .enter-room-btn {
-        background: linear-gradient(#102a4d, #071931);
-        border-radius: 10px;
+        background: linear-gradient(#2a4a8f, #1a3060);
+        border-radius: 20px;
         color: #fff0f0;
         border: none;
         padding: 5px 10px;
-        box-shadow: 0px 0px 2px 0px #03162f;
+        box-shadow: 0 0 15px 3px rgba(100, 140, 255, 0.2), 1px 1px 4px 2px #03162f;
         font-weight: 600;
         font-size: 20px;
         cursor: pointer;
       }
 
       .enter-room-btn:hover {
-        background: linear-gradient(#243e61, #0c203a);
+        background: linear-gradient(#3558a0, #1f3870);
+        box-shadow: 0 0 20px 4px rgba(100, 140, 255, 0.3), 1px 1px 4px 2px #03162f;
       }
 
       .enter-room-btn:focus {
-        background: linear-gradient(#243e61, #0c203a);
+        background: linear-gradient(#3558a0, #1f3870);
+        box-shadow: 0 0 20px 4px rgba(100, 140, 255, 0.3), 1px 1px 4px 2px #03162f;
       }
 
       sl-tooltip::part(body) {
