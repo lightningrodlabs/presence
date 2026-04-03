@@ -36,9 +36,9 @@ export type ConnectionPhase =
 export const VALID_TRANSITIONS: Record<ConnectionPhase, Set<ConnectionPhase>> = {
   idle:          new Set(['signaling', 'closed']),
   signaling:     new Set(['connecting', 'disconnected', 'closed']),
-  connecting:    new Set(['connected', 'disconnected', 'closed']),
+  connecting:    new Set(['connected', 'signaling', 'disconnected', 'closed']),
   connected:     new Set(['reconnecting', 'disconnected', 'failed', 'closed']),
-  reconnecting:  new Set(['reconnecting', 'connected', 'disconnected', 'failed', 'closed']),
+  reconnecting:  new Set(['reconnecting', 'signaling', 'connected', 'disconnected', 'failed', 'closed']),
   disconnected:  new Set(['signaling', 'idle', 'closed']),
   failed:        new Set(['idle', 'closed']),
   closed:        new Set([]),  // terminal — no transitions out
@@ -177,8 +177,7 @@ export type FSMEventType =
   | 'remote-track'
   | 'data-channel-message'
   | 'data-channel-open'
-  | 'error'
-  | 'closed';
+  | 'error';
 
 export type FSMEvent = {
   type: FSMEventType;

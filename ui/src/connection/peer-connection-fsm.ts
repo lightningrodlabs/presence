@@ -259,26 +259,8 @@ export class PeerConnectionFSM {
     if ((this._state === 'reconnecting' || this._state === 'connecting') &&
         'type' in signal && signal.type === 'offer' &&
         isNewRemoteSession) {
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
+      this._transition('signaling', {
         trigger: `fresh peer for new remote connection ${remoteConnectionId!.slice(0, 8)} (was ${this._remoteConnectionId?.slice(0, 8) ?? 'null'})`,
-        peerSessionId: this._session.local,
-      });
-      this._clearAllTimers();
-      this._destroyPeer();
-      this._resetReadinessFlags();
-      this._newPeerSession();
-      // Timeout in case the fresh peer doesn't connect
-      this._startTimer('fresh-peer-timeout', this._config.connectionTimeoutMs, () => {
-        if (this._state === 'reconnecting') {
-          this._scheduleReconnectAttempt();
-        } else if (this._state === 'connecting') {
-          this._transition('disconnected', { trigger: `connection timeout (${this._config.connectionTimeoutMs}ms)` });
-        }
       });
     }
 

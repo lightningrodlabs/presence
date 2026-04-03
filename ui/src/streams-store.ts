@@ -615,7 +615,6 @@ export class StreamsStore {
           this._screenShareConnectionsOutgoing.update(currentValue => {
             currentValue[pubKeyB64] = {
               connectionId,
-
               video: true,
               audio: false,
               connected: true,
@@ -639,7 +638,6 @@ export class StreamsStore {
           this._screenShareConnectionsIncoming.update(currentValue => {
             currentValue[pubKeyB64] = {
               connectionId,
-
               video: false,
               audio: false,
               connected: true,
@@ -1985,7 +1983,6 @@ export class StreamsStore {
           if (!conns[pubkeyB64]) {
             conns[pubkeyB64] = {
               connectionId: '',
-
               video: false,
               audio: false,
               connected: false,
