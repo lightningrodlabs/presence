@@ -39,6 +39,7 @@ export class RTCPeer {
   private _onSignal: (data: RTCSessionDescriptionInit | RTCIceCandidateInit) => void;
   private _handlers: Map<string, RTCPeerEventHandler[]> = new Map();
   private _dataChannel: RTCDataChannel | null = null;
+  private _remoteDataChannels: RTCDataChannel[] = [];
   private _destroyed = false;
   private _destroying = false;
 
@@ -246,6 +247,10 @@ export class RTCPeer {
         this._dataChannel.close();
         this._dataChannel = null;
       }
+      for (const ch of this._remoteDataChannels) {
+        try { ch.close(); } catch (_) {}
+      }
+      this._remoteDataChannels = [];
       this.pc.close();
     } catch (e) {
       // Ignore errors during teardown
@@ -480,6 +485,7 @@ export class RTCPeer {
     this.pc.addEventListener('datachannel', (event: any) => {
       if (this._destroyed) return;
       const channel = event.channel;
+      this._remoteDataChannels.push(channel);
       channel.addEventListener('message', (msgEvent: any) => {
         if (this._destroyed) return;
         this._emit({ type: 'data', data: msgEvent.data });

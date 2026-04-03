@@ -615,7 +615,7 @@ export class StreamsStore {
           this._screenShareConnectionsOutgoing.update(currentValue => {
             currentValue[pubKeyB64] = {
               connectionId,
-              peer: null as any,
+
               video: true,
               audio: false,
               connected: true,
@@ -639,7 +639,7 @@ export class StreamsStore {
           this._screenShareConnectionsIncoming.update(currentValue => {
             currentValue[pubKeyB64] = {
               connectionId,
-              peer: null as any,
+
               video: false,
               audio: false,
               connected: true,
@@ -720,7 +720,6 @@ export class StreamsStore {
         const inheritVideo = canInheritMedia && existing != null;
         newOpenConnections[agent] = {
           connectionId: fsm?.connectionId ?? '',
-          peer: null as any,
           video: inheritVideo ? existing!.video : hasVideoStream,
           audio: inheritVideo ? existing!.audio : hasAudioStream,
           connected: state === 'connected',
@@ -821,8 +820,9 @@ export class StreamsStore {
     );
 
     // Wait for allAgents to load before first ping so we actually have peers to contact
+    let initUnsub: (() => void) | undefined;
     await new Promise<void>((resolve) => {
-      roomStore.allAgents.subscribe(val => {
+      initUnsub = roomStore.allAgents.subscribe(val => {
         if (val.status === 'complete') {
           streamsStore.allAgents = val.value;
           resolve();
@@ -832,6 +832,8 @@ export class StreamsStore {
         }
       });
     });
+    // Unsubscribe the one-shot — the ongoing subscription below takes over
+    initUnsub?.();
 
     // Keep subscribing for ongoing updates
     streamsStore.allAgentsUnsubscribe = roomStore.allAgents.subscribe(val => {
@@ -884,6 +886,8 @@ export class StreamsStore {
     this._openConnections.set({});
     this._screenShareConnectionsOutgoing.set({});
     this._screenShareConnectionsIncoming.set({});
+    this._videoStreams = {};
+    this._screenShareStreams = {};
   }
 
   enableTrickleICE() {
@@ -1296,9 +1300,6 @@ export class StreamsStore {
           const audioTrack = this.mainStream.getAudioTracks()[0];
           audioTrack.enabled = false;
         }
-        this.eventCallback({
-          type: 'my-audio-on',
-        });
       } catch (e: any) {
         const error = `Failed to get media devices (audio): ${e.toString()}`;
         console.error(error);
@@ -1984,7 +1985,7 @@ export class StreamsStore {
           if (!conns[pubkeyB64]) {
             conns[pubkeyB64] = {
               connectionId: '',
-              peer: null as any,
+
               video: false,
               audio: false,
               connected: false,

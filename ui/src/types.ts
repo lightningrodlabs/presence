@@ -33,7 +33,6 @@ export type RTCMessage =
 
 export type OpenConnectionInfo = {
   connectionId: ConnectionId;
-  peer: any;
   video: boolean;
   audio: boolean;
   connected: boolean;

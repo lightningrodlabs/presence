@@ -89,6 +89,7 @@ export class PeerConnectionFSM {
 
   // Reconnection state
   private _reconnectCount = 0;
+  private _disconnectedRetryCount = 0;
   private _reconnectStartedAt = 0;
   private _reconnectReason: ReconnectContext['retryReason'] = 'ice-failed';
   private _lastReconnectStrategy: 'ice-restart' | 'full-reconnect' = 'ice-restart';
@@ -113,6 +114,9 @@ export class PeerConnectionFSM {
   // DTLS watchdog — tracks when ICE connects but DTLS hasn't completed
   private _iceConnectedAt: number | null = null;
   private _dtlsWatchdogId: ReturnType<typeof setTimeout> | null = null;
+
+  // Track event listener cleanup
+  private _trackCleanups: (() => void)[] = [];
   private _dtlsStallCount = 0;
 
   // Diagnostic counters
@@ -462,6 +466,7 @@ export class PeerConnectionFSM {
     // Reset reconnection state on successful connection
     if (newState === 'connected') {
       this._reconnectCount = 0;
+      this._disconnectedRetryCount = 0;
       this._reconnectStartedAt = 0;
     }
 
@@ -498,6 +503,14 @@ export class PeerConnectionFSM {
         break;
 
       case 'disconnected': {
+        // Guard: give up after max attempts to avoid infinite retry loops
+        // (e.g., remote peer never responds to the initial connection).
+        if (this._disconnectedRetryCount >= this._reconnectPolicy.maxAttempts) {
+          this._transition('failed', { trigger: 'disconnected retry limit reached' });
+          break;
+        }
+        this._disconnectedRetryCount++;
+
         // Auto-retry with jitter to desynchronize both peers' retry cadence.
         // Without jitter, both sides create new NAT mappings simultaneously,
         // invalidating each other's previous STUN bindings.
@@ -726,6 +739,8 @@ export class PeerConnectionFSM {
   }
 
   private _destroyPeer(): void {
+    for (const cleanup of this._trackCleanups) cleanup();
+    this._trackCleanups = [];
     if (this._peer) {
       this._peer.destroy();
       this._peer = null;
@@ -823,7 +838,6 @@ export class PeerConnectionFSM {
     peer.on('ice-state-change', (event) => {
       if (this._destroyed) return;
       const iceState = event.data as string;
-      const agentShort = this.remoteAgent.slice(0, 8);
       this._onTransition?.({
         timestamp: Date.now(),
         connectionId: this.connectionId,
@@ -915,16 +929,22 @@ export class PeerConnectionFSM {
       if (track.kind === 'video') {
         this._videoReceiving = true;
         this._videoMuted = track.muted;
-        track.onmute = () => {
+        const onMute = () => {
           if (this._destroyed) return;
           this._videoMuted = true;
           this._notifyViewModelChange();
         };
-        track.onunmute = () => {
+        const onUnmute = () => {
           if (this._destroyed) return;
           this._videoMuted = false;
           this._notifyViewModelChange();
         };
+        track.addEventListener('mute', onMute);
+        track.addEventListener('unmute', onUnmute);
+        this._trackCleanups.push(() => {
+          track.removeEventListener('mute', onMute);
+          track.removeEventListener('unmute', onUnmute);
+        });
       }
       this._emitEvent({
         type: 'remote-track',

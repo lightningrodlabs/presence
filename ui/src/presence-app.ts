@@ -965,7 +965,6 @@ export class PresenceApp extends LitElement {
             >
             <div class="column top-panel">
               <div class="row" style="position: absolute; top: 0; right: 20px; align-items: center; gap: 10px;">
-                presence.f
                 <sl-icon
                   .src=${wrapPathInSvg(mdiCog)}
                   style="font-size: 22px; cursor: pointer; opacity: 0.8;"

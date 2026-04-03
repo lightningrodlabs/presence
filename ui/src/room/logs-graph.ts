@@ -711,15 +711,6 @@ function simpleEventTypeToColor(
       return ['lightblue', undefined];
     case 'SdpData':
       return ['gray', undefined];
-    case 'SimplePeerClose':
-      return ['black', undefined];
-    case 'SimplePeerError':
-      return ['red', undefined];
-    case 'SimplePeerStream':
-      return ['darkblue', undefined];
-    case 'SimplePeerTrack':
-      return ['cyan', undefined];
-
     // Media events
     case 'PeerAudioOnSignal':
       return ['darkred', undefined];
@@ -785,10 +776,6 @@ function yEventType(event: SimpleEventType): [number, number] {
     case 'InitAccept':
     case 'InitRequest':
     case 'SdpData':
-    case 'SimplePeerClose':
-    case 'SimplePeerError':
-    case 'SimplePeerStream':
-    case 'SimplePeerTrack':
     case 'PeerLeave':
       return [0, 1.5];
 
