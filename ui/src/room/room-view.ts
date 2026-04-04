@@ -23,6 +23,7 @@ import {
   mdiMinus,
   mdiMonitorScreenshot,
   mdiNoteEditOutline,
+  mdiCubeOutline,
   mdiPaperclip,
   mdiPencilCircleOutline,
   mdiPhoneRefresh,
@@ -43,12 +44,13 @@ import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
 import '@shoelace-style/shoelace/dist/components/dropdown/dropdown.js';
 import '@shoelace-style/shoelace/dist/components/menu/menu.js';
 import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
-import { AssetStoreContent, WAL, WeaveClient } from '@theweave/api';
+import { AssetStoreContent, stringifyWal, WAL, weaveUrlFromWal, WeaveClient } from '@theweave/api';
+import './elements/shared-wal-embed';
 
 import { roomStoreContext, streamsStoreContext } from '../contexts';
 import { sharedStyles } from '../sharedStyles';
 import './elements/avatar-with-nickname';
-import { RoomInfo, StreamAndTrackInfo, weaveClientContext } from '../types';
+import { RoomInfo, SharedWalPayload, StreamAndTrackInfo, weaveClientContext } from '../types';
 import { RoomStore } from './room-store';
 import './elements/attachment-element';
 import './elements/agent-connection-status';
@@ -151,6 +153,18 @@ export class RoomView extends LitElement {
   _screenShareConnectionsIncoming = new StoreSubscriber(
     this,
     () => this.streamsStore._screenShareConnectionsIncoming,
+    () => [this.streamsStore]
+  );
+
+  _mySharedWal = new StoreSubscriber(
+    this,
+    () => this.streamsStore._mySharedWal,
+    () => [this.streamsStore]
+  );
+
+  _peerSharedWals = new StoreSubscriber(
+    this,
+    () => this.streamsStore._peerSharedWals,
     () => [this.streamsStore]
   );
 
@@ -413,6 +427,11 @@ export class RoomView extends LitElement {
           }
           break;
         }
+        case 'peer-share-wal':
+        case 'peer-stop-share-wal': {
+          this.requestUpdate();
+          break;
+        }
         default:
           break;
       }
@@ -441,6 +460,31 @@ export class RoomView extends LitElement {
     await this._weaveClient.assets.removeAssetRelation(relationHash);
   }
 
+  async startShareWal() {
+    const selectedWal = await this._weaveClient.assets.userSelectAsset();
+    if (!selectedWal) return;
+
+    let assetName: string | undefined;
+    let assetIconSrc: string | undefined;
+    try {
+      const info = await this._weaveClient.assets.assetInfo(selectedWal);
+      if (info) {
+        assetName = info.assetInfo.name;
+        assetIconSrc = info.assetInfo.icon_src;
+      }
+    } catch (e) {
+      console.warn('Could not resolve asset info for shared WAL:', e);
+    }
+
+    const payload: SharedWalPayload = {
+      walStringified: stringifyWal(selectedWal),
+      weaveUrl: weaveUrlFromWal(selectedWal),
+      assetName,
+      assetIconSrc,
+    };
+    await this.streamsStore.shareWal(payload);
+  }
+
   openCustomEventLogDialog() {
     this._customLogTimestamp = Date.now();
     this._showCustomLogDialog = true;
@@ -455,6 +499,54 @@ export class RoomView extends LitElement {
       this._maximizedVideo = id;
     } else {
       this._maximizedVideo = undefined;
+    }
+  }
+
+  updated(changedProperties: Map<string, unknown>) {
+    // Re-apply video srcObjects after layout changes (e.g. maximize/minimize).
+    // The display:contents transition can destroy video rendering context,
+    // so we force re-assign srcObject after the DOM settles.
+    if (changedProperties.has('_maximizedVideo')) {
+      setTimeout(() => this._reapplyVideoStreams(), 50);
+    }
+  }
+
+  private _reapplyVideoStreams() {
+    const restoreVideo = (el: HTMLVideoElement | null, stream: MediaStream | undefined | null) => {
+      if (!el || !stream) return;
+      // Force re-assign to recover from display:contents transition
+      el.srcObject = null;
+      el.srcObject = stream;
+      el.autoplay = true;
+      el.play().catch(() => {});
+    };
+
+    // Own screen share
+    restoreVideo(
+      this.shadowRoot?.getElementById('my-own-screen') as HTMLVideoElement | null,
+      this.streamsStore.screenShareStream,
+    );
+
+    // Own camera
+    restoreVideo(
+      this.shadowRoot?.getElementById('my-own-stream') as HTMLVideoElement | null,
+      this.streamsStore.mainStream,
+    );
+
+    // Peer screen shares
+    for (const [pubkeyB64, conn] of Object.entries(this._screenShareConnectionsIncoming.value)) {
+      restoreVideo(
+        this.shadowRoot?.getElementById(conn.connectionId) as HTMLVideoElement | null,
+        this.streamsStore._screenShareStreams[pubkeyB64],
+      );
+    }
+
+    // Peer video streams
+    for (const [pubkeyB64, conn] of Object.entries(this._openConnections.value)) {
+      restoreVideo(
+        this.shadowRoot?.getElementById(conn.connectionId) as HTMLVideoElement | null,
+        this.streamsStore._videoStreams[pubkeyB64],
+      );
     }
   }
 
@@ -1290,6 +1382,39 @@ export class RoomView extends LitElement {
         </sl-tooltip>
 
         <sl-tooltip
+          content="${this._mySharedWal.value
+            ? msg('Stop Sharing Asset')
+            : msg('Share Asset')}"
+          hoist
+        >
+          <div
+            class="toggle-btn ${this._mySharedWal.value ? '' : 'btn-off'}"
+            tabindex="0"
+            @click=${async () => {
+              if (this._mySharedWal.value) {
+                await this.streamsStore.stopShareWal();
+              } else {
+                await this.startShareWal();
+              }
+            }}
+            @keypress=${async (e: KeyboardEvent) => {
+              if (e.key === 'Enter') {
+                if (this._mySharedWal.value) {
+                  await this.streamsStore.stopShareWal();
+                } else {
+                  await this.startShareWal();
+                }
+              }
+            }}
+          >
+            <sl-icon
+              class="toggle-btn-icon ${this._mySharedWal.value ? '' : 'btn-icon-off'}"
+              .src=${wrapPathInSvg(mdiCubeOutline)}
+            ></sl-icon>
+          </div>
+        </sl-tooltip>
+
+        <sl-tooltip
           content="${this._selfViewHidden
             ? msg('Show Self View')
             : msg('Hide Self View')}"
@@ -1567,8 +1692,13 @@ export class RoomView extends LitElement {
     const incomingScreenShares = Object.entries(this._screenShareConnectionsIncoming.value).filter(
       ([_, conn]) => conn.direction === 'incoming'
     );
+    const allSharedWals = {
+      ...(this._mySharedWal.value ? { [encodeHashToBase64(this.roomStore.client.client.myPubKey)]: this._mySharedWal.value } : {}),
+      ...(this._peerSharedWals.value || {}),
+    };
+    const sharedWalEntries = Object.entries(allSharedWals);
     const hasScreenShares =
-      !!this.streamsStore.screenShareStream || incomingScreenShares.length > 0;
+      !!this.streamsStore.screenShareStream || incomingScreenShares.length > 0 || sharedWalEntries.length > 0;
     const splitMode = hasScreenShares && !this._maximizedVideo;
     return html`
       <div
@@ -1678,12 +1808,13 @@ export class RoomView extends LitElement {
         ${this.roomName()}
       </div>
       <div class="videos-container${splitMode ? ' split-mode' : ''}">
+        ${this._isResizing ? html`<div class="resize-overlay"></div>` : html``}
         ${hasScreenShares ? html`
         <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
         <!-- My own screen first if screen sharing is enabled -->
         <div
           style="${this.streamsStore.screenShareStream ? '' : 'display: none;'}"
-          class="video-container screen-share ${this.idToLayout(
+          class="video-container screen-share shared-panel-frame ${this.idToLayout(
             'my-own-screen',
             true
           )}"
@@ -1744,7 +1875,7 @@ export class RoomView extends LitElement {
           ([_pubkeyB64, conn]) => conn.connectionId,
           ([pubkeyB64, conn]) => html`
             <div
-              class="video-container screen-share ${this.idToLayout(
+              class="video-container screen-share shared-panel-frame ${this.idToLayout(
                 conn.connectionId,
                 true
               )}"
@@ -1816,6 +1947,44 @@ export class RoomView extends LitElement {
             </div>
           `
         )}
+
+        <!-- Shared WAL embeds -->
+        ${sharedWalEntries.map(([agentB64, walPayload]) => {
+          const isMe = agentB64 === encodeHashToBase64(this.roomStore.client.client.myPubKey);
+          const walEmbedId = `shared-wal-${agentB64.slice(0, 8)}`;
+          const walLayout = this._maximizedVideo === walEmbedId ? 'maximized' : this._maximizedVideo ? 'hidden' : '';
+          return html`
+          <div class="shared-wal-container shared-panel-frame ${walLayout}"
+            @dblclick=${() => this.toggleMaximized(walEmbedId)}
+          >
+            <shared-wal-embed
+              .src=${walPayload.weaveUrl}
+              .closable=${isMe}
+              @close=${() => this.streamsStore.stopShareWal()}
+              style="flex: 1;"
+            ></shared-wal-embed>
+            <sl-icon
+              title="${this._maximizedVideo === walEmbedId ? 'minimize' : 'maximize'}"
+              .src=${this._maximizedVideo === walEmbedId
+                ? wrapPathInSvg(mdiFullscreenExit)
+                : wrapPathInSvg(mdiFullscreen)}
+              tabindex="0"
+              class="maximize-icon"
+              @click=${() => this.toggleMaximized(walEmbedId)}
+              @keypress=${(e: KeyboardEvent) => {
+                if (e.key === 'Enter') this.toggleMaximized(walEmbedId);
+              }}
+            ></sl-icon>
+            <div class="shared-wal-footer">
+              <avatar-with-nickname
+                .size=${36}
+                .agentPubKey=${decodeHashFromBase64(agentB64)}
+                style="height: 36px;"
+              ></avatar-with-nickname>
+            </div>
+          </div>
+        `})}
+
         </div>
         ${splitMode ? html`<div class="resize-handle" @mousedown=${this._onResizeStart} @touchstart=${this._onResizeStart}></div>` : html``}
         ` : html``}
@@ -2261,6 +2430,19 @@ export class RoomView extends LitElement {
       >
         ${msg('Stop Screen Share')}
       </div>
+      <div
+        class="stop-share"
+        tabindex="0"
+        style="${this._mySharedWal.value ? '' : 'display: none'}"
+        @click=${async () => this.streamsStore.stopShareWal()}
+        @keypress=${async (e: KeyboardEvent) => {
+          if (e.key === 'Enter') {
+            await this.streamsStore.stopShareWal();
+          }
+        }}
+      >
+        ${msg('Stop Sharing Asset')}${this._mySharedWal.value?.assetName ? ` — ${this._mySharedWal.value.assetName}` : ''}
+      </div>
     `;
   }
 
@@ -2474,6 +2656,25 @@ export class RoomView extends LitElement {
         background: #fd5959;
       }
 
+      .shared-wal-container {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        flex: 1;
+        min-height: 150px;
+        position: relative;
+      }
+
+      .shared-wal-footer {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        position: absolute;
+        bottom: 10px;
+        right: 10px;
+        background: none;
+      }
+
       .error-message {
         position: fixed;
         bottom: 10px;
@@ -2497,6 +2698,7 @@ export class RoomView extends LitElement {
         min-height: 100vh;
         margin: 0;
         align-content: center;
+        position: relative;
       }
 
       .video-container {
@@ -2540,14 +2742,14 @@ export class RoomView extends LitElement {
       }
 
       .maximized {
-        height: 98.5vh;
-        width: 98.5vw;
+        height: 100vh;
+        width: 100vw;
         margin: 0;
       }
 
       .video-container.screen-share.maximized {
-        width: 98.5vw;
-        min-width: 98.5vw;
+        width: 100vw;
+        min-width: 100vw;
       }
 
       .maximize-icon {
@@ -2576,8 +2778,16 @@ export class RoomView extends LitElement {
       }
 
       .video-container.screen-share {
-        border: 4px solid #ffe100;
-        border-radius: 20px;
+        aspect-ratio: auto;
+      }
+
+      .shared-panel-frame {
+        border: 4px solid #ffe100 !important;
+        border-radius: 20px !important;
+        overflow: hidden;
+        box-sizing: border-box;
+        background: black;
+        margin: 0 !important;
       }
 
       .video-container.screen-share .video-el {
@@ -2613,13 +2823,26 @@ export class RoomView extends LitElement {
       }
 
       .screen-share-panel {
+        position: static;
         min-width: 0;
         min-height: 0;
+        padding-top: 50px;
+        box-sizing: border-box;
+        flex-direction: column;
+        flex-wrap: nowrap;
+        align-items: stretch;
       }
 
-      /* When not in split mode (e.g. maximized), make the panel invisible */
+      /* When not in split mode (e.g. maximized), fill the viewport.
+         Avoid display:contents which destroys video rendering context on transition. */
       .videos-container:not(.split-mode) .screen-share-panel {
-        display: contents;
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        padding-top: 0;
+        z-index: 2;
       }
 
       .people-panel {
@@ -2648,6 +2871,16 @@ export class RoomView extends LitElement {
 
       .layout-transparent {
         display: contents;
+      }
+
+      .resize-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 100;
+        cursor: col-resize;
       }
 
       .resize-handle {
@@ -2785,9 +3018,15 @@ export class RoomView extends LitElement {
       /* Screen share panel: screen shares are 16:9, so stack vertically
          for 2 (full width, 49% height each) to maximize visible area.
          For 3+, use a grid that constrains both dimensions. */
+      .screen-share-panel > * {
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+      }
+
       .screen-share-panel .single {
         height: min(98cqh, 100%);
-        width: min(98cqw, 100%);
+        //width: min(98cqw, 100%);
         max-height: 98cqh;
       }
       .screen-share-panel .double {
