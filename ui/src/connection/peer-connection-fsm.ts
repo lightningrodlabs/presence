@@ -890,6 +890,11 @@ export class PeerConnectionFSM {
       this._dataChannelOpen = dcState === 'open';
       if (this._dataChannelOpen) {
         this._checkCompositeReadiness();
+        this._emitEvent({
+          type: 'data-channel-open',
+          connectionId: this.connectionId,
+          remoteAgent: this.remoteAgent,
+        });
       }
     });
 
@@ -958,17 +963,7 @@ export class PeerConnectionFSM {
       });
     });
 
-    // Data channel open
-    peer.on('data-channel-state-change', (event) => {
-      if (this._destroyed) return;
-      if (event.data === 'open') {
-        this._emitEvent({
-          type: 'data-channel-open',
-          connectionId: this.connectionId,
-          remoteAgent: this.remoteAgent,
-        });
-      }
-    });
+
 
     // Errors
     peer.on('error', (event) => {

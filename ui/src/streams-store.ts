@@ -196,7 +196,7 @@ export class StreamsStore {
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
     );
     navigator.mediaDevices.ondevicechange = e => {
-      console.log('Got devide change: ', e);
+      console.log('Got device change: ', e);
     };
   }
 
@@ -223,12 +223,6 @@ export class StreamsStore {
         event: 'StreamReceived',
         connectionId,
       });
-      console.log(
-        '#### GOT STREAM with tracks from:',
-        pubKeyB64,
-        stream.getTracks()
-      );
-
       // Store to existing streams
       this._videoStreams[pubKeyB64] = stream;
 
@@ -876,6 +870,7 @@ export class StreamsStore {
     // Destroy screen share ConnectionManager
     this.screenShareConnectionManager.destroy();
 
+    navigator.mediaDevices.ondevicechange = null;
     this.videoOff();
     this.audioOff();
     this.screenShareOff();
@@ -1071,7 +1066,6 @@ export class StreamsStore {
     const deviceId = get(this._videoInputId);
     if (this.mainStream) {
       if (this.mainStream.getVideoTracks()[0]) {
-        console.log('### CASE A');
         this.mainStream.getVideoTracks()[0].enabled = true;
         this.eventCallback({
           type: 'my-video-on',
@@ -1081,7 +1075,6 @@ export class StreamsStore {
         // to some peers. updateLocalStream checks for missing tracks.
         this.connectionManager.updateLocalStream(this.mainStream);
       } else {
-        console.log('### CASE B');
         let videoStream: MediaStream | undefined;
         try {
           videoStream = await navigator.mediaDevices.getUserMedia({
@@ -1321,19 +1314,15 @@ export class StreamsStore {
   }
 
   audioOff() {
-    console.log('### AUDIO OFF');
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
       timestamp: Date.now(),
       event: 'MyAudioOff',
     });
-    console.log('this._mainStream.getTracks(): ', this.mainStream?.getTracks());
     if (this.mainStream) {
-      console.log('### DISABLING ALL AUDIO TRACKS');
       this.mainStream.getAudioTracks().forEach(track => {
         // eslint-disable-next-line no-param-reassign
         track.enabled = false;
-        console.log('### DISABLED AUDIO TRACK: ', track);
       });
       // Send audio-off message to all connected peers
       this._sendToAllConnected({
