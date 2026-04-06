@@ -44,7 +44,7 @@ import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
 import '@shoelace-style/shoelace/dist/components/dropdown/dropdown.js';
 import '@shoelace-style/shoelace/dist/components/menu/menu.js';
 import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
-import { AssetStoreContent, stringifyWal, WAL, weaveUrlFromWal, WeaveClient } from '@theweave/api';
+import { AssetStoreContent, WAL, weaveUrlFromWal, WeaveClient } from '@theweave/api';
 import './elements/shared-wal-embed';
 
 import { roomStoreContext, streamsStoreContext } from '../contexts';
@@ -467,7 +467,6 @@ export class RoomView extends LitElement {
     }
 
     const payload: SharedWalPayload = {
-      walStringified: stringifyWal(selectedWal),
       weaveUrl: weaveUrlFromWal(selectedWal),
       assetName,
       assetIconSrc,

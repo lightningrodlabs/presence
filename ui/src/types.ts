@@ -93,8 +93,6 @@ export type PongMetaData<T> = {
 };
 
 export type SharedWalPayload = {
-  /** WAL serialized via stringifyWal() */
-  walStringified: string;
   /** WeaveUrl for use as wal-embed src (e.g. weave-0.15://...) */
   weaveUrl: string;
   /** Human-readable name of the asset (if available at share time) */
