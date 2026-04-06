@@ -2159,7 +2159,7 @@ export class StreamsStore {
       // Handle shared WAL propagation for late-joiners
       if (metaData.data.sharedWal) {
         const currentPeerWals = get(this._peerSharedWals);
-        if (!currentPeerWals[pubkeyB64] || currentPeerWals[pubkeyB64].walStringified !== metaData.data.sharedWal.walStringified) {
+        if (!currentPeerWals[pubkeyB64] || currentPeerWals[pubkeyB64].weaveUrl !== metaData.data.sharedWal.weaveUrl) {
           this._peerSharedWals.update(v => {
             v[pubkeyB64] = metaData.data.sharedWal!;
             return v;
