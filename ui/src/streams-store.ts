@@ -27,10 +27,12 @@ import {
   RoomSignal,
   RTCMessage,
   SdpPayload,
+  ModuleStateEnvelope,
   SharedWalPayload,
   StoreEventPayload,
   StreamAndTrackInfo,
 } from './types';
+import { getModule } from './room/modules/registry';
 import { RoomClient } from './room/room-client';
 import { RoomStore } from './room/room-store';
 import { PresenceLogger } from './logging';
@@ -1100,6 +1102,139 @@ export class StreamsStore {
    */
   _peerSharedWals: Writable<Record<AgentPubKeyB64, SharedWalPayload>> = writable({});
 
+  // ===========================================================================================
+  // MODULE SYSTEM
+  // ===========================================================================================
+
+  /** My own active module states, keyed by moduleId */
+  _myModuleStates: Writable<Record<string, ModuleStateEnvelope>> = writable({});
+
+  /** Peer module states, keyed by AgentPubKeyB64 then moduleId */
+  _peerModuleStates: Writable<Record<AgentPubKeyB64, Record<string, ModuleStateEnvelope>>> = writable({});
+
+  /** Receiver-controlled overrides: which replace module to view per peer (local only) */
+  _receiverModuleOverrides: Writable<Record<AgentPubKeyB64, string>> = writable({});
+
+  async activateModule(moduleId: string, payload?: string): Promise<void> {
+    const mod = getModule(moduleId);
+    const actualPayload = payload ?? mod?.defaultState?.() ?? '{}';
+    const envelope: ModuleStateEnvelope = {
+      moduleId,
+      active: true,
+      payload: actualPayload,
+      updatedAt: Date.now(),
+    };
+    this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
+    await this._broadcastModuleState(envelope);
+    mod?.onActivate?.({ streamsStore: this, myPubKeyB64: this.myPubKeyB64 });
+  }
+
+  async deactivateModule(moduleId: string): Promise<void> {
+    const mod = getModule(moduleId);
+    const envelope: ModuleStateEnvelope = {
+      moduleId,
+      active: false,
+      payload: '',
+      updatedAt: Date.now(),
+    };
+    this._myModuleStates.update(s => {
+      const next = { ...s };
+      delete next[moduleId];
+      return next;
+    });
+    await this._broadcastModuleState(envelope);
+    mod?.onDeactivate?.();
+  }
+
+  async updateModuleState(moduleId: string, payload: string): Promise<void> {
+    const envelope: ModuleStateEnvelope = {
+      moduleId,
+      active: true,
+      payload,
+      updatedAt: Date.now(),
+    };
+    this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
+    await this._broadcastModuleState(envelope);
+  }
+
+  async sendModuleData(moduleId: string, chunk: string): Promise<void> {
+    const agentsToNotify = Object.keys(get(this._knownAgents))
+      .filter(a => a !== this.myPubKeyB64)
+      .map(a => decodeHashFromBase64(a));
+    if (agentsToNotify.length > 0) {
+      try {
+        await this.roomClient.sendMessage(
+          agentsToNotify,
+          'ModuleData',
+          JSON.stringify({ moduleId, chunk })
+        );
+      } catch (e) {
+        console.error('Failed to send ModuleData signal:', e);
+      }
+    }
+  }
+
+  setReceiverOverride(agentPubKeyB64: AgentPubKeyB64, moduleId: string | null): void {
+    this._receiverModuleOverrides.update(o => {
+      const next = { ...o };
+      if (moduleId) {
+        next[agentPubKeyB64] = moduleId;
+      } else {
+        delete next[agentPubKeyB64];
+      }
+      return next;
+    });
+  }
+
+  handleModuleState(signal: Extract<RoomSignal, { type: 'Message' }>): void {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    try {
+      const envelope: ModuleStateEnvelope = JSON.parse(signal.payload);
+      this._peerModuleStates.update(all => {
+        const updated = { ...all };
+        if (!updated[pubkeyB64]) updated[pubkeyB64] = {};
+        if (envelope.active) {
+          updated[pubkeyB64] = { ...updated[pubkeyB64], [envelope.moduleId]: envelope };
+        } else {
+          const agentModules = { ...updated[pubkeyB64] };
+          delete agentModules[envelope.moduleId];
+          updated[pubkeyB64] = agentModules;
+        }
+        return updated;
+      });
+    } catch (e) {
+      console.warn('Failed to parse ModuleState payload:', e);
+    }
+  }
+
+  handleModuleData(signal: Extract<RoomSignal, { type: 'Message' }>): void {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    try {
+      const { moduleId, chunk } = JSON.parse(signal.payload);
+      const mod = getModule(moduleId);
+      mod?.onData?.(pubkeyB64, chunk);
+    } catch (e) {
+      console.warn('Failed to parse ModuleData payload:', e);
+    }
+  }
+
+  private async _broadcastModuleState(envelope: ModuleStateEnvelope): Promise<void> {
+    const agentsToNotify = Object.keys(get(this._knownAgents))
+      .filter(a => a !== this.myPubKeyB64)
+      .map(a => decodeHashFromBase64(a));
+    if (agentsToNotify.length > 0) {
+      try {
+        await this.roomClient.sendMessage(
+          agentsToNotify,
+          'ModuleState',
+          JSON.stringify(envelope)
+        );
+      } catch (e) {
+        console.error('Failed to send ModuleState signal:', e);
+      }
+    }
+  }
+
   // ********************************************************************************************
   //
   //   S I M P L E   P E E R   H A N D L I N G
@@ -1887,6 +2022,9 @@ export class StreamsStore {
           streamInfo,
           audio: get(this._openConnections)[agentB64]?.audio,
           sharedWal: get(this._mySharedWal) ?? undefined,
+          moduleStates: Object.keys(get(this._myModuleStates)).length > 0
+            ? get(this._myModuleStates)
+            : undefined,
         },
       };
       try {
@@ -2373,6 +2511,12 @@ export class StreamsStore {
           case 'StopShareWal':
             this.handleStopShareWal(signal);
             break;
+          case 'ModuleState':
+            this.handleModuleState(signal);
+            break;
+          case 'ModuleData':
+            this.handleModuleData(signal);
+            break;
           default:
             console.warn('Unknown msg_type:', signal.msg_type);
         }
@@ -2408,6 +2552,9 @@ export class StreamsStore {
           streamInfo,
           audio: get(this._openConnections)[pubkeyB64]?.audio,
           sharedWal: get(this._mySharedWal) ?? undefined,
+          moduleStates: Object.keys(get(this._myModuleStates)).length > 0
+            ? get(this._myModuleStates)
+            : undefined,
         },
       };
       await this.roomClient.sendMessage(
@@ -2507,6 +2654,13 @@ export class StreamsStore {
     // Clean up any active WAL share from this peer
     this._peerSharedWals.update(v => { delete v[pubkeyB64]; return v; });
 
+    // Clean up module states for this peer
+    this._peerModuleStates.update(all => {
+      const updated = { ...all };
+      delete updated[pubkeyB64];
+      return updated;
+    });
+
     // Fire event so UI updates
     this.eventCallback({ type: 'peer-disconnected', pubKeyB64: pubkeyB64, connectionId: '' });
   }
@@ -2599,6 +2753,38 @@ export class StreamsStore {
           this.eventCallback({
             type: 'peer-stop-share-wal',
             pubKeyB64: pubkeyB64,
+          });
+        }
+      }
+      // Reconcile module states from pong for late-joiners
+      if (metaData.data.moduleStates) {
+        const current = get(this._peerModuleStates)[pubkeyB64] || {};
+        const incoming = metaData.data.moduleStates;
+        let changed = false;
+        const merged = { ...current };
+        for (const [moduleId, envelope] of Object.entries(incoming)) {
+          if (!merged[moduleId] || envelope.updatedAt > merged[moduleId].updatedAt) {
+            merged[moduleId] = envelope;
+            changed = true;
+          }
+        }
+        // Remove modules no longer in pong (agent deactivated them)
+        for (const moduleId of Object.keys(merged)) {
+          if (!incoming[moduleId]) {
+            delete merged[moduleId];
+            changed = true;
+          }
+        }
+        if (changed) {
+          this._peerModuleStates.update(all => ({ ...all, [pubkeyB64]: merged }));
+        }
+      } else {
+        // No module states in pong — clear any we had for this peer
+        if (get(this._peerModuleStates)[pubkeyB64] && Object.keys(get(this._peerModuleStates)[pubkeyB64]).length > 0) {
+          this._peerModuleStates.update(all => {
+            const updated = { ...all };
+            delete updated[pubkeyB64];
+            return updated;
           });
         }
       }

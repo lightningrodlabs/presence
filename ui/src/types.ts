@@ -123,6 +123,18 @@ export type PongMetaDataV1 = {
   video?: boolean;
   /** If this peer is currently sharing a WAL, included so late-joiners learn about it */
   sharedWal?: SharedWalPayload;
+  /** Active module states for this agent, keyed by moduleId */
+  moduleStates?: Record<string, ModuleStateEnvelope>;
+};
+
+/**
+ * Envelope for module state data sent over signals and included in pong metadata.
+ */
+export type ModuleStateEnvelope = {
+  moduleId: string;
+  active: boolean;
+  payload: string;
+  updatedAt: number;
 };
 
 export type ConnectionStatuses = Record<AgentPubKeyB64, ConnectionStatus>;
