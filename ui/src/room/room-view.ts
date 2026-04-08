@@ -37,6 +37,7 @@ import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { localized, msg } from '@lit/localize';
 import { consume } from '@lit/context';
 import { repeat } from 'lit/directives/repeat.js';
+import { html as staticHtml, unsafeStatic } from 'lit/static-html.js';
 
 import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/icon-button/icon-button.js';
@@ -291,37 +292,6 @@ export class RoomView extends LitElement {
   @state()
   _unsubscribe: (() => void) | undefined;
 
-  // Module timer management for produceState intervals
-  private _moduleTimers: Map<string, number> = new Map();
-
-  private _startModuleTimer(moduleId: string) {
-    const mod = getModule(moduleId);
-    if (mod?.produceState && mod.stateInterval) {
-      // Clear any existing timer first
-      this._stopModuleTimer(moduleId);
-      const timer = window.setInterval(() => {
-        const payload = mod.produceState!();
-        if (payload) {
-          this.streamsStore.updateModuleState(moduleId, payload);
-        }
-      }, mod.stateInterval);
-      this._moduleTimers.set(moduleId, timer);
-    }
-  }
-
-  private _stopModuleTimer(moduleId: string) {
-    const timer = this._moduleTimers.get(moduleId);
-    if (timer !== undefined) {
-      clearInterval(timer);
-      this._moduleTimers.delete(moduleId);
-    }
-  }
-
-  private _stopAllModuleTimers() {
-    for (const [moduleId] of this._moduleTimers) {
-      this._stopModuleTimer(moduleId);
-    }
-  }
 
   closeClosables = () => {
     if (this._showAttachmentsPanel) {
@@ -366,7 +336,6 @@ export class RoomView extends LitElement {
   }
 
   quitRoom() {
-    this._stopAllModuleTimers();
     this.streamsStore.disconnect();
     this.streamsStore.logger.endSession();
     this.dispatchEvent(
@@ -1587,10 +1556,8 @@ export class RoomView extends LitElement {
             const toggle = async () => {
               if (myState) {
                 await this.streamsStore.deactivateModule(mod.id);
-                this._stopModuleTimer(mod.id);
               } else {
                 await this.streamsStore.activateModule(mod.id);
-                this._startModuleTimer(mod.id);
               }
             };
             return mod.renderToolbarButton!(myState, toggle);
@@ -1631,12 +1598,14 @@ export class RoomView extends LitElement {
     // Find modules with renderReplace that the receiver can switch to:
     // - receiver-activated modules (always switchable when active)
     // - sender-activated modules that also have an overlay (replace is an optional deeper view)
+    const hasReplace = (mod: NonNullable<ReturnType<typeof getModule>>) => !!mod.renderReplace || !!mod.replaceElement;
+    const hasOverlay = (mod: NonNullable<ReturnType<typeof getModule>>) => !!mod.renderOverlay || !!mod.overlayElement;
     const switchableModules = Object.entries(peerModules)
       .map(([moduleId, _envelope]) => getModule(moduleId))
       .filter((mod): mod is NonNullable<typeof mod> =>
-        !!mod && !!mod.renderReplace && (
+        !!mod && hasReplace(mod) && (
           mod.activationControl === 'receiver' ||
-          (mod.activationControl === 'sender' && !!mod.renderOverlay)
+          (mod.activationControl === 'sender' && hasOverlay(mod))
         )
       );
 
@@ -1677,6 +1646,10 @@ export class RoomView extends LitElement {
    * Determines the active replace module for an agent's pane.
    * Priority: receiver override > sender-activated replace modules > null (default video).
    * Returns { moduleId, html } or null if default video should show.
+   *
+   * If the module defines replaceElement, the returned html uses that custom element
+   * with data passed as properties (independent re-render boundary).
+   * Otherwise falls back to calling renderReplace() directly.
    */
   _getActiveReplaceModule(
     pubkeyB64: AgentPubKeyB64,
@@ -1687,13 +1660,25 @@ export class RoomView extends LitElement {
       ? (this._myModuleStates.value || {})
       : (this._peerModuleStates.value?.[pubkeyB64] || {});
 
+    const renderForModule = (mod: ReturnType<typeof getModule>, moduleState: ModuleStateEnvelope | null) => {
+      if (mod!.replaceElement) {
+        const tag = unsafeStatic(mod!.replaceElement);
+        return staticHtml`<${tag}
+          .agentPubKeyB64=${pubkeyB64}
+          .moduleState=${moduleState}
+          .context=${context}
+        ></${tag}>`;
+      }
+      return mod!.renderReplace!(pubkeyB64, moduleState, context);
+    };
+
     // Check receiver override first (works for both receiver- and sender-activated modules)
     const override = this._receiverModuleOverrides.value?.[pubkeyB64];
     if (override) {
       const mod = getModule(override);
-      if (mod?.renderReplace) {
+      if (mod?.renderReplace || mod?.replaceElement) {
         const state = (modules as Record<string, ModuleStateEnvelope>)[override] || null;
-        return { moduleId: override, html: mod.renderReplace(pubkeyB64, state, context) };
+        return { moduleId: override, html: renderForModule(mod, state) };
       }
     }
 
@@ -1701,8 +1686,8 @@ export class RoomView extends LitElement {
     for (const [moduleId, envelope] of Object.entries(modules)) {
       if (moduleId === 'video') continue;
       const mod = getModule(moduleId);
-      if (mod?.renderReplace && !mod.renderOverlay && mod.activationControl === 'sender' && envelope.active) {
-        return { moduleId, html: mod.renderReplace(pubkeyB64, envelope, context) };
+      if ((mod?.renderReplace || mod?.replaceElement) && !mod?.renderOverlay && !mod?.overlayElement && mod?.activationControl === 'sender' && envelope.active) {
+        return { moduleId, html: renderForModule(mod, envelope) };
       }
     }
 
@@ -1754,14 +1739,31 @@ export class RoomView extends LitElement {
   /**
    * Renders all active overlay modules for an agent's pane.
    */
+  private _renderOverlayForModule(
+    mod: ReturnType<typeof getModule>,
+    pubkeyB64: string,
+    envelope: ModuleStateEnvelope,
+    context: ModuleRenderContext,
+  ): unknown {
+    if (mod!.overlayElement) {
+      const tag = unsafeStatic(mod!.overlayElement);
+      return staticHtml`<${tag}
+        .agentPubKeyB64=${pubkeyB64}
+        .moduleState=${envelope}
+        .context=${context}
+      ></${tag}>`;
+    }
+    return mod!.renderOverlay!(pubkeyB64, envelope, context);
+  }
+
   renderModuleOverlays(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
     const peerModules = this._peerModuleStates.value?.[pubkeyB64] || {};
     const overlays: unknown[] = [];
 
     for (const [moduleId, envelope] of Object.entries(peerModules)) {
       const mod = getModule(moduleId);
-      if (mod?.renderOverlay) {
-        overlays.push(mod.renderOverlay(pubkeyB64, envelope, context));
+      if (mod?.renderOverlay || mod?.overlayElement) {
+        overlays.push(this._renderOverlayForModule(mod, pubkeyB64, envelope, context));
       }
     }
 
@@ -1777,8 +1779,8 @@ export class RoomView extends LitElement {
 
     for (const [moduleId, envelope] of Object.entries(myModules)) {
       const mod = getModule(moduleId);
-      if (mod?.renderOverlay) {
-        overlays.push(mod.renderOverlay(myPubKeyB64, envelope, context));
+      if (mod?.renderOverlay || mod?.overlayElement) {
+        overlays.push(this._renderOverlayForModule(mod, myPubKeyB64, envelope, context));
       }
     }
 

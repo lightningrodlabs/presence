@@ -61,6 +61,19 @@ export interface ModuleDefinition {
 
   // --- Display aspects ---
 
+  /**
+   * Custom element tag for overlay rendering. When set, the pane renderer
+   * creates this element and passes data via properties instead of calling
+   * renderOverlay(). Use when the module needs local state or independent
+   * re-render boundaries.
+   */
+  overlayElement?: string;
+
+  /**
+   * Custom element tag for replace rendering. Same rationale as overlayElement.
+   */
+  replaceElement?: string;
+
   /** Content rendered on top of the pane, always visible when module is active. */
   renderOverlay?(
     agentPubKeyB64: string,
@@ -88,10 +101,6 @@ export interface ModuleDefinition {
 
   /** Initial JSON payload when module is activated. */
   defaultState?(): string;
-  /** Periodic state producer. Return updated payload JSON, or null if no change. */
-  produceState?(): string | null;
-  /** Interval in ms between produceState calls. */
-  stateInterval?: number;
 
   // --- Stream aspect ---
 

@@ -2763,7 +2763,9 @@ export class StreamsStore {
         let changed = false;
         const merged = { ...current };
         for (const [moduleId, envelope] of Object.entries(incoming)) {
-          if (!merged[moduleId] || envelope.updatedAt > merged[moduleId].updatedAt) {
+          if (!merged[moduleId] ||
+              (envelope.updatedAt > merged[moduleId].updatedAt &&
+               (envelope.payload !== merged[moduleId].payload || envelope.active !== merged[moduleId].active))) {
             merged[moduleId] = envelope;
             changed = true;
           }
