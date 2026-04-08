@@ -2,7 +2,7 @@ import { html } from 'lit';
 import {
   mdiVideo,
   mdiMicrophoneOff,
-  mdiPhoneRefresh,
+  mdiRefresh,
   mdiHub,
 } from '@mdi/js';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
@@ -17,8 +17,9 @@ enum MuteIcon { Muted = 0 }
 /** State icon indices for the relay indicator */
 enum RelayIcon { Relayed = 0 }
 
-/** State icon indices for the reconnect button */
-enum ReconnectIcon { Available = 0 }
+/** State icon indices for reset media button */
+enum ResetMedia { Available = 0 }
+
 
 const videoModule: ModuleDefinition = {
   id: 'video',
@@ -53,17 +54,18 @@ const videoModule: ModuleDefinition = {
       currentState: conn.relayed ? RelayIcon.Relayed : undefined,
     });
 
-    // Reconnect button -- visible when connected but video is missing or muted
-    const needsReconnect = conn.videoMuted || (conn.connected && !conn.video);
+    // Reset media -- visible when video track is degraded (muted or missing)
+    const needsReset = conn.videoMuted || (conn.connected && !conn.video);
     icons.push({
       states: [
-        { icon: mdiPhoneRefresh, tooltip: 'Reconnect', color: '#e7a008' },
+        { icon: mdiRefresh, tooltip: 'Reset media', color: '#e7a008' },
       ],
-      currentState: needsReconnect ? ReconnectIcon.Available : undefined,
-      onSelect: needsReconnect
-        ? () => context.streamsStore.disconnectFromPeerVideo(agentPubKeyB64)
+      currentState: needsReset ? ResetMedia.Available : undefined,
+      onSelect: needsReset
+        ? () => context.streamsStore.refreshTracksForPeer(agentPubKeyB64)
         : undefined,
     });
+
 
     return icons;
   },

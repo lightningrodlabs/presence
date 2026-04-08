@@ -1698,6 +1698,39 @@ export class RoomView extends LitElement {
    * Renders the standardized icon strip for all active modules on an agent's pane.
    * Collects icons from all active modules, filters hidden ones, renders in a row.
    */
+  private _renderModuleIcon(icon: ModuleIconDefinition) {
+    const stateInfo = icon.states[icon.currentState!];
+    if (icon.menuItems && icon.menuItems.length > 0) {
+      return html`
+        <sl-dropdown placement="top" distance="4" hoist>
+          <sl-icon
+            slot="trigger"
+            style="color: ${stateInfo.color || 'white'}; height: 30px; width: 30px; cursor: pointer;"
+            title="${stateInfo.tooltip || ''}"
+            .src=${wrapPathInSvg(stateInfo.icon)}
+          ></sl-icon>
+          <sl-menu class="reconnect-menu secondary-font">
+            ${icon.menuItems.map(item => html`
+              <sl-menu-item
+                class="reconnect-menu-item"
+                @click=${() => item.action()}
+              >${item.label}</sl-menu-item>
+            `)}
+          </sl-menu>
+        </sl-dropdown>
+      `;
+    }
+    const clickable = !!icon.onSelect;
+    return html`
+      <sl-icon
+        style="color: ${stateInfo.color || 'white'}; height: 30px; width: 30px;${clickable ? ' cursor: pointer;' : ''}"
+        title="${stateInfo.tooltip || ''}"
+        .src=${wrapPathInSvg(stateInfo.icon)}
+        @click=${clickable ? () => icon.onSelect!(icon.currentState!) : undefined}
+      ></sl-icon>
+    `;
+  }
+
   renderModuleIconStrip(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
     const peerModules = this._peerModuleStates.value?.[pubkeyB64] || {};
     const allIcons: ModuleIconDefinition[] = [];
@@ -1721,18 +1754,7 @@ export class RoomView extends LitElement {
     if (visibleIcons.length === 0) return html``;
 
     return html`
-      ${visibleIcons.map(icon => {
-        const stateInfo = icon.states[icon.currentState!];
-        const clickable = !!icon.onSelect;
-        return html`
-          <sl-icon
-            style="color: ${stateInfo.color || 'white'}; height: 30px; width: 30px;${clickable ? ' cursor: pointer;' : ''}"
-            title="${stateInfo.tooltip || ''}"
-            .src=${wrapPathInSvg(stateInfo.icon)}
-            @click=${clickable ? () => icon.onSelect!(icon.currentState!) : undefined}
-          ></sl-icon>
-        `;
-      })}
+      ${visibleIcons.map(icon => this._renderModuleIcon(icon))}
     `;
   }
 
@@ -1805,18 +1827,7 @@ export class RoomView extends LitElement {
     if (visibleIcons.length === 0) return html``;
 
     return html`
-      ${visibleIcons.map(icon => {
-        const stateInfo = icon.states[icon.currentState!];
-        const clickable = !!icon.onSelect;
-        return html`
-          <sl-icon
-            style="color: ${stateInfo.color || 'white'}; height: 30px; width: 30px;${clickable ? ' cursor: pointer;' : ''}"
-            title="${stateInfo.tooltip || ''}"
-            .src=${wrapPathInSvg(stateInfo.icon)}
-            @click=${clickable ? () => icon.onSelect!(icon.currentState!) : undefined}
-          ></sl-icon>
-        `;
-      })}
+      ${visibleIcons.map(icon => this._renderModuleIcon(icon))}
     `;
   }
 
@@ -2491,6 +2502,16 @@ export class RoomView extends LitElement {
                           style="height: 36px;"
                         ></avatar-with-nickname>
                         ${this.renderModuleSwitcher(pubkeyB64)}
+                        <sl-tooltip content="Full reconnect" class="tooltip-filled" hoist>
+                          <sl-icon-button
+                            class="phone-refresh"
+                            style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
+                            src=${wrapPathInSvg(mdiPhoneRefresh)}
+                            @click=${() => {
+                              this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                            }}
+                          ></sl-icon-button>
+                        </sl-tooltip>
                         ${this._showConnectionDetails
                           ? html`
                               <sl-tooltip
@@ -2557,6 +2578,16 @@ export class RoomView extends LitElement {
                         style="height: 36px;"
                       ></avatar-with-nickname>
                       ${this.renderModuleSwitcher(pubkeyB64)}
+                      <sl-tooltip content="Full reconnect" class="tooltip-filled" hoist>
+                        <sl-icon-button
+                          class="phone-refresh"
+                          style="margin-left: 4px; margin-bottom: -5px; font-size: 20px;"
+                          src=${wrapPathInSvg(mdiPhoneRefresh)}
+                          @click=${() => {
+                            this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
+                          }}
+                        ></sl-icon-button>
+                      </sl-tooltip>
                       <sl-icon
                         title="${this._maximizedVideo === conn.connectionId
                           ? 'minimize'

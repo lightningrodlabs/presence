@@ -21,6 +21,8 @@ export interface ModuleIconDefinition {
   currentState: number | undefined;
   /** Called when the icon is clicked, receiving the current state index. */
   onSelect?: (currentStateIndex: number) => void;
+  /** When present, clicking shows a dropdown menu instead of calling onSelect. */
+  menuItems?: Array<{ label: string; action: () => void }>;
 }
 
 /**
