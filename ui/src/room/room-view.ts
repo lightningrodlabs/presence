@@ -1938,7 +1938,7 @@ export class RoomView extends LitElement {
         )}
 
         <!-- Shared WAL embeds -->
-        ${sharedWalEntries.map(([agentB64, walPayload]) => {
+        ${repeat(sharedWalEntries, ([agentB64]) => agentB64, ([agentB64, walPayload]) => {
           const isMe = agentB64 === encodeHashToBase64(this.roomStore.client.client.myPubKey);
           const walEmbedId = `shared-wal-${agentB64.slice(0, 8)}`;
           const walLayout = this._maximizedVideo === walEmbedId ? 'maximized' : this._maximizedVideo ? 'hidden' : '';

@@ -53,7 +53,25 @@ export class SharedWalEmbed extends LitElement {
   @state()
   groupProfiles: Map<DnaHash, GroupProfile> | undefined;
 
+  private _loadedSrc: string | undefined;
+
   async firstUpdated() {
+    await this._loadAsset();
+  }
+
+  async updated(changedProperties: Map<string, unknown>) {
+    if (changedProperties.has('src') && this.src !== this._loadedSrc) {
+      await this._loadAsset();
+    }
+  }
+
+  private async _loadAsset() {
+    this._loadedSrc = this.src;
+    this.assetStatus = { type: 'loading' };
+    this.wal = undefined;
+    this.appletInfo = undefined;
+    this.groupProfiles = undefined;
+
     let weaveLocation;
     try {
       weaveLocation = weaveUrlToLocation(this.src);
