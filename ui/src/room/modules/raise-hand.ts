@@ -17,9 +17,6 @@ import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { registerModule } from './registry';
 import type { ModuleDefinition, ModuleRenderContext, ModuleStateEnvelope } from './types';
 
-interface RaiseHandPayload {
-  note?: string;
-}
 
 const numericCircleIcons = [
   mdiNumeric1Circle,
@@ -73,12 +70,12 @@ function getHandPosition(agentPubKeyB64: string, context: ModuleRenderContext): 
 const raiseHandModule: ModuleDefinition = {
   id: 'raise-hand',
   type: 'agent',
-  label: 'Raise Hand',
+  label: 'Raised at',
   icon: mdiHandBackRight,
   activationControl: 'sender',
 
   defaultState() {
-    return JSON.stringify({ note: '' } satisfies RaiseHandPayload);
+    return '{}';
   },
 
   renderOverlay(
@@ -114,22 +111,14 @@ const raiseHandModule: ModuleDefinition = {
     state: ModuleStateEnvelope | null,
     _context: ModuleRenderContext,
   ) {
-    let note = '';
-    try {
-      const data: RaiseHandPayload = JSON.parse(state?.payload || '{}');
-      note = data.note || '';
-    } catch { /* empty */ }
+    const raisedAt = state?.updatedAt
+      ? new Date(state.updatedAt).toLocaleTimeString()
+      : '';
 
     return html`
       <div style="display: flex; flex-direction: column; align-items: center; justify-content: center;
                   width: 100%; height: 100%; background: #1a1a2e; color: #e0e0e0; padding: 16px; box-sizing: border-box;">
-        <sl-icon
-          style="color: #ffd700; height: 64px; width: 64px; margin-bottom: 12px;"
-          .src=${wrapPathInSvg(mdiHandBackRight)}
-        ></sl-icon>
-        ${note
-          ? html`<div style="font-size: 1.1em; text-align: center; max-width: 90%; word-break: break-word;">${note}</div>`
-          : html`<div style="font-size: 0.9em; opacity: 0.6;">Hand raised</div>`}
+        <div style="font-size: 1.1em; opacity: 0.8;">Raised at: ${raisedAt}</div>
       </div>
     `;
   },

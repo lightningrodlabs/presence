@@ -2,7 +2,7 @@
 
 ## Status: In Progress
 
-Core module system is implemented. Screen share and WAL modules are not yet extracted.
+Core module system is implemented. Panes decoupled from WebRTC (driven by `_activeAgents`). Video is a proper activated module. Screen share and WAL modules are not yet extracted.
 
 ## What's Built
 
@@ -43,22 +43,20 @@ Core module system is implemented. Screen share and WAL modules are not yet extr
 3. Generalize sharing panel to render from share-type modules
 4. `splitMode` calculation becomes "any share-type module active"
 
-### Future Architectural Change: Decouple Pane Existence from WebRTC
+### Completed: Pane Existence Decoupled from WebRTC
 
-**Current state**: Agent panes render from `_openConnections` (WebRTC connection map). No WebRTC = no pane. This means:
-- You can't see an agent without a WebRTC connection to them
-- Modules that work purely over holochain signals (raise-hand, clock) still require WebRTC
-- "Full reconnect" destroys the pane temporarily
-- Can't connect/disconnect WebRTC independently of pane existence
+Panes now render from `_activeAgents` (derived from `_knownAgents`, filtered by pong recency within `3 * PING_INTERVAL`). Key changes:
+- Pane identity is `pubkeyB64` (not `connectionId`) -- Lit reuses DOM nodes across WebRTC reconnects
+- Video is a proper activated module with `renderReplace` handling all connection states (no conn, connecting, connected)
+- WebRTC initiation gated on video module being active in `_myModuleStates`
+- `peer-leave` event (agent left room) vs `peer-disconnected` (WebRTC only) -- leave audio/maximize-clear only on leave
+- Video special-casing removed: no force-fetch of video icons, no `moduleId === 'video'` guards
+- `renderMyModuleIconStrip`/`renderMyModuleOverlays` collapsed into unified methods using `context.isMe`
+- "Reconnect video" button (was "Full reconnect") only shown when WebRTC connection exists
 
-**Target state**: Panes should render from `_knownAgents` (holochain presence via ping/pong), not `_openConnections`. This would mean:
-- An agent is "present" as soon as they appear in pongs
-- The video module manages its own WebRTC lifecycle within the pane
-- Signal-only modules work without WebRTC
-- WebRTC disconnect doesn't remove the pane -- it just affects the video module
-- Full reconnect becomes "WebRTC reconnect" in the video module; holochain presence is always-on
+### Performance: Unnecessary Re-renders from Pong Cycle
 
-This is a significant refactor touching the connection lifecycle, pane rendering loop, and how `_openConnections` vs `_knownAgents` drive the UI. It should be done as a separate effort.
+`handlePongUi` unconditionally calls `.update()` on `_othersConnectionStatuses` (sets `lastUpdated: Date.now()`) and `_knownAgents` (sets `lastSeen: Date.now()`) every 2 seconds per peer. These stores are subscribed via `StoreSubscriber` in room-view, triggering a full Lit render cycle each time -- even though the data they carry (`lastUpdated`, `lastSeen`) is only consumed when connection details are toggled on or the "people" tab is active. Module rendering (including the clock) gets re-rendered as a side effect. Should be guarded to skip `.update()` when only timestamps changed and no structural data differs.
 
 ### Pre-existing Bug: Video Toggle Freeze on Remote Peers
 

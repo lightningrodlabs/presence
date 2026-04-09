@@ -91,7 +91,7 @@ export class ModuleClockReplace extends LitElement {
 const clockModule: ModuleDefinition = {
   id: 'clock',
   type: 'agent',
-  label: 'Clock',
+  label: 'Local Time',
   icon: mdiClockOutline,
   activationControl: 'receiver',
 

@@ -113,6 +113,27 @@ export class StreamsStore {
     const roomClient = roomStore.client;
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
+
+    const ACTIVE_AGENT_STALENESS = 3 * PING_INTERVAL;
+    this._activeAgents = derived(
+      [this._knownAgents, this.blockedAgents] as [Writable<Record<AgentPubKeyB64, AgentInfo>>, Writable<AgentPubKeyB64[]>],
+      ([knownAgents, blocked]) => {
+        const now = Date.now();
+        const active: Record<AgentPubKeyB64, AgentInfo> = {};
+        for (const [pubkey, info] of Object.entries(knownAgents)) {
+          if (
+            pubkey !== this.myPubKeyB64 &&
+            !blocked.includes(pubkey) &&
+            info.lastSeen !== undefined &&
+            now - info.lastSeen < ACTIVE_AGENT_STALENESS
+          ) {
+            active[pubkey] = info;
+          }
+        }
+        return active;
+      },
+    );
+
     // TODO potentially move this to a connect() method which also returns
     // the Unsubscribe function
     this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
@@ -1043,6 +1064,13 @@ export class StreamsStore {
    * anchor (in case this hasn't gossiped to us yet).
    */
   _knownAgents: Writable<Record<AgentPubKeyB64, AgentInfo>> = writable({});
+
+  /**
+   * Agents that are actively present (recent pong within staleness threshold).
+   * Derived from _knownAgents. Drives pane rendering instead of _openConnections.
+   * Excludes self and blocked agents.
+   */
+  _activeAgents!: Readable<Record<AgentPubKeyB64, AgentInfo>>;
 
   /**
    * The statuses of WebRTC main stream connections to peers
@@ -2619,6 +2647,14 @@ export class StreamsStore {
       event: 'PeerLeave',
     });
 
+    // Clear lastSeen so agent immediately drops from _activeAgents (pane removal)
+    this._knownAgents.update(agents => {
+      if (agents[pubkeyB64]) {
+        agents[pubkeyB64] = { ...agents[pubkeyB64], lastSeen: undefined };
+      }
+      return agents;
+    });
+
     // Destroy video connection
     const openConn = get(this._openConnections)[pubkeyB64];
     if (openConn) {
@@ -2661,8 +2697,8 @@ export class StreamsStore {
       return updated;
     });
 
-    // Fire event so UI updates
-    this.eventCallback({ type: 'peer-disconnected', pubKeyB64: pubkeyB64, connectionId: '' });
+    // Fire event so UI updates (peer-leave = agent left the room, distinct from WebRTC disconnect)
+    this.eventCallback({ type: 'peer-leave', pubKeyB64: pubkeyB64 });
   }
 
   /**
@@ -2801,7 +2837,11 @@ export class StreamsStore {
      * sending the pong and there is no open connection yet with this agent and there is
      * no pending InitRequest from less than 5 seconds ago (and we therefore have to
      * assume that a remote signal got lost), send an InitRequest.
+     *
+     * Only initiate if the video module is active (i.e., we want WebRTC).
      */
+    const videoModuleActive = !!get(this._myModuleStates)['video'];
+
     // Clean up stale video connection if the underlying WebRTC is dead.
     // This allows the normal initiation flow to proceed for a re-joining peer.
     const existingConn = get(this._openConnections)[pubkeyB64];
@@ -2827,51 +2867,55 @@ export class StreamsStore {
     // alreadyOpen here does not include the case where SDP exchange is already ongoing
     // but no actual connection has happened yet
     const alreadyOpen = get(this._openConnections)[pubkeyB64];
-    const pendingInits = this._pendingInits[pubkeyB64];
-    if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
-      if (!pendingInits) {
-        console.log('#### SENDING FIRST INIT REQUEST.');
-        const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
-        if (lastDisconnect) {
-          const gap = Date.now() - lastDisconnect;
-          this.logger.logCustomMessage(
-            `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
-          );
-        }
-        const newConnectionId = uuidv4();
-        this._pendingInits[pubkeyB64] = [
-          { connectionId: newConnectionId, t0: now },
-        ];
-        await this.roomClient.sendMessage(
-          [signal.from_agent],
-          'InitRequest',
-          JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-        );
-        this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-      } else {
-        console.log(
-          `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
-        );
-        const latestInit = pendingInits.sort(
-          (init_a, init_b) => init_b.t0 - init_a.t0
-        )[0];
-        if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
+
+    // Only initiate/manage WebRTC video connections when video module is active
+    if (videoModuleActive) {
+      const pendingInits = this._pendingInits[pubkeyB64];
+      if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
+        if (!pendingInits) {
+          console.log('#### SENDING FIRST INIT REQUEST.');
+          const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
+          if (lastDisconnect) {
+            const gap = Date.now() - lastDisconnect;
+            this.logger.logCustomMessage(
+              `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
+            );
+          }
           const newConnectionId = uuidv4();
-          pendingInits.push({ connectionId: newConnectionId, t0: now });
-          this._pendingInits[pubkeyB64] = pendingInits;
+          this._pendingInits[pubkeyB64] = [
+            { connectionId: newConnectionId, t0: now },
+          ];
           await this.roomClient.sendMessage(
             [signal.from_agent],
             'InitRequest',
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
           );
           this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
+        } else {
+          console.log(
+            `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
+          );
+          const latestInit = pendingInits.sort(
+            (init_a, init_b) => init_b.t0 - init_a.t0
+          )[0];
+          if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
+            const newConnectionId = uuidv4();
+            pendingInits.push({ connectionId: newConnectionId, t0: now });
+            this._pendingInits[pubkeyB64] = pendingInits;
+            await this.roomClient.sendMessage(
+              [signal.from_agent],
+              'InitRequest',
+              JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
+            );
+            this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
+          }
         }
+      } else if (!alreadyOpen && !pendingInits) {
+        this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
+      } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
+        // If the connection is already open, reconcile with our expected stream state
+        this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
       }
-    } else if (!alreadyOpen && !pendingInits) {
-      this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
-    } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
-      // If the connection is already open, reconcile with our expected stream state
-      this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
     }
 
     // Check whether they have the right expectation of our audio state and if not,

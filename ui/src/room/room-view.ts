@@ -60,7 +60,7 @@ import './elements/toggle-switch';
 import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
 import { PING_INTERVAL, StreamsStore } from '../streams-store';
-import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope } from '../types';
+import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
 import { exportLogs } from '../logging';
 import { getAllModules, getModule } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
@@ -139,6 +139,12 @@ export class RoomView extends LitElement {
   _openConnections = new StoreSubscriber(
     this,
     () => this.streamsStore._openConnections,
+    () => [this.streamsStore]
+  );
+
+  _activeAgents = new StoreSubscriber(
+    this,
+    () => this.streamsStore._activeAgents,
     () => [this.streamsStore]
   );
 
@@ -397,7 +403,13 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-disconnected': {
-          if (this._maximizedVideo === event.connectionId) {
+          // WebRTC disconnect only — pane persists via _activeAgents.
+          // No audio or maximize clear needed.
+          break;
+        }
+        case 'peer-leave': {
+          // Agent left the room — clear maximize if they were maximized
+          if (this._maximizedVideo === event.pubKeyB64) {
             this._maximizedVideo = undefined;
           }
           await this._leaveAudio.play();
@@ -408,7 +420,7 @@ export class RoomView extends LitElement {
           // so we add a timeout here.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
-              event.connectionId
+              `video-${event.pubKeyB64}`
             ) as HTMLVideoElement | undefined;
             if (videoEl) {
               videoEl.autoplay = true;
@@ -466,6 +478,10 @@ export class RoomView extends LitElement {
         this.streamsStore.activateModule(mod.id);
       }
     }
+
+    // Auto-activate video module so it appears in module states and
+    // participates in the normal module rendering pipeline
+    this.streamsStore.activateModule('video');
   }
 
   async addAttachment() {
@@ -561,9 +577,9 @@ export class RoomView extends LitElement {
     }
 
     // Peer video streams
-    for (const [pubkeyB64, conn] of Object.entries(this._openConnections.value)) {
+    for (const [pubkeyB64] of Object.entries(this._openConnections.value)) {
       restoreVideo(
-        this.shadowRoot?.getElementById(conn.connectionId) as HTMLVideoElement | null,
+        this.shadowRoot?.getElementById(`video-${pubkeyB64}`) as HTMLVideoElement | null,
         this.streamsStore._videoStreams[pubkeyB64],
       );
     }
@@ -637,7 +653,7 @@ export class RoomView extends LitElement {
     const hasScreenShares = totalScreenShares > 0;
 
     const videoOnlyCount =
-      Object.keys(this._openConnections.value).length + 1;
+      Object.keys(this._activeAgents.value).length + 1;
     const totalCount = videoOnlyCount + totalScreenShares;
 
     // In split mode, size items based on their panel's count
@@ -1591,8 +1607,10 @@ export class RoomView extends LitElement {
    * Lists available replace modules the receiver can switch to.
    * Only shown when the peer has receiver-activated modules with renderReplace.
    */
-  renderModuleSwitcher(pubkeyB64: AgentPubKeyB64) {
-    const peerModules = this._peerModuleStates.value?.[pubkeyB64] || {};
+  renderModuleSwitcher(pubkeyB64: AgentPubKeyB64, isMe = false) {
+    const peerModules = isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
     const currentOverride = this._receiverModuleOverrides.value?.[pubkeyB64];
 
     // Find modules with renderReplace that the receiver can switch to:
@@ -1623,10 +1641,14 @@ export class RoomView extends LitElement {
         <sl-menu class="reconnect-menu secondary-font">
           <sl-menu-item
             class="reconnect-menu-item"
-            @click=${() => this.streamsStore.setReceiverOverride(pubkeyB64, null)}
+            @click=${() => {
+              this.streamsStore.setReceiverOverride(pubkeyB64, null);
+              // Switching back to video creates a new <video> element — reapply srcObject
+              setTimeout(() => this._reapplyVideoStreams(), 100);
+            }}
           >
             <sl-icon slot="prefix" .src=${wrapPathInSvg(mdiVideo)} style="font-size: 16px;"></sl-icon>
-            Video${!currentOverride ? ' ✓' : ''}
+            Video/Audio${!currentOverride ? ' ✓' : ''}
           </sl-menu-item>
           ${switchableModules.map(mod => html`
             <sl-menu-item
@@ -1654,9 +1676,8 @@ export class RoomView extends LitElement {
   _getActiveReplaceModule(
     pubkeyB64: AgentPubKeyB64,
     context: ModuleRenderContext,
-    useMyStates = false,
   ): { moduleId: string; html: unknown } | null {
-    const modules = useMyStates
+    const modules = context.isMe
       ? (this._myModuleStates.value || {})
       : (this._peerModuleStates.value?.[pubkeyB64] || {});
 
@@ -1684,7 +1705,6 @@ export class RoomView extends LitElement {
 
     // Check sender-activated replace-only modules (no overlay = forces replace)
     for (const [moduleId, envelope] of Object.entries(modules)) {
-      if (moduleId === 'video') continue;
       const mod = getModule(moduleId);
       if ((mod?.renderReplace || mod?.replaceElement) && !mod?.renderOverlay && !mod?.overlayElement && mod?.activationControl === 'sender' && envelope.active) {
         return { moduleId, html: renderForModule(mod, envelope) };
@@ -1732,18 +1752,12 @@ export class RoomView extends LitElement {
   }
 
   renderModuleIconStrip(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
-    const peerModules = this._peerModuleStates.value?.[pubkeyB64] || {};
+    const modules = context.isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
     const allIcons: ModuleIconDefinition[] = [];
 
-    // Always get video module icons (video is always "active" for connected peers)
-    const videoMod = getModule('video');
-    if (videoMod?.getStateIcons) {
-      allIcons.push(...videoMod.getStateIcons(pubkeyB64, null, context));
-    }
-
-    // Get icons from other active modules
-    for (const [moduleId, envelope] of Object.entries(peerModules)) {
-      if (moduleId === 'video') continue;
+    for (const [moduleId, envelope] of Object.entries(modules)) {
       const mod = getModule(moduleId);
       if (mod?.getStateIcons) {
         allIcons.push(...mod.getStateIcons(pubkeyB64, envelope, context));
@@ -1779,10 +1793,12 @@ export class RoomView extends LitElement {
   }
 
   renderModuleOverlays(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
-    const peerModules = this._peerModuleStates.value?.[pubkeyB64] || {};
+    const modules = context.isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
     const overlays: unknown[] = [];
 
-    for (const [moduleId, envelope] of Object.entries(peerModules)) {
+    for (const [moduleId, envelope] of Object.entries(modules)) {
       const mod = getModule(moduleId);
       if (mod?.renderOverlay || mod?.overlayElement) {
         overlays.push(this._renderOverlayForModule(mod, pubkeyB64, envelope, context));
@@ -1790,45 +1806,6 @@ export class RoomView extends LitElement {
     }
 
     return overlays;
-  }
-
-  /**
-   * Renders overlay modules for the self-pane using _myModuleStates.
-   */
-  renderMyModuleOverlays(myPubKeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
-    const myModules = this._myModuleStates.value || {};
-    const overlays: unknown[] = [];
-
-    for (const [moduleId, envelope] of Object.entries(myModules)) {
-      const mod = getModule(moduleId);
-      if (mod?.renderOverlay || mod?.overlayElement) {
-        overlays.push(this._renderOverlayForModule(mod, myPubKeyB64, envelope, context));
-      }
-    }
-
-    return overlays;
-  }
-
-  /**
-   * Renders the module icon strip for the self-pane using _myModuleStates.
-   */
-  renderMyModuleIconStrip(myPubKeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
-    const myModules = this._myModuleStates.value || {};
-    const allIcons: ModuleIconDefinition[] = [];
-
-    for (const [moduleId, envelope] of Object.entries(myModules)) {
-      const mod = getModule(moduleId);
-      if (mod?.getStateIcons) {
-        allIcons.push(...mod.getStateIcons(myPubKeyB64, envelope, context));
-      }
-    }
-
-    const visibleIcons = allIcons.filter(icon => icon.currentState !== undefined);
-    if (visibleIcons.length === 0) return html``;
-
-    return html`
-      ${visibleIcons.map(icon => this._renderModuleIcon(icon))}
-    `;
   }
 
   /**
@@ -2283,7 +2260,7 @@ export class RoomView extends LitElement {
             streamsStore: this.streamsStore,
             myPubKeyB64,
           };
-          const myActiveReplace = this._getActiveReplaceModule(myPubKeyB64, myModuleContext, true);
+          const myActiveReplace = this._getActiveReplaceModule(myPubKeyB64, myModuleContext);
           return html`
         <div
           style="${this._selfViewHidden ? 'display: none;' : ''}"
@@ -2326,7 +2303,7 @@ export class RoomView extends LitElement {
             : html``}
 
           <!-- Module overlays (self) -->
-          ${this.renderMyModuleOverlays(myPubKeyB64, myModuleContext)}
+          ${this.renderModuleOverlays(myPubKeyB64, myModuleContext)}
 
           <!-- Icons and Avatar/nickname for circle view (centered, stacked) -->
           ${this._circleView
@@ -2354,14 +2331,17 @@ export class RoomView extends LitElement {
                         }
                       }}
                     ></sl-icon>
-                    ${this.renderMyModuleIconStrip(myPubKeyB64, myModuleContext)}
+                    ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
                   </div>
-                  <avatar-with-nickname
-                    .size=${36}
-                    .hideAvatar=${!this._camera}
-                    .agentPubKey=${this.roomStore.client.client.myPubKey}
-                    style="height: 36px;"
-                  ></avatar-with-nickname>
+                  <div class="row" style="align-items: center;">
+                    <avatar-with-nickname
+                      .size=${36}
+                      .hideAvatar=${!this._camera}
+                      .agentPubKey=${this.roomStore.client.client.myPubKey}
+                      style="height: 36px;"
+                    ></avatar-with-nickname>
+                    ${this.renderModuleSwitcher(myPubKeyB64, true)}
+                  </div>
                 </div>
               `
             : html`
@@ -2369,12 +2349,13 @@ export class RoomView extends LitElement {
                   class="tile-meta"
                   style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
                 >
-                  ${this.renderMyModuleIconStrip(myPubKeyB64, myModuleContext)}
+                  ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
                   <avatar-with-nickname
                     .size=${36}
                     .agentPubKey=${this.roomStore.client.client.myPubKey}
                     style="height: 36px;"
                   ></avatar-with-nickname>
+                  ${this.renderModuleSwitcher(myPubKeyB64, true)}
                   <sl-icon
                     title="${this._maximizedVideo === 'my-own-stream'
                       ? 'minimize'
@@ -2399,14 +2380,15 @@ export class RoomView extends LitElement {
           `;
         })()}
 
-        <!-- Video stream of others -->
+        <!-- Panes for present agents (driven by holochain presence, not WebRTC) -->
         ${repeat(
-          Object.entries(this._openConnections.value),
-          ([_pubkeyB64, conn]) => conn.connectionId,
-          ([pubkeyB64, conn]) => {
+          Object.entries(this._activeAgents.value),
+          ([pubkeyB64]) => pubkeyB64,
+          ([pubkeyB64]) => {
+            const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
             const moduleContext: ModuleRenderContext = {
               isMe: false,
-              connected: conn.connected,
+              connected: true,
               circleView: this._circleView,
               streamsStore: this.streamsStore,
               myPubKeyB64: encodeHashToBase64(this.roomStore.client.client.myPubKey),
@@ -2414,42 +2396,54 @@ export class RoomView extends LitElement {
             };
             // Determine active replace module for this peer's pane
             const activeReplaceModule = this._getActiveReplaceModule(pubkeyB64, moduleContext);
+            const videoElId = `video-${pubkeyB64}`;
 
             return html`
             <div
-              class="video-container ${this.idToLayout(conn.connectionId)}${this._circleView ? '' : ' square-view'}"
-              @dblclick=${() => this.toggleMaximized(conn.connectionId)}
+              class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
+              @dblclick=${() => this.toggleMaximized(pubkeyB64)}
             >
               <!-- Replace content -->
               ${activeReplaceModule
                 ? html`<div class="module-replace-content">${activeReplaceModule.html}</div>`
-                : html`
-                  <video
-                    style="${conn.video ? '' : 'display: none;'}"
-                    id="${conn.connectionId}"
-                    class="video-el"
-                  ></video>
-                  <avatar-with-nickname
-                    .hideNickname=${true}
-                    .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                    style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
-                  ></avatar-with-nickname>
-                  <div
-                    style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
-                  >
-                    establishing connection...
-                  </div>
-                  <div
-                    style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
-                  >
-                    connecting media...
-                  </div>
-                `}
+                : conn
+                  ? html`
+                    <video
+                      style="${conn.video ? '' : 'display: none;'}"
+                      id="${videoElId}"
+                      class="video-el"
+                    ></video>
+                    <avatar-with-nickname
+                      .hideNickname=${true}
+                      .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                      style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
+                    ></avatar-with-nickname>
+                    <div
+                      style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
+                    >
+                      establishing connection...
+                    </div>
+                    <div
+                      style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
+                    >
+                      connecting media...
+                    </div>
+                  `
+                  : html`
+                    <avatar-with-nickname
+                      .hideNickname=${true}
+                      .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                      style="width: 35%;"
+                    ></avatar-with-nickname>
+                    <div style="color: #b98484;">
+                      waiting for connection...
+                    </div>
+                  `}
               <!-- Hidden video element so srcObject assignment still works when a replace module is active -->
-              ${activeReplaceModule
+              ${activeReplaceModule && conn
                 ? html`<video
                     style="display: none;"
-                    id="${conn.connectionId}"
+                    id="${videoElId}"
                     class="video-el"
                   ></video>`
                 : html``}
@@ -2475,20 +2469,20 @@ export class RoomView extends LitElement {
                     >
                       <div class="row" style="margin-bottom: 4px;">
                         <sl-icon
-                          title="${this._maximizedVideo === conn.connectionId
+                          title="${this._maximizedVideo === pubkeyB64
                             ? 'minimize'
                             : 'maximize'}"
-                          .src=${this._maximizedVideo === conn.connectionId
+                          .src=${this._maximizedVideo === pubkeyB64
                             ? wrapPathInSvg(mdiFullscreenExit)
                             : wrapPathInSvg(mdiFullscreen)}
                           tabindex="0"
                           style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
                           @click=${() => {
-                            this.toggleMaximized(conn.connectionId);
+                            this.toggleMaximized(pubkeyB64);
                           }}
                           @keypress=${(e: KeyboardEvent) => {
                             if (e.key === 'Enter') {
-                              this.toggleMaximized(conn.connectionId);
+                              this.toggleMaximized(pubkeyB64);
                             }
                           }}
                         ></sl-icon>
@@ -2497,21 +2491,11 @@ export class RoomView extends LitElement {
                       <div class="row" style="align-items: center;">
                         <avatar-with-nickname
                           .size=${36}
-                          .hideAvatar=${!conn.video}
+                          .hideAvatar=${!conn?.video}
                           .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                           style="height: 36px;"
                         ></avatar-with-nickname>
                         ${this.renderModuleSwitcher(pubkeyB64)}
-                        <sl-tooltip content="Full reconnect" class="tooltip-filled" hoist>
-                          <sl-icon-button
-                            class="phone-refresh"
-                            style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
-                            src=${wrapPathInSvg(mdiPhoneRefresh)}
-                            @click=${() => {
-                              this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                            }}
-                          ></sl-icon-button>
-                        </sl-tooltip>
                         ${this._showConnectionDetails
                           ? html`
                               <sl-tooltip
@@ -2523,7 +2507,7 @@ export class RoomView extends LitElement {
                                   style="margin-bottom: -5px;"
                                   @click=${() => {
                                     const videoEl = this.shadowRoot?.getElementById(
-                                      conn.connectionId
+                                      videoElId
                                     ) as HTMLVideoElement;
                                     if (videoEl) {
                                       const stream = videoEl.srcObject;
@@ -2578,31 +2562,21 @@ export class RoomView extends LitElement {
                         style="height: 36px;"
                       ></avatar-with-nickname>
                       ${this.renderModuleSwitcher(pubkeyB64)}
-                      <sl-tooltip content="Full reconnect" class="tooltip-filled" hoist>
-                        <sl-icon-button
-                          class="phone-refresh"
-                          style="margin-left: 4px; margin-bottom: -5px; font-size: 20px;"
-                          src=${wrapPathInSvg(mdiPhoneRefresh)}
-                          @click=${() => {
-                            this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                          }}
-                        ></sl-icon-button>
-                      </sl-tooltip>
                       <sl-icon
-                        title="${this._maximizedVideo === conn.connectionId
+                        title="${this._maximizedVideo === pubkeyB64
                           ? 'minimize'
                           : 'maximize'}"
-                        .src=${this._maximizedVideo === conn.connectionId
+                        .src=${this._maximizedVideo === pubkeyB64
                           ? wrapPathInSvg(mdiFullscreenExit)
                           : wrapPathInSvg(mdiFullscreen)}
                         tabindex="0"
                         style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
                         @click=${() => {
-                          this.toggleMaximized(conn.connectionId);
+                          this.toggleMaximized(pubkeyB64);
                         }}
                         @keypress=${(e: KeyboardEvent) => {
                           if (e.key === 'Enter') {
-                            this.toggleMaximized(conn.connectionId);
+                            this.toggleMaximized(pubkeyB64);
                           }
                         }}
                       ></sl-icon>
@@ -2617,7 +2591,7 @@ export class RoomView extends LitElement {
                                 style="margin-bottom: -5px;"
                                 @click=${() => {
                                   const videoEl = this.shadowRoot?.getElementById(
-                                    conn.connectionId
+                                    videoElId
                                   ) as HTMLVideoElement;
                                   if (videoEl) {
                                     const stream = videoEl.srcObject;
@@ -3584,6 +3558,11 @@ export class RoomView extends LitElement {
         font-size: 14px;
         color: #c3c9eb;
         padding: 2px 10px;
+        text-align: left;
+      }
+
+      .reconnect-menu-item::part(prefix) {
+        margin-inline-end: 8px;
       }
 
       .reconnect-menu-item::part(base):hover {

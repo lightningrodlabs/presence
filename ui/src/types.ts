@@ -292,6 +292,10 @@ export type StoreEventPayload =
       connectionId: ConnectionId;
     }
   | {
+      type: 'peer-leave';
+      pubKeyB64: AgentPubKeyB64;
+    }
+  | {
       type: 'peer-screen-share-connected';
       pubKeyB64: AgentPubKeyB64;
       connectionId: ConnectionId;

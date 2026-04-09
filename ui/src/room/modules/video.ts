@@ -1,12 +1,10 @@
-import { html } from 'lit';
 import {
   mdiVideo,
   mdiMicrophoneOff,
   mdiRefresh,
   mdiHub,
+  mdiPhoneRefresh,
 } from '@mdi/js';
-import { wrapPathInSvg } from '@holochain-open-dev/elements';
-import { decodeHashFromBase64 } from '@holochain/client';
 import { registerModule } from './registry';
 import type { ModuleDefinition, ModuleIconDefinition, ModuleRenderContext, ModuleStateEnvelope } from './types';
 import type { OpenConnectionInfo } from '../../types';
@@ -20,13 +18,20 @@ enum RelayIcon { Relayed = 0 }
 /** State icon indices for reset media button */
 enum ResetMedia { Available = 0 }
 
+/** State icon indices for full WebRTC reconnect */
+enum Reconnect { Available = 0 }
+
 
 const videoModule: ModuleDefinition = {
   id: 'video',
   type: 'agent',
-  label: 'Video',
+  label: 'Video/Audio',
   icon: mdiVideo,
   activationControl: 'sender',
+
+  defaultState() {
+    return '{}';
+  },
 
   getStateIcons(
     agentPubKeyB64: string,
@@ -66,41 +71,24 @@ const videoModule: ModuleDefinition = {
         : undefined,
     });
 
+    // Full WebRTC reconnect -- always available when connected
+    icons.push({
+      states: [
+        { icon: mdiPhoneRefresh, tooltip: 'Reconnect', color: '#ffe100' },
+      ],
+      currentState: Reconnect.Available,
+      onSelect: () => context.streamsStore.disconnectFromPeerVideo(agentPubKeyB64),
+    });
 
     return icons;
   },
 
-  renderReplace(
-    agentPubKeyB64: string,
-    _state: ModuleStateEnvelope | null,
-    context: ModuleRenderContext,
-  ) {
-    const conn = context.extra?.conn as OpenConnectionInfo | undefined;
-    if (!conn) return html``;
-
-    return html`
-      <video
-        style="${conn.video ? '' : 'display: none;'}"
-        id="${conn.connectionId}"
-        class="video-el"
-      ></video>
-      <avatar-with-nickname
-        .hideNickname=${true}
-        .agentPubKey=${decodeHashFromBase64(agentPubKeyB64)}
-        style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
-      ></avatar-with-nickname>
-      <div
-        style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
-      >
-        establishing connection...
-      </div>
-      <div
-        style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
-      >
-        connecting media...
-      </div>
-    `;
-  },
+  // Video does NOT provide renderReplace. The pane's inline template handles
+  // video rendering directly because:
+  // - Self pane needs local-only concerns (this._camera, muted, mirrored)
+  // - Peer pane's default content IS the video view (inline, not overlay)
+  // - Wrapping in .module-replace-content (absolute positioning) breaks layout
+  // The video module's role is: state propagation + icon strip contribution.
 };
 
 registerModule(videoModule);
