@@ -5,3 +5,4 @@ export * from './registry';
 import './video';
 import './raise-hand';
 import './clock';
+import './reactions';

@@ -479,9 +479,9 @@ export class RoomView extends LitElement {
       }
     }
 
-    // Auto-activate video module so it appears in module states and
-    // participates in the normal module rendering pipeline
+    // Auto-activate modules that should be on by default
     this.streamsStore.activateModule('video');
+    this.streamsStore.activateModule('reactions');
   }
 
   async addAttachment() {
@@ -2973,7 +2973,7 @@ export class RoomView extends LitElement {
       }
 
       .tile-meta {
-        z-index: 3;
+        z-index: 5;
       }
 
       .maximize-icon {
