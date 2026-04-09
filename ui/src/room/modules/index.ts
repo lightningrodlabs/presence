@@ -6,3 +6,6 @@ import './video';
 import './raise-hand';
 import './clock';
 import './reactions';
+import './wal';
+import './timer';
+import './screen-share';

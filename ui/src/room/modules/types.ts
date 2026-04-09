@@ -76,6 +76,22 @@ export interface ModuleDefinition {
    */
   replaceElement?: string;
 
+  /**
+   * Custom element tag for share rendering. Used by share-type modules
+   * that need local state (e.g. timer's tick loop). The element receives
+   * .agentPubKeyB64, .moduleState, .context as properties.
+   */
+  shareElement?: string;
+
+  /**
+   * CSS class for the share's outer wrapper. Determines the structural
+   * layout (e.g. 'video-container screen-share' for aspect-ratio video tiles
+   * vs 'shared-wal-container' for flex-grow flat tiles). The renderer
+   * always also adds 'shared-panel-frame' and the layout sizing class.
+   * Defaults to 'video-container screen-share' if omitted.
+   */
+  shareWrapperClass?: string;
+
   /** Content rendered on top of the pane, always visible when module is active. */
   renderOverlay?(
     agentPubKeyB64: string,
@@ -85,6 +101,18 @@ export interface ModuleDefinition {
 
   /** Content that fills the pane when viewer switches to this module's view. */
   renderReplace?(
+    agentPubKeyB64: string,
+    state: ModuleStateEnvelope | null,
+    context: ModuleRenderContext,
+  ): TemplateResult;
+
+  /**
+   * Content rendered as a tile in the shared panel for share-type modules.
+   * Called once per (active share-module, agent) pair. The agentPubKeyB64
+   * identifies whose share this is. Use context.isMe to render owner-specific
+   * controls (e.g. close button).
+   */
+  renderShare?(
     agentPubKeyB64: string,
     state: ModuleStateEnvelope | null,
     context: ModuleRenderContext,
@@ -120,5 +148,6 @@ export interface ModuleDefinition {
   renderToolbarButton?(
     myState: ModuleStateEnvelope | null,
     toggle: () => void,
+    streamsStore: StreamsStore,
   ): TemplateResult;
 }

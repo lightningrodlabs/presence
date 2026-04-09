@@ -21,12 +21,10 @@ import {
   mdiMicrophone,
   mdiMicrophoneOff,
   mdiMinus,
-  mdiMonitorScreenshot,
   mdiNoteEditOutline,
   mdiCubeOutline,
   mdiPaperclip,
   mdiPencilCircleOutline,
-  mdiPhoneRefresh,
   mdiHub,
   mdiDownload,
   mdiCloudDownloadOutline,
@@ -62,7 +60,7 @@ import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
 import { PING_INTERVAL, StreamsStore } from '../streams-store';
 import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
 import { exportLogs } from '../logging';
-import { getAllModules, getModule } from './modules/registry';
+import { getAllModules, getModule, getShareModules } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import './modules'; // side-effect: registers all modules
 
@@ -436,7 +434,7 @@ export class RoomView extends LitElement {
           // so we add a timeout here.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
-              event.connectionId
+              `video-screen-${event.pubKeyB64}`
             ) as HTMLVideoElement | undefined;
             console.log('&&&& Trying to set video element (screen share)');
             if (videoEl) {
@@ -447,7 +445,9 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-screen-share-disconnected': {
-          if (this._maximizedVideo === event.connectionId) {
+          // Maximize is now keyed by share-${moduleId}-${pubkey}, not connectionId.
+          // Clear maximize if this peer's screen share was maximized.
+          if (this._maximizedVideo === `share-screen-share-${event.pubKeyB64}`) {
             this._maximizedVideo = undefined;
           }
           break;
@@ -517,7 +517,11 @@ export class RoomView extends LitElement {
       assetName,
       assetIconSrc,
     };
-    await this.streamsStore.shareWal(payload);
+    await this.streamsStore.activateModule('wal', JSON.stringify(payload));
+  }
+
+  async stopShareWal() {
+    await this.streamsStore.deactivateModule('wal');
   }
 
   openCustomEventLogDialog() {
@@ -538,9 +542,8 @@ export class RoomView extends LitElement {
   }
 
   updated(changedProperties: Map<string, unknown>) {
-    // Re-apply video srcObjects after layout changes (e.g. maximize/minimize).
-    // The display:contents transition can destroy video rendering context,
-    // so we force re-assign srcObject after the DOM settles.
+    // Re-apply video srcObjects after maximize/minimize, which destroys video
+    // rendering context via the display:contents transition.
     if (changedProperties.has('_maximizedVideo')) {
       setTimeout(() => this._reapplyVideoStreams(), 50);
     }
@@ -569,9 +572,9 @@ export class RoomView extends LitElement {
     );
 
     // Peer screen shares
-    for (const [pubkeyB64, conn] of Object.entries(this._screenShareConnectionsIncoming.value)) {
+    for (const [pubkeyB64] of Object.entries(this._screenShareConnectionsIncoming.value)) {
       restoreVideo(
-        this.shadowRoot?.getElementById(conn.connectionId) as HTMLVideoElement | null,
+        this.shadowRoot?.getElementById(`video-screen-${pubkeyB64}`) as HTMLVideoElement | null,
         this.streamsStore._screenShareStreams[pubkeyB64],
       );
     }
@@ -642,24 +645,20 @@ export class RoomView extends LitElement {
     this.streamsStore.disconnect();
   }
 
-  idToLayout(id: string, isScreenShare: boolean = false) {
+  idToLayout(id: string, isShared: boolean = false) {
     if (id === this._maximizedVideo) return 'maximized';
     if (this._maximizedVideo) return 'hidden';
-    const incomingScreenShareNum = Object.keys(
-      this._screenShareConnectionsIncoming.value
-    ).length;
-    const ownScreenShareNum = this.streamsStore.screenShareStream ? 1 : 0;
-    const totalScreenShares = incomingScreenShareNum + ownScreenShareNum;
-    const hasScreenShares = totalScreenShares > 0;
+    const activeShareCount = this._getActiveShares().length;
+    const hasShared = activeShareCount > 0;
 
     const videoOnlyCount =
       Object.keys(this._activeAgents.value).length + 1;
-    const totalCount = videoOnlyCount + totalScreenShares;
+    const totalCount = videoOnlyCount + activeShareCount;
 
     // In split mode, size items based on their panel's count
-    const num = isScreenShare
-      ? totalScreenShares
-      : hasScreenShares
+    const num = isShared
+      ? activeShareCount
+      : hasShared
         ? videoOnlyCount
         : totalCount;
 
@@ -1379,63 +1378,32 @@ export class RoomView extends LitElement {
           </div>
         </sl-tooltip>
 
-        <sl-tooltip
-          content="${this.streamsStore.screenShareStream
-            ? msg('Stop Screen Sharing')
-            : msg('Share Screen')}"
-          hoist
-        >
-          <div
-            class="toggle-btn ${this.streamsStore.screenShareStream
-              ? ''
-              : 'btn-off'}"
-            tabindex="0"
-            @click=${async () => {
-              if (this.streamsStore.screenShareStream) {
-                await this.streamsStore.screenShareOff();
-              } else {
-                await this.streamsStore.screenShareOn();
-              }
-            }}
-            @keypress=${async (e: KeyboardEvent) => {
-              if (e.key === 'Enter') {
-                if (this.streamsStore.screenShareStream) {
-                  await this.streamsStore.screenShareOff();
-                } else {
-                  await this.streamsStore.screenShareOn();
-                }
-              }
-            }}
-          >
-            <sl-icon
-              class="toggle-btn-icon ${this.streamsStore.screenShareStream
-                ? ''
-                : 'btn-icon-off'}"
-              .src=${wrapPathInSvg(mdiMonitorScreenshot)}
-            ></sl-icon>
-          </div>
-        </sl-tooltip>
+        <!-- raise-hand toolbar button (between video and wal) -->
+        ${this._renderModuleToolbarButton('raise-hand')}
 
+        ${(() => {
+          const walActive = !!(this._myModuleStates.value || {})['wal'];
+          return html`
         <sl-tooltip
-          content="${this._mySharedWal.value
+          content="${walActive
             ? msg('Stop Sharing Asset')
             : msg('Share Asset')}"
           hoist
         >
           <div
-            class="toggle-btn ${this._mySharedWal.value ? '' : 'btn-off'}"
+            class="toggle-btn ${walActive ? '' : 'btn-off'}"
             tabindex="0"
             @click=${async () => {
-              if (this._mySharedWal.value) {
-                await this.streamsStore.stopShareWal();
+              if (walActive) {
+                await this.stopShareWal();
               } else {
                 await this.startShareWal();
               }
             }}
             @keypress=${async (e: KeyboardEvent) => {
               if (e.key === 'Enter') {
-                if (this._mySharedWal.value) {
-                  await this.streamsStore.stopShareWal();
+                if (walActive) {
+                  await this.stopShareWal();
                 } else {
                   await this.startShareWal();
                 }
@@ -1443,11 +1411,16 @@ export class RoomView extends LitElement {
             }}
           >
             <sl-icon
-              class="toggle-btn-icon ${this._mySharedWal.value ? '' : 'btn-icon-off'}"
+              class="toggle-btn-icon ${walActive ? '' : 'btn-icon-off'}"
               .src=${wrapPathInSvg(mdiCubeOutline)}
             ></sl-icon>
           </div>
         </sl-tooltip>
+        `;})()}
+
+        <!-- screen-share and timer toolbar buttons (after wal) -->
+        ${this._renderModuleToolbarButton('screen-share')}
+        ${this._renderModuleToolbarButton('timer')}
 
         <sl-tooltip
           content="${this._selfViewHidden
@@ -1564,21 +1537,6 @@ export class RoomView extends LitElement {
           </div>
         </sl-tooltip>
 
-        <!-- Module toolbar buttons -->
-        ${getAllModules()
-          .filter(m => m.renderToolbarButton)
-          .map(mod => {
-            const myState = this._myModuleStates.value?.[mod.id] || null;
-            const toggle = async () => {
-              if (myState) {
-                await this.streamsStore.deactivateModule(mod.id);
-              } else {
-                await this.streamsStore.activateModule(mod.id);
-              }
-            };
-            return mod.renderToolbarButton!(myState, toggle);
-          })
-        }
 
         <sl-tooltip content="${msg('Leave Call')}" hoist>
           <div
@@ -1751,6 +1709,20 @@ export class RoomView extends LitElement {
     `;
   }
 
+  _renderModuleToolbarButton(moduleId: string) {
+    const mod = getModule(moduleId);
+    if (!mod?.renderToolbarButton) return html``;
+    const myState = this._myModuleStates.value?.[moduleId] || null;
+    const toggle = async () => {
+      if (myState) {
+        await this.streamsStore.deactivateModule(moduleId);
+      } else {
+        await this.streamsStore.activateModule(moduleId);
+      }
+    };
+    return mod.renderToolbarButton(myState, toggle, this.streamsStore);
+  }
+
   renderModuleIconStrip(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
     const modules = context.isMe
       ? (this._myModuleStates.value || {})
@@ -1806,6 +1778,124 @@ export class RoomView extends LitElement {
     }
 
     return overlays;
+  }
+
+  /**
+   * Enumerate all active share-type module instances across self and peers.
+   * Returns one entry per (active share-module, agent) pair.
+   */
+  _getActiveShares(): Array<{
+    moduleId: string;
+    agentPubKeyB64: AgentPubKeyB64;
+    state: ModuleStateEnvelope;
+    isMe: boolean;
+  }> {
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const shareModuleIds = new Set(getShareModules().map(m => m.id));
+    const result: Array<{
+      moduleId: string;
+      agentPubKeyB64: AgentPubKeyB64;
+      state: ModuleStateEnvelope;
+      isMe: boolean;
+    }> = [];
+
+    // Self shares
+    const myStates = this._myModuleStates.value || {};
+    for (const [moduleId, envelope] of Object.entries(myStates)) {
+      if (shareModuleIds.has(moduleId) && envelope.active) {
+        result.push({ moduleId, agentPubKeyB64: myPubKeyB64, state: envelope, isMe: true });
+      }
+    }
+
+    // Peer shares
+    const peerStates = this._peerModuleStates.value || {};
+    for (const [pubkeyB64, modules] of Object.entries(peerStates)) {
+      for (const [moduleId, envelope] of Object.entries(modules)) {
+        if (shareModuleIds.has(moduleId) && envelope.active) {
+          result.push({ moduleId, agentPubKeyB64: pubkeyB64, state: envelope, isMe: false });
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Render a single share tile via the module's renderShare or shareElement.
+   */
+  private _renderShareForModule(
+    mod: NonNullable<ReturnType<typeof getModule>>,
+    pubkeyB64: string,
+    envelope: ModuleStateEnvelope,
+    context: ModuleRenderContext,
+  ): unknown {
+    if (mod.shareElement) {
+      const tag = unsafeStatic(mod.shareElement);
+      return staticHtml`<${tag}
+        .agentPubKeyB64=${pubkeyB64}
+        .moduleState=${envelope}
+        .context=${context}
+      ></${tag}>`;
+    }
+    if (mod.renderShare) {
+      return mod.renderShare(pubkeyB64, envelope, context);
+    }
+    return null;
+  }
+
+  /**
+   * Render the shared panel from active share-type modules. Each share tile
+   * is wrapped in shared-panel-frame and supports maximize via the
+   * `share-${moduleId}-${pubkey}` keying scheme.
+   */
+  renderSharedPanel() {
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const shares = this._getActiveShares();
+    if (shares.length === 0) return html``;
+
+    // Use repeat() with a stable key per share so Lit moves existing DOM
+    // nodes instead of recreating them when the share list reorders.
+    // Without this, locally adding a share (which inserts at the front)
+    // tears down peer screen-share <video> elements and loses srcObject.
+    return html`${repeat(
+      shares,
+      ({ moduleId, agentPubKeyB64 }) => `share-${moduleId}-${agentPubKeyB64}`,
+      ({ moduleId, agentPubKeyB64, state, isMe }) => {
+        const mod = getModule(moduleId);
+        if (!mod) return html``;
+        const shareKey = `share-${moduleId}-${agentPubKeyB64}`;
+        const layout = this.idToLayout(shareKey, true);
+        const wrapperClass = mod.shareWrapperClass ?? 'video-container screen-share';
+        const context: ModuleRenderContext = {
+          isMe,
+          connected: true,
+          circleView: false,
+          streamsStore: this.streamsStore,
+          myPubKeyB64,
+        };
+        const content = this._renderShareForModule(mod, agentPubKeyB64, state, context);
+        return html`
+          <div
+            class="${wrapperClass} shared-panel-frame ${layout}"
+            @dblclick=${() => this.toggleMaximized(shareKey)}
+          >
+            ${content}
+            <sl-icon
+              title="${this._maximizedVideo === shareKey ? 'minimize' : 'maximize'}"
+              .src=${this._maximizedVideo === shareKey
+                ? wrapPathInSvg(mdiFullscreenExit)
+                : wrapPathInSvg(mdiFullscreen)}
+              tabindex="0"
+              class="maximize-icon"
+              @click=${() => this.toggleMaximized(shareKey)}
+              @keypress=${(e: KeyboardEvent) => {
+                if (e.key === 'Enter') this.toggleMaximized(shareKey);
+              }}
+            ></sl-icon>
+          </div>
+        `;
+      },
+    )}`;
   }
 
   /**
@@ -1950,17 +2040,9 @@ export class RoomView extends LitElement {
   }
 
   render() {
-    const incomingScreenShares = Object.entries(this._screenShareConnectionsIncoming.value).filter(
-      ([_, conn]) => conn.direction === 'incoming'
-    );
-    const allSharedWals = {
-      ...(this._mySharedWal.value ? { [encodeHashToBase64(this.roomStore.client.client.myPubKey)]: this._mySharedWal.value } : {}),
-      ...(this._peerSharedWals.value || {}),
-    };
-    const sharedWalEntries = Object.entries(allSharedWals);
-    const hasScreenShares =
-      !!this.streamsStore.screenShareStream || incomingScreenShares.length > 0 || sharedWalEntries.length > 0;
-    const splitMode = hasScreenShares && !this._maximizedVideo;
+    const activeShares = this._getActiveShares();
+    const hasShared = activeShares.length > 0;
+    const splitMode = hasShared && !this._maximizedVideo;
     return html`
       <div
         class="custom-log-dialog"
@@ -2070,181 +2152,10 @@ export class RoomView extends LitElement {
       </div>
       <div class="videos-container${splitMode ? ' split-mode' : ''}">
         ${this._isResizing ? html`<div class="resize-overlay"></div>` : html``}
-        ${hasScreenShares ? html`
+        ${hasShared ? html`
         <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
-        <!-- My own screen first if screen sharing is enabled -->
-        <div
-          style="${this.streamsStore.screenShareStream ? '' : 'display: none;'}"
-          class="video-container screen-share shared-panel-frame ${this.idToLayout(
-            'my-own-screen',
-            true
-          )}"
-          @dblclick=${() => this.toggleMaximized('my-own-screen')}
-        >
-          <video
-            muted
-            id="my-own-screen"
-            class="video-el"
-            @resize=${this._onScreenShareResize}
-            @loadedmetadata=${this._onScreenShareResize}
-          ></video>
-
-          <!-- Connection states indicators -->
-          ${this._showConnectionDetails
-            ? html`<div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
-              >
-                ${this.renderAgentConnectionStatuses('my-screen-share')}
-              </div>`
-            : html``}
-
-          <!-- Avatar and nickname -->
-          <div
-            style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
-          >
-            <avatar-with-nickname
-              .size=${36}
-              .agentPubKey=${this.roomStore.client.client.myPubKey}
-              style="height: 36px;"
-            ></avatar-with-nickname>
-          </div>
-          <sl-icon
-            title="${this._maximizedVideo === 'my-own-screen'
-              ? 'minimize'
-              : 'maximize'}"
-            .src=${this._maximizedVideo === 'my-own-screen'
-              ? wrapPathInSvg(mdiFullscreenExit)
-              : wrapPathInSvg(mdiFullscreen)}
-            tabindex="0"
-            class="maximize-icon"
-            @click=${() => {
-              this.toggleMaximized('my-own-screen');
-            }}
-            @keypress=${(e: KeyboardEvent) => {
-              if (e.key === 'Enter') {
-                this.toggleMaximized('my-own-screen');
-              }
-            }}
-          ></sl-icon>
-        </div>
-        <!--Then other agents' screens -->
-
-        ${repeat(
-          Object.entries(this._screenShareConnectionsIncoming.value).filter(
-            ([_, conn]) => conn.direction === 'incoming'
-          ),
-          ([_pubkeyB64, conn]) => conn.connectionId,
-          ([pubkeyB64, conn]) => html`
-            <div
-              class="video-container screen-share shared-panel-frame ${this.idToLayout(
-                conn.connectionId,
-                true
-              )}"
-              @dblclick=${() => this.toggleMaximized(conn.connectionId)}
-            >
-              <video
-                style="${conn.connected ? '' : 'display: none;'}"
-                id="${conn.connectionId}"
-                class="video-el"
-                @resize=${this._onScreenShareResize}
-                @loadedmetadata=${this._onScreenShareResize}
-              ></video>
-              <div
-                style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
-              >
-                establishing connection...
-              </div>
-
-              <!-- Connection states indicators -->
-              ${this._showConnectionDetails
-                ? html`<div
-                    style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
-                  >
-                    ${this.renderAgentConnectionStatuses(
-                      'their-screen-share',
-                      pubkeyB64
-                    )}
-                  </div>`
-                : html``}
-
-              <!-- Avatar and nickname -->
-              <div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
-              >
-                <avatar-with-nickname
-                  .size=${36}
-                  .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                  style="height: 36px;"
-                ></avatar-with-nickname>
-                <sl-tooltip content="reconnect" class="tooltip-filled">
-                  <sl-icon-button
-                    class="phone-refresh"
-                    style="margin-left: 4px; margin-bottom: -5px;"
-                    src=${wrapPathInSvg(mdiPhoneRefresh)}
-                    @click=${() => {
-                      this.streamsStore.disconnectFromPeerScreen(pubkeyB64);
-                    }}
-                  ></sl-icon-button>
-                </sl-tooltip>
-              </div>
-              <sl-icon
-                title="${this._maximizedVideo === conn.connectionId
-                  ? 'minimize'
-                  : 'maximize'}"
-                .src=${this._maximizedVideo === conn.connectionId
-                  ? wrapPathInSvg(mdiFullscreenExit)
-                  : wrapPathInSvg(mdiFullscreen)}
-                tabindex="0"
-                class="maximize-icon"
-                @click=${() => {
-                  this.toggleMaximized(conn.connectionId);
-                }}
-                @keypress=${(e: KeyboardEvent) => {
-                  if (e.key === 'Enter') {
-                    this.toggleMaximized(conn.connectionId);
-                  }
-                }}
-              ></sl-icon>
-            </div>
-          `
-        )}
-
-        <!-- Shared WAL embeds -->
-        ${sharedWalEntries.map(([agentB64, walPayload]) => {
-          const isMe = agentB64 === encodeHashToBase64(this.roomStore.client.client.myPubKey);
-          const walEmbedId = `shared-wal-${agentB64.slice(0, 8)}`;
-          const walLayout = this._maximizedVideo === walEmbedId ? 'maximized' : this._maximizedVideo ? 'hidden' : '';
-          return html`
-          <div class="shared-wal-container shared-panel-frame ${walLayout}"
-            @dblclick=${() => this.toggleMaximized(walEmbedId)}
-          >
-            <shared-wal-embed
-              .src=${walPayload.weaveUrl}
-              .closable=${isMe}
-              @close=${() => this.streamsStore.stopShareWal()}
-              style="flex: 1;"
-            ></shared-wal-embed>
-            <sl-icon
-              title="${this._maximizedVideo === walEmbedId ? 'minimize' : 'maximize'}"
-              .src=${this._maximizedVideo === walEmbedId
-                ? wrapPathInSvg(mdiFullscreenExit)
-                : wrapPathInSvg(mdiFullscreen)}
-              tabindex="0"
-              class="maximize-icon"
-              @click=${() => this.toggleMaximized(walEmbedId)}
-              @keypress=${(e: KeyboardEvent) => {
-                if (e.key === 'Enter') this.toggleMaximized(walEmbedId);
-              }}
-            ></sl-icon>
-            <div class="shared-wal-footer">
-              <avatar-with-nickname
-                .size=${36}
-                .agentPubKey=${decodeHashFromBase64(agentB64)}
-                style="height: 36px;"
-              ></avatar-with-nickname>
-            </div>
-          </div>
-        `})}
+        <!-- All shares: screen-share, WAL, timer, etc. -->
+        ${this.renderSharedPanel()}
 
         </div>
         ${splitMode ? html`<div class="resize-handle" @mousedown=${this._onResizeStart} @touchstart=${this._onResizeStart}></div>` : html``}
@@ -2662,19 +2573,27 @@ export class RoomView extends LitElement {
       >
         ${msg('Stop Screen Share')}
       </div>
+      ${(() => {
+        const walState = (this._myModuleStates.value || {})['wal'];
+        let walPayload: SharedWalPayload | null = null;
+        if (walState?.payload) {
+          try { walPayload = JSON.parse(walState.payload) as SharedWalPayload; } catch { /* empty */ }
+        }
+        return html`
       <div
         class="stop-share"
         tabindex="0"
-        style="${this._mySharedWal.value ? '' : 'display: none'}"
-        @click=${async () => this.streamsStore.stopShareWal()}
+        style="${walPayload ? '' : 'display: none'}"
+        @click=${async () => this.stopShareWal()}
         @keypress=${async (e: KeyboardEvent) => {
           if (e.key === 'Enter') {
-            await this.streamsStore.stopShareWal();
+            await this.stopShareWal();
           }
         }}
       >
-        ${msg('Stop Sharing Asset')}${this._mySharedWal.value?.assetName ? ` — ${this._mySharedWal.value.assetName}` : ''}
-      </div>
+        ${msg('Stop Sharing Asset')}${walPayload?.assetName ? ` — ${walPayload.assetName}` : ''}
+      </div>`;
+      })()}
     `;
   }
 
@@ -3292,26 +3211,33 @@ export class RoomView extends LitElement {
         min-width: 0;
         max-height: 49cqh;
       }
-      .screen-share-panel .triplett,
-      .screen-share-panel .quartett {
-        width: min(49%, 49cqw);
+      /* Panel is column-stacked (flex-direction: column, nowrap), so all
+         tiles span the full width regardless of count. Vertical sizing is
+         handled by max-height. */
+      .screen-share-panel .triplett {
+        width: 100%;
         min-width: 0;
-        max-height: 49cqh;
+        max-height: 32cqh;
+      }
+      .screen-share-panel .quartett {
+        width: 100%;
+        min-width: 0;
+        max-height: 24cqh;
       }
       .screen-share-panel .sextett {
-        width: min(32%, 32cqw);
+        width: 100%;
         min-width: 0;
-        max-height: 49cqh;
+        max-height: 16cqh;
       }
       .screen-share-panel .octett {
-        width: min(32%, 32cqw);
+        width: 100%;
         min-width: 0;
-        max-height: 32cqh;
+        max-height: 12cqh;
       }
       .screen-share-panel .unlimited {
-        width: min(24%, 24cqw);
+        width: 100%;
         min-width: 0;
-        max-height: 32cqh;
+        max-height: 9cqh;
       }
 
       /* People panel circle-mode: constrain width by height so
