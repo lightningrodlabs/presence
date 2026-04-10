@@ -1,7 +1,7 @@
 import { html } from 'lit';
 import { get } from '@holochain-open-dev/stores';
 import { decodeHashFromBase64 } from '@holochain/client';
-import { mdiMonitorScreenshot } from '@mdi/js';
+import { mdiMonitorScreenshot, mdiPhoneRefresh } from '@mdi/js';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { registerModule } from './registry';
 import type { ModuleDefinition, ModuleRenderContext, ModuleStateEnvelope } from './types';
@@ -68,6 +68,14 @@ const screenShareModule: ModuleDefinition = {
           .agentPubKey=${decodeHashFromBase64(agentPubKeyB64)}
           style="height: 36px;"
         ></avatar-with-nickname>
+        <sl-tooltip content="reconnect" class="tooltip-filled">
+          <sl-icon-button
+            class="phone-refresh"
+            style="margin-left: 4px; margin-bottom: -5px;"
+            .src=${wrapPathInSvg(mdiPhoneRefresh)}
+            @click=${() => store.disconnectFromPeerScreen(agentPubKeyB64)}
+          ></sl-icon-button>
+        </sl-tooltip>
       </div>
     `;
   },
