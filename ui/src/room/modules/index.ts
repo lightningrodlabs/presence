@@ -9,3 +9,4 @@ import './reactions';
 import './wal';
 import './timer';
 import './screen-share';
+import './voice';

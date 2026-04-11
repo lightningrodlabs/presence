@@ -1404,9 +1404,10 @@ export class RoomView extends LitElement {
         </sl-tooltip>
         `;})()}
 
-        <!-- screen-share and timer toolbar buttons (after wal) -->
+        <!-- screen-share, timer, and voice (signals) toolbar buttons (after wal) -->
         ${this._renderModuleToolbarButton('screen-share')}
         ${this._renderModuleToolbarButton('timer')}
+        ${this._renderModuleToolbarButton('voice')}
 
         <sl-tooltip
           content="${this._selfViewHidden
