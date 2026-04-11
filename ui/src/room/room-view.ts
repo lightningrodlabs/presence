@@ -1874,12 +1874,28 @@ export class RoomView extends LitElement {
           myPubKeyB64,
         };
         const content = this._renderShareForModule(mod, agentPubKeyB64, state, context);
+        // Screen-share diagnostic overlay: legacy behavior gated by
+        // _showConnectionDetails. Kept as an inline special-case rather than
+        // a ModuleRenderContext extension because only screen-share needs
+        // per-tile connection statuses today.
+        const diagnosticsOverlay =
+          moduleId === 'screen-share' && this._showConnectionDetails
+            ? html`<div
+                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
+              >
+                ${this.renderAgentConnectionStatuses(
+                  isMe ? 'my-screen-share' : 'their-screen-share',
+                  isMe ? undefined : agentPubKeyB64,
+                )}
+              </div>`
+            : html``;
         return html`
           <div
             class="${wrapperClass} shared-panel-frame ${layout}"
             @dblclick=${() => this.toggleMaximized(shareKey)}
           >
             ${content}
+            ${diagnosticsOverlay}
             <sl-icon
               title="${this._maximizedVideo === shareKey ? 'minimize' : 'maximize'}"
               .src=${this._maximizedVideo === shareKey
