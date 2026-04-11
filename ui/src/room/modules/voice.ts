@@ -382,6 +382,22 @@ const voiceModule: ModuleDefinition = {
     controller.receiveFrame(agentPubKeyB64, chunk);
   },
 
+  getStateIcons(_agentPubKeyB64, state, _context) {
+    // The icon strip only invokes getStateIcons for modules that are present
+    // in this agent's state map, so by the time we're called the module is
+    // active for that agent. Show a broadcast badge so peers can tell that
+    // *this* agent is talking via voice-over-signals as opposed to WebRTC.
+    if (!state?.active) return [];
+    return [
+      {
+        states: [
+          { icon: mdiBroadcast, tooltip: 'Voice (signals)', color: '#7adc7a' },
+        ],
+        currentState: 0,
+      },
+    ];
+  },
+
   renderToolbarButton(myState, _toggle, streamsStore) {
     const active = !!myState;
     const handler = async () => {

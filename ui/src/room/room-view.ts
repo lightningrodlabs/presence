@@ -463,8 +463,14 @@ export class RoomView extends LitElement {
       }
     }
 
-    // Auto-activate modules that should be on by default
-    this.streamsStore.activateModule('video');
+    // Auto-activate modules that should be on by default.
+    // The video (WebRTC) module can be opted out of via localStorage so that
+    // alternate audio paths (e.g. the voice-over-signals module) can be tested
+    // without parallel WebRTC traffic. The toolbar toggle on the video module
+    // writes the same flag.
+    if (window.localStorage.getItem('disableAutoVideo') !== 'true') {
+      this.streamsStore.activateModule('video');
+    }
     this.streamsStore.activateModule('reactions');
   }
 
@@ -1404,10 +1410,11 @@ export class RoomView extends LitElement {
         </sl-tooltip>
         `;})()}
 
-        <!-- screen-share, timer, and voice (signals) toolbar buttons (after wal) -->
+        <!-- screen-share, timer, voice (signals), and webrtc toggle (after wal) -->
         ${this._renderModuleToolbarButton('screen-share')}
         ${this._renderModuleToolbarButton('timer')}
         ${this._renderModuleToolbarButton('voice')}
+        ${this._renderModuleToolbarButton('video')}
 
         <sl-tooltip
           content="${this._selfViewHidden
