@@ -62,6 +62,7 @@ import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo 
 import { exportLogs } from '../logging';
 import { getAllModules, getModule, getShareModules } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
+import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
 import './modules'; // side-effect: registers all modules
 
 declare const __APP_VERSION__: string;
@@ -370,7 +371,7 @@ export class RoomView extends LitElement {
           this.requestUpdate();
           await this.updateComplete;
           const myScreenVideo = this.shadowRoot?.getElementById(
-            'my-own-screen'
+            MY_OWN_SCREEN_VIDEO_ID
           ) as HTMLVideoElement;
           if (myScreenVideo) {
             myScreenVideo.autoplay = true;
@@ -379,7 +380,7 @@ export class RoomView extends LitElement {
           break;
         }
         case 'my-screen-share-off': {
-          if (this._maximizedVideo === 'my-own-screen') {
+          if (this._maximizedVideo === MY_OWN_SCREEN_VIDEO_ID) {
             this._maximizedVideo = undefined;
           }
           break;
@@ -422,7 +423,7 @@ export class RoomView extends LitElement {
           // so we add a timeout here.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
-              `video-screen-${event.pubKeyB64}`
+              peerScreenVideoId(event.pubKeyB64)
             ) as HTMLVideoElement | undefined;
             console.log('&&&& Trying to set video element (screen share)');
             if (videoEl) {
@@ -544,7 +545,7 @@ export class RoomView extends LitElement {
 
     // Own screen share
     restoreVideo(
-      this.shadowRoot?.getElementById('my-own-screen') as HTMLVideoElement | null,
+      this.shadowRoot?.getElementById(MY_OWN_SCREEN_VIDEO_ID) as HTMLVideoElement | null,
       this.streamsStore.screenShareStream,
     );
 
@@ -557,7 +558,7 @@ export class RoomView extends LitElement {
     // Peer screen shares
     for (const [pubkeyB64] of Object.entries(this._screenShareConnectionsIncoming.value)) {
       restoreVideo(
-        this.shadowRoot?.getElementById(`video-screen-${pubkeyB64}`) as HTMLVideoElement | null,
+        this.shadowRoot?.getElementById(peerScreenVideoId(pubkeyB64)) as HTMLVideoElement | null,
         this.streamsStore._screenShareStreams[pubkeyB64],
       );
     }
@@ -570,14 +571,6 @@ export class RoomView extends LitElement {
       );
     }
   }
-
-  _onScreenShareResize = (e: Event) => {
-    const video = e.target as HTMLVideoElement;
-    const container = video.closest('.video-container') as HTMLElement;
-    if (container && video.videoWidth && video.videoHeight) {
-      container.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
-    }
-  };
 
   _onResizeStart = (e: MouseEvent | TouchEvent) => {
     e.preventDefault();
@@ -1065,6 +1058,13 @@ export class RoomView extends LitElement {
   }
 
   renderToggles() {
+    // Toolbar buttons are explicitly listed (and explicitly ordered) instead
+    // of being collected from getAllModules().filter(m => m.renderToolbarButton).
+    // Reasons: (1) the embedded webview blocks window.prompt() in some module
+    // toolbars (e.g. timer, wal), so each one needs bespoke activation glue
+    // here; (2) we care about left-to-right ordering of mic / video / hand /
+    // wal / screen / timer / hide-self / leave for muscle memory. Adding a
+    // new module's toolbar button means adding one line below, not nothing.
     return html`
       <div class="toggles-panel">
         ${this._showConnectionDetails
@@ -1364,6 +1364,9 @@ export class RoomView extends LitElement {
         <!-- raise-hand toolbar button (between video and wal) -->
         ${this._renderModuleToolbarButton('raise-hand')}
 
+        <!-- WAL bypasses _renderModuleToolbarButton because activation
+             routes through the WeaveClient asset picker, which lives on
+             room-view (not the module). -->
         ${(() => {
           const walActive = !!(this._myModuleStates.value || {})['wal'];
           return html`
@@ -3210,31 +3213,26 @@ export class RoomView extends LitElement {
         min-width: 0;
         max-height: 49cqh;
       }
-      /* Panel is column-stacked (flex-direction: column, nowrap), so all
-         tiles span the full width regardless of count. Vertical sizing is
-         handled by max-height. */
+      /* Panel is column-stacked (flex-direction: column, nowrap); width is
+         supplied by the .screen-share-panel > * rule above. Per-count rules
+         only need to cap height. */
       .screen-share-panel .triplett {
-        width: 100%;
         min-width: 0;
         max-height: 32cqh;
       }
       .screen-share-panel .quartett {
-        width: 100%;
         min-width: 0;
         max-height: 24cqh;
       }
       .screen-share-panel .sextett {
-        width: 100%;
         min-width: 0;
         max-height: 16cqh;
       }
       .screen-share-panel .octett {
-        width: 100%;
         min-width: 0;
         max-height: 12cqh;
       }
       .screen-share-panel .unlimited {
-        width: 100%;
         min-width: 0;
         max-height: 9cqh;
       }

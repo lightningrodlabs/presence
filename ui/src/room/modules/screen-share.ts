@@ -6,6 +6,16 @@ import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { registerModule } from './registry';
 import type { ModuleDefinition, ModuleRenderContext, ModuleStateEnvelope } from './types';
 
+/**
+ * DOM ids for screen-share <video> elements. These are referenced both by
+ * renderShare() (which creates the elements) and by room-view's
+ * peer-screen-share-stream / my-screen-share-on event handlers (which set
+ * srcObject after the stream arrives). Keep them in one place so the two
+ * sides can't drift.
+ */
+export const MY_OWN_SCREEN_VIDEO_ID = 'my-own-screen';
+export const peerScreenVideoId = (pubKeyB64: string) => `video-screen-${pubKeyB64}`;
+
 const screenShareModule: ModuleDefinition = {
   id: 'screen-share',
   type: 'share',
@@ -13,10 +23,6 @@ const screenShareModule: ModuleDefinition = {
   icon: mdiMonitorScreenshot,
   activationControl: 'sender',
   shareWrapperClass: 'video-container screen-share',
-
-  defaultState() {
-    return '{}';
-  },
 
   renderShare(
     agentPubKeyB64: string,
@@ -31,7 +37,7 @@ const screenShareModule: ModuleDefinition = {
       return html`
         <video
           muted
-          id="my-own-screen"
+          id="${MY_OWN_SCREEN_VIDEO_ID}"
           class="video-el"
         ></video>
         <div
@@ -49,7 +55,7 @@ const screenShareModule: ModuleDefinition = {
     // Peer side: look up incoming connection by pubkey
     const incomingConnections = get(store._screenShareConnectionsIncoming);
     const incomingConn = incomingConnections[agentPubKeyB64];
-    const videoElId = `video-screen-${agentPubKeyB64}`;
+    const videoElId = peerScreenVideoId(agentPubKeyB64);
 
     return html`
       <video
@@ -88,7 +94,10 @@ const screenShareModule: ModuleDefinition = {
         await streamsStore.deactivateModule('screen-share');
       } else {
         // Activate module first so the video element renders before
-        // screenShareOn() fires the my-screen-share-on event
+        // screenShareOn() fires the my-screen-share-on event. Between
+        // activation and the picker resolving, peers see the module as
+        // active with no stream — handled by the renderShare peer branch's
+        // "establishing connection..." placeholder.
         await streamsStore.activateModule('screen-share');
         await streamsStore.screenShareOn();
         // If acquisition was canceled, no stream — roll back the activation
