@@ -164,18 +164,6 @@ export class RoomView extends LitElement {
     () => [this.streamsStore]
   );
 
-  _mySharedWal = new StoreSubscriber(
-    this,
-    () => this.streamsStore._mySharedWal,
-    () => [this.streamsStore]
-  );
-
-  _peerSharedWals = new StoreSubscriber(
-    this,
-    () => this.streamsStore._peerSharedWals,
-    () => [this.streamsStore]
-  );
-
   _myModuleStates = new StoreSubscriber(
     this,
     () => this.streamsStore._myModuleStates,
@@ -450,11 +438,6 @@ export class RoomView extends LitElement {
           if (this._maximizedVideo === `share-screen-share-${event.pubKeyB64}`) {
             this._maximizedVideo = undefined;
           }
-          break;
-        }
-        case 'peer-share-wal':
-        case 'peer-stop-share-wal': {
-          this.requestUpdate();
           break;
         }
         default:

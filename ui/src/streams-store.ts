@@ -28,7 +28,6 @@ import {
   RTCMessage,
   SdpPayload,
   ModuleStateEnvelope,
-  SharedWalPayload,
   StoreEventPayload,
   StreamAndTrackInfo,
 } from './types';
@@ -792,48 +791,6 @@ export class StreamsStore {
     }
   }
 
-  // ===========================================================================================
-  // SHARE WAL
-  // ===========================================================================================
-
-  async shareWal(payload: SharedWalPayload) {
-    this._mySharedWal.set(payload);
-    const knownAgents = get(this._knownAgents);
-    const agentsToNotify = Object.keys(knownAgents)
-      .filter(a => a !== this.myPubKeyB64)
-      .map(a => decodeHashFromBase64(a));
-    if (agentsToNotify.length > 0) {
-      try {
-        await this.roomClient.sendMessage(
-          agentsToNotify,
-          'ShareWal',
-          JSON.stringify(payload),
-        );
-      } catch (e) {
-        console.error('Failed to send ShareWal signal:', e);
-      }
-    }
-  }
-
-  async stopShareWal() {
-    this._mySharedWal.set(null);
-    const knownAgents = get(this._knownAgents);
-    const agentsToNotify = Object.keys(knownAgents)
-      .filter(a => a !== this.myPubKeyB64)
-      .map(a => decodeHashFromBase64(a));
-    if (agentsToNotify.length > 0) {
-      try {
-        await this.roomClient.sendMessage(
-          agentsToNotify,
-          'StopShareWal',
-          '',
-        );
-      } catch (e) {
-        console.error('Failed to send StopShareWal signal:', e);
-      }
-    }
-  }
-
   disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64) {
     const relevantConnection = get(this._openConnections)[pubKeyB64];
     if (relevantConnection) relevantConnection.peer.destroy();
@@ -1115,20 +1072,6 @@ export class StreamsStore {
    * Tracks pending diagnostic requests (for UI timeout display)
    */
   _pendingDiagnosticRequests: Set<AgentPubKeyB64> = new Set();
-
-  // ===========================================================================================
-  // SHARED WAL
-  // ===========================================================================================
-
-  /**
-   * WAL that we are currently sharing (null if not sharing)
-   */
-  _mySharedWal: Writable<SharedWalPayload | null> = writable(null);
-
-  /**
-   * WALs that peers are currently sharing, keyed by AgentPubKeyB64
-   */
-  _peerSharedWals: Writable<Record<AgentPubKeyB64, SharedWalPayload>> = writable({});
 
   // ===========================================================================================
   // MODULE SYSTEM
@@ -2049,7 +1992,6 @@ export class StreamsStore {
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[agentB64]?.audio,
-          sharedWal: get(this._mySharedWal) ?? undefined,
           moduleStates: Object.keys(get(this._myModuleStates)).length > 0
             ? get(this._myModuleStates)
             : undefined,
@@ -2533,12 +2475,6 @@ export class StreamsStore {
           case 'DiagnosticResponse':
             this.handleDiagnosticResponse(signal);
             break;
-          case 'ShareWal':
-            this.handleShareWal(signal);
-            break;
-          case 'StopShareWal':
-            this.handleStopShareWal(signal);
-            break;
           case 'ModuleState':
             this.handleModuleState(signal);
             break;
@@ -2579,7 +2515,6 @@ export class StreamsStore {
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[pubkeyB64]?.audio,
-          sharedWal: get(this._mySharedWal) ?? undefined,
           moduleStates: Object.keys(get(this._myModuleStates)).length > 0
             ? get(this._myModuleStates)
             : undefined,
@@ -2687,9 +2622,6 @@ export class StreamsStore {
     this.updateConnectionStatus(pubkeyB64, { type: 'Disconnected' });
     this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
 
-    // Clean up any active WAL share from this peer
-    this._peerSharedWals.update(v => { delete v[pubkeyB64]; return v; });
-
     // Clean up module states for this peer
     this._peerModuleStates.update(all => {
       const updated = { ...all };
@@ -2768,30 +2700,6 @@ export class StreamsStore {
         }
         return knownAgents;
       });
-      // Handle shared WAL propagation for late-joiners
-      if (metaData.data.sharedWal) {
-        const currentPeerWals = get(this._peerSharedWals);
-        if (!currentPeerWals[pubkeyB64] || currentPeerWals[pubkeyB64].weaveUrl !== metaData.data.sharedWal.weaveUrl) {
-          this._peerSharedWals.update(v => {
-            v[pubkeyB64] = metaData.data.sharedWal!;
-            return v;
-          });
-          this.eventCallback({
-            type: 'peer-share-wal',
-            pubKeyB64: pubkeyB64,
-            payload: metaData.data.sharedWal,
-          });
-        }
-      } else {
-        // Peer stopped sharing — clean up if we had them tracked
-        if (get(this._peerSharedWals)[pubkeyB64]) {
-          this._peerSharedWals.update(v => { delete v[pubkeyB64]; return v; });
-          this.eventCallback({
-            type: 'peer-stop-share-wal',
-            pubKeyB64: pubkeyB64,
-          });
-        }
-      }
       // Reconcile module states from pong for late-joiners
       if (metaData.data.moduleStates) {
         const current = get(this._peerModuleStates)[pubkeyB64] || {};
@@ -3497,37 +3405,4 @@ export class StreamsStore {
     }
   }
 
-  // ===========================================================================================
-  // SHARE WAL SIGNAL HANDLERS
-  // ===========================================================================================
-
-  handleShareWal(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    try {
-      const payload: SharedWalPayload = JSON.parse(signal.payload);
-      this._peerSharedWals.update(current => {
-        current[pubkeyB64] = payload;
-        return current;
-      });
-      this.eventCallback({
-        type: 'peer-share-wal',
-        pubKeyB64: pubkeyB64,
-        payload,
-      });
-    } catch (e) {
-      console.warn('Failed to parse ShareWal payload:', e);
-    }
-  }
-
-  handleStopShareWal(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    this._peerSharedWals.update(current => {
-      delete current[pubkeyB64];
-      return current;
-    });
-    this.eventCallback({
-      type: 'peer-stop-share-wal',
-      pubKeyB64: pubkeyB64,
-    });
-  }
 }

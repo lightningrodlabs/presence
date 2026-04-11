@@ -121,8 +121,6 @@ export type PongMetaDataV1 = {
    * to be on or off
    */
   video?: boolean;
-  /** If this peer is currently sharing a WAL, included so late-joiners learn about it */
-  sharedWal?: SharedWalPayload;
   /** Active module states for this agent, keyed by moduleId */
   moduleStates?: Record<string, ModuleStateEnvelope>;
 };
@@ -304,15 +302,6 @@ export type StoreEventPayload =
       type: 'peer-screen-share-disconnected';
       pubKeyB64: AgentPubKeyB64;
       connectionId: ConnectionId;
-    }
-  | {
-      type: 'peer-share-wal';
-      pubKeyB64: AgentPubKeyB64;
-      payload: SharedWalPayload;
-    }
-  | {
-      type: 'peer-stop-share-wal';
-      pubKeyB64: AgentPubKeyB64;
     }
   | {
       type: 'error';
