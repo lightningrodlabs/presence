@@ -127,12 +127,20 @@ export type PongMetaDataV1 = {
 
 /**
  * Envelope for module state data sent over signals and included in pong metadata.
+ *
+ * `phase` lets a module reserve its local slot ("acquiring") so self-facing UI
+ * can mount — e.g. the <video> element for screen-share, or a loading-state
+ * mic icon — before peers are told anything is happening. Peer-facing dispatch
+ * surfaces (peer icon strip, peer overlays, onPeerStateChange) suppress
+ * acquiring envelopes; self-facing surfaces honor them. Default when omitted
+ * is 'active', so existing modules keep their current behavior unchanged.
  */
 export type ModuleStateEnvelope = {
   moduleId: string;
   active: boolean;
   payload: string;
   updatedAt: number;
+  phase?: 'acquiring' | 'active';
 };
 
 export type ConnectionStatuses = Record<AgentPubKeyB64, ConnectionStatus>;

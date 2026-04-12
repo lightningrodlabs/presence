@@ -2,7 +2,7 @@ export * from './types';
 export * from './registry';
 
 // Module registrations (side-effect imports)
-import './video';
+import './conversation';
 import './raise-hand';
 import './clock';
 import './reactions';

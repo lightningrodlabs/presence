@@ -54,6 +54,7 @@ import { RoomStore } from './room-store';
 import './elements/attachment-element';
 import './elements/agent-connection-status';
 import './elements/agent-connection-status-icon';
+import './elements/audio-level-meter';
 import './elements/toggle-switch';
 import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
@@ -243,6 +244,12 @@ export class RoomView extends LitElement {
   @state()
   _reconnectAudio = new Audio('old-phone-ring-connect.mp3#t=0,3.5');
 
+  /** Tracks the previous set of active agent pubkeys for diffing.
+   * Used to detect signal-level presence changes (agent appear/disappear)
+   * and play join/leave sounds, independent of WebRTC state. */
+  private _prevActiveAgentKeys = new Set<string>();
+  private _activeAgentsUnsubscribe: (() => void) | null = null;
+
   @state()
   _showAttachmentsPanel = false;
 
@@ -386,7 +393,8 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-connected': {
-          await this._joinAudio.play();
+          // Join sound now plays on signal-level presence (agent appears
+          // in _activeAgents), not on WebRTC connection establishment.
           break;
         }
         case 'peer-disconnected': {
@@ -395,11 +403,12 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-leave': {
-          // Agent left the room — clear maximize if they were maximized
+          // Agent left the room — clear maximize if they were maximized.
+          // Leave sound now plays on signal-level presence (agent
+          // disappears from _activeAgents), not here.
           if (this._maximizedVideo === event.pubKeyB64) {
             this._maximizedVideo = undefined;
           }
-          await this._leaveAudio.play();
           break;
         }
         case 'peer-stream': {
@@ -448,6 +457,29 @@ export class RoomView extends LitElement {
     this._leaveAudio.volume = 0.05;
     this._joinAudio.volume = 0.07;
     this._reconnectAudio.volume = 0.1;
+
+    // Subscribe to signal-level presence changes. Play join/leave sounds
+    // when agents appear/disappear in _activeAgents (driven by ping/pong),
+    // independent of WebRTC connection state. This means the user hears
+    // someone arrive the moment their pong lands, not when (or if) WebRTC
+    // establishes.
+    this._activeAgentsUnsubscribe = this.streamsStore._activeAgents.subscribe(
+      agents => {
+        const currentKeys = new Set(Object.keys(agents));
+        for (const key of currentKeys) {
+          if (!this._prevActiveAgentKeys.has(key)) {
+            this._joinAudio.play().catch(() => {});
+          }
+        }
+        for (const key of this._prevActiveAgentKeys) {
+          if (!currentKeys.has(key)) {
+            this._leaveAudio.play().catch(() => {});
+          }
+        }
+        this._prevActiveAgentKeys = currentKeys;
+      }
+    );
+
     this._roomInfo = await this.roomStore.client.getRoomInfo();
 
     this._weaveClient.assets.assetStore(this.wal).subscribe(status => {
@@ -464,13 +496,11 @@ export class RoomView extends LitElement {
     }
 
     // Auto-activate modules that should be on by default.
-    // The video (WebRTC) module can be opted out of via localStorage so that
-    // alternate audio paths (e.g. the voice-over-signals module) can be tested
-    // without parallel WebRTC traffic. The toolbar toggle on the video module
-    // writes the same flag.
-    if (window.localStorage.getItem('disableAutoVideo') !== 'true') {
-      this.streamsStore.activateModule('video');
-    }
+    // The conversation module is always active — it owns mic/video state
+    // and carrier routing. The global WebRTC kill switch is a separate
+    // flag (webrtcGloballyDisabled) that suppresses WebRTC initiation
+    // without deactivating the module.
+    this.streamsStore.activateModule('conversation');
     this.streamsStore.activateModule('reactions');
   }
 
@@ -623,6 +653,7 @@ export class RoomView extends LitElement {
   disconnectedCallback(): void {
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this._unsubscribe) this._unsubscribe();
+    if (this._activeAgentsUnsubscribe) this._activeAgentsUnsubscribe();
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect();
   }
@@ -685,30 +716,76 @@ export class RoomView extends LitElement {
 
   renderConnectionDetailsToggle() {
     return html`
-      <div class="row toggle-switch-container" style="align-items: center;">
-        <toggle-switch
-          class="toggle-switch ${this._showConnectionDetails ? 'active' : ''}"
-          .toggleState=${this._showConnectionDetails}
-          @click=${(e: Event) => {
-            e.stopPropagation();
-          }}
-          @toggle-on=${() => {
-            this._showConnectionDetails = true;
-          }}
-          @toggle-off=${() => {
-            this._showConnectionDetails = false;
-          }}
-        ></toggle-switch>
-        <span
-          class="secondary-font"
-          style="cursor: default; margin-left: 7px; ${this
-            ._showConnectionDetails
-            ? 'opacity: 0.8;'
-            : 'opacity: 0.5;'}"
-          >${this._showConnectionDetails
-            ? 'Hide connection details'
-            : 'Show connection details'}</span
-        >
+      <div class="row toggle-switch-container" style="align-items: center; gap: 16px;">
+        <div class="row" style="align-items: center;">
+          <toggle-switch
+            class="toggle-switch ${this._showConnectionDetails ? 'active' : ''}"
+            .toggleState=${this._showConnectionDetails}
+            @click=${(e: Event) => {
+              e.stopPropagation();
+            }}
+            @toggle-on=${() => {
+              this._showConnectionDetails = true;
+            }}
+            @toggle-off=${() => {
+              this._showConnectionDetails = false;
+            }}
+          ></toggle-switch>
+          <span
+            class="secondary-font"
+            style="cursor: default; margin-left: 7px; ${this
+              ._showConnectionDetails
+              ? 'opacity: 0.8;'
+              : 'opacity: 0.5;'}"
+            >${this._showConnectionDetails
+              ? 'Hide connection details'
+              : 'Show connection details'}</span
+          >
+        </div>
+        ${this._showConnectionDetails
+          ? html`
+            <div class="row" style="align-items: center;">
+              <toggle-switch
+                class="toggle-switch ${this.streamsStore.webrtcGloballyDisabled ? 'active' : ''}"
+                .toggleState=${this.streamsStore.webrtcGloballyDisabled}
+                @click=${(e: Event) => {
+                  e.stopPropagation();
+                }}
+                @toggle-on=${async () => {
+                  // Disable WebRTC globally: tear down all connections
+                  // and broadcast the flag so peers stop trying.
+                  // Conversation module stays active — mic still works
+                  // via signals carrier.
+                  this.streamsStore.webrtcGloballyDisabled = true;
+                  window.localStorage.setItem('disableAllWebrtc', 'true');
+                  const openConns = this._openConnections.value || {};
+                  for (const pubKeyB64 of Object.keys(openConns)) {
+                    this.streamsStore.disconnectFromPeerVideo(pubKeyB64);
+                  }
+                  this.streamsStore.videoOff();
+                  await this.streamsStore._syncConversationPayload({ webrtcDisabled: true });
+                  this.requestUpdate();
+                }}
+                @toggle-off=${async () => {
+                  // Re-enable WebRTC. Broadcast so peers resume init.
+                  this.streamsStore.webrtcGloballyDisabled = false;
+                  window.localStorage.removeItem('disableAllWebrtc');
+                  await this.streamsStore._syncConversationPayload({ webrtcDisabled: false });
+                  this.requestUpdate();
+                }}
+              ></toggle-switch>
+              <span
+                class="secondary-font"
+                style="cursor: default; margin-left: 7px; ${this.streamsStore.webrtcGloballyDisabled
+                  ? 'opacity: 0.8; color: #c72100;'
+                  : 'opacity: 0.5;'}"
+                >${this.streamsStore.webrtcGloballyDisabled
+                  ? 'WebRTC disabled'
+                  : 'Disable all WebRTC'}</span
+              >
+            </div>
+          `
+          : html``}
       </div>
     `;
   }
@@ -1410,11 +1487,9 @@ export class RoomView extends LitElement {
         </sl-tooltip>
         `;})()}
 
-        <!-- screen-share, timer, voice (signals), and webrtc toggle (after wal) -->
+        <!-- screen-share, timer -->
         ${this._renderModuleToolbarButton('screen-share')}
         ${this._renderModuleToolbarButton('timer')}
-        ${this._renderModuleToolbarButton('voice')}
-        ${this._renderModuleToolbarButton('video')}
 
         <sl-tooltip
           content="${this._selfViewHidden
@@ -1724,6 +1799,10 @@ export class RoomView extends LitElement {
     const allIcons: ModuleIconDefinition[] = [];
 
     for (const [moduleId, envelope] of Object.entries(modules)) {
+      // Peer-facing acquiring envelopes are filtered at the dispatch surface:
+      // a self-view of a loading module can show a local "acquiring" badge,
+      // but peers should not yet believe the module is live.
+      if (!context.isMe && envelope.phase === 'acquiring') continue;
       const mod = getModule(moduleId);
       if (mod?.getStateIcons) {
         allIcons.push(...mod.getStateIcons(pubkeyB64, envelope, context));
@@ -1765,6 +1844,9 @@ export class RoomView extends LitElement {
     const overlays: unknown[] = [];
 
     for (const [moduleId, envelope] of Object.entries(modules)) {
+      // Peer-facing acquiring envelopes are filtered here; self views still
+      // get to render a loading overlay if the module wants one.
+      if (!context.isMe && envelope.phase === 'acquiring') continue;
       const mod = getModule(moduleId);
       if (mod?.renderOverlay || mod?.overlayElement) {
         overlays.push(this._renderOverlayForModule(mod, pubkeyB64, envelope, context));
@@ -1793,7 +1875,8 @@ export class RoomView extends LitElement {
       isMe: boolean;
     }> = [];
 
-    // Self shares
+    // Self shares. Acquiring envelopes are included so the initiator's
+    // <video>/DOM hooks mount before the stream bytes arrive.
     const myStates = this._myModuleStates.value || {};
     for (const [moduleId, envelope] of Object.entries(myStates)) {
       if (shareModuleIds.has(moduleId) && envelope.active) {
@@ -1801,11 +1884,16 @@ export class RoomView extends LitElement {
       }
     }
 
-    // Peer shares
+    // Peer shares. Acquiring envelopes are skipped — peers should not see
+    // an "establishing connection…" tile for the initiator's picker gap.
     const peerStates = this._peerModuleStates.value || {};
     for (const [pubkeyB64, modules] of Object.entries(peerStates)) {
       for (const [moduleId, envelope] of Object.entries(modules)) {
-        if (shareModuleIds.has(moduleId) && envelope.active) {
+        if (
+          shareModuleIds.has(moduleId) &&
+          envelope.active &&
+          envelope.phase !== 'acquiring'
+        ) {
           result.push({ moduleId, agentPubKeyB64: pubkeyB64, state: envelope, isMe: false });
         }
       }
@@ -1915,6 +2003,55 @@ export class RoomView extends LitElement {
    * @param pubkeyb64
    * @returns
    */
+  /**
+   * Render a small volume bar for signals-carrier audio from a peer.
+   * Only shown when connection details are visible AND the peer has no
+   * WebRTC connection (audio is flowing via signals). Reads from the
+   * plain Map on voiceController — no reactive subscription, just
+   * piggybacks on the existing render cycle.
+   */
+  private _renderAudioLevelMeter(pubkeyB64: AgentPubKeyB64) {
+    // Hide when peer's mic is muted — no audio to show levels for
+    const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
+    if (peerConv) {
+      try {
+        const p = JSON.parse(peerConv.payload);
+        if (p.micMuted || p.muted) return html``;
+      } catch {}
+    }
+    return html`
+      <audio-level-meter
+        .streamsStore=${this.streamsStore}
+        .agentPubKeyB64=${pubkeyB64}
+      ></audio-level-meter>
+    `;
+  }
+
+  /**
+   * Render a per-peer "Disable WebRTC" toggle. Only shown when connection
+   * details are visible. When WebRTC is disabled for a peer, neither side
+   * initiates or accepts WebRTC — audio flows via signals automatically.
+   */
+  private _renderWebrtcToggle(pubkeyB64: AgentPubKeyB64) {
+    const disabled = this.streamsStore.webrtcDisabled(pubkeyB64);
+    return html`
+      <sl-tooltip
+        content="${disabled
+          ? 'WebRTC disabled — click to re-enable'
+          : 'Click to disable WebRTC for this peer'}"
+        hoist
+      >
+        <sl-icon
+          style="color: ${disabled ? '#c72100' : '#7adc7a'}; height: 24px; width: 24px; cursor: pointer;"
+          .src=${disabled ? wrapPathInSvg(mdiVideoOff) : wrapPathInSvg(mdiVideo)}
+          @click=${() => {
+            this.streamsStore.toggleDisableWebrtc(pubkeyB64);
+          }}
+        ></sl-icon>
+      </sl-tooltip>
+    `;
+  }
+
   renderAgentConnectionStatuses(
     type: 'video' | 'my-video' | 'my-screen-share' | 'their-screen-share',
     pubkeyb64?: AgentPubKeyB64
@@ -2340,12 +2477,12 @@ export class RoomView extends LitElement {
                       style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
                     ></avatar-with-nickname>
                     <div
-                      style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
+                      style="color: #b9a884; font-size: 0.8em; ${conn.connected ? 'display: none' : ''}"
                     >
-                      establishing connection...
+                      establishing video carrier...
                     </div>
                     <div
-                      style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
+                      style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
                     >
                       connecting media...
                     </div>
@@ -2356,9 +2493,6 @@ export class RoomView extends LitElement {
                       .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                       style="width: 35%;"
                     ></avatar-with-nickname>
-                    <div style="color: #b98484;">
-                      waiting for connection...
-                    </div>
                   `}
               <!-- Hidden video element so srcObject assignment still works when a replace module is active -->
               ${activeReplaceModule && conn
@@ -2372,9 +2506,10 @@ export class RoomView extends LitElement {
               <!-- Connection detail statuses (debug) -->
               ${this._showConnectionDetails
                 ? html`<div
-                    style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
+                    style="display: flex; flex-direction: row; align-items: center; gap: 6px; position: absolute; top: 10px; left: 10px; background: none;"
                   >
                     ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
+                    ${this._renderWebrtcToggle(pubkeyB64)}
                   </div>`
                 : html``}
 
@@ -2417,6 +2552,7 @@ export class RoomView extends LitElement {
                           style="height: 36px;"
                         ></avatar-with-nickname>
                         ${this.renderModuleSwitcher(pubkeyB64)}
+                        ${this._renderAudioLevelMeter(pubkeyB64)}
                         ${this._showConnectionDetails
                           ? html`
                               <sl-tooltip
@@ -2501,6 +2637,7 @@ export class RoomView extends LitElement {
                           }
                         }}
                       ></sl-icon>
+                      ${this._renderAudioLevelMeter(pubkeyB64)}
                       ${this._showConnectionDetails
                         ? html`
                             <sl-tooltip

@@ -154,6 +154,28 @@ export interface ModuleDefinition {
     next: ModuleStateEnvelope | null,
   ): void;
 
+  /**
+   * Called when a peer's payload for THIS module changes while the module
+   * remains active on both sides of the transition. Complements
+   * `onPeerStateChange`, which only fires on active-flag flips.
+   *
+   * Use case: the conversation module needs to tear down a WebRTC
+   * connection when a peer adds us to their `disableWebrtcWith` list,
+   * which is a payload-only change (the module stays active).
+   *
+   * Not fired when either prev or next has `phase === 'acquiring'`.
+   *
+   * Implementations should be cheap and idempotent — the hook fires on
+   * *any* payload diff, including high-frequency ones like mute toggles.
+   * Guard on the specific field you care about inside the handler.
+   */
+  onModulePayloadChange?(
+    agentPubKeyB64: string,
+    prev: ModuleStateEnvelope,
+    next: ModuleStateEnvelope,
+    streamsStore: StreamsStore,
+  ): void;
+
   // --- Toolbar ---
 
   /** Render a button for the bottom control bar (activation toggle). */

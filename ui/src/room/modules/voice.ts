@@ -1,9 +1,9 @@
-import { html } from 'lit';
 import { mdiBroadcast } from '@mdi/js';
-import { wrapPathInSvg } from '@holochain-open-dev/elements';
+import { get } from '@holochain-open-dev/stores';
 import { registerModule } from './registry';
-import type { ModuleDefinition, ModuleStateEnvelope } from './types';
+import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
+import type { MicAcquireResult } from '../../mic-source';
 
 /**
  * Voice module — sends audio to all peers in the room over Holochain remote
@@ -11,14 +11,27 @@ import type { StreamsStore } from '../../streams-store';
  * zome calls. The signal envelope reuses `ModuleData` so the existing
  * sendModuleData / handleModuleData / onData wiring carries everything.
  *
- * Capture: getUserMedia(audio) → MediaStreamTrackProcessor → AudioEncoder (Opus)
+ * Capture: MicSource (shared mic track) → MediaStreamTrackProcessor → AudioEncoder (Opus)
  * Wire   : { seq, ts, type, data(base64) } in JSON, sent via sendModuleData
  * Play   : AudioDecoder → AudioBufferSourceNode scheduled into a small jitter buffer
  *
- * NOTE: this is intentionally minimal v1. No AEC beyond what getUserMedia
- * provides, no PLC, no FEC, no per-peer subscription model — every peer in
- * `_knownAgents` receives every frame. See research notes for the path to
- * datagram transport / native AEC.
+ * Phase 4 moved the mic acquisition out of this module: voice now acquires
+ * a handle from `streamsStore.micSource` instead of calling `getUserMedia`
+ * itself. Consequences:
+ *
+ *   - WebRTC and voice share a single device. Toggling the mic button mutes
+ *     both (via `track.enabled = false`), no separate voice mute path.
+ *   - Device changes from the audio chevron replace the shared track; voice
+ *     rebuilds its MediaStreamTrackProcessor on the `onTrackChanged`
+ *     consumer callback.
+ *   - Voice no longer owns an `AudioContext`; it borrows the single shared
+ *     one that MicSource owns. The squelch synth and future playback
+ *     consumers all schedule into that one context.
+ *
+ * NOTE: still intentionally minimal v1 on the wire protocol. No AEC beyond
+ * what getUserMedia provides, no PLC, no FEC, no per-peer subscription —
+ * every peer in `_knownAgents` receives every frame. See research notes
+ * for the path to datagram transport / native AEC.
  */
 
 // WebCodecs types are not in lib.dom for older TS targets, so use locals.
@@ -46,16 +59,32 @@ const PLAYBACK_RESET_DRIFT_MS = 400;
 class VoiceController {
   private store: StreamsStore | null = null;
 
-  // Send-side state
-  private mediaStream: MediaStream | null = null;
+  // Send-side state (capture pipeline)
+  private micHandle: MicAcquireResult | null = null;
   private encoder: any = null; // AudioEncoder
   private encoderReader: ReadableStreamDefaultReader<any> | null = null;
+  /**
+   * Monotonic generation counter for the capture pipeline. Incremented on
+   * every (re)build — startCapture, stopCapture, device change. The pump
+   * loop captures its generation on entry and exits when the counter moves
+   * out from under it. Prevents racing pump loops from two overlapping
+   * MediaStreamTrackProcessors after a device change.
+   */
+  private pipelineGeneration = 0;
   private seq = 0;
-  private muted = false;
 
   // Receive-side state
   private audioContext: AudioContext | null = null;
   private peers = new Map<string, PeerVoiceState>();
+
+  /**
+   * Per-peer peak audio level from the most recent decoded frame.
+   * Range 0.0–1.0. Written in playAudioData, read by the UI on its
+   * existing render cycle (no reactive store — plain Map to avoid
+   * triggering re-renders at 50 fps). Entries are removed when a peer's
+   * decoder is closed.
+   */
+  peerAudioLevels = new Map<string, number>();
 
   bind(store: StreamsStore) {
     this.store = store;
@@ -67,15 +96,11 @@ class VoiceController {
       try { p.decoder.close(); } catch {}
     }
     this.peers.clear();
-    // Defer AudioContext close so any squelch scheduled just before unbind
-    // (in onDeactivate) gets to play out.
-    const ac = this.audioContext;
+    this.peerAudioLevels.clear();
+    // AudioContext is owned by MicSource now — don't close it here. It
+    // stays alive across voice deactivate/reactivate and is disposed by
+    // StreamsStore.disconnect → MicSource.dispose.
     this.audioContext = null;
-    if (ac) {
-      setTimeout(() => {
-        try { ac.close(); } catch {}
-      }, 200);
-    }
     this.store = null;
   }
 
@@ -126,7 +151,7 @@ class VoiceController {
 
   async startCapture(): Promise<boolean> {
     if (!this.store) return false;
-    if (this.mediaStream) return true;
+    if (this.micHandle) return true;
 
     const g: any = globalThis as any;
     if (!g.AudioEncoder || !g.MediaStreamTrackProcessor) {
@@ -134,28 +159,23 @@ class VoiceController {
       return false;
     }
 
-    try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-          sampleRate: 48000,
-        },
-        video: false,
-      });
-    } catch (e) {
-      console.error('voice: getUserMedia failed', e);
+    // Acquire the mic from MicSource. If WebRTC is already holding it, the
+    // underlying device is not reopened — both consumers share the same
+    // track. If nothing is holding it yet, MicSource calls getUserMedia on
+    // our behalf.
+    const handle = await this.store.micSource.acquire({
+      id: 'voice',
+      onTrackChanged: (newTrack: MediaStreamTrack) => {
+        this.onMicTrackChanged(newTrack).catch(e =>
+          console.error('voice: onMicTrackChanged failed', e)
+        );
+      },
+    });
+    if (!handle) {
+      console.error('voice: micSource.acquire failed');
       return false;
     }
-
-    const track = this.mediaStream.getAudioTracks()[0];
-    if (!track) {
-      console.error('voice: no audio track');
-      this.stopCapture().catch(() => {});
-      return false;
-    }
+    this.micHandle = handle;
 
     try {
       this.encoder = new g.AudioEncoder({
@@ -174,22 +194,68 @@ class VoiceController {
       return false;
     }
 
-    try {
-      const processor = new g.MediaStreamTrackProcessor({ track });
-      this.encoderReader = processor.readable.getReader();
-    } catch (e) {
-      console.error('voice: failed to create MediaStreamTrackProcessor', e);
+    // Build the track processor + reader pair bound to the current track.
+    const ok = this.buildTrackReader(handle.track);
+    if (!ok) {
       this.stopCapture().catch(() => {});
       return false;
     }
 
-    this.pumpEncoder().catch(e => console.error('voice: pump error', e));
+    this.pipelineGeneration += 1;
+    const gen = this.pipelineGeneration;
+    this.pumpEncoder(gen).catch(e => console.error('voice: pump error', e));
     return true;
   }
 
-  private async pumpEncoder() {
+  /**
+   * Called by MicSource when the shared track is replaced (device change).
+   * We must rebuild the MediaStreamTrackProcessor because it's bound to
+   * the specific track instance. The encoder stays — it's track-agnostic
+   * — so seq numbers and timestamps continue uninterrupted and peers'
+   * decoders don't see a discontinuity.
+   */
+  private async onMicTrackChanged(newTrack: MediaStreamTrack): Promise<void> {
+    if (!this.micHandle) return;
+
+    // Cancel the existing reader to wake up the pump loop; bump the
+    // generation so the old pump exits cleanly when its read() returns.
+    if (this.encoderReader) {
+      try { await this.encoderReader.cancel(); } catch {}
+      this.encoderReader = null;
+    }
+
+    const ok = this.buildTrackReader(newTrack);
+    if (!ok) {
+      console.error('voice: failed to rebuild track reader after device change');
+      return;
+    }
+
+    this.pipelineGeneration += 1;
+    const gen = this.pipelineGeneration;
+    this.pumpEncoder(gen).catch(e =>
+      console.error('voice: pump error after device change', e)
+    );
+  }
+
+  private buildTrackReader(track: MediaStreamTrack): boolean {
+    const g: any = globalThis as any;
+    try {
+      const processor = new g.MediaStreamTrackProcessor({ track });
+      this.encoderReader = processor.readable.getReader();
+      return true;
+    } catch (e) {
+      console.error('voice: failed to create MediaStreamTrackProcessor', e);
+      return false;
+    }
+  }
+
+  private async pumpEncoder(gen: number) {
     if (!this.encoderReader || !this.encoder) return;
-    while (this.encoderReader && this.encoder) {
+    while (
+      this.encoderReader &&
+      this.encoder &&
+      gen === this.pipelineGeneration
+    ) {
       let read: ReadableStreamReadResult<any>;
       try {
         read = await this.encoderReader.read();
@@ -197,10 +263,21 @@ class VoiceController {
         break;
       }
       if (read.done) break;
+      // Another pump loop may have taken over while we were awaiting
+      // read() — drop the value and exit.
+      if (gen !== this.pipelineGeneration) {
+        try { read.value?.close?.(); } catch {}
+        break;
+      }
       const audioData = read.value as AnyAudioData;
       if (!audioData) continue;
       try {
-        if (this.muted) {
+        // Read mute state directly from the shared track's enabled flag.
+        // MicSource.setMuted(true) flips this across every consumer at
+        // once, so muting via the mic button automatically silences voice
+        // without voice having to subscribe to any separate mute event.
+        const track = this.micHandle?.track;
+        if (track && track.enabled === false) {
           continue;
         }
         if (this.encoder && this.encoder.state === 'configured') {
@@ -216,6 +293,10 @@ class VoiceController {
 
   private handleEncodedChunk(chunk: AnyEncodedAudioChunk) {
     if (!this.store) return;
+    // Read the precomputed signals targets set. This is a cached derived
+    // store value — no per-chunk recomputation, just a property read.
+    const targets = get(this.store._signalsTargets);
+    if (targets.size === 0) return;
     const buf = new Uint8Array(chunk.byteLength);
     chunk.copyTo(buf);
     const payload: VoiceFramePayload = {
@@ -224,10 +305,12 @@ class VoiceController {
       type: chunk.type,
       data: bytesToBase64(buf),
     };
-    this.store.sendModuleData('voice', JSON.stringify(payload)).catch(() => {});
+    this.store.sendModuleData('voice', JSON.stringify(payload), targets).catch(() => {});
   }
 
   async stopCapture(): Promise<void> {
+    // Invalidate any in-flight pump loop.
+    this.pipelineGeneration += 1;
     if (this.encoderReader) {
       try { await this.encoderReader.cancel(); } catch {}
       this.encoderReader = null;
@@ -236,15 +319,11 @@ class VoiceController {
       try { this.encoder.close(); } catch {}
       this.encoder = null;
     }
-    if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach(t => t.stop());
-      this.mediaStream = null;
+    if (this.micHandle) {
+      try { this.micHandle.release(); } catch {}
+      this.micHandle = null;
     }
     this.seq = 0;
-  }
-
-  setMuted(muted: boolean) {
-    this.muted = muted;
   }
 
   // ----- receive side -----------------------------------------------------
@@ -292,16 +371,12 @@ class VoiceController {
 
   private ensureAudioContext(): AudioContext | null {
     if (this.audioContext) return this.audioContext;
-    try {
-      this.audioContext = new AudioContext({ sampleRate: 48000 });
-      // best-effort unlock; in Electron this normally succeeds without a gesture
-      const ac = this.audioContext;
-      ac.resume().catch(() => {});
-      return ac;
-    } catch (e) {
-      console.error('voice: failed to create AudioContext', e);
-      return null;
-    }
+    // Borrow the shared context from MicSource. When unbind runs, we drop
+    // our reference but don't close it — MicSource.dispose does that.
+    if (!this.store) return null;
+    const ac = this.store.micSource.ensureAudioContext();
+    this.audioContext = ac;
+    return ac;
   }
 
   private openPeer(agentPubKeyB64: string): PeerVoiceState | null {
@@ -320,7 +395,7 @@ class VoiceController {
     };
     try {
       state.decoder = new g.AudioDecoder({
-        output: (data: AnyAudioData) => this.playAudioData(state, data),
+        output: (data: AnyAudioData) => this.playAudioData(state, agentPubKeyB64, data),
         error: (e: any) =>
           console.error(`voice: decoder error ${agentPubKeyB64.slice(0, 8)}`, e),
       });
@@ -337,7 +412,7 @@ class VoiceController {
     return state;
   }
 
-  private playAudioData(state: PeerVoiceState, data: AnyAudioData) {
+  private playAudioData(state: PeerVoiceState, agentPubKeyB64: string, data: AnyAudioData) {
     const ctx = this.audioContext;
     if (!ctx) {
       try { data.close(); } catch {}
@@ -358,6 +433,18 @@ class VoiceController {
           data.copyTo(channel, { planeIndex: ch });
         }
         buffer.copyToChannel(channel, ch);
+
+        // Peak detection for the volume indicator. Sample every 10th
+        // value — 96 iterations for a typical 960-sample Opus frame.
+        // ~1 microsecond per peer, zero allocations.
+        if (ch === 0) {
+          let peak = 0;
+          for (let i = 0; i < channel.length; i += 10) {
+            const v = channel[i] < 0 ? -channel[i] : channel[i];
+            if (v > peak) peak = v;
+          }
+          this.peerAudioLevels.set(agentPubKeyB64, peak);
+        }
       }
       const source = ctx.createBufferSource();
       source.buffer = buffer;
@@ -386,6 +473,9 @@ class VoiceController {
 
 const controller = new VoiceController();
 
+/** Exported for streams-store to drive the encoder lifecycle. */
+export { controller as voiceController };
+
 function bytesToBase64(bytes: Uint8Array): string {
   let s = '';
   // chunk to avoid stack overflow on large inputs (Opus frames are ~200B so
@@ -407,6 +497,15 @@ function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
+/**
+ * Voice module — receive-only registration. The voice encoder is now
+ * driven by streams-store's `_reconcileSignalsAudio` (automatic carrier
+ * routing), not by a user toolbar button. This module definition exists
+ * solely to provide the `onData` hook so incoming voice frames get
+ * routed to the VoiceController's decoder.
+ *
+ * No toolbar button, no user-facing activation, no state icons.
+ */
 const voiceModule: ModuleDefinition = {
   id: 'voice',
   type: 'agent',
@@ -414,81 +513,8 @@ const voiceModule: ModuleDefinition = {
   icon: mdiBroadcast,
   activationControl: 'sender',
 
-  defaultState() {
-    return '{}';
-  },
-
-  onActivate(ctx) {
-    controller.bind(ctx.streamsStore);
-    controller.playSquelch('up');
-  },
-
-  onDeactivate() {
-    controller.playSquelch('down');
-    controller.unbind();
-  },
-
   onData(agentPubKeyB64, chunk) {
     controller.receiveFrame(agentPubKeyB64, chunk);
-  },
-
-  onPeerStateChange(_agentPubKeyB64, prev, next) {
-    const wasActive = !!prev?.active;
-    const isActive = !!next?.active;
-    if (!wasActive && isActive) {
-      controller.playSquelch('up');
-    } else if (wasActive && !isActive) {
-      controller.playSquelch('down');
-    }
-  },
-
-  getStateIcons(_agentPubKeyB64, state, _context) {
-    // The icon strip only invokes getStateIcons for modules that are present
-    // in this agent's state map, so by the time we're called the module is
-    // active for that agent. Show a broadcast badge so peers can tell that
-    // *this* agent is talking via voice-over-signals as opposed to WebRTC.
-    if (!state?.active) return [];
-    return [
-      {
-        states: [
-          { icon: mdiBroadcast, tooltip: 'Voice (signals)', color: '#7adc7a' },
-        ],
-        currentState: 0,
-      },
-    ];
-  },
-
-  renderToolbarButton(myState, _toggle, streamsStore) {
-    const active = !!myState;
-    const handler = async () => {
-      if (active) {
-        await controller.stopCapture();
-        await streamsStore.deactivateModule('voice');
-      } else {
-        await streamsStore.activateModule('voice');
-        const ok = await controller.startCapture();
-        if (!ok) {
-          await streamsStore.deactivateModule('voice');
-        }
-      }
-    };
-    return html`
-      <sl-tooltip content="${active ? 'Stop Voice (signals)' : 'Voice (signals)'}" hoist>
-        <div
-          class="toggle-btn ${active ? '' : 'btn-off'}"
-          tabindex="0"
-          @click=${handler}
-          @keypress=${(e: KeyboardEvent) => {
-            if (e.key === 'Enter') handler();
-          }}
-        >
-          <sl-icon
-            class="toggle-btn-icon ${active ? '' : 'btn-icon-off'}"
-            .src=${wrapPathInSvg(mdiBroadcast)}
-          ></sl-icon>
-        </div>
-      </sl-tooltip>
-    `;
   },
 };
 
