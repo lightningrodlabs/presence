@@ -142,6 +142,18 @@ export interface ModuleDefinition {
   onActivate?(context: ModuleLifecycleContext): void;
   onDeactivate?(): void;
 
+  /**
+   * Called when a peer's active-state for THIS module transitions
+   * (inactive→active or active→inactive). Not called for payload-only updates
+   * while the module remains active. Fired from handleModuleState, pong
+   * reconciliation, and peer-leave. Useful for arrival/leave audio cues, etc.
+   */
+  onPeerStateChange?(
+    agentPubKeyB64: string,
+    prev: ModuleStateEnvelope | null,
+    next: ModuleStateEnvelope | null,
+  ): void;
+
   // --- Toolbar ---
 
   /** Render a button for the bottom control bar (activation toggle). */

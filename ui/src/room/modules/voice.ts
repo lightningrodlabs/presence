@@ -2,7 +2,7 @@ import { html } from 'lit';
 import { mdiBroadcast } from '@mdi/js';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { registerModule } from './registry';
-import type { ModuleDefinition } from './types';
+import type { ModuleDefinition, ModuleStateEnvelope } from './types';
 import type { StreamsStore } from '../../streams-store';
 
 /**
@@ -67,11 +67,59 @@ class VoiceController {
       try { p.decoder.close(); } catch {}
     }
     this.peers.clear();
-    if (this.audioContext) {
-      try { this.audioContext.close(); } catch {}
-      this.audioContext = null;
+    // Defer AudioContext close so any squelch scheduled just before unbind
+    // (in onDeactivate) gets to play out.
+    const ac = this.audioContext;
+    this.audioContext = null;
+    if (ac) {
+      setTimeout(() => {
+        try { ac.close(); } catch {}
+      }, 200);
     }
     this.store = null;
+  }
+
+  // ----- arrival/leave squelch (synth, no assets) ------------------------
+  //
+  // Cheap walkie-talkie idiom: a short burst of band-limited noise with a
+  // sharp attack and a quick decay. Two slightly different tunings for
+  // arrive vs leave so the ear can tell them apart even at low volume.
+
+  playSquelch(direction: 'up' | 'down') {
+    const ctx = this.ensureAudioContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const dur = 0.09; // 90 ms
+
+    // Short white-noise buffer.
+    const sampleCount = Math.floor(ctx.sampleRate * dur);
+    const buffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+
+    // Bandpass filter — different center for up vs down.
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = direction === 'up' ? 1800 : 1100;
+    filter.Q.value = 4;
+
+    // Gain envelope: fast attack, exponential decay.
+    const gain = ctx.createGain();
+    const peak = 0.18;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(peak, now + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+
+    source.start(now);
+    source.stop(now + dur + 0.02);
   }
 
   // ----- send side --------------------------------------------------------
@@ -372,14 +420,26 @@ const voiceModule: ModuleDefinition = {
 
   onActivate(ctx) {
     controller.bind(ctx.streamsStore);
+    controller.playSquelch('up');
   },
 
   onDeactivate() {
+    controller.playSquelch('down');
     controller.unbind();
   },
 
   onData(agentPubKeyB64, chunk) {
     controller.receiveFrame(agentPubKeyB64, chunk);
+  },
+
+  onPeerStateChange(_agentPubKeyB64, prev, next) {
+    const wasActive = !!prev?.active;
+    const isActive = !!next?.active;
+    if (!wasActive && isActive) {
+      controller.playSquelch('up');
+    } else if (wasActive && !isActive) {
+      controller.playSquelch('down');
+    }
   },
 
   getStateIcons(_agentPubKeyB64, state, _context) {

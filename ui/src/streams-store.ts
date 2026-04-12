@@ -1157,10 +1157,31 @@ export class StreamsStore {
     });
   }
 
+  /**
+   * Fire a module's onPeerStateChange callback when active-flag actually
+   * transitions. Payload-only changes do not trigger.
+   */
+  private _dispatchPeerModuleTransition(
+    pubkeyB64: AgentPubKeyB64,
+    moduleId: string,
+    prev: ModuleStateEnvelope | null,
+    next: ModuleStateEnvelope | null,
+  ) {
+    const wasActive = !!prev?.active;
+    const isActive = !!next?.active;
+    if (wasActive === isActive) return;
+    try {
+      getModule(moduleId)?.onPeerStateChange?.(pubkeyB64, prev, next);
+    } catch (e) {
+      console.warn(`onPeerStateChange threw for ${moduleId}:`, e);
+    }
+  }
+
   handleModuleState(signal: Extract<RoomSignal, { type: 'Message' }>): void {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     try {
       const envelope: ModuleStateEnvelope = JSON.parse(signal.payload);
+      const prev = get(this._peerModuleStates)[pubkeyB64]?.[envelope.moduleId] || null;
       this._peerModuleStates.update(all => {
         const updated = { ...all };
         if (!updated[pubkeyB64]) updated[pubkeyB64] = {};
@@ -1173,6 +1194,8 @@ export class StreamsStore {
         }
         return updated;
       });
+      const next = envelope.active ? envelope : null;
+      this._dispatchPeerModuleTransition(pubkeyB64, envelope.moduleId, prev, next);
     } catch (e) {
       console.warn('Failed to parse ModuleState payload:', e);
     }
@@ -2622,12 +2645,16 @@ export class StreamsStore {
     this.updateConnectionStatus(pubkeyB64, { type: 'Disconnected' });
     this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
 
-    // Clean up module states for this peer
+    // Clean up module states for this peer (capture pre-image for transition dispatch)
+    const peerModulesAtLeave = get(this._peerModuleStates)[pubkeyB64] || {};
     this._peerModuleStates.update(all => {
       const updated = { ...all };
       delete updated[pubkeyB64];
       return updated;
     });
+    for (const [moduleId, envelope] of Object.entries(peerModulesAtLeave)) {
+      this._dispatchPeerModuleTransition(pubkeyB64, moduleId, envelope, null);
+    }
 
     // Fire event so UI updates (peer-leave = agent left the room, distinct from WebRTC disconnect)
     this.eventCallback({ type: 'peer-leave', pubKeyB64: pubkeyB64 });
@@ -2703,6 +2730,7 @@ export class StreamsStore {
       // Reconcile module states from pong for late-joiners
       if (metaData.data.moduleStates) {
         const current = get(this._peerModuleStates)[pubkeyB64] || {};
+        const prevSnapshot = { ...current };
         const incoming = metaData.data.moduleStates;
         let changed = false;
         const merged = { ...current };
@@ -2723,15 +2751,29 @@ export class StreamsStore {
         }
         if (changed) {
           this._peerModuleStates.update(all => ({ ...all, [pubkeyB64]: merged }));
+          // Fire transition callbacks for any module whose active state flipped
+          const allIds = new Set([...Object.keys(prevSnapshot), ...Object.keys(merged)]);
+          for (const moduleId of allIds) {
+            this._dispatchPeerModuleTransition(
+              pubkeyB64,
+              moduleId,
+              prevSnapshot[moduleId] || null,
+              merged[moduleId] || null,
+            );
+          }
         }
       } else {
         // No module states in pong — clear any we had for this peer
-        if (get(this._peerModuleStates)[pubkeyB64] && Object.keys(get(this._peerModuleStates)[pubkeyB64]).length > 0) {
+        const cleared = get(this._peerModuleStates)[pubkeyB64];
+        if (cleared && Object.keys(cleared).length > 0) {
           this._peerModuleStates.update(all => {
             const updated = { ...all };
             delete updated[pubkeyB64];
             return updated;
           });
+          for (const [moduleId, envelope] of Object.entries(cleared)) {
+            this._dispatchPeerModuleTransition(pubkeyB64, moduleId, envelope, null);
+          }
         }
       }
     } catch (e) {
