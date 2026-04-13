@@ -220,27 +220,28 @@ const timerModule: ModuleDefinition = {
     ];
 
     return html`
-      <sl-dropdown placement="top" distance="4" hoist>
-        <div
-          slot="trigger"
-          class="toggle-btn btn-off"
-          tabindex="0"
-          title="Start Timer"
-        >
-          <sl-icon
-            class="toggle-btn-icon btn-icon-off"
-            .src=${wrapPathInSvg(mdiTimerOutline)}
-          ></sl-icon>
-        </div>
-        <sl-menu class="reconnect-menu secondary-font">
-          ${presets.map(p => html`
-            <sl-menu-item
-              class="reconnect-menu-item"
-              @click=${() => startTimer(p.minutes)}
-            >${p.label}</sl-menu-item>
-          `)}
-        </sl-menu>
-      </sl-dropdown>
+      <sl-tooltip content="Start Timer" hoist>
+        <sl-dropdown placement="top" distance="4" hoist>
+          <div
+            slot="trigger"
+            class="toggle-btn btn-off"
+            tabindex="0"
+          >
+            <sl-icon
+              class="toggle-btn-icon btn-icon-off"
+              .src=${wrapPathInSvg(mdiTimerOutline)}
+            ></sl-icon>
+          </div>
+          <sl-menu class="reconnect-menu secondary-font">
+            ${presets.map(p => html`
+              <sl-menu-item
+                class="reconnect-menu-item"
+                @click=${() => startTimer(p.minutes)}
+              >${p.label}</sl-menu-item>
+            `)}
+          </sl-menu>
+        </sl-dropdown>
+      </sl-tooltip>
     `;
   },
 };

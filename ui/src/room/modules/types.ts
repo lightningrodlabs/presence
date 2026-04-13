@@ -152,6 +152,7 @@ export interface ModuleDefinition {
     agentPubKeyB64: string,
     prev: ModuleStateEnvelope | null,
     next: ModuleStateEnvelope | null,
+    streamsStore: StreamsStore,
   ): void;
 
   /**

@@ -1502,7 +1502,7 @@ export class StreamsStore {
     const isActive = !!next?.active && next?.phase !== 'acquiring';
     if (wasActive === isActive) return;
     try {
-      getModule(moduleId)?.onPeerStateChange?.(pubkeyB64, prev, next);
+      getModule(moduleId)?.onPeerStateChange?.(pubkeyB64, prev, next, this);
     } catch (e) {
       console.warn(`onPeerStateChange threw for ${moduleId}:`, e);
     }

@@ -123,19 +123,46 @@ const raiseHandModule: ModuleDefinition = {
     `;
   },
 
-  renderToolbarButton(
-    myState: ModuleStateEnvelope | null,
-    toggle: () => void,
-  ) {
+  /**
+   * When a peer lowers their hand, clear any receiver override that was
+   * pointing at the raise-hand replace view for this peer. Otherwise the
+   * pane would stay stuck on the now-stale "Raised at: ..." content.
+   */
+  onPeerStateChange(agentPubKeyB64, prev, next, streamsStore) {
+    const wasActive = !!prev?.active;
+    const isActive = !!next?.active;
+    if (wasActive && !isActive) {
+      const override = get(streamsStore._receiverModuleOverrides)[agentPubKeyB64];
+      if (override === 'raise-hand') {
+        streamsStore.setReceiverOverride(agentPubKeyB64, null);
+      }
+    }
+  },
+
+  renderToolbarButton(myState, toggle, streamsStore) {
     const active = !!myState;
+    // Wrap the toggle so that lowering OUR hand also clears any receiver
+    // override on our self pane that was pointing at the raise-hand view.
+    // The onPeerStateChange hook handles the peer case; this handles self.
+    const handler = async () => {
+      const wasActive = active;
+      await toggle();
+      if (wasActive) {
+        const myPubKey = streamsStore.myPubKeyB64;
+        const override = get(streamsStore._receiverModuleOverrides)[myPubKey];
+        if (override === 'raise-hand') {
+          streamsStore.setReceiverOverride(myPubKey, null);
+        }
+      }
+    };
     return html`
       <sl-tooltip content="${active ? 'Lower Hand' : 'Raise Hand'}" hoist>
         <div
           class="toggle-btn ${active ? '' : 'btn-off'}"
           tabindex="0"
-          @click=${toggle}
+          @click=${handler}
           @keypress=${(e: KeyboardEvent) => {
-            if (e.key === 'Enter') toggle();
+            if (e.key === 'Enter') handler();
           }}
         >
           <sl-icon
