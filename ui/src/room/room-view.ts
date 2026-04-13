@@ -2033,19 +2033,50 @@ export class RoomView extends LitElement {
    * initiates or accepts WebRTC — audio flows via signals automatically.
    */
   private _renderWebrtcToggle(pubkeyB64: AgentPubKeyB64) {
-    const disabled = this.streamsStore.webrtcDisabled(pubkeyB64);
+    // Check who disabled WebRTC for this link. If the peer disabled it
+    // (globally or specifically for us), our toggle can't re-enable it
+    // — we disable the button and show a different message.
+    let disabledByPeer = false;
+    const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
+    if (peerConv) {
+      try {
+        const p = JSON.parse(peerConv.payload);
+        if (p.webrtcDisabled) disabledByPeer = true;
+        if (Array.isArray(p.disableWebrtcWith) &&
+            p.disableWebrtcWith.includes(this.streamsStore.myPubKeyB64)) {
+          disabledByPeer = true;
+        }
+      } catch {}
+    }
+
+    const disabledByMe = !disabledByPeer && this.streamsStore.webrtcDisabled(pubkeyB64);
+    const disabled = disabledByPeer || disabledByMe;
+
+    const tooltip = disabledByPeer
+      ? 'WebRTC disabled by agent'
+      : disabledByMe
+        ? 'WebRTC disabled - click to re-enable'
+        : 'Click to disable WebRTC for this peer';
+
+    const clickable = !disabledByPeer;
+    const color = disabled ? '#c72100' : '#7adc7a';
+    const cursor = clickable ? 'pointer' : 'not-allowed';
+    const opacity = clickable ? '1' : '0.5';
+
     return html`
       <sl-tooltip
-        content="${disabled
-          ? 'WebRTC disabled — click to re-enable'
-          : 'Click to disable WebRTC for this peer'}"
         hoist
+        class="tooltip-filled"
+        placement="top"
+        content="${tooltip}"
       >
         <sl-icon
-          style="color: ${disabled ? '#c72100' : '#7adc7a'}; height: 24px; width: 24px; cursor: pointer;"
+          style="color: ${color}; height: 24px; width: 24px; cursor: ${cursor}; opacity: ${opacity};"
           .src=${disabled ? wrapPathInSvg(mdiVideoOff) : wrapPathInSvg(mdiVideo)}
           @click=${() => {
-            this.streamsStore.toggleDisableWebrtc(pubkeyB64);
+            if (clickable) {
+              this.streamsStore.toggleDisableWebrtc(pubkeyB64);
+            }
           }}
         ></sl-icon>
       </sl-tooltip>
