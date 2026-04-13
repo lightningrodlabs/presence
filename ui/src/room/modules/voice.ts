@@ -51,6 +51,16 @@ interface PeerVoiceState {
   nextPlaybackTime: number;
   /** highest seq seen from this peer (for drop-old-packets) */
   lastSeq: number;
+  /** wall-clock ms at which we received the previous frame (for jitter calc) */
+  lastArrivalMs: number;
+  /** EWMA of inter-arrival deviation from the 20ms Opus nominal period */
+  jitterEwma: number;
+  /** Count of lost packets inferred from seq gaps (rolling window) */
+  lostCount: number;
+  /** Count of packets received in the rolling window */
+  receivedCount: number;
+  /** Wall-clock ms of the window start */
+  windowStartMs: number;
 }
 
 const JITTER_BUFFER_MS = 80;
@@ -345,6 +355,45 @@ class VoiceController {
       // out-of-order or duplicate; cheap drop
       return;
     }
+
+    // --- stats update ---
+    const now = Date.now();
+    // Loss from seq gaps: any skipped seq numbers count as lost.
+    // Opus frames at ~50fps, so gaps > 1 are real losses, not reorder
+    // (out-of-order frames are dropped above and don't reach here).
+    if (state.lastSeq !== 0) {
+      const gap = payload.seq - state.lastSeq - 1;
+      if (gap > 0) state.lostCount += gap;
+    }
+    state.receivedCount += 1;
+
+    // Jitter: EWMA of absolute deviation of inter-arrival time from the
+    // 20ms Opus nominal period. alpha = 0.1 for slow smoothing.
+    if (state.lastArrivalMs > 0) {
+      const delta = now - state.lastArrivalMs;
+      const deviation = Math.abs(delta - 20);
+      state.jitterEwma = 0.1 * deviation + 0.9 * state.jitterEwma;
+    }
+    state.lastArrivalMs = now;
+
+    // Publish stats on a ~1s cadence (when the window closes). Computing
+    // per-frame would write 50 times/sec for no visual benefit.
+    if (now - state.windowStartMs >= 1000) {
+      const total = state.receivedCount + state.lostCount;
+      const loss = total > 0 ? (state.lostCount / total) * 100 : 0;
+      if (this.store) {
+        const existing = this.store.signalsStats.get(agentPubKeyB64) ?? {
+          rttMs: null, jitterMs: null, lossPercent: null,
+        };
+        existing.jitterMs = Math.round(state.jitterEwma * 10) / 10;
+        existing.lossPercent = Math.round(loss * 10) / 10;
+        this.store.signalsStats.set(agentPubKeyB64, existing);
+      }
+      state.lostCount = 0;
+      state.receivedCount = 0;
+      state.windowStartMs = now;
+    }
+
     state.lastSeq = payload.seq;
 
     const data = base64ToBytes(payload.data);
@@ -392,6 +441,11 @@ class VoiceController {
       decoder: null,
       nextPlaybackTime: 0,
       lastSeq: 0,
+      lastArrivalMs: 0,
+      jitterEwma: 0,
+      lostCount: 0,
+      receivedCount: 0,
+      windowStartMs: Date.now(),
     };
     try {
       state.decoder = new g.AudioDecoder({

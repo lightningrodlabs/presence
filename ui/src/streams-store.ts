@@ -544,7 +544,14 @@ export class StreamsStore {
     const agentsToPing = Object.keys(get(this._knownAgents))
       .filter(agent => !get(this.blockedAgents).includes(agent))
       .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
-    await this.roomStore.client.sendMessage(agentsToPing, 'PingUi');
+    // Include a send-side timestamp so peers can echo it back in their
+    // pong, letting us compute signals-carrier RTT on receipt without
+    // adding new messages. See handlePingUi / handlePongUi.
+    await this.roomStore.client.sendMessage(
+      agentsToPing,
+      'PingUi',
+      JSON.stringify({ t0: Date.now() }),
+    );
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
@@ -616,6 +623,15 @@ export class StreamsStore {
   }
 
   async videoOn() {
+    // Camera needs WebRTC — video doesn't go over the signals carrier.
+    // Implicitly re-enable WebRTC if the user has it globally disabled,
+    // otherwise turning the camera on would silently fail to reach any
+    // peer and be deeply confusing.
+    if (this.webrtcGloballyDisabled) {
+      this.webrtcGloballyDisabled = false;
+      window.localStorage.removeItem('disableAllWebrtc');
+      await this._syncConversationPayload({ webrtcDisabled: false });
+    }
     const deviceId = get(this._videoInputId);
     if (this.mainStream) {
       if (this.mainStream.getVideoTracks()[0]) {
@@ -1406,6 +1422,11 @@ export class StreamsStore {
     return voiceController.peerAudioLevels;
   }
 
+  /** True iff a WebRTC video connection currently exists to this peer. */
+  hasWebrtcConnection(pubKeyB64: string): boolean {
+    return !!get(this._openConnections)[pubKeyB64];
+  }
+
   /**
    * Per-peer WebRTC AnalyserNodes for reading incoming audio levels.
    * Created when a peer stream arrives, removed on disconnect.
@@ -1413,6 +1434,25 @@ export class StreamsStore {
    */
   private _peerAnalysers = new Map<string, AnalyserNode>();
   private _peerAnalyserBuffers = new Map<string, Uint8Array>();
+
+  /**
+   * Per-peer latency/quality stats for the signals carrier. Updated on
+   * each pong receive (RTT) and by VoiceController (jitter, loss).
+   * Plain Map — read by the peer-stats-panel element at its own poll rate.
+   */
+  signalsStats = new Map<string, import('./types').CarrierStats>();
+
+  /**
+   * Per-peer latency/quality stats for the WebRTC carrier. Updated by
+   * the periodic getStats() poll. Plain Map — not reactive.
+   */
+  webrtcStats = new Map<string, import('./types').CarrierStats>();
+
+  /**
+   * Rolling EWMA of signals-carrier RTT per peer. Smooths out noise
+   * from jitter on individual ping/pong round trips.
+   */
+  private _signalsRttEwma = new Map<string, number>();
 
   /**
    * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
@@ -2030,6 +2070,7 @@ export class StreamsStore {
       delete this._staleCycles[pubKeyB64];
       delete this._reconcileAttemptCount[pubKeyB64];
       this.removePeerAudioAnalyser(pubKeyB64);
+      this.webrtcStats.delete(pubKeyB64);
 
       // Also tear down any outgoing screen share to this peer since they
       // have disconnected. Without this, the stale WebRTC connection may
@@ -2099,6 +2140,7 @@ export class StreamsStore {
         delete this._pendingScreenShareInits[pubKeyB64];
       }
       this.removePeerAudioAnalyser(pubKeyB64);
+      this.webrtcStats.delete(pubKeyB64);
 
       this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
       this.eventCallback({
@@ -2743,16 +2785,70 @@ export class StreamsStore {
         const stats = await pc.getStats();
         let audioBytes = 0;
         let videoBytes = 0;
+        // Per-kind jitter/loss. Prefer audio for display when available
+        // (more time-sensitive); fall back to video otherwise.
+        let audioJitter: number | null = null;
+        let audioPacketsReceived = 0;
+        let audioPacketsLost = 0;
+        let videoJitter: number | null = null;
+        let videoPacketsReceived = 0;
+        let videoPacketsLost = 0;
+        let rttMs: number | null = null;
+        let candPairRttMs: number | null = null;
 
         stats.forEach((report: any) => {
           if (report.type === 'inbound-rtp') {
-            if (report.kind === 'audio' || report.mediaType === 'audio') {
+            const kind = report.kind || report.mediaType;
+            if (kind === 'audio') {
               audioBytes = report.bytesReceived || 0;
-            }
-            if (report.kind === 'video' || report.mediaType === 'video') {
+              if (typeof report.jitter === 'number') audioJitter = report.jitter;
+              audioPacketsReceived = report.packetsReceived || 0;
+              audioPacketsLost = report.packetsLost || 0;
+            } else if (kind === 'video') {
               videoBytes = report.bytesReceived || 0;
+              if (typeof report.jitter === 'number') videoJitter = report.jitter;
+              videoPacketsReceived = report.packetsReceived || 0;
+              videoPacketsLost = report.packetsLost || 0;
             }
           }
+          // RTT from remote-inbound-rtp (our outgoing direction).
+          if (report.type === 'remote-inbound-rtp' &&
+              typeof report.roundTripTime === 'number') {
+            rttMs = Math.round(report.roundTripTime * 1000);
+          }
+          // Fallback: candidate-pair gives ICE-level RTT.
+          if (report.type === 'candidate-pair' &&
+              report.state === 'succeeded' &&
+              typeof report.currentRoundTripTime === 'number') {
+            candPairRttMs = Math.round(report.currentRoundTripTime * 1000);
+          }
+        });
+
+        if (rttMs === null) rttMs = candPairRttMs;
+
+        // Pick whichever kind has data. Audio is preferred when both
+        // are flowing. If neither, leave jitter/loss null.
+        const hasAudio = audioPacketsReceived + audioPacketsLost > 0;
+        const hasVideo = videoPacketsReceived + videoPacketsLost > 0;
+        const jitter = hasAudio
+          ? audioJitter
+          : (hasVideo ? videoJitter : null);
+        const pktsRecv = hasAudio
+          ? audioPacketsReceived
+          : (hasVideo ? videoPacketsReceived : 0);
+        const pktsLost = hasAudio
+          ? audioPacketsLost
+          : (hasVideo ? videoPacketsLost : 0);
+        const totalPackets = pktsRecv + pktsLost;
+
+        this.webrtcStats.set(pubKeyB64, {
+          rttMs,
+          jitterMs: jitter !== null
+            ? Math.round((jitter as number) * 1000 * 10) / 10
+            : null,
+          lossPercent: totalPackets > 0
+            ? Math.round((pktsLost / totalPackets) * 1000) / 10
+            : null,
         });
 
         const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
@@ -2884,6 +2980,16 @@ export class StreamsStore {
 
     const streamInfo = getStreamInfo(this._videoStreams[pubkeyB64]);
 
+    // Extract the sender's ping timestamp so we can echo it back for RTT.
+    // Old peers send an empty payload — pingT0 stays undefined in that case.
+    let pingT0: number | undefined;
+    if (signal.payload && signal.payload.length > 0) {
+      try {
+        const parsed = JSON.parse(signal.payload);
+        if (typeof parsed?.t0 === 'number') pingT0 = parsed.t0;
+      } catch {}
+    }
+
     if (pubkeyB64 !== this.myPubKeyB64) {
       const metaData: PongMetaData<PongMetaDataV1> = {
         formatVersion: 1,
@@ -2896,6 +3002,7 @@ export class StreamsStore {
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[pubkeyB64]?.audio,
+          pingT0,
           moduleStates: Object.keys(get(this._myModuleStates)).length > 0
             ? get(this._myModuleStates)
             : undefined,
@@ -3042,6 +3149,28 @@ export class StreamsStore {
       );
       this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
       metaDataExt = metaData;
+
+      // Compute signals-carrier RTT from the echoed ping timestamp.
+      // Smooth with EWMA so single-cycle jitter doesn't make the display
+      // jump around. Alpha = 0.3 gives ~3-sample effective window.
+      if (typeof metaData.data.pingT0 === 'number') {
+        const rtt = Date.now() - metaData.data.pingT0;
+        if (rtt >= 0 && rtt < 60000) {
+          const prev = this._signalsRttEwma.get(pubkeyB64) ?? rtt;
+          const next = Math.round(0.3 * rtt + 0.7 * prev);
+          this._signalsRttEwma.set(pubkeyB64, next);
+          const existing = this.signalsStats.get(pubkeyB64) ?? {
+            rttMs: null, jitterMs: null, lossPercent: null,
+          };
+          existing.rttMs = next;
+          this.signalsStats.set(pubkeyB64, existing);
+        }
+      } else {
+        // Peer on old code — their pong doesn't echo pingT0 yet.
+        console.debug(
+          `[stats] No pingT0 in pong from ${pubkeyB64.slice(0, 8)} — remote may be on older code`
+        );
+      }
       this._othersConnectionStatuses.update(statuses => {
         const newStatuses = statuses;
         newStatuses[pubkeyB64] = {

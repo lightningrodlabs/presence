@@ -107,6 +107,13 @@ export type PongMetaDataV1 = {
   knownAgents?: Record<AgentPubKeyB64, AgentInfo>;
   appVersion?: string;
   /**
+   * Echo of the t0 timestamp from the Ping that triggered this Pong.
+   * Used by the sender to compute signals-carrier RTT on receipt:
+   * `rtt = Date.now() - pingT0`. Clock skew is irrelevant since only
+   * the sender compares two timestamps from its own clock.
+   */
+  pingT0?: number;
+  /**
    * Info about how we see the stream of the peer to
    * which we're sending this PongMetaData
    */
@@ -123,6 +130,17 @@ export type PongMetaDataV1 = {
   video?: boolean;
   /** Active module states for this agent, keyed by moduleId */
   moduleStates?: Record<string, ModuleStateEnvelope>;
+};
+
+/**
+ * Per-peer latency/quality stats for a single carrier. Null = unknown
+ * or not yet measured. Rendered in the stats panel under the connection
+ * detail avatars.
+ */
+export type CarrierStats = {
+  rttMs: number | null;
+  jitterMs: number | null;
+  lossPercent: number | null;
 };
 
 /**

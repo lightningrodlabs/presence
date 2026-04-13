@@ -55,6 +55,7 @@ import './elements/attachment-element';
 import './elements/agent-connection-status';
 import './elements/agent-connection-status-icon';
 import './elements/audio-level-meter';
+import './elements/peer-stats-panel';
 import './elements/toggle-switch';
 import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
@@ -2020,7 +2021,7 @@ export class RoomView extends LitElement {
       } catch {}
     }
     return html`
-      <audio-level-meter
+      <audio-level-meter style="margin-left:3px"
         .streamsStore=${this.streamsStore}
         .agentPubKeyB64=${pubkeyB64}
       ></audio-level-meter>
@@ -2151,7 +2152,7 @@ export class RoomView extends LitElement {
       sortConnectionStatuses
     );
     return html`
-      <div class="row" style="align-items: center; flex-wrap: wrap;">
+      <div class="row" style="align-items: center; flex-wrap: wrap; line-height: 1;">
         ${repeat(
           sortedStatuses,
           ([pubkeyb64, _status]) => pubkeyb64,
@@ -2210,7 +2211,7 @@ export class RoomView extends LitElement {
         )}
         <span
           class="tertiary-font"
-          style="color: #c3c9eb; font-size: 24px; margin-left: 5px;"
+          style="color: #c3c9eb; font-size: 18px; margin-left: 5px; line-height: 1;"
           >(${nConnections})</span
         >
       </div>
@@ -2537,10 +2538,16 @@ export class RoomView extends LitElement {
               <!-- Connection detail statuses (debug) -->
               ${this._showConnectionDetails
                 ? html`<div
-                    style="display: flex; flex-direction: row; align-items: center; gap: 6px; position: absolute; top: 10px; left: 10px; background: none;"
+                    style="display: flex; flex-direction: column; align-items: flex-start; gap: 2px; position: absolute; top: 10px; left: 10px; background: none;"
                   >
-                    ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
-                    ${this._renderWebrtcToggle(pubkeyB64)}
+                    <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
+                      ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
+                      ${this._renderWebrtcToggle(pubkeyB64)}
+                    </div>
+                    <peer-stats-panel
+                      .streamsStore=${this.streamsStore}
+                      .agentPubKeyB64=${pubkeyB64}
+                    ></peer-stats-panel>
                   </div>`
                 : html``}
 
