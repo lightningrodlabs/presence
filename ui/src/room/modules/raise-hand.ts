@@ -70,7 +70,7 @@ function getHandPosition(agentPubKeyB64: string, context: ModuleRenderContext): 
 const raiseHandModule: ModuleDefinition = {
   id: 'raise-hand',
   type: 'agent',
-  label: 'Raised at',
+  label: 'Stack',
   icon: mdiHandBackRight,
   activationControl: 'sender',
 
@@ -118,7 +118,7 @@ const raiseHandModule: ModuleDefinition = {
     return html`
       <div style="display: flex; flex-direction: column; align-items: center; justify-content: center;
                   width: 100%; height: 100%; background: #1a1a2e; color: #e0e0e0; padding: 16px; box-sizing: border-box;">
-        <div style="font-size: 1.1em; opacity: 0.8;">Raised at: ${raisedAt}</div>
+        <div style="font-size: 1.1em; opacity: 0.8;">Entered stack at: ${raisedAt}</div>
       </div>
     `;
   },
@@ -156,7 +156,7 @@ const raiseHandModule: ModuleDefinition = {
       }
     };
     return html`
-      <sl-tooltip content="${active ? 'Lower Hand' : 'Raise Hand'}" hoist>
+      <sl-tooltip content="${active ? 'Leave Stack' : 'Enter Stack'}" hoist>
         <div
           class="toggle-btn ${active ? '' : 'btn-off'}"
           tabindex="0"
