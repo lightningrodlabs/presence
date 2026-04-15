@@ -665,8 +665,13 @@ export class RoomView extends LitElement {
     const activeShareCount = this._getActiveShares().length;
     const hasShared = activeShareCount > 0;
 
+    // Phantom tiles (reported-by-others but not connected to us) render
+    // alongside active tiles in the same grid and must be counted toward
+    // layout sizing. Without this the layout class is computed for fewer
+    // tiles than actually render, and every tile is oversized.
+    const phantomCount = this.streamsStore.phantomAgents().length;
     const videoOnlyCount =
-      Object.keys(this._activeAgents.value).length + 1;
+      Object.keys(this._activeAgents.value).length + 1 + phantomCount;
     const totalCount = videoOnlyCount + activeShareCount;
 
     // In split mode, size items based on their panel's count
@@ -2087,6 +2092,78 @@ export class RoomView extends LitElement {
     `;
   }
 
+  /**
+   * Render a placeholder tile per agent in `phantomAgents()` — agents
+   * other peers report as in-room with a working audio link, but who we
+   * cannot see directly. Suppresses the normal tile chrome (no video
+   * element, no module overlays, no audio meter, no per-tile connection
+   * details) since none of that data exists for an unconnected peer.
+   * Lists the observers who DO see them so the user can tell whether
+   * the issue is the peer or our own connectivity.
+   */
+  private _renderPhantomTiles() {
+    const phantoms = this.streamsStore.phantomAgents();
+    if (phantoms.length === 0) return html``;
+    return html`${repeat(
+      phantoms,
+      pk => pk,
+      pk => {
+        const seeing = this.streamsStore.observersSeeing(pk);
+        const connected = this.streamsStore.observersConnectedTo(pk);
+        // Prefer the "connected via" framing when any observer has a
+        // working link; fall back to "last seen by" when presence is
+        // only ping-level (impolite close in progress, link broken
+        // everywhere).
+        const label = connected.length > 0 ? 'connected via' : 'last seen by';
+        const observers = seeing;
+        return html`
+          <div
+            class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
+            style="opacity: 0.7;"
+            title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not connected to you"
+          >
+            <avatar-with-nickname
+              .hideNickname=${true}
+              .agentPubKey=${decodeHashFromBase64(pk)}
+              style="width: 35%;"
+            ></avatar-with-nickname>
+            <div
+              class="secondary-font"
+              style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
+            >
+              reported in room — not connected to you
+            </div>
+            ${observers.length > 0
+              ? html`<div
+                  style="position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px;"
+                >
+                  <span
+                    class="secondary-font"
+                    style="color: #c3c9eb; font-size: 18px; opacity: 0.85;"
+                    >${label}</span
+                  >
+                  <div style="display: flex; flex-direction: row; gap: 4px;">
+                    ${repeat(
+                      observers,
+                      obs => obs,
+                      obs => html`<div
+                        style="width: 24px; height: 24px; display: inline-block;"
+                      >
+                        <avatar-with-nickname
+                          .hideNickname=${true}
+                          .agentPubKey=${decodeHashFromBase64(obs)}
+                        ></avatar-with-nickname>
+                      </div>`,
+                    )}
+                  </div>
+                </div>`
+              : html``}
+          </div>
+        `;
+      },
+    )}`;
+  }
+
   renderAgentConnectionStatuses(
     type: 'video' | 'my-video' | 'my-screen-share' | 'their-screen-share',
     pubkeyb64?: AgentPubKeyB64
@@ -2815,6 +2892,7 @@ export class RoomView extends LitElement {
             </div>
           `}
         )}
+        ${this._renderPhantomTiles()}
         </div>
       </div>
       ${this.renderToggles()}

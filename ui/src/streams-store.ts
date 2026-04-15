@@ -1508,6 +1508,7 @@ export class StreamsStore {
    */
   globalPresenceSet(): Set<AgentPubKeyB64> {
     const out = new Set<AgentPubKeyB64>();
+    const blocked = new Set(get(this.blockedAgents));
     // We know we're here. Including self matters because peer tiles need
     // to render their observer's view of US — the icon strip on Gaston's
     // tile must include me. Excluding self happens at the per-tile level
@@ -1515,18 +1516,114 @@ export class StreamsStore {
     out.add(this.myPubKeyB64);
     // My own active agents.
     for (const k of Object.keys(get(this._activeAgents))) {
-      out.add(k);
+      if (!blocked.has(k)) out.add(k);
     }
-    // Anyone any fresh observer reports as present (lastSeen bucket
-    // 'fresh' or 'stale' in their broadcast peerLinks).
+    // Anyone a *fresh* observer reports as present. We require the
+    // observer's broadcast itself to be recent so that an observer who
+    // dropped out doesn't keep ghost peers in the set forever.
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
       if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
       for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
+        if (blocked.has(peerKey)) continue;
         if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
           out.add(peerKey);
         }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Agents reported as present (ping-recent) by at least one fresh
+   * observer, but who we ourselves cannot see directly. Drives placeholder
+   * tiles. Ping-presence is sufficient — we do not require the observer
+   * to have a working audio link, because in impolite-close scenarios
+   * every peer's link to the departing agent breaks at roughly the same
+   * time while `knownAgents` broadcasts still list them for ~30s; we want
+   * the phantom tile to persist through that decay window rather than
+   * vanishing in lockstep with everyone else's link failure.
+   *
+   * Whether anyone has a *working* link is exposed separately via
+   * `observersConnectedTo()` so the placeholder can label the observer
+   * list accurately.
+   */
+  phantomAgents(): AgentPubKeyB64[] {
+    const active = get(this._activeAgents);
+    const blocked = new Set(get(this.blockedAgents));
+    const out = new Set<AgentPubKeyB64>();
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      // Observer must themselves be fresh from our point of view — a peer
+      // whose own broadcast we're losing shouldn't keep promoting phantoms.
+      if (!active[observerKey]) continue;
+      for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
+        if (peerKey === this.myPubKeyB64) continue;
+        if (blocked.has(peerKey)) continue;
+        if (active[peerKey]) continue; // we already see them directly
+        if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
+          out.add(peerKey);
+        }
+      }
+    }
+    return Array.from(out);
+  }
+
+  /**
+   * For a phantom agent, which fresh observers still ping-see them
+   * (lastSeen bucket 'fresh' or 'stale' in their broadcast peerLinks).
+   * Drives the observer list on the placeholder tile.
+   */
+  observersSeeing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
+    const out: AgentPubKeyB64[] = [];
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      const snap = obs.peerLinks[peerB64];
+      if (!snap) continue;
+      if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
+        out.push(observerKey);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Subset of `observersSeeing` who additionally have a working or
+   * in-progress audio link to the phantom. Used to pick the observer-list
+   * label: "connected via" when this is non-empty, "last seen by"
+   * otherwise.
+   */
+  observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
+    const out: AgentPubKeyB64[] = [];
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      const snap = obs.peerLinks[peerB64];
+      if (!snap) continue;
+      if (
+        snap.audioLink === 'webrtc' ||
+        snap.audioLink === 'signals' ||
+        snap.audioLink === 'negotiating'
+      ) {
+        out.push(observerKey);
       }
     }
     return out;
