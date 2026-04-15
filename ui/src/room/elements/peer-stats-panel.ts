@@ -30,6 +30,7 @@ export class PeerStatsPanel extends LitElement {
   private _lastRtt: number | null = null;
   private _lastJitter: number | null = null;
   private _lastLoss: number | null = null;
+  private _lastFlow: 'both' | 'tx' | 'rx' | 'idle' = 'idle';
 
   static styles = css`
     :host {
@@ -65,9 +66,22 @@ export class PeerStatsPanel extends LitElement {
     const carrier = this._lastCarrier;
     const fmt = (v: number | null, unit: string) =>
       v === null ? '-' : `${v}${unit}`;
+    const flowGlyph =
+      this._lastFlow === 'both' ? '⇅'
+      : this._lastFlow === 'tx' ? '↑'
+      : this._lastFlow === 'rx' ? '↓'
+      : '·';
+    const flowColor =
+      this._lastFlow === 'idle' ? '#e07070' : '#7adc7a';
     return html`
       <div class="panel">
         <span class="carrier">${carrier}</span>
+        <span class="flow" style="color: ${flowColor}" title="audio flow: ${
+          this._lastFlow === 'both' ? 'transmitting & receiving'
+          : this._lastFlow === 'tx' ? 'transmitting'
+          : this._lastFlow === 'rx' ? 'receiving'
+          : 'idle'
+        }">${flowGlyph}</span>
         <span><span class="label">rtt</span> <span class="value">${fmt(this._lastRtt, 'ms')}</span></span>
         <span><span class="label">jit</span> <span class="value">${fmt(this._lastJitter, 'ms')}</span></span>
         <span><span class="label">loss</span> <span class="value">${fmt(this._lastLoss, '%')}</span></span>
@@ -101,16 +115,45 @@ export class PeerStatsPanel extends LitElement {
     const jitter = stats?.jitterMs ?? null;
     const loss = stats?.lossPercent ?? null;
 
+    // Flow detection: is audio actually moving in each direction right now?
+    // The stats panel historically inferred carrier from _openConnections
+    // presence alone, which can lie — pong RTT populates signalsStats even
+    // when the local voice encoder is idle, and a lingering _openConnections
+    // entry can show "webrtc" while media has stopped flowing. The flow
+    // glyph surfaces the truth: recent frames in/out, per direction.
+    const FLOW_WINDOW_MS = 2000;
+    const now = Date.now();
+    let tx = false;
+    let rx = false;
+    if (carrier === 'signals') {
+      const encoderRunning = this.streamsStore.voiceEncoderRunning;
+      const lastSent = this.streamsStore.signalsLastSent.get(this.agentPubKeyB64);
+      const lastRecv = this.streamsStore.signalsLastRecv.get(this.agentPubKeyB64);
+      tx = !!encoderRunning && !!lastSent && now - lastSent < FLOW_WINDOW_MS;
+      rx = !!lastRecv && now - lastRecv < FLOW_WINDOW_MS;
+    } else {
+      // WebRTC: approximate flow from conn.audio/video presence.
+      // Receiving counts as rx; sending is implied by our own mic being
+      // unmuted while the connection is audio-enabled.
+      const conn = this.streamsStore.openConnectionInfo(this.agentPubKeyB64);
+      rx = !!conn?.audio;
+      tx = !!conn?.connected;
+    }
+    const flow: 'both' | 'tx' | 'rx' | 'idle' =
+      tx && rx ? 'both' : tx ? 'tx' : rx ? 'rx' : 'idle';
+
     if (
       carrier !== this._lastCarrier ||
       rtt !== this._lastRtt ||
       jitter !== this._lastJitter ||
-      loss !== this._lastLoss
+      loss !== this._lastLoss ||
+      flow !== this._lastFlow
     ) {
       this._lastCarrier = carrier;
       this._lastRtt = rtt;
       this._lastJitter = jitter;
       this._lastLoss = loss;
+      this._lastFlow = flow;
       this.requestUpdate();
     }
   };

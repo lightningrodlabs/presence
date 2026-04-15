@@ -167,9 +167,13 @@ const conversationModule: ModuleDefinition = {
 
   /**
    * React to payload changes from a peer's conversation module.
-   * When a peer adds us to their `disableWebrtcWith`, tear down the
-   * WebRTC connection — the retry loop won't restart it because
-   * `webrtcDisabled(peer)` is now true.
+   * Tear down the WebRTC connection when the peer has disabled WebRTC
+   * for this link — either globally (`webrtcDisabled`) or for us
+   * specifically (`disableWebrtcWith` includes our pubkey). Without
+   * this, recovery would depend on simple-peer's `close` event
+   * propagating, which can lag or be missed, leaving `_openConnections`
+   * populated and `_signalsTargets` excluding the peer — so audio would
+   * not route over signals to them.
    */
   onModulePayloadChange(
     agentPubKeyB64: string,
@@ -182,8 +186,12 @@ const conversationModule: ModuleDefinition = {
     if (!prevPayload || !nextPayload) return;
 
     const myPubKey = streamsStore.myPubKeyB64;
-    const wasDisabled = prevPayload.disableWebrtcWith.includes(myPubKey);
-    const isDisabled = nextPayload.disableWebrtcWith.includes(myPubKey);
+    const wasDisabled =
+      prevPayload.webrtcDisabled ||
+      prevPayload.disableWebrtcWith.includes(myPubKey);
+    const isDisabled =
+      nextPayload.webrtcDisabled ||
+      nextPayload.disableWebrtcWith.includes(myPubKey);
 
     if (wasDisabled === isDisabled) return;
 

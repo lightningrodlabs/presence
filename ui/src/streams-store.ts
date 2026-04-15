@@ -1422,9 +1422,29 @@ export class StreamsStore {
     return voiceController.peerAudioLevels;
   }
 
+  /** True iff the signals-carrier voice encoder is currently capturing. */
+  get voiceEncoderRunning(): boolean {
+    return this._voiceEncoderRunning;
+  }
+
+  /** Wall-clock ms of the last voice frame sent to each peer. */
+  get signalsLastSent(): Map<string, number> {
+    return voiceController.peerLastSentMs;
+  }
+
+  /** Wall-clock ms of the last voice frame received from each peer. */
+  get signalsLastRecv(): Map<string, number> {
+    return voiceController.peerLastRecvMs;
+  }
+
   /** True iff a WebRTC video connection currently exists to this peer. */
   hasWebrtcConnection(pubKeyB64: string): boolean {
     return !!get(this._openConnections)[pubKeyB64];
+  }
+
+  /** Current OpenConnectionInfo for a peer, or undefined. */
+  openConnectionInfo(pubKeyB64: string): OpenConnectionInfo | undefined {
+    return get(this._openConnections)[pubKeyB64];
   }
 
   /**

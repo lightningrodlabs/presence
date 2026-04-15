@@ -96,6 +96,19 @@ class VoiceController {
    */
   peerAudioLevels = new Map<string, number>();
 
+  /**
+   * Wall-clock ms of the last voice frame we sent TO this peer. Updated in
+   * handleEncodedChunk per target. Consumers (stats panel) compare against
+   * Date.now() to decide if audio is actively flowing in each direction.
+   */
+  peerLastSentMs = new Map<string, number>();
+
+  /**
+   * Wall-clock ms of the last voice frame we received FROM this peer.
+   * Updated in receiveFrame.
+   */
+  peerLastRecvMs = new Map<string, number>();
+
   bind(store: StreamsStore) {
     this.store = store;
   }
@@ -107,6 +120,8 @@ class VoiceController {
     }
     this.peers.clear();
     this.peerAudioLevels.clear();
+    this.peerLastSentMs.clear();
+    this.peerLastRecvMs.clear();
     // AudioContext is owned by MicSource now — don't close it here. It
     // stays alive across voice deactivate/reactivate and is disposed by
     // StreamsStore.disconnect → MicSource.dispose.
@@ -315,6 +330,10 @@ class VoiceController {
       type: chunk.type,
       data: bytesToBase64(buf),
     };
+    const now = Date.now();
+    for (const peer of targets) {
+      this.peerLastSentMs.set(peer, now);
+    }
     this.store.sendModuleData('voice', JSON.stringify(payload), targets).catch(() => {});
   }
 
@@ -355,6 +374,8 @@ class VoiceController {
       // out-of-order or duplicate; cheap drop
       return;
     }
+
+    this.peerLastRecvMs.set(agentPubKeyB64, Date.now());
 
     // --- stats update ---
     const now = Date.now();
