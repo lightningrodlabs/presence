@@ -20,8 +20,14 @@ import {
   Profile,
 } from '@holochain-open-dev/profiles';
 import { EntryRecord } from '@holochain-open-dev/utils';
-import { ConnectionStatus } from '../../types';
-import { connectionStatusToColor } from '../../utils';
+import { AudioLinkState, ConnectionStatus, LastSeenBucket } from '../../types';
+import {
+  audioLinkToColor,
+  audioLinkToText,
+  connectionStatusToColor,
+  lastSeenBucketToColor,
+  lastSeenBucketToText,
+} from '../../utils';
 import { sharedStyles } from '../../sharedStyles';
 import '../../shared/holo-identicon';
 
@@ -45,17 +51,38 @@ export class AgentConnectionStatusIcon extends LitElement {
   @property()
   connectionStatus: ConnectionStatus | undefined;
 
+  /**
+   * AudioLink state from the observer's point of view. When provided,
+   * drives the ring color instead of `connectionStatus` — so the ring
+   * reflects "can this observer hear this agent" rather than pure WebRTC
+   * negotiation phase.
+   */
+  @property()
+  audioLink: AudioLinkState | undefined;
+
   @property()
   onlyToldAbout = false;
+
+  /**
+   * Freshness bucket of the observer's last pong from this agent. Drives
+   * the corner dot color without clock-skew sensitivity (the bucket is
+   * computed by the observer, not by us comparing timestamps). Falls back
+   * to the legacy `lastSeen` timestamp when absent.
+   */
+  @property()
+  lastSeenBucket: LastSeenBucket | undefined;
 
   @property()
   lastSeen: number | undefined;
 
   @property({ type: String })
-  audioStatus: 'on' | 'muted' | 'off' | undefined;
+  audioStatus: 'live' | 'stale' | 'muted' | 'off' | undefined;
 
   @property({ type: String })
-  videoStatus: 'on' | 'muted' | 'off' | undefined;
+  videoStatus: 'live' | 'muted' | 'off' | undefined;
+
+  @property({ type: String })
+  audioCarrier: 'webrtc' | 'signals' | 'none' | undefined;
 
   /** Dependencies */
 
@@ -119,6 +146,21 @@ export class AgentConnectionStatusIcon extends LitElement {
   }
 
   renderProfile(profile: EntryRecord<Profile> | undefined) {
+    const ringColor = this.audioLink
+      ? audioLinkToColor(this.audioLink)
+      : connectionStatusToColor(this.connectionStatus);
+    const dim =
+      this.audioLink
+        ? this.audioLink === 'absent' || this.audioLink === 'unknown'
+        : !this.connectionStatus ||
+          this.connectionStatus.type === 'Disconnected';
+    // When the observer doesn't see this agent in the room, audio/video
+    // icons would be meaningless ("not in room" already implies no flow).
+    const hideTrackIcons =
+      this.audioLink === 'absent' || this.audioLink === 'unknown';
+    const linkText = this.audioLink
+      ? audioLinkToText(this.audioLink)
+      : this.statusToText(this.connectionStatus);
     return html`
       <sl-tooltip
         class="tooltip-filled"
@@ -126,14 +168,17 @@ export class AgentConnectionStatusIcon extends LitElement {
         hoist
         content=${`${
           profile ? profile.entry.nickname : 'Unknown'
-        } (${this.statusToText(this.connectionStatus)})${
+        } (${linkText})${
           this.audioStatus ? ` | audio: ${this.audioStatus}` : ''
-        }${this.videoStatus ? ` | video: ${this.videoStatus}` : ''}`}
+        }${this.videoStatus ? ` | video: ${this.videoStatus}` : ''}${
+          this.audioCarrier && this.audioCarrier !== 'none'
+            ? ` via ${this.audioCarrier}`
+            : ''
+        }`}
       >
         <div
           class="row"
-          style="position: relative; align-items: center; margin: 0; padding: 0; ${!this
-            .connectionStatus || this.connectionStatus.type === 'Disconnected'
+          style="position: relative; align-items: center; margin: 0; padding: 0; ${dim
             ? 'opacity: 0.5'
             : ''}"
         >
@@ -153,14 +198,19 @@ export class AgentConnectionStatusIcon extends LitElement {
                   hoist
                   class="tooltip-filled"
                   placement="bottom"
-                  content="${lastSeenToText(this.lastSeen)}"
-                  style="--sl-tooltip-background-color: ${lastSeenToColor(
-                    this.lastSeen
-                  )};"
+                  content="${this.lastSeenBucket !== undefined
+                    ? lastSeenBucketToText(this.lastSeenBucket)
+                    : lastSeenToText(this.lastSeen)}"
+                  style="--sl-tooltip-background-color: ${this.lastSeenBucket !==
+                  undefined
+                    ? lastSeenBucketToColor(this.lastSeenBucket)
+                    : lastSeenToColor(this.lastSeen)};"
                 >
                   <div
                     class="last-seen-indicator"
-                    style="background: ${lastSeenToColor(this.lastSeen)};"
+                    style="background: ${this.lastSeenBucket !== undefined
+                      ? lastSeenBucketToColor(this.lastSeenBucket)
+                      : lastSeenToColor(this.lastSeen)};"
                   ></div>
                 </sl-tooltip>
               `}
@@ -168,9 +218,7 @@ export class AgentConnectionStatusIcon extends LitElement {
             ? html`
                 <img
                   style="height: ${this.size}px; width: ${this
-                    .size}px; border-radius: 50%; border: 3px solid ${connectionStatusToColor(
-                    this.connectionStatus
-                  )};"
+                    .size}px; border-radius: 50%; border: 3px solid ${ringColor};"
                   src=${profile.entry.fields.avatar}
                   alt="${profile.entry.nickname}'s avatar"
                 />
@@ -182,13 +230,12 @@ export class AgentConnectionStatusIcon extends LitElement {
                   .hash=${this.agentPubKey}
                   .size=${this.size}
                   title="${encodeHashToBase64(this.agentPubKey)}"
-                  style="border-radius: 50%; border: 3px solid ${connectionStatusToColor(
-                    this.connectionStatus
-                  )};"
+                  style="border-radius: 50%; border: 3px solid ${ringColor};"
                 >
                 </holo-identicon>
               `}
-          ${this.audioStatus !== undefined || this.videoStatus !== undefined
+          ${!hideTrackIcons &&
+          (this.audioStatus !== undefined || this.videoStatus !== undefined)
             ? html`
                 <div class="track-indicators">
                   ${this.audioStatus !== undefined
@@ -196,11 +243,16 @@ export class AgentConnectionStatusIcon extends LitElement {
                         hoist
                         class="tooltip-filled"
                         placement="top"
-                        content="audio: ${this.audioStatus}"
+                        content="audio: ${this.audioStatus}${this.audioCarrier &&
+                        this.audioCarrier !== 'none'
+                          ? ` (${this.audioCarrier})`
+                          : ''}"
                       >
                         <sl-icon
                           class="track-icon"
-                          style="color: ${trackStatusColor(this.audioStatus)};"
+                          style="color: ${audioTrackColor(
+                            this.audioStatus
+                          )};"
                           .src=${wrapPathInSvg(mdiMicrophone)}
                         ></sl-icon>
                       </sl-tooltip>`
@@ -214,7 +266,7 @@ export class AgentConnectionStatusIcon extends LitElement {
                       >
                         <sl-icon
                           class="track-icon"
-                          style="color: ${trackStatusColor(this.videoStatus)};"
+                          style="color: ${videoTrackColor(this.videoStatus)};"
                           .src=${wrapPathInSvg(mdiVideo)}
                         ></sl-icon>
                       </sl-tooltip>`
@@ -322,9 +374,24 @@ function lastSeenToColor(lastSeen: number | undefined): string {
   return 'gray';
 }
 
-function trackStatusColor(status: 'on' | 'muted' | 'off'): string {
+function audioTrackColor(
+  status: 'live' | 'stale' | 'muted' | 'off',
+): string {
   switch (status) {
-    case 'on':
+    case 'live':
+      return '#0886e7';
+    case 'stale':
+      return '#e7a008'; // amber — connected but not actually flowing
+    case 'muted':
+      return '#e7bb08';
+    case 'off':
+      return 'gray';
+  }
+}
+
+function videoTrackColor(status: 'live' | 'muted' | 'off'): string {
+  switch (status) {
+    case 'live':
       return '#0886e7';
     case 'muted':
       return '#e7bb08';

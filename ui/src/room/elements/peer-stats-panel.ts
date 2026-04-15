@@ -30,7 +30,7 @@ export class PeerStatsPanel extends LitElement {
   private _lastRtt: number | null = null;
   private _lastJitter: number | null = null;
   private _lastLoss: number | null = null;
-  private _lastFlow: 'both' | 'tx' | 'rx' | 'idle' = 'idle';
+  private _lastFlow: 'both' | 'tx' | 'rx' | 'idle' | 'muted' = 'idle';
 
   static styles = css`
     :host {
@@ -70,9 +70,12 @@ export class PeerStatsPanel extends LitElement {
       this._lastFlow === 'both' ? '⇅'
       : this._lastFlow === 'tx' ? '↑'
       : this._lastFlow === 'rx' ? '↓'
+      : this._lastFlow === 'muted' ? '∅'
       : '·';
     const flowColor =
-      this._lastFlow === 'idle' ? '#e07070' : '#7adc7a';
+      this._lastFlow === 'idle' ? '#e07070'
+      : this._lastFlow === 'muted' ? '#c3c9eb'
+      : '#7adc7a';
     return html`
       <div class="panel">
         <span class="carrier">${carrier}</span>
@@ -80,6 +83,7 @@ export class PeerStatsPanel extends LitElement {
           this._lastFlow === 'both' ? 'transmitting & receiving'
           : this._lastFlow === 'tx' ? 'transmitting'
           : this._lastFlow === 'rx' ? 'receiving'
+          : this._lastFlow === 'muted' ? 'peer is muted'
           : 'idle'
         }">${flowGlyph}</span>
         <span><span class="label">rtt</span> <span class="value">${fmt(this._lastRtt, 'ms')}</span></span>
@@ -139,8 +143,14 @@ export class PeerStatsPanel extends LitElement {
       rx = !!conn?.audio;
       tx = !!conn?.connected;
     }
-    const flow: 'both' | 'tx' | 'rx' | 'idle' =
+    let flow: 'both' | 'tx' | 'rx' | 'idle' | 'muted' =
       tx && rx ? 'both' : tx ? 'tx' : rx ? 'rx' : 'idle';
+    // Idle silence is misleading when the silence is intentional. The
+    // muted glyph wins over idle but never over actual flow.
+    if (flow === 'idle') {
+      const link = this.streamsStore.audioLinkFor(this.agentPubKeyB64);
+      if (link === 'muted') flow = 'muted';
+    }
 
     if (
       carrier !== this._lastCarrier ||

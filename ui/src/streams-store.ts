@@ -30,6 +30,9 @@ import {
   ModuleStateEnvelope,
   StoreEventPayload,
   StreamAndTrackInfo,
+  AudioLinkState,
+  LastSeenBucket,
+  PeerLinkSnapshot,
 } from './types';
 import { getModule } from './room/modules/registry';
 import {
@@ -1257,6 +1260,11 @@ export class StreamsStore {
          * How they perceive our stream
          */
         perceivedStreamInfo?: StreamAndTrackInfo;
+        /**
+         * Their per-peer snapshot of every other agent's audio link state.
+         * Drives the pair-wise indicators in the details overlay.
+         */
+        peerLinks?: Record<AgentPubKeyB64, PeerLinkSnapshot>;
       }
     >
   > = writable({});
@@ -1381,6 +1389,166 @@ export class StreamsStore {
   }
 
   /**
+   * Freshness bucket for the last pong we received from a peer. Thresholds
+   * match `lastSeenToColor` in agent-connection-status-icon.ts so broadcast
+   * and locally-rendered dots pick the same bucket.
+   */
+  lastSeenBucket(peerB64: AgentPubKeyB64): LastSeenBucket {
+    const known = get(this._knownAgents)[peerB64];
+    if (!known || typeof known.lastSeen !== 'number') return 'unknown';
+    const age = Date.now() - known.lastSeen;
+    if (age < 15_000) return 'fresh';
+    if (age < 30_000) return 'stale';
+    return 'gone';
+  }
+
+  /**
+   * Roll-up audio link state from this agent's local observations of the
+   * given peer. Parallel FSM to `ConnectionStatus`: that one answers "what
+   * stage is the WebRTC negotiation in?" — this one answers "can I hear
+   * this peer right now, and via what carrier?"
+   */
+  audioLinkFor(peerB64: AgentPubKeyB64): AudioLinkState {
+    if (get(this.blockedAgents).includes(peerB64)) return 'blocked';
+
+    const bucket = this.lastSeenBucket(peerB64);
+    if (bucket === 'gone' || bucket === 'unknown') return 'absent';
+
+    const conn = get(this._openConnections)[peerB64];
+    const status = get(this._connectionStatuses)[peerB64];
+
+    // Active flow takes precedence over everything else: if audio is
+    // actually arriving, the link is working regardless of any stale
+    // intent or status flags.
+    const webrtcAudioLive =
+      !!conn?.connected &&
+      !!conn?.audio &&
+      (this._staleCycles[peerB64]?.audio ?? 0) < 2;
+    if (webrtcAudioLive) return 'webrtc';
+
+    const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
+    const signalsLive = !!lastRecv && Date.now() - lastRecv < 2000;
+    if (signalsLive) return 'signals';
+
+    // No flow. Peer intent comes BEFORE the negotiation check: a stale
+    // ConnectionStatus stuck in InitSent/AcceptSent (e.g. left over from
+    // before webrtc was globally disabled) would otherwise mask the fact
+    // that the peer is intentionally muted. Muted is the more accurate
+    // answer when both could apply.
+    const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
+    if (peerConv) {
+      const payload = parseConversationPayload(peerConv);
+      if (payload?.micMuted) return 'muted';
+    }
+
+    // Genuine in-progress negotiation (no flow, peer not muted).
+    if (status) {
+      switch (status.type) {
+        case 'AwaitingInit':
+        case 'InitSent':
+        case 'AcceptSent':
+        case 'SdpExchange':
+          return 'negotiating';
+        default:
+          break;
+      }
+    }
+
+    // Reachable, not muted, no flow and not negotiating — broken.
+    return 'down';
+  }
+
+  /**
+   * Build the pair-wise snapshot broadcast in pong metadata so every peer
+   * can render "how I see each other agent."
+   */
+  peerLinkFor(peerB64: AgentPubKeyB64): PeerLinkSnapshot {
+    const conn = get(this._openConnections)[peerB64];
+    const audioLink = this.audioLinkFor(peerB64);
+
+    let carrier: PeerLinkSnapshot['carrier'];
+    if (audioLink === 'webrtc') carrier = 'webrtc';
+    else if (audioLink === 'signals') carrier = 'signals';
+    else if (conn?.connected) carrier = 'webrtc';
+    else carrier = 'none';
+
+    let audio: PeerLinkSnapshot['audio'];
+    if (audioLink === 'webrtc' || audioLink === 'signals') audio = 'live';
+    else if (audioLink === 'muted') audio = 'muted';
+    else if (conn?.connected && conn.audio) audio = 'stale';
+    else audio = 'off';
+
+    const video: PeerLinkSnapshot['video'] = conn?.video
+      ? 'live'
+      : conn?.videoMuted
+        ? 'muted'
+        : 'off';
+
+    return {
+      audioLink,
+      carrier,
+      audio,
+      video,
+      lastSeen: this.lastSeenBucket(peerB64),
+    };
+  }
+
+  /**
+   * Set of agents anyone (me or any peer with a fresh broadcast) reports
+   * as currently present in the room. Drives the icon list in the
+   * connection-details overlay so that:
+   *
+   *   - An agent first noticed by some other peer pops onto everyone's
+   *     list immediately, without waiting for our own ping cycle.
+   *   - An agent nobody sees is hidden entirely rather than lingering as
+   *     a "not in room" entry on every tile.
+   *
+   * Per-tile rendering still asks "does THIS observer see them?" — that
+   * gates the audio/video icons and ring color.
+   */
+  globalPresenceSet(): Set<AgentPubKeyB64> {
+    const out = new Set<AgentPubKeyB64>();
+    // We know we're here. Including self matters because peer tiles need
+    // to render their observer's view of US — the icon strip on Gaston's
+    // tile must include me. Excluding self happens at the per-tile level
+    // (drop the observer from each tile's iteration), not here.
+    out.add(this.myPubKeyB64);
+    // My own active agents.
+    for (const k of Object.keys(get(this._activeAgents))) {
+      out.add(k);
+    }
+    // Anyone any fresh observer reports as present (lastSeen bucket
+    // 'fresh' or 'stale' in their broadcast peerLinks).
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
+        if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
+          out.add(peerKey);
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Build the full peerLinks map that goes into a pong — one snapshot per
+   * known agent including the recipient (so they can render "how X sees
+   * me" with the same pair-wise path as any other pair). Excludes only
+   * self.
+   */
+  private _buildPeerLinks(): Record<AgentPubKeyB64, PeerLinkSnapshot> {
+    const out: Record<AgentPubKeyB64, PeerLinkSnapshot> = {};
+    const known = get(this._knownAgents);
+    for (const pubkey of Object.keys(known)) {
+      if (pubkey === this.myPubKeyB64) continue;
+      out[pubkey] = this.peerLinkFor(pubkey);
+    }
+    return out;
+  }
+
+  /**
    * Toggle a peer in/out of our `disableWebrtcWith` list and broadcast
    * the updated conversation module payload. When a peer is added, the
    * retry loop stops initiating WebRTC for them and the conversation
@@ -1410,7 +1578,46 @@ export class StreamsStore {
 
     if (idx < 0) {
       this.disconnectFromPeerVideo(peerB64);
+      this._clearPendingWebrtcStatus(peerB64);
     }
+  }
+
+  /**
+   * Force a peer's WebRTC `ConnectionStatus` to `Disconnected` if it is
+   * currently in any negotiation phase. The close handler clears Connected
+   * statuses on its own; pending Init/Accept/SDP states have no equivalent
+   * teardown event, so they otherwise persist forever once webrtc is
+   * disabled — leaving `audioLinkFor` to misreport "negotiating" when the
+   * link is actually permanently down by intent.
+   */
+  _clearPendingWebrtcStatus(peerB64?: AgentPubKeyB64): void {
+    const isPending = (s: ConnectionStatus | undefined) =>
+      !!s &&
+      (s.type === 'AwaitingInit' ||
+        s.type === 'InitSent' ||
+        s.type === 'AcceptSent' ||
+        s.type === 'SdpExchange');
+
+    this._connectionStatuses.update(curr => {
+      if (peerB64) {
+        if (isPending(curr[peerB64])) curr[peerB64] = { type: 'Disconnected' };
+      } else {
+        for (const k of Object.keys(curr)) {
+          if (isPending(curr[k])) curr[k] = { type: 'Disconnected' };
+        }
+      }
+      return curr;
+    });
+    this._pendingInits = peerB64
+      ? Object.fromEntries(
+          Object.entries(this._pendingInits).filter(([k]) => k !== peerB64),
+        )
+      : {};
+    this._pendingAccepts = peerB64
+      ? Object.fromEntries(
+          Object.entries(this._pendingAccepts).filter(([k]) => k !== peerB64),
+        )
+      : {};
   }
 
   /**
@@ -2432,6 +2639,7 @@ export class StreamsStore {
             ? get(this._screenShareConnectionStatuses)
             : undefined,
           knownAgents: get(this._knownAgents),
+          peerLinks: this._buildPeerLinks(),
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[agentB64]?.audio,
@@ -3019,6 +3227,7 @@ export class StreamsStore {
             ? get(this._screenShareConnectionStatuses)
             : undefined,
           knownAgents: get(this._knownAgents),
+          peerLinks: this._buildPeerLinks(),
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[pubkeyB64]?.audio,
@@ -3090,7 +3299,9 @@ export class StreamsStore {
       event: 'PeerLeave',
     });
 
-    // Clear lastSeen so agent immediately drops from _activeAgents (pane removal)
+    // Clear lastSeen so agent immediately drops from _activeAgents (pane
+    // removal). Same observable as "never joined" — both surface as
+    // `absent` from this observer's view.
     this._knownAgents.update(agents => {
       if (agents[pubkeyB64]) {
         agents[pubkeyB64] = { ...agents[pubkeyB64], lastSeen: undefined };
@@ -3199,6 +3410,7 @@ export class StreamsStore {
           screenShareStatuses: metaData.data.screenShareConnectionStatuses,
           knownAgents: metaData.data.knownAgents,
           perceivedStreamInfo: metaData.data.streamInfo,
+          peerLinks: metaData.data.peerLinks,
         };
         return statuses;
       });

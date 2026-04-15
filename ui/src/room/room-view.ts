@@ -764,6 +764,9 @@ export class RoomView extends LitElement {
                     this.streamsStore.disconnectFromPeerVideo(pubKeyB64);
                   }
                   this.streamsStore.videoOff();
+                  // Clear any peers that were stuck mid-negotiation; the
+                  // close handler only fires for actually-open connections.
+                  this.streamsStore._clearPendingWebrtcStatus();
                   await this.streamsStore._syncConversationPayload({ webrtcDisabled: true });
                   this.requestUpdate();
                 }}
@@ -2143,14 +2146,50 @@ export class RoomView extends LitElement {
       this.roomStore.client.client.myPubKey
     );
 
-    const nConnections = Object.values(connectionStatuses).filter(
-      status => status.type === 'Connected'
-    ).length;
+    // Observer's broadcast per-peer link snapshots (or undefined for
+    // my-video / my-screen-share where the observer is us).
+    const observerLinks: Record<AgentPubKeyB64, import('../types').PeerLinkSnapshot> | undefined =
+      type === 'my-video' || type === 'my-screen-share'
+        ? undefined
+        : this._othersConnectionStatuses.value[pubkeyb64!]?.peerLinks;
 
-    // if the info is older than >2.8 PING_INTERVAL, show the info opaque to indicated that it's outdated
-    const sortedStatuses = Object.entries(connectionStatuses).sort(
-      sortConnectionStatuses
-    );
+    // Count peers this observer can actually hear — AudioLink ∈
+    // {webrtc, signals}. Replaces the old WebRTC-Connected count, which
+    // undercounted signals-only peers and overcounted connected-but-silent
+    // links.
+    const audibleCount = (() => {
+      if (type === 'my-video') {
+        return Object.keys(connectionStatuses).filter(pk => {
+          const s = this.streamsStore.audioLinkFor(pk);
+          return s === 'webrtc' || s === 'signals';
+        }).length;
+      }
+      if (observerLinks) {
+        return Object.values(observerLinks).filter(
+          l => l.audioLink === 'webrtc' || l.audioLink === 'signals',
+        ).length;
+      }
+      return Object.values(connectionStatuses).filter(
+        s => s.type === 'Connected',
+      ).length;
+    })();
+
+    // Iteration set is the global presence union, with the observer
+    // themselves removed — an icon strip is "this observer's view of
+    // OTHERS", so the observer's own pubkey would render as e.g.
+    // "Gaston (Disconnected from Gaston)", which is meaningless.
+    const observerPubKey: AgentPubKeyB64 | undefined =
+      type === 'my-video' || type === 'my-screen-share'
+        ? myPubKeyB64
+        : pubkeyb64;
+    const presenceSet = this.streamsStore.globalPresenceSet();
+    const sortedStatuses = Array.from(presenceSet)
+      .filter(pk => pk !== observerPubKey)
+      .map(pk => [
+        pk,
+        connectionStatuses[pk] ?? { type: 'Disconnected' },
+      ] as [AgentPubKeyB64, import('../types').ConnectionStatus])
+      .sort(sortConnectionStatuses);
     return html`
       <div class="row" style="align-items: center; flex-wrap: wrap; line-height: 1;">
         ${repeat(
@@ -2169,31 +2208,71 @@ export class RoomView extends LitElement {
               ? knownAgents[innerPubkey]?.lastSeen
               : undefined;
 
-            // Determine track status for this avatar
-            let audioStatus: 'on' | 'muted' | 'off' | undefined;
-            let videoStatus: 'on' | 'muted' | 'off' | undefined;
+            // Pair-wise (observer, observed) link. For my-video the
+            // observer is us — derive locally. For peer tiles, read the
+            // observer's broadcast peerLinks. Falls back to the
+            // perceivedStreamInfo-based derivation only when the observer
+            // is on older code and never broadcasts peerLinks.
+            let audioStatus:
+              | 'live'
+              | 'stale'
+              | 'muted'
+              | 'off'
+              | undefined;
+            let videoStatus: 'live' | 'muted' | 'off' | undefined;
+            let audioCarrier:
+              | 'webrtc'
+              | 'signals'
+              | 'none'
+              | undefined;
+            let audioLink: import('../types').AudioLinkState | undefined;
+            let lastSeenBucket:
+              | import('../types').LastSeenBucket
+              | undefined;
 
             if (type === 'my-video') {
-              // Our tile: show what we receive from each peer
-              const conn = this._openConnections.value[innerPubkey];
-              if (conn?.connected) {
-                audioStatus = conn.audio ? 'on' : 'off';
-                videoStatus = conn.video
-                  ? 'on'
-                  : conn.videoMuted
-                    ? 'muted'
-                    : 'off';
+              const snap = this.streamsStore.peerLinkFor(innerPubkey);
+              audioStatus = snap.audio;
+              videoStatus = snap.video;
+              audioCarrier = snap.carrier;
+              audioLink = snap.audioLink;
+              lastSeenBucket = this.streamsStore.lastSeenBucket(innerPubkey);
+            } else if (type === 'video') {
+              const snap = observerLinks?.[innerPubkey];
+              if (snap) {
+                audioStatus = snap.audio;
+                videoStatus = snap.video;
+                audioCarrier = snap.carrier;
+                audioLink = snap.audioLink;
+                lastSeenBucket = snap.lastSeen;
+              } else if (innerPubkey === myPubKeyB64) {
+                // Legacy fallback for peers on older code that don't
+                // broadcast peerLinks but do broadcast perceivedStreamInfo.
+                const legacyAudio = streamInfoToTrackStatus(
+                  perceivedStreamInfo,
+                  'audio',
+                );
+                const legacyVideo = streamInfoToTrackStatus(
+                  perceivedStreamInfo,
+                  'video',
+                );
+                audioStatus =
+                  legacyAudio === 'on'
+                    ? 'live'
+                    : legacyAudio === 'muted'
+                      ? 'muted'
+                      : legacyAudio === 'off'
+                        ? 'off'
+                        : undefined;
+                videoStatus =
+                  legacyVideo === 'on'
+                    ? 'live'
+                    : legacyVideo === 'muted'
+                      ? 'muted'
+                      : legacyVideo === 'off'
+                        ? 'off'
+                        : undefined;
               }
-            } else if (type === 'video' && innerPubkey === myPubKeyB64) {
-              // Peer's tile: show how they see OUR stream (only on our avatar)
-              audioStatus = streamInfoToTrackStatus(
-                perceivedStreamInfo,
-                'audio'
-              );
-              videoStatus = streamInfoToTrackStatus(
-                perceivedStreamInfo,
-                'video'
-              );
             }
 
             return html`<agent-connection-status-icon
@@ -2202,17 +2281,21 @@ export class RoomView extends LitElement {
                 : ''}"
               .agentPubKey=${decodeHashFromBase64(innerPubkey)}
               .connectionStatus=${status}
+              .audioLink=${audioLink}
               .onlyToldAbout=${onlyToldAbout}
               .lastSeen=${lastSeen}
+              .lastSeenBucket=${lastSeenBucket}
               .audioStatus=${audioStatus}
               .videoStatus=${videoStatus}
+              .audioCarrier=${audioCarrier}
             ></agent-connection-status-icon>`;
           }
         )}
         <span
           class="tertiary-font"
           style="color: #c3c9eb; font-size: 18px; margin-left: 5px; line-height: 1;"
-          >(${nConnections})</span
+          title="peers I can hear (webrtc + signals)"
+          >(${audibleCount})</span
         >
       </div>
     `;

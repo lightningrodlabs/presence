@@ -101,10 +101,63 @@ export type SharedWalPayload = {
   assetIconSrc?: string;
 };
 
+/**
+ * User-facing per-peer audio link state. Distinct from `ConnectionStatus`
+ * (which is the pure WebRTC negotiation FSM): this rolls up reachability,
+ * WebRTC media liveness, signals-carrier flow, and peer intent into the
+ * single answer "can I hear this peer right now, and over what?"
+ *
+ * Runs in parallel with `ConnectionStatus`; the latter remains the source
+ * of truth for init/accept/SDP state.
+ */
+export type AudioLinkState =
+  /**
+   * From the observer's perspective, the agent is not currently in the
+   * room — no recent pong, regardless of whether they ever joined or
+   * intentionally left. Both cases collapse here because the user-facing
+   * answer is the same: this observer doesn't see them.
+   */
+  | 'absent'
+  | 'blocked'
+  | 'negotiating' // webrtc handshaking, no signals fallback flowing yet
+  | 'webrtc' // webrtc connected + recent media
+  | 'signals' // voice frames arriving via signals carrier
+  | 'muted' // peer reachable but intentionally silent
+  | 'down' // reachable, not muted, no working audio path
+  | 'unknown';
+
+/**
+ * Discrete freshness bucket for "last time I heard from this peer via
+ * signals." Broadcast instead of an absolute timestamp so clock skew
+ * between observers does not flip the color.
+ */
+export type LastSeenBucket = 'fresh' | 'stale' | 'gone' | 'unknown';
+
+/**
+ * One observer's snapshot of a single other peer's audio/video link state.
+ * Broadcast inside `PongMetaDataV1.peerLinks` so every peer can render
+ * "how X sees Y" — the pair-wise information that makes the details
+ * overlay genuinely relational rather than a repetition of the local
+ * view on each tile.
+ */
+export type PeerLinkSnapshot = {
+  audioLink: AudioLinkState;
+  carrier: 'webrtc' | 'signals' | 'none';
+  audio: 'live' | 'stale' | 'muted' | 'off';
+  video: 'live' | 'muted' | 'off';
+  lastSeen: LastSeenBucket;
+};
+
 export type PongMetaDataV1 = {
   connectionStatuses: ConnectionStatuses;
   screenShareConnectionStatuses?: ConnectionStatuses;
   knownAgents?: Record<AgentPubKeyB64, AgentInfo>;
+  /**
+   * Per-peer observation snapshot from this sender's perspective. Key is
+   * the observed peer's pubkey. Enables pair-wise UI ("X can't hear Y")
+   * without N² broadcasts — piggybacks on the existing pong.
+   */
+  peerLinks?: Record<AgentPubKeyB64, PeerLinkSnapshot>;
   appVersion?: string;
   /**
    * Echo of the t0 timestamp from the Ping that triggered this Pong.
