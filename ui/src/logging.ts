@@ -99,13 +99,26 @@ export type SimpleEventType =
   | 'StreamReceived'
   | 'StaleCleanup'
   | 'SdpTimeout'
-  | 'PeerLeave';
+  | 'PeerLeave'
+  // Carrier (WebRTC ↔ signals) transition for a given peer's audio.
+  | 'CarrierSwitch'
+  // Bucketed change in (carrier, rtt-bucket, loss-bucket). Emitted only
+  // when the bucket actually changes, so the log volume scales with
+  // real quality changes rather than poll rate.
+  | 'QualityBucketChange'
+  // Local intent: this agent explicitly disabled / re-enabled WebRTC.
+  // Scope is carried in `detail` ("global" or "per-peer"). For per-peer
+  // events, `agent` is the affected peer; for global events it's self.
+  | 'MyWebrtcDisable'
+  | 'MyWebrtcEnable';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
   timestamp: number;
   event: SimpleEventType;
   connectionId?: string;
+  /** Short human-readable summary. Ignored by older log readers. */
+  detail?: string;
 };
 
 export type PresenceLogEvent =

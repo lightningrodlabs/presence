@@ -764,6 +764,12 @@ export class RoomView extends LitElement {
                   // via signals carrier.
                   this.streamsStore.webrtcGloballyDisabled = true;
                   window.localStorage.setItem('disableAllWebrtc', 'true');
+                  this.streamsStore.logger.logAgentEvent({
+                    agent: this.streamsStore.myPubKeyB64,
+                    timestamp: Date.now(),
+                    event: 'MyWebrtcDisable',
+                    detail: 'global',
+                  });
                   const openConns = this._openConnections.value || {};
                   for (const pubKeyB64 of Object.keys(openConns)) {
                     this.streamsStore.disconnectFromPeerVideo(pubKeyB64);
@@ -779,6 +785,12 @@ export class RoomView extends LitElement {
                   // Re-enable WebRTC. Broadcast so peers resume init.
                   this.streamsStore.webrtcGloballyDisabled = false;
                   window.localStorage.removeItem('disableAllWebrtc');
+                  this.streamsStore.logger.logAgentEvent({
+                    agent: this.streamsStore.myPubKeyB64,
+                    timestamp: Date.now(),
+                    event: 'MyWebrtcEnable',
+                    detail: 'global',
+                  });
                   await this.streamsStore._syncConversationPayload({ webrtcDisabled: false });
                   this.requestUpdate();
                 }}

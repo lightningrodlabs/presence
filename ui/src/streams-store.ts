@@ -633,6 +633,12 @@ export class StreamsStore {
     if (this.webrtcGloballyDisabled) {
       this.webrtcGloballyDisabled = false;
       window.localStorage.removeItem('disableAllWebrtc');
+      this.logger.logAgentEvent({
+        agent: this.myPubKeyB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcEnable',
+        detail: 'global (implicit: videoOn)',
+      });
       await this._syncConversationPayload({ webrtcDisabled: false });
     }
     const deviceId = get(this._videoInputId);
@@ -1666,9 +1672,21 @@ export class StreamsStore {
     if (idx >= 0) {
       payload.disableWebrtcWith = payload.disableWebrtcWith.filter(p => p !== peerB64);
       console.log(`toggleDisableWebrtc: re-enabled WebRTC for ${peerB64.slice(0, 8)}`);
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcEnable',
+        detail: 'per-peer',
+      });
     } else {
       payload.disableWebrtcWith = [...payload.disableWebrtcWith, peerB64];
       console.log(`toggleDisableWebrtc: disabled WebRTC for ${peerB64.slice(0, 8)}`);
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcDisable',
+        detail: 'per-peer',
+      });
     }
 
     await this._syncConversationPayload(payload);
@@ -1777,6 +1795,14 @@ export class StreamsStore {
    * from jitter on individual ping/pong round trips.
    */
   private _signalsRttEwma = new Map<string, number>();
+
+  /**
+   * Last-emitted quality bucket per peer, keyed by pubKeyB64. Value is
+   * a stable string like `"webrtc:ok:clean"`. Used to dedupe so that
+   * QualityBucketChange events only fire when the bucket actually changes
+   * rather than every poll cycle.
+   */
+  private _lastQualityBucket = new Map<string, string>();
 
   /**
    * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
@@ -2280,6 +2306,17 @@ export class StreamsStore {
         event: 'Connected',
         connectionId,
       });
+      // Audio carrier just flipped from signals → webrtc for this peer.
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: 'CarrierSwitch',
+        connectionId,
+        detail: 'signals->webrtc',
+      });
+      // Reset the quality bucket so the first webrtc stats sample is
+      // recorded (its bucket will differ from the old signals bucket).
+      this._lastQualityBucket.delete(pubKeyB64);
 
       delete this._pendingInits[pubKeyB64];
 
@@ -2357,12 +2394,29 @@ export class StreamsStore {
     peer.on('close', async () => {
       console.log('#### GOT CLOSE EVENT ####');
 
+      // If this peer was actually the audio carrier (i.e. the connection
+      // had fully connected), closing it flips the carrier back to
+      // signals. Connections that never reached `connected` were still
+      // on signals the whole time, so skip the switch event then.
+      const closingConn = get(this._openConnections)[pubKeyB64];
+      const wasWebrtcCarrier = !!closingConn?.connected;
+
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'SimplePeerClose',
         connectionId,
       });
+      if (wasWebrtcCarrier) {
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'CarrierSwitch',
+          connectionId,
+          detail: 'webrtc->signals',
+        });
+      }
+      this._lastQualityBucket.delete(pubKeyB64);
       this._lastDisconnectTime[pubKeyB64] = Date.now();
 
       // Remove from existing streams
@@ -3093,6 +3147,68 @@ export class StreamsStore {
   }
 
   /**
+   * Bucket RTT and loss into coarse human-scale bands. The goal is
+   * log compression: every poll cycle the raw numbers wiggle, but the
+   * bucket changes only when quality actually shifts category. RTT bands
+   * are tuned for voice — >200ms is where duplex conversation starts to
+   * feel laggy; >400ms is walkie-talkie territory. Loss bands match the
+   * points where Opus concealment starts to be audible (1%) and where
+   * most listeners will complain (3%).
+   */
+  private _qualityBucket(
+    carrier: 'webrtc' | 'signals',
+    rttMs: number | null,
+    lossPercent: number | null,
+  ): string {
+    const rttBand =
+      rttMs === null ? 'unknown'
+      : rttMs <= 80 ? 'good'
+      : rttMs <= 200 ? 'ok'
+      : rttMs <= 400 ? 'poor'
+      : 'bad';
+    const lossBand =
+      lossPercent === null ? 'unknown'
+      : lossPercent < 1 ? 'clean'
+      : lossPercent <= 3 ? 'mild'
+      : 'lossy';
+    return `${carrier}:${rttBand}:${lossBand}`;
+  }
+
+  /**
+   * Emit a QualityBucketChange event iff the (carrier, rtt-band, loss-band)
+   * tuple for this peer has changed since the last emission. Called from
+   * both the WebRTC stats poll and the pong handler — whichever carrier is
+   * currently active drives the emission. Skip the initial transition from
+   * `unknown`-only buckets to avoid a spurious event on first sample.
+   */
+  private _maybeEmitQualityChange(
+    pubKeyB64: AgentPubKeyB64,
+    carrier: 'webrtc' | 'signals',
+    rttMs: number | null,
+    jitterMs: number | null,
+    lossPercent: number | null,
+  ) {
+    const bucket = this._qualityBucket(carrier, rttMs, lossPercent);
+    const last = this._lastQualityBucket.get(pubKeyB64);
+    if (bucket === last) return;
+    this._lastQualityBucket.set(pubKeyB64, bucket);
+    // Don't emit before we have any signal at all — a transition from
+    // (no data) to (no data) on carrier flip is not interesting.
+    if (rttMs === null && lossPercent === null) return;
+    const detail =
+      `${bucket}` +
+      (rttMs !== null ? ` rtt=${rttMs}ms` : '') +
+      (jitterMs !== null ? ` jit=${jitterMs}ms` : '') +
+      (lossPercent !== null ? ` loss=${lossPercent}%` : '');
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: Date.now(),
+      event: 'QualityBucketChange',
+      detail,
+    });
+  }
+
+  /**
    * Checks inbound RTP bytesReceived for each open connection.
    * If bytes haven't increased for 2+ consecutive cycles (4+ seconds at 2s ping interval),
    * the track is considered dead and we request the sender to refresh via data channel.
@@ -3166,15 +3282,24 @@ export class StreamsStore {
           : (hasVideo ? videoPacketsLost : 0);
         const totalPackets = pktsRecv + pktsLost;
 
+        const jitterRounded = jitter !== null
+          ? Math.round((jitter as number) * 1000 * 10) / 10
+          : null;
+        const lossRounded = totalPackets > 0
+          ? Math.round((pktsLost / totalPackets) * 1000) / 10
+          : null;
         this.webrtcStats.set(pubKeyB64, {
           rttMs,
-          jitterMs: jitter !== null
-            ? Math.round((jitter as number) * 1000 * 10) / 10
-            : null,
-          lossPercent: totalPackets > 0
-            ? Math.round((pktsLost / totalPackets) * 1000) / 10
-            : null,
+          jitterMs: jitterRounded,
+          lossPercent: lossRounded,
         });
+        this._maybeEmitQualityChange(
+          pubKeyB64,
+          'webrtc',
+          rttMs,
+          jitterRounded,
+          lossRounded,
+        );
 
         const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
         const stale = this._staleCycles[pubKeyB64] || { audio: 0, video: 0 };
@@ -3395,6 +3520,7 @@ export class StreamsStore {
       timestamp: Date.now(),
       event: 'PeerLeave',
     });
+    this._lastQualityBucket.delete(pubkeyB64);
 
     // Clear lastSeen so agent immediately drops from _activeAgents (pane
     // removal). Same observable as "never joined" — both surface as
@@ -3492,6 +3618,19 @@ export class StreamsStore {
           };
           existing.rttMs = next;
           this.signalsStats.set(pubkeyB64, existing);
+          // Only evaluate bucket on the signals path if signals is the
+          // active carrier for this peer — otherwise the webrtc poll is
+          // the source of truth and will emit if bucket changes.
+          const openConn = get(this._openConnections)[pubkeyB64];
+          if (!openConn?.connected) {
+            this._maybeEmitQualityChange(
+              pubkeyB64,
+              'signals',
+              existing.rttMs,
+              existing.jitterMs,
+              existing.lossPercent,
+            );
+          }
         }
       } else {
         // Peer on old code — their pong doesn't echo pingT0 yet.
