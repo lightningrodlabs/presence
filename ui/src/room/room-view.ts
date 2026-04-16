@@ -2286,11 +2286,19 @@ export class RoomView extends LitElement {
           ([pubkeyb64, _status]) => pubkeyb64,
           ([innerPubkey, status]) => {
             // Check whether the agent for which the statuses are rendered has only been told by others that
-            // the rendered agent exists
+            // the rendered agent exists. `type === 'told'` alone is insufficient:
+            // per types.ts AgentInfo, 'told' also covers "received a Pong from
+            // that agent themselves" — so it stays 'told' forever once we've
+            // had direct contact. Gate on `lastSeen === undefined` so the
+            // indicator clears as soon as a direct pong arrives (pong handler
+            // in streams-store stamps `lastSeen = Date.now()`; agents learned
+            // only via another peer's knownAgents metadata are written with
+            // `lastSeen: undefined`).
             const onlyToldAbout = !!(
               knownAgents &&
               knownAgents[innerPubkey] &&
-              knownAgents[innerPubkey].type === 'told'
+              knownAgents[innerPubkey].type === 'told' &&
+              knownAgents[innerPubkey].lastSeen === undefined
             );
 
             const lastSeen = knownAgents
