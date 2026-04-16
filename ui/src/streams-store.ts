@@ -595,6 +595,9 @@ export class StreamsStore {
 
     // Health check for dead tracks (bytesReceived stall detection)
     await this._checkTrackHealth();
+
+    // Scan for sustained audibility outages with a relay opportunity
+    this._checkAudibilityOutages();
   }
 
   async changeVideoInput(deviceId: string) {
@@ -1803,6 +1806,17 @@ export class StreamsStore {
    * rather than every poll cycle.
    */
   private _lastQualityBucket = new Map<string, string>();
+
+  /**
+   * Per-peer audibility-outage tracking. When our audioLink to this peer
+   * has been 'down' or 'negotiating' for ≥ OUTAGE_THRESHOLD_MS, *and* some
+   * third peer reports being audible to that target, we emit an
+   * AudibilityOutageStart event. The `emitted` flag guards against
+   * multiple Starts per outage and tells the End side whether to fire on
+   * recovery. Populated / drained by `_checkAudibilityOutages` on the
+   * 2s ping tick.
+   */
+  private _outageStates = new Map<string, { startedAt: number; emitted: boolean }>();
 
   /**
    * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
@@ -3209,6 +3223,80 @@ export class StreamsStore {
   }
 
   /**
+   * Scan every peer in the presence set for sustained audibility outages.
+   * The condition is: our audioLinkFor(peer) has been in 'down' or
+   * 'negotiating' for ≥30s AND at least one other peer's broadcast
+   * peerLinks reports *they* are audible to that same peer (webrtc or
+   * signals). That's the "a relay could fix this" signal — we skip
+   * flagging outages where no relay opportunity exists (the peer is
+   * actually unreachable from everyone, or we're the only observer).
+   *
+   * Called from pingAgents() every PING_INTERVAL (2s). The 30s threshold
+   * means a Start event fires no sooner than ~3 poll cycles after the
+   * link first goes bad. End fires on any transition back to an audible
+   * state ('webrtc', 'signals', 'muted', 'blocked', 'absent').
+   */
+  private _checkAudibilityOutages(): void {
+    const OUTAGE_THRESHOLD_MS = 30_000;
+    const now = Date.now();
+    const presence = this.globalPresenceSet();
+    const others = get(this._othersConnectionStatuses);
+
+    for (const peerB64 of presence) {
+      if (peerB64 === this.myPubKeyB64) continue;
+
+      const link = this.audioLinkFor(peerB64);
+      const isOutage = link === 'down' || link === 'negotiating';
+      const state = this._outageStates.get(peerB64);
+
+      if (isOutage) {
+        if (!state) {
+          this._outageStates.set(peerB64, { startedAt: now, emitted: false });
+          continue;
+        }
+        if (state.emitted) continue;
+        if (now - state.startedAt < OUTAGE_THRESHOLD_MS) continue;
+
+        // Relay opportunity: does any third peer report they can hear
+        // this target right now?
+        let relayVia: AgentPubKeyB64 | undefined;
+        for (const [otherB64, entry] of Object.entries(others)) {
+          if (otherB64 === this.myPubKeyB64 || otherB64 === peerB64) continue;
+          const theirView = entry.peerLinks?.[peerB64];
+          if (
+            theirView &&
+            (theirView.audioLink === 'webrtc' || theirView.audioLink === 'signals')
+          ) {
+            relayVia = otherB64;
+            break;
+          }
+        }
+        if (!relayVia) continue;
+
+        state.emitted = true;
+        const durationSec = Math.floor((now - state.startedAt) / 1000);
+        this.logger.logAgentEvent({
+          agent: peerB64,
+          timestamp: now,
+          event: 'AudibilityOutageStart',
+          detail: `${link} ${durationSec}s; relay-via=${relayVia.slice(0, 8)}`,
+        });
+      } else if (state) {
+        if (state.emitted) {
+          const durationSec = Math.floor((now - state.startedAt) / 1000);
+          this.logger.logAgentEvent({
+            agent: peerB64,
+            timestamp: now,
+            event: 'AudibilityOutageEnd',
+            detail: `${durationSec}s; recovered via ${link}`,
+          });
+        }
+        this._outageStates.delete(peerB64);
+      }
+    }
+  }
+
+  /**
    * Checks inbound RTP bytesReceived for each open connection.
    * If bytes haven't increased for 2+ consecutive cycles (4+ seconds at 2s ping interval),
    * the track is considered dead and we request the sender to refresh via data channel.
@@ -3521,6 +3609,20 @@ export class StreamsStore {
       event: 'PeerLeave',
     });
     this._lastQualityBucket.delete(pubkeyB64);
+    // If we were mid-outage for this peer, close it out — the peer is
+    // gone, not silently unreachable. Wouldn't fire via _checkAudibilityOutages
+    // because peer drops from the presence set on next tick.
+    const outage = this._outageStates.get(pubkeyB64);
+    if (outage?.emitted) {
+      const durationSec = Math.floor((Date.now() - outage.startedAt) / 1000);
+      this.logger.logAgentEvent({
+        agent: pubkeyB64,
+        timestamp: Date.now(),
+        event: 'AudibilityOutageEnd',
+        detail: `${durationSec}s; peer left`,
+      });
+    }
+    this._outageStates.delete(pubkeyB64);
 
     // Clear lastSeen so agent immediately drops from _activeAgents (pane
     // removal). Same observable as "never joined" — both surface as

@@ -110,7 +110,13 @@ export type SimpleEventType =
   // Scope is carried in `detail` ("global" or "per-peer"). For per-peer
   // events, `agent` is the affected peer; for global events it's self.
   | 'MyWebrtcDisable'
-  | 'MyWebrtcEnable';
+  | 'MyWebrtcEnable'
+  // Audibility outage: our audioLink to this peer has been 'down' or
+  // stuck 'negotiating' for ≥ a threshold, AND some third peer reports
+  // being audible to the same target. Signals "relay opportunity" —
+  // a signals-layer forwarder could rescue this link.
+  | 'AudibilityOutageStart'
+  | 'AudibilityOutageEnd';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
