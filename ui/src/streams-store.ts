@@ -2313,6 +2313,29 @@ export class StreamsStore {
       }
     });
     peer.on('connect', async () => {
+      // Supersede guard: if a newer PeerConnection for this peer has
+      // already taken the _openConnections slot, we are a zombie that
+      // happened to complete ICE. Mutating shared state here would
+      // falsely mark the NEW connection as connected and addStream into
+      // the wrong peer. Log the skip for forensics and bail.
+      const currentOnConnect = get(this._openConnections)[pubKeyB64];
+      if (currentOnConnect && currentOnConnect.connectionId !== connectionId) {
+        this.logger.logCustomMessage(
+          `Superseded connect [${pubKeyB64.slice(0, 8)}]: ` +
+            `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnConnect.connectionId.slice(0, 8)} ` +
+            `— skipping (would have: marked connected=true, addStream'd mainStream, ` +
+            `fired peer-connected, set ConnectionStatus=Connected, logged CarrierSwitch signals->webrtc)`
+        );
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededConnect',
+          connectionId,
+          detail: `superseded-by=${currentOnConnect.connectionId}`,
+        });
+        peer.destroy();
+        return;
+      }
       console.log('#### CONNECTED with', pubKeyB64);
       this.logger.logAgentEvent({
         agent: pubKeyB64,
@@ -2408,11 +2431,40 @@ export class StreamsStore {
     peer.on('close', async () => {
       console.log('#### GOT CLOSE EVENT ####');
 
+      // Supersede guard: if the current _openConnections entry for this
+      // peer points at a DIFFERENT connectionId, this closing peer was
+      // already replaced. Running the normal cleanup path would delete
+      // the NEW connection's state (openConnections entry, _videoStreams,
+      // _staleCycles, audio analyser) and fire peer-disconnected on a
+      // live peer. Log what would have happened and bail. The new
+      // connection keeps operating; this peer's resources are already
+      // being freed (peer.destroy on line below is idempotent).
+      const currentOnClose = get(this._openConnections)[pubKeyB64];
+      if (currentOnClose && currentOnClose.connectionId !== connectionId) {
+        this.logger.logCustomMessage(
+          `Superseded close [${pubKeyB64.slice(0, 8)}]: ` +
+            `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnClose.connectionId.slice(0, 8)} ` +
+            `— skipping cleanup (would have: deleted _openConnections entry, deleted _videoStreams, ` +
+            `cleared _lastBytesReceived/_staleCycles/_reconcileAttemptCount, removed audio analyser, ` +
+            `set _lastDisconnectTime, set ConnectionStatus=Disconnected, ` +
+            `torn down outgoing screen share, fired peer-disconnected)`
+        );
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededClose',
+          connectionId,
+          detail: `superseded-by=${currentOnClose.connectionId}`,
+        });
+        peer.destroy();
+        return;
+      }
+
       // If this peer was actually the audio carrier (i.e. the connection
       // had fully connected), closing it flips the carrier back to
       // signals. Connections that never reached `connected` were still
       // on signals the whole time, so skip the switch event then.
-      const closingConn = get(this._openConnections)[pubKeyB64];
+      const closingConn = currentOnClose;
       const wasWebrtcCarrier = !!closingConn?.connected;
 
       this.logger.logAgentEvent({
@@ -2487,6 +2539,31 @@ export class StreamsStore {
     });
     peer.on('error', e => {
       console.log('#### GOT ERROR EVENT ####: ', e);
+
+      // Supersede guard (see peer.on('close') for the full rationale).
+      // An orphaned superseded peer's ICE eventually fails → error fires;
+      // without this guard, the ensuing cleanup would wipe the healthy
+      // new connection's state.
+      const currentOnError = get(this._openConnections)[pubKeyB64];
+      if (currentOnError && currentOnError.connectionId !== connectionId) {
+        this.logger.logCustomMessage(
+          `Superseded error [${pubKeyB64.slice(0, 8)}]: ` +
+            `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnError.connectionId.slice(0, 8)} ` +
+            `err=${e.message || e} — skipping cleanup (would have: deleted _openConnections entry, ` +
+            `deleted _videoStreams, removed audio analyser, torn down outgoing screen share, ` +
+            `set ConnectionStatus=Disconnected, fired peer-disconnected)`
+        );
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededError',
+          connectionId,
+          detail: `superseded-by=${currentOnError.connectionId}; err=${e.message || e}`,
+        });
+        peer.destroy();
+        return;
+      }
+
       peer.destroy();
 
       this.logger.logCustomMessage(
@@ -4199,6 +4276,12 @@ export class StreamsStore {
             );
           }
 
+          // Capture any prior openConnection for this peer so we can
+          // destroy it after installing the new entry. Without this, the
+          // old PC would linger until its own ICE failed, and its close
+          // handler (pre-guard) would wipe the new entry's state.
+          const priorOpenForInitAccept = get(this._openConnections)[pubKey64];
+
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
             openConnections[pubKey64] = {
@@ -4211,6 +4294,30 @@ export class StreamsStore {
             };
             return openConnections;
           });
+
+          // New entry is now installed. If there was a prior open
+          // connection with a different connectionId, destroy it. Its
+          // close handler will fire (possibly synchronously from
+          // destroy()), re-read _openConnections — which now has the new
+          // connectionId — and no-op via the supersede guard.
+          if (
+            priorOpenForInitAccept &&
+            priorOpenForInitAccept.connectionId !== connection_id
+          ) {
+            this.logger.logCustomMessage(
+              `Superseding [${pubKey64.slice(0, 8)}]: destroying prior open ` +
+                `connId=${priorOpenForInitAccept.connectionId.slice(0, 8)} ` +
+                `for new connId=${connection_id.slice(0, 8)} (initiator path)`
+            );
+            this.logger.logAgentEvent({
+              agent: pubKey64,
+              timestamp: Date.now(),
+              event: 'Superseded',
+              connectionId: priorOpenForInitAccept.connectionId,
+              detail: `superseded-by=${connection_id}; path=initiator`,
+            });
+            priorOpenForInitAccept.peer.destroy();
+          }
 
           delete this._pendingInits[pubKey64];
 
@@ -4354,6 +4461,13 @@ export class StreamsStore {
           console.log(
             '#### FOUND PENDING ACCEPT! Moving to open connections...'
           );
+
+          // Capture any prior openConnection so we can destroy it after
+          // installing the new entry. See handleInitAccept comment for
+          // the full rationale (close handler uses the supersede guard
+          // to no-op once the new entry is in place).
+          const priorOpenForSdp = get(this._openConnections)[pubkeyB64];
+
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
             openConnections[pubkeyB64] = {
@@ -4366,6 +4480,26 @@ export class StreamsStore {
             };
             return openConnections;
           });
+
+          if (
+            priorOpenForSdp &&
+            priorOpenForSdp.connectionId !== connection_id
+          ) {
+            this.logger.logCustomMessage(
+              `Superseding [${pubkeyB64.slice(0, 8)}]: destroying prior open ` +
+                `connId=${priorOpenForSdp.connectionId.slice(0, 8)} ` +
+                `for new connId=${connection_id.slice(0, 8)} (acceptor path)`
+            );
+            this.logger.logAgentEvent({
+              agent: pubkeyB64,
+              timestamp: Date.now(),
+              event: 'Superseded',
+              connectionId: priorOpenForSdp.connectionId,
+              detail: `superseded-by=${connection_id}; path=acceptor`,
+            });
+            priorOpenForSdp.peer.destroy();
+          }
+
           const otherPendingAccepts = pendingAcceptsForAgent.filter(
             pendingAccept => pendingAccept.connectionId !== connection_id
           );

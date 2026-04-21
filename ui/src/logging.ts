@@ -116,7 +116,16 @@ export type SimpleEventType =
   // being audible to the same target. Signals "relay opportunity" —
   // a signals-layer forwarder could rescue this link.
   | 'AudibilityOutageStart'
-  | 'AudibilityOutageEnd';
+  | 'AudibilityOutageEnd'
+  // Superseded-connection forensics. When a new RTCPeerConnection takes
+  // the `_openConnections[peer]` slot, the prior PC is orphaned. Its
+  // close/error/connect events still fire later; they must no-op rather
+  // than clobber the new (healthy) connection's state. These events
+  // record what was skipped so log analysis retains full visibility.
+  | 'Superseded'          // write-side: prior conn destroyed at supersede
+  | 'SupersededClose'     // read-side: 'close' fired on a superseded peer
+  | 'SupersededError'     // read-side: 'error' fired on a superseded peer
+  | 'SupersededConnect';  // read-side: 'connect' fired on a superseded peer
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
