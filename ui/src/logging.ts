@@ -99,13 +99,41 @@ export type SimpleEventType =
   | 'StreamReceived'
   | 'StaleCleanup'
   | 'SdpTimeout'
-  | 'PeerLeave';
+  | 'PeerLeave'
+  // Carrier (WebRTC ↔ signals) transition for a given peer's audio.
+  | 'CarrierSwitch'
+  // Bucketed change in (carrier, rtt-bucket, loss-bucket). Emitted only
+  // when the bucket actually changes, so the log volume scales with
+  // real quality changes rather than poll rate.
+  | 'QualityBucketChange'
+  // Local intent: this agent explicitly disabled / re-enabled WebRTC.
+  // Scope is carried in `detail` ("global" or "per-peer"). For per-peer
+  // events, `agent` is the affected peer; for global events it's self.
+  | 'MyWebrtcDisable'
+  | 'MyWebrtcEnable'
+  // Audibility outage: our audioLink to this peer has been 'down' or
+  // stuck 'negotiating' for ≥ a threshold, AND some third peer reports
+  // being audible to the same target. Signals "relay opportunity" —
+  // a signals-layer forwarder could rescue this link.
+  | 'AudibilityOutageStart'
+  | 'AudibilityOutageEnd'
+  // Superseded-connection forensics. When a new RTCPeerConnection takes
+  // the `_openConnections[peer]` slot, the prior PC is orphaned. Its
+  // close/error/connect events still fire later; they must no-op rather
+  // than clobber the new (healthy) connection's state. These events
+  // record what was skipped so log analysis retains full visibility.
+  | 'Superseded'          // write-side: prior conn destroyed at supersede
+  | 'SupersededClose'     // read-side: 'close' fired on a superseded peer
+  | 'SupersededError'     // read-side: 'error' fired on a superseded peer
+  | 'SupersededConnect';  // read-side: 'connect' fired on a superseded peer
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
   timestamp: number;
   event: SimpleEventType;
   connectionId?: string;
+  /** Short human-readable summary. Ignored by older log readers. */
+  detail?: string;
 };
 
 export type PresenceLogEvent =

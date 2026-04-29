@@ -27,13 +27,24 @@ import {
   RoomSignal,
   RTCMessage,
   SdpPayload,
-  SharedWalPayload,
+  ModuleStateEnvelope,
   StoreEventPayload,
   StreamAndTrackInfo,
+  AudioLinkState,
+  LastSeenBucket,
+  PeerLinkSnapshot,
 } from './types';
+import { getModule } from './room/modules/registry';
+import {
+  DEFAULT_CONVERSATION_PAYLOAD,
+  ConversationPayload,
+  parseConversationPayload,
+} from './room/modules/conversation';
 import { RoomClient } from './room/room-client';
 import { RoomStore } from './room/room-store';
 import { PresenceLogger } from './logging';
+import { MicSource, MicAcquireResult } from './mic-source';
+import { voiceController } from './room/modules/voice';
 import { getStreamInfo } from './utils';
 
 declare const __APP_VERSION__: string;
@@ -64,7 +75,7 @@ export const PING_INTERVAL = 2000;
 export class StreamsStore {
   private roomClient: RoomClient;
 
-  private myPubKeyB64: AgentPubKeyB64;
+  myPubKeyB64: AgentPubKeyB64;
 
   private signalUnsubscribe: () => void;
 
@@ -91,6 +102,15 @@ export class StreamsStore {
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
 
   /**
+   * Global WebRTC kill switch. When true, no WebRTC connections are
+   * initiated or accepted for any peer. Audio flows via signals only.
+   * Independent of the conversation module's active state — you can
+   * still talk (mic on, signals carrier) with WebRTC globally disabled.
+   * Persisted in localStorage as 'disableAllWebrtc'.
+   */
+  webrtcGloballyDisabled = false;
+
+  /**
    * Max random delay in ms to add before processing each incoming signal.
    * 0 = no delay (production). Set via settings UI to simulate high-latency signaling.
    */
@@ -99,6 +119,33 @@ export class StreamsStore {
   private _signalQueue: RoomSignal[] = [];
 
   private _processingSignal = false;
+
+  /**
+   * Transport-agnostic microphone owner. Consumers (WebRTC audio, the
+   * voice module, a future transcription module) acquire a track from it
+   * rather than calling getUserMedia themselves. See ui/src/mic-source.ts
+   * for the full rationale.
+   */
+  micSource: MicSource;
+
+  /**
+   * Whether the voice encoder is currently running (sending audio to
+   * peers without WebRTC via Holochain signals). Driven by
+   * `_reconcileSignalsAudio` — starts when mic is held AND at least one
+   * peer is in `_signalsTargets`; stops when either condition drops.
+   */
+  private _voiceEncoderRunning = false;
+
+  /** Unsubscribe from the _signalsTargets subscription. */
+  private _signalsTargetsUnsub: (() => void) | null = null;
+
+  /**
+   * Release handle held by the WebRTC audio path. Populated on `audioOn`,
+   * cleared on full release. `audioOff` does NOT release — it just calls
+   * `micSource.setMuted(true)` so the track stays alive for fast
+   * re-enable without WebRTC renegotiation.
+   */
+  private _webrtcMicHandle: MicAcquireResult | null = null;
 
   constructor(
     roomStore: RoomStore,
@@ -111,6 +158,27 @@ export class StreamsStore {
     const roomClient = roomStore.client;
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
+
+    const ACTIVE_AGENT_STALENESS = 3 * PING_INTERVAL;
+    this._activeAgents = derived(
+      [this._knownAgents, this.blockedAgents] as [Writable<Record<AgentPubKeyB64, AgentInfo>>, Writable<AgentPubKeyB64[]>],
+      ([knownAgents, blocked]) => {
+        const now = Date.now();
+        const active: Record<AgentPubKeyB64, AgentInfo> = {};
+        for (const [pubkey, info] of Object.entries(knownAgents)) {
+          if (
+            pubkey !== this.myPubKeyB64 &&
+            !blocked.includes(pubkey) &&
+            info.lastSeen !== undefined &&
+            now - info.lastSeen < ACTIVE_AGENT_STALENESS
+          ) {
+            active[pubkey] = info;
+          }
+        }
+        return active;
+      },
+    );
+
     // TODO potentially move this to a connect() method which also returns
     // the Unsubscribe function
     this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
@@ -124,6 +192,7 @@ export class StreamsStore {
     if (trickleICE) {
       this.trickleICE = JSON.parse(trickleICE);
     }
+    this.webrtcGloballyDisabled = window.localStorage.getItem('disableAllWebrtc') === 'true';
     this.turnUrl = window.localStorage.getItem('turnUrl') || '';
     this.turnUsername = window.localStorage.getItem('turnUsername') || '';
     this.turnCredential = window.localStorage.getItem('turnCredential') || '';
@@ -131,9 +200,158 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
+    this._signalsTargets = derived(
+      [this._activeAgents, this._openConnections],
+      ([active, connections]) => {
+        const targets = new Set<AgentPubKeyB64>();
+        for (const pubkey of Object.keys(active)) {
+          if (!connections[pubkey]) {
+            targets.add(pubkey);
+          }
+        }
+        return targets;
+      },
+    );
+
     navigator.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
+
+    this.micSource = new MicSource({
+      getDeviceId: () => get(this._audioInputId),
+      setDeviceId: id => this._audioInputId.set(id),
+      onTrackChange: (newTrack, oldTrack) => {
+        this._onMicTrackChange(newTrack, oldTrack);
+      },
+      onMutedChange: muted => {
+        // Fan the mute state out to cloned streams (simple-peer issue #606).
+        // The primary track's `enabled` flag is flipped inside MicSource;
+        // only the clones need to be touched here.
+        this.mainStreamClones.forEach(clonedStream => {
+          clonedStream.getAudioTracks().forEach(track => {
+            // eslint-disable-next-line no-param-reassign
+            track.enabled = !muted;
+          });
+        });
+      },
+    });
+
+    // Bind the voice controller to this store permanently so the receive
+    // side (decoder + playback) works regardless of whether the local mic
+    // is on. The send side (encoder) is gated separately by
+    // _reconcileSignalsAudio. Unbind happens in disconnect().
+    voiceController.bind(this);
+
+    // Subscribe to _signalsTargets changes. When the set transitions
+    // between empty and non-empty while the mic is held, start or stop
+    // the voice encoder so audio automatically flows to peers without
+    // WebRTC. The subscription fires on every _activeAgents or
+    // _openConnections change, but _reconcileSignalsAudio is cheap
+    // (a boolean check + set size).
+    this._signalsTargetsUnsub = this._signalsTargets.subscribe(() => {
+      this._reconcileSignalsAudio();
+    });
+  }
+
+  /**
+   * Start or stop the voice encoder based on whether the mic is held AND
+   * at least one peer needs audio via signals. Called from the
+   * _signalsTargets subscription and from audioOn/audioOff.
+   */
+  private _reconcileSignalsAudio(): void {
+    const micHeld = !!this._webrtcMicHandle || this.micSource.consumerCount > 0;
+    const hasTargets = get(this._signalsTargets).size > 0;
+    const shouldRun = micHeld && hasTargets;
+
+    if (shouldRun && !this._voiceEncoderRunning) {
+      // Only start the encoder (send side). The controller is already
+      // bound to the store at construction time so the receive side works
+      // regardless.
+      voiceController.startCapture().then(ok => {
+        if (!ok) {
+          this._voiceEncoderRunning = false;
+          console.warn('Voice encoder failed to start');
+        }
+      });
+      this._voiceEncoderRunning = true;
+    } else if (!shouldRun && this._voiceEncoderRunning) {
+      voiceController.stopCapture().catch(() => {});
+      this._voiceEncoderRunning = false;
+    }
+  }
+
+  /**
+   * Handles MicSource track lifecycle events. Branches on the (new, old)
+   * pair because opening, replacing, and closing all have different
+   * implications for `mainStream`, `mainStreamClones`, and peer fanout.
+   *
+   *   - open         (newTrack, null)   : lazily create mainStream if needed,
+   *                                       add the track, addTrack on peers.
+   *   - device-change (newTrack, oldTrack): removeTrack/addTrack on
+   *                                       mainStream, replaceTrack on peers.
+   *                                       mainStreamClones are intentionally
+   *                                       left alone here — device-change
+   *                                       during an active reconnection path
+   *                                       is a latent bug that predates this
+   *                                       refactor; don't introduce new
+   *                                       regressions while fixing the
+   *                                       normal path.
+   *   - close         (null, oldTrack)  : removeTrack from mainStream, remove
+   *                                       from peers.
+   */
+  private _onMicTrackChange(
+    newTrack: MediaStreamTrack | null,
+    oldTrack: MediaStreamTrack | null,
+  ): void {
+    // --- open ---
+    if (newTrack && !oldTrack) {
+      if (!this.mainStream) {
+        this.mainStream = new MediaStream();
+      }
+      // Drop any stale audio track (shouldn't happen, but cheap to guard).
+      this.mainStream.getAudioTracks().forEach(t => {
+        this.mainStream!.removeTrack(t);
+      });
+      this.mainStream.addTrack(newTrack);
+      Object.values(get(this._openConnections)).forEach(conn => {
+        try {
+          conn.peer.addTrack(newTrack, this.mainStream!);
+        } catch (e: any) {
+          console.warn('MicSource open: peer.addTrack failed:', e.message);
+        }
+      });
+      return;
+    }
+
+    // --- device change ---
+    if (newTrack && oldTrack) {
+      if (this.mainStream) {
+        try { this.mainStream.removeTrack(oldTrack); } catch {}
+        try { this.mainStream.addTrack(newTrack); } catch {}
+      }
+      Object.values(get(this._openConnections)).forEach(conn => {
+        try {
+          conn.peer.replaceTrack(oldTrack, newTrack, this.mainStream!);
+        } catch (e: any) {
+          console.warn('MicSource device-change: peer.replaceTrack failed:', e.message);
+        }
+      });
+      return;
+    }
+
+    // --- close ---
+    if (!newTrack && oldTrack) {
+      if (this.mainStream) {
+        try { this.mainStream.removeTrack(oldTrack); } catch {}
+      }
+      Object.values(get(this._openConnections)).forEach(conn => {
+        try {
+          conn.peer.removeTrack(oldTrack, this.mainStream!);
+        } catch (e: any) {
+          console.warn('MicSource close: peer.removeTrack failed:', e.message);
+        }
+      });
+    }
   }
 
   static async connect(
@@ -200,6 +418,24 @@ export class StreamsStore {
     });
     this.videoOff();
     this.audioOff();
+    // Stop the voice encoder if running, then unbind the controller
+    // (tears down both send and receive state).
+    if (this._voiceEncoderRunning) {
+      voiceController.stopCapture().catch(() => {});
+      this._voiceEncoderRunning = false;
+    }
+    voiceController.unbind();
+    if (this._signalsTargetsUnsub) {
+      this._signalsTargetsUnsub();
+      this._signalsTargetsUnsub = null;
+    }
+    // Release the WebRTC mic handle and force-close the MicSource (which
+    // stops the underlying track and closes the shared AudioContext).
+    if (this._webrtcMicHandle) {
+      try { this._webrtcMicHandle.release(); } catch {}
+      this._webrtcMicHandle = null;
+    }
+    this.micSource.dispose();
     this.screenShareOff();
     this.mainStream = null;
     this.screenShareStream = null;
@@ -311,7 +547,14 @@ export class StreamsStore {
     const agentsToPing = Object.keys(get(this._knownAgents))
       .filter(agent => !get(this.blockedAgents).includes(agent))
       .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
-    await this.roomStore.client.sendMessage(agentsToPing, 'PingUi');
+    // Include a send-side timestamp so peers can echo it back in their
+    // pong, letting us compute signals-carrier RTT on receipt without
+    // adding new messages. See handlePingUi / handlePongUi.
+    await this.roomStore.client.sendMessage(
+      agentsToPing,
+      'PingUi',
+      JSON.stringify({ t0: Date.now() }),
+    );
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
@@ -352,6 +595,9 @@ export class StreamsStore {
 
     // Health check for dead tracks (bytesReceived stall detection)
     await this._checkTrackHealth();
+
+    // Scan for sustained audibility outages with a relay opportunity
+    this._checkAudibilityOutages();
   }
 
   async changeVideoInput(deviceId: string) {
@@ -383,6 +629,21 @@ export class StreamsStore {
   }
 
   async videoOn() {
+    // Camera needs WebRTC — video doesn't go over the signals carrier.
+    // Implicitly re-enable WebRTC if the user has it globally disabled,
+    // otherwise turning the camera on would silently fail to reach any
+    // peer and be deeply confusing.
+    if (this.webrtcGloballyDisabled) {
+      this.webrtcGloballyDisabled = false;
+      window.localStorage.removeItem('disableAllWebrtc');
+      this.logger.logAgentEvent({
+        agent: this.myPubKeyB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcEnable',
+        detail: 'global (implicit: videoOn)',
+      });
+      await this._syncConversationPayload({ webrtcDisabled: false });
+    }
     const deviceId = get(this._videoInputId);
     if (this.mainStream) {
       if (this.mainStream.getVideoTracks()[0]) {
@@ -527,35 +788,12 @@ export class StreamsStore {
       event: 'ChangeMyAudioInput',
     });
     console.log('Changing audio input to: ', deviceId);
-    this._audioInputId.set(deviceId);
-    // If a stream is running with audio track, remove the existing track
-    // and turn audio back on
-    if (this.mainStream) {
-      const audioTrack = this.mainStream.getAudioTracks()[0];
-      if (audioTrack) {
-        const enabled = audioTrack.enabled;
-        audioTrack.stop();
-        this.mainStream!.removeTrack(audioTrack);
-        // Object.values(get(this._openConnections)).forEach(conn => {
-        //   conn.peer.removeTrack(audioTrack, this.mainStream!);
-        // });
-        const newAudioStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            noiseSuppression: true,
-            echoCancellation: true,
-            deviceId,
-          },
-        });
-        const newAudioTrack = newAudioStream.getAudioTracks()[0];
-        if (!enabled) {
-          newAudioTrack.enabled = false;
-        }
-        this.mainStream.addTrack(newAudioTrack);
-        Object.values(get(this._openConnections)).forEach(conn => {
-          conn.peer.replaceTrack(audioTrack, newAudioTrack, this.mainStream!);
-        });
-      }
-    }
+    // MicSource owns the device-switch path: it stores the new id, opens a
+    // new track, replaces the active track, and fires _onMicTrackChange,
+    // which is what updates mainStream and replaceTracks on all peers.
+    // If no consumer currently holds the mic (WebRTC off + voice off), the
+    // id is stored and the next acquire picks it up.
+    await this.micSource.changeDevice(deviceId);
     Object.values(get(this._openConnections)).forEach(conn => {
       const msg: RTCMessage = {
         type: 'action',
@@ -578,78 +816,42 @@ export class StreamsStore {
       timestamp: Date.now(),
       event: 'MyAudioOn',
     });
-    const deviceId = get(this._audioInputId);
-    if (this.mainStream) {
-      if (this.mainStream.getAudioTracks()[0]) {
-        // Apparently, it is not necessary to enable the tracks of the
-        // cloned streams explicitly as well here.
-        if (enabled) {
-          this.mainStream.getAudioTracks()[0].enabled = true;
-        }
-      } else {
-        let audioStream: MediaStream | undefined;
-        try {
-          audioStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              noiseSuppression: true,
-              echoCancellation: true,
-              deviceId,
-            },
-          });
-        } catch (e: any) {
-          const error = `Failed to get media devices (audio): ${e.toString()}`;
-          console.error(error);
-          this.eventCallback({
-            type: 'error',
-            error,
-          });
-          return;
-        }
-        try {
-          const audioTrack = audioStream.getAudioTracks()[0];
-          if (!enabled) {
-            audioTrack.enabled = false;
-          }
-          this.mainStream.addTrack(audioTrack);
-          Object.values(get(this._openConnections)).forEach(conn => {
-            conn.peer.addTrack(audioTrack, this.mainStream!);
-          });
-        } catch (e: any) {
-          console.error(`Failed to add video track: ${e.toString()}`);
-        }
-      }
-    } else {
-      try {
-        this.mainStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            noiseSuppression: true,
-            echoCancellation: true,
-            deviceId,
-          },
-        });
-        if (!enabled) {
-          const audioTrack = this.mainStream.getAudioTracks()[0];
-          audioTrack.enabled = false;
-        }
-        this.eventCallback({
-          type: 'my-audio-on',
-        });
-      } catch (e: any) {
-        const error = `Failed to get media devices (audio): ${e.toString()}`;
+
+    // Acquire the mic via MicSource on the first audioOn. Subsequent calls
+    // just flip the mute flag — we hold the handle until disconnect, or
+    // until a future explicit release path wants it back.
+    if (!this._webrtcMicHandle) {
+      const handle = await this.micSource.acquire({ id: 'webrtc' });
+      if (!handle) {
+        const error = 'Failed to acquire mic for WebRTC audio';
         console.error(error);
-        this.eventCallback({
-          type: 'error',
-          error,
-        });
+        this.eventCallback({ type: 'error', error });
         return;
       }
-      Object.values(get(this._openConnections)).forEach(conn => {
-        conn.peer.addStream(this.mainStream!);
-      });
+      this._webrtcMicHandle = handle;
+      // The acquire call triggered _onMicTrackChange → mainStream.addTrack
+      // and peer.addTrack for every open connection. Nothing more to do on
+      // the stream-attachment side here.
     }
-    this.eventCallback({
-      type: 'my-audio-on',
-    });
+
+    // Apply the requested mute state. MicSource.setMuted is a no-op if the
+    // state already matches, so calling audioOn(true) while already
+    // unmuted is cheap.
+    this.micSource.setMuted(!enabled);
+
+    // Activate or update the `mic` module so peers' icon strips render the
+    // mute state from its broadcast payload rather than from the WebRTC
+    // `conn.audio` flag. This is the new source of truth for peer mic
+    // state; the RTCMessage 'audio-on'/'audio-off' path below is kept
+    // running for backward compatibility with peers on older code that
+    // haven't learned about the conversation module yet.
+    await this._syncConversationPayload({ micMuted: !enabled });
+
+    // Start the voice encoder if peers need signals-carried audio.
+    this._reconcileSignalsAudio();
+
+    this.eventCallback({ type: 'my-audio-on' });
+
     Object.values(get(this._openConnections)).forEach(conn => {
       const msg: RTCMessage = {
         type: 'action',
@@ -666,47 +868,64 @@ export class StreamsStore {
     });
   }
 
-  audioOff() {
+  /**
+   * Update the conversation module's broadcast payload, activating the
+   * module if it isn't already. Merges into the existing payload (so
+   * toggling `micMuted` preserves `disableWebrtcWith` and vice versa).
+   */
+  async _syncConversationPayload(
+    patch: Partial<ConversationPayload>,
+  ): Promise<void> {
+    const existing = get(this._myModuleStates)['conversation'];
+    const prev: ConversationPayload = existing
+      ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
+      : { ...DEFAULT_CONVERSATION_PAYLOAD };
+    const next: ConversationPayload = { ...prev, ...patch };
+    const payload = JSON.stringify(next);
+    if (existing) {
+      await this.updateModuleState('conversation', payload);
+    } else {
+      await this.activateModule('conversation', payload);
+    }
+  }
+
+  async audioOff() {
     console.log('### AUDIO OFF');
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
       timestamp: Date.now(),
       event: 'MyAudioOff',
     });
-    console.log('this._mainStream.getTracks(): ', this.mainStream?.getTracks());
-    if (this.mainStream) {
-      console.log('### DISABLING ALL AUDIO TRACKS');
-      this.mainStream.getAudioTracks().forEach(track => {
-        // eslint-disable-next-line no-param-reassign
-        track.enabled = false;
-        console.log('### DISABLED AUDIO TRACK: ', track);
-      });
-      // Disable the audio tracks of all cloned streams as well
-      this.mainStreamClones.forEach(clonedStream => {
-        clonedStream.getAudioTracks().forEach(track => {
-          // eslint-disable-next-line no-param-reassign
-          track.enabled = false;
-          console.log('### DISABLED AUDIO TRACK: ', track);
-        });
-      });
-      Object.values(get(this._openConnections)).forEach(conn => {
-        const msg: RTCMessage = {
-          type: 'action',
-          message: 'audio-off',
-        };
-        try {
-          conn.peer.send(JSON.stringify(msg));
-        } catch (e: any) {
-          console.error(
-            'Failed to send audio-off message to peer: ',
-            e.toString()
-          );
-        }
-      });
-      this.eventCallback({
-        type: 'my-audio-off',
-      });
-    }
+
+    // Mute via MicSource. This flips track.enabled on the primary track and
+    // fires the onMutedChange binding, which fans the flag out to every
+    // mainStreamClones entry — matching the old behavior without any
+    // per-stream track iteration here. We intentionally do NOT release the
+    // WebRTC mic handle: the track stays alive for fast re-enable without
+    // WebRTC renegotiation.
+    this.micSource.setMuted(true);
+
+    // Propagate mute state to the conversation module so peers' icon
+    // strips update.
+    await this._syncConversationPayload({ micMuted: true });
+
+    Object.values(get(this._openConnections)).forEach(conn => {
+      const msg: RTCMessage = {
+        type: 'action',
+        message: 'audio-off',
+      };
+      try {
+        conn.peer.send(JSON.stringify(msg));
+      } catch (e: any) {
+        console.error(
+          'Failed to send audio-off message to peer: ',
+          e.toString()
+        );
+      }
+    });
+    this.eventCallback({
+      type: 'my-audio-off',
+    });
   }
 
   async screenShareOn() {
@@ -766,48 +985,6 @@ export class StreamsStore {
       this.eventCallback({
         type: 'my-screen-share-off',
       });
-    }
-  }
-
-  // ===========================================================================================
-  // SHARE WAL
-  // ===========================================================================================
-
-  async shareWal(payload: SharedWalPayload) {
-    this._mySharedWal.set(payload);
-    const knownAgents = get(this._knownAgents);
-    const agentsToNotify = Object.keys(knownAgents)
-      .filter(a => a !== this.myPubKeyB64)
-      .map(a => decodeHashFromBase64(a));
-    if (agentsToNotify.length > 0) {
-      try {
-        await this.roomClient.sendMessage(
-          agentsToNotify,
-          'ShareWal',
-          JSON.stringify(payload),
-        );
-      } catch (e) {
-        console.error('Failed to send ShareWal signal:', e);
-      }
-    }
-  }
-
-  async stopShareWal() {
-    this._mySharedWal.set(null);
-    const knownAgents = get(this._knownAgents);
-    const agentsToNotify = Object.keys(knownAgents)
-      .filter(a => a !== this.myPubKeyB64)
-      .map(a => decodeHashFromBase64(a));
-    if (agentsToNotify.length > 0) {
-      try {
-        await this.roomClient.sendMessage(
-          agentsToNotify,
-          'StopShareWal',
-          '',
-        );
-      } catch (e) {
-        console.error('Failed to send StopShareWal signal:', e);
-      }
     }
   }
 
@@ -957,6 +1134,19 @@ export class StreamsStore {
   private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
+   * The set of active peers that do NOT have a WebRTC connection. Audio
+   * for these peers should be carried over Holochain remote signals
+   * (the voice encoder path). Precomputed as a derived store so the
+   * voice encoder's pump loop doesn't recompute per-chunk — it just
+   * reads the cached set.
+   *
+   * Updates when: a peer appears/disappears in _activeAgents, a WebRTC
+   * connection opens/closes in _openConnections, or disableWebrtcWith
+   * changes (which tears down WebRTC, adding the peer to this set).
+   */
+  _signalsTargets!: Readable<Set<AgentPubKeyB64>>;
+
+  /**
    * Number of consecutive health check cycles where bytesReceived did not increase.
    */
   private _staleCycles: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
@@ -1043,6 +1233,13 @@ export class StreamsStore {
   _knownAgents: Writable<Record<AgentPubKeyB64, AgentInfo>> = writable({});
 
   /**
+   * Agents that are actively present (recent pong within staleness threshold).
+   * Derived from _knownAgents. Drives pane rendering instead of _openConnections.
+   * Excludes self and blocked agents.
+   */
+  _activeAgents!: Readable<Record<AgentPubKeyB64, AgentInfo>>;
+
+  /**
    * The statuses of WebRTC main stream connections to peers
    */
   _connectionStatuses: Writable<ConnectionStatuses> = writable({});
@@ -1072,6 +1269,11 @@ export class StreamsStore {
          * How they perceive our stream
          */
         perceivedStreamInfo?: StreamAndTrackInfo;
+        /**
+         * Their per-peer snapshot of every other agent's audio link state.
+         * Drives the pair-wise indicators in the details overlay.
+         */
+        peerLinks?: Record<AgentPubKeyB64, PeerLinkSnapshot>;
       }
     >
   > = writable({});
@@ -1087,18 +1289,703 @@ export class StreamsStore {
   _pendingDiagnosticRequests: Set<AgentPubKeyB64> = new Set();
 
   // ===========================================================================================
-  // SHARED WAL
+  // MODULE SYSTEM
   // ===========================================================================================
 
-  /**
-   * WAL that we are currently sharing (null if not sharing)
-   */
-  _mySharedWal: Writable<SharedWalPayload | null> = writable(null);
+  /** My own active module states, keyed by moduleId */
+  _myModuleStates: Writable<Record<string, ModuleStateEnvelope>> = writable({});
+
+  /** Peer module states, keyed by AgentPubKeyB64 then moduleId */
+  _peerModuleStates: Writable<Record<AgentPubKeyB64, Record<string, ModuleStateEnvelope>>> = writable({});
+
+  /** Receiver-controlled overrides: which replace module to view per peer (local only) */
+  _receiverModuleOverrides: Writable<Record<AgentPubKeyB64, string>> = writable({});
+
+  async activateModule(moduleId: string, payload?: string): Promise<void> {
+    const mod = getModule(moduleId);
+    const actualPayload = payload ?? mod?.defaultState?.() ?? '{}';
+    const envelope: ModuleStateEnvelope = {
+      moduleId,
+      active: true,
+      payload: actualPayload,
+      updatedAt: Date.now(),
+    };
+    this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
+    await this._broadcastModuleState(envelope);
+    mod?.onActivate?.({ streamsStore: this, myPubKeyB64: this.myPubKeyB64 });
+  }
+
+  async deactivateModule(moduleId: string): Promise<void> {
+    const mod = getModule(moduleId);
+    const envelope: ModuleStateEnvelope = {
+      moduleId,
+      active: false,
+      payload: '',
+      updatedAt: Date.now(),
+    };
+    this._myModuleStates.update(s => {
+      const next = { ...s };
+      delete next[moduleId];
+      return next;
+    });
+    await this._broadcastModuleState(envelope);
+    mod?.onDeactivate?.();
+  }
+
+  async updateModuleState(moduleId: string, payload: string): Promise<void> {
+    const envelope: ModuleStateEnvelope = {
+      moduleId,
+      active: true,
+      payload,
+      updatedAt: Date.now(),
+    };
+    this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
+    await this._broadcastModuleState(envelope);
+  }
+
+  async sendModuleData(
+    moduleId: string,
+    chunk: string,
+    targets?: Iterable<AgentPubKeyB64>,
+  ): Promise<void> {
+    const agentsToNotify = targets
+      ? Array.from(targets).map(a => decodeHashFromBase64(a))
+      : Object.keys(get(this._knownAgents))
+          .filter(a => a !== this.myPubKeyB64)
+          .map(a => decodeHashFromBase64(a));
+    if (agentsToNotify.length > 0) {
+      try {
+        await this.roomClient.sendMessage(
+          agentsToNotify,
+          'ModuleData',
+          JSON.stringify({ moduleId, chunk })
+        );
+      } catch (e) {
+        console.error('Failed to send ModuleData signal:', e);
+      }
+    }
+  }
 
   /**
-   * WALs that peers are currently sharing, keyed by AgentPubKeyB64
+   * Returns true iff WebRTC is disabled for the link between us and
+   * `peerB64`. Symmetric union semantics: either side having the other
+   * in their `disableWebrtcWith` list is sufficient.
+   *
+   * Reads synchronously from the module state stores so it can gate the
+   * retry loop in `handlePongUi` without making that path async.
    */
-  _peerSharedWals: Writable<Record<AgentPubKeyB64, SharedWalPayload>> = writable({});
+  webrtcDisabled(peerB64: AgentPubKeyB64): boolean {
+    // Check my per-peer override
+    const myConv = get(this._myModuleStates)['conversation'];
+    if (myConv) {
+      const myPayload = parseConversationPayload(myConv);
+      if (myPayload && myPayload.disableWebrtcWith.includes(peerB64)) {
+        return true;
+      }
+    }
+    // Check peer's broadcast state: both per-peer and global
+    const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
+    if (peerConv) {
+      const peerPayload = parseConversationPayload(peerConv);
+      if (peerPayload) {
+        // Peer has globally disabled WebRTC
+        if (peerPayload.webrtcDisabled) return true;
+        // Peer has disabled WebRTC specifically for us
+        if (peerPayload.disableWebrtcWith.includes(this.myPubKeyB64)) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Freshness bucket for the last pong we received from a peer. Thresholds
+   * match `lastSeenToColor` in agent-connection-status-icon.ts so broadcast
+   * and locally-rendered dots pick the same bucket.
+   */
+  lastSeenBucket(peerB64: AgentPubKeyB64): LastSeenBucket {
+    const known = get(this._knownAgents)[peerB64];
+    if (!known || typeof known.lastSeen !== 'number') return 'unknown';
+    const age = Date.now() - known.lastSeen;
+    if (age < 15_000) return 'fresh';
+    if (age < 30_000) return 'stale';
+    return 'gone';
+  }
+
+  /**
+   * Roll-up audio link state from this agent's local observations of the
+   * given peer. Parallel FSM to `ConnectionStatus`: that one answers "what
+   * stage is the WebRTC negotiation in?" — this one answers "can I hear
+   * this peer right now, and via what carrier?"
+   */
+  audioLinkFor(peerB64: AgentPubKeyB64): AudioLinkState {
+    if (get(this.blockedAgents).includes(peerB64)) return 'blocked';
+
+    const bucket = this.lastSeenBucket(peerB64);
+    if (bucket === 'gone' || bucket === 'unknown') return 'absent';
+
+    const conn = get(this._openConnections)[peerB64];
+    const status = get(this._connectionStatuses)[peerB64];
+
+    // Active flow takes precedence over everything else: if audio is
+    // actually arriving, the link is working regardless of any stale
+    // intent or status flags.
+    const webrtcAudioLive =
+      !!conn?.connected &&
+      !!conn?.audio &&
+      (this._staleCycles[peerB64]?.audio ?? 0) < 2;
+    if (webrtcAudioLive) return 'webrtc';
+
+    const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
+    const signalsLive = !!lastRecv && Date.now() - lastRecv < 2000;
+    if (signalsLive) return 'signals';
+
+    // No flow. Peer intent comes BEFORE the negotiation check: a stale
+    // ConnectionStatus stuck in InitSent/AcceptSent (e.g. left over from
+    // before webrtc was globally disabled) would otherwise mask the fact
+    // that the peer is intentionally muted. Muted is the more accurate
+    // answer when both could apply.
+    const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
+    if (peerConv) {
+      const payload = parseConversationPayload(peerConv);
+      if (payload?.micMuted) return 'muted';
+    }
+
+    // Genuine in-progress negotiation (no flow, peer not muted).
+    if (status) {
+      switch (status.type) {
+        case 'AwaitingInit':
+        case 'InitSent':
+        case 'AcceptSent':
+        case 'SdpExchange':
+          return 'negotiating';
+        default:
+          break;
+      }
+    }
+
+    // Reachable, not muted, no flow and not negotiating — broken.
+    return 'down';
+  }
+
+  /**
+   * Build the pair-wise snapshot broadcast in pong metadata so every peer
+   * can render "how I see each other agent."
+   */
+  peerLinkFor(peerB64: AgentPubKeyB64): PeerLinkSnapshot {
+    const conn = get(this._openConnections)[peerB64];
+    const audioLink = this.audioLinkFor(peerB64);
+
+    let carrier: PeerLinkSnapshot['carrier'];
+    if (audioLink === 'webrtc') carrier = 'webrtc';
+    else if (audioLink === 'signals') carrier = 'signals';
+    else if (conn?.connected) carrier = 'webrtc';
+    else carrier = 'none';
+
+    let audio: PeerLinkSnapshot['audio'];
+    if (audioLink === 'webrtc' || audioLink === 'signals') audio = 'live';
+    else if (audioLink === 'muted') audio = 'muted';
+    else if (conn?.connected && conn.audio) audio = 'stale';
+    else audio = 'off';
+
+    const video: PeerLinkSnapshot['video'] = conn?.video
+      ? 'live'
+      : conn?.videoMuted
+        ? 'muted'
+        : 'off';
+
+    return {
+      audioLink,
+      carrier,
+      audio,
+      video,
+      lastSeen: this.lastSeenBucket(peerB64),
+    };
+  }
+
+  /**
+   * Set of agents anyone (me or any peer with a fresh broadcast) reports
+   * as currently present in the room. Drives the icon list in the
+   * connection-details overlay so that:
+   *
+   *   - An agent first noticed by some other peer pops onto everyone's
+   *     list immediately, without waiting for our own ping cycle.
+   *   - An agent nobody sees is hidden entirely rather than lingering as
+   *     a "not in room" entry on every tile.
+   *
+   * Per-tile rendering still asks "does THIS observer see them?" — that
+   * gates the audio/video icons and ring color.
+   */
+  globalPresenceSet(): Set<AgentPubKeyB64> {
+    const out = new Set<AgentPubKeyB64>();
+    const blocked = new Set(get(this.blockedAgents));
+    // We know we're here. Including self matters because peer tiles need
+    // to render their observer's view of US — the icon strip on Gaston's
+    // tile must include me. Excluding self happens at the per-tile level
+    // (drop the observer from each tile's iteration), not here.
+    out.add(this.myPubKeyB64);
+    // My own active agents.
+    for (const k of Object.keys(get(this._activeAgents))) {
+      if (!blocked.has(k)) out.add(k);
+    }
+    // Anyone a *fresh* observer reports as present. We require the
+    // observer's broadcast itself to be recent so that an observer who
+    // dropped out doesn't keep ghost peers in the set forever.
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
+        if (blocked.has(peerKey)) continue;
+        if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
+          out.add(peerKey);
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Agents reported as present (ping-recent) by at least one fresh
+   * observer, but who we ourselves cannot see directly. Drives placeholder
+   * tiles. Ping-presence is sufficient — we do not require the observer
+   * to have a working audio link, because in impolite-close scenarios
+   * every peer's link to the departing agent breaks at roughly the same
+   * time while `knownAgents` broadcasts still list them for ~30s; we want
+   * the phantom tile to persist through that decay window rather than
+   * vanishing in lockstep with everyone else's link failure.
+   *
+   * Whether anyone has a *working* link is exposed separately via
+   * `observersConnectedTo()` so the placeholder can label the observer
+   * list accurately.
+   */
+  phantomAgents(): AgentPubKeyB64[] {
+    const active = get(this._activeAgents);
+    const blocked = new Set(get(this.blockedAgents));
+    const out = new Set<AgentPubKeyB64>();
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      // Observer must themselves be fresh from our point of view — a peer
+      // whose own broadcast we're losing shouldn't keep promoting phantoms.
+      if (!active[observerKey]) continue;
+      for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
+        if (peerKey === this.myPubKeyB64) continue;
+        if (blocked.has(peerKey)) continue;
+        if (active[peerKey]) continue; // we already see them directly
+        if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
+          out.add(peerKey);
+        }
+      }
+    }
+    return Array.from(out);
+  }
+
+  /**
+   * For a phantom agent, which fresh observers still ping-see them
+   * (lastSeen bucket 'fresh' or 'stale' in their broadcast peerLinks).
+   * Drives the observer list on the placeholder tile.
+   */
+  observersSeeing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
+    const out: AgentPubKeyB64[] = [];
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      const snap = obs.peerLinks[peerB64];
+      if (!snap) continue;
+      if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
+        out.push(observerKey);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Subset of `observersSeeing` who additionally have a working or
+   * in-progress audio link to the phantom. Used to pick the observer-list
+   * label: "connected via" when this is non-empty, "last seen by"
+   * otherwise.
+   */
+  observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
+    const out: AgentPubKeyB64[] = [];
+    const now = Date.now();
+    const observerStaleness = 2.8 * PING_INTERVAL;
+    const others = get(this._othersConnectionStatuses);
+    for (const observerKey of Object.keys(others)) {
+      const obs = others[observerKey];
+      if (!obs.peerLinks) continue;
+      if (now - obs.lastUpdated > observerStaleness) continue;
+      const snap = obs.peerLinks[peerB64];
+      if (!snap) continue;
+      if (
+        snap.audioLink === 'webrtc' ||
+        snap.audioLink === 'signals' ||
+        snap.audioLink === 'negotiating'
+      ) {
+        out.push(observerKey);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Build the full peerLinks map that goes into a pong — one snapshot per
+   * known agent including the recipient (so they can render "how X sees
+   * me" with the same pair-wise path as any other pair). Excludes only
+   * self.
+   */
+  private _buildPeerLinks(): Record<AgentPubKeyB64, PeerLinkSnapshot> {
+    const out: Record<AgentPubKeyB64, PeerLinkSnapshot> = {};
+    const known = get(this._knownAgents);
+    for (const pubkey of Object.keys(known)) {
+      if (pubkey === this.myPubKeyB64) continue;
+      out[pubkey] = this.peerLinkFor(pubkey);
+    }
+    return out;
+  }
+
+  /**
+   * Toggle a peer in/out of our `disableWebrtcWith` list and broadcast
+   * the updated conversation module payload. When a peer is added, the
+   * retry loop stops initiating WebRTC for them and the conversation
+   * module's `onModulePayloadChange` on the remote side tears down the
+   * existing connection. When removed, the next pong cycle restarts
+   * WebRTC.
+   *
+   * Also tears down the local WebRTC connection immediately when adding
+   * (we don't wait for the next pong cycle).
+   */
+  async toggleDisableWebrtc(peerB64: AgentPubKeyB64): Promise<void> {
+    const existing = get(this._myModuleStates)['conversation'];
+    const payload: ConversationPayload = existing
+      ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
+      : { ...DEFAULT_CONVERSATION_PAYLOAD };
+
+    const idx = payload.disableWebrtcWith.indexOf(peerB64);
+    if (idx >= 0) {
+      payload.disableWebrtcWith = payload.disableWebrtcWith.filter(p => p !== peerB64);
+      console.log(`toggleDisableWebrtc: re-enabled WebRTC for ${peerB64.slice(0, 8)}`);
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcEnable',
+        detail: 'per-peer',
+      });
+    } else {
+      payload.disableWebrtcWith = [...payload.disableWebrtcWith, peerB64];
+      console.log(`toggleDisableWebrtc: disabled WebRTC for ${peerB64.slice(0, 8)}`);
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcDisable',
+        detail: 'per-peer',
+      });
+    }
+
+    await this._syncConversationPayload(payload);
+
+    if (idx < 0) {
+      this.disconnectFromPeerVideo(peerB64);
+      this._clearPendingWebrtcStatus(peerB64);
+    }
+  }
+
+  /**
+   * Force a peer's WebRTC `ConnectionStatus` to `Disconnected` if it is
+   * currently in any negotiation phase. The close handler clears Connected
+   * statuses on its own; pending Init/Accept/SDP states have no equivalent
+   * teardown event, so they otherwise persist forever once webrtc is
+   * disabled — leaving `audioLinkFor` to misreport "negotiating" when the
+   * link is actually permanently down by intent.
+   */
+  _clearPendingWebrtcStatus(peerB64?: AgentPubKeyB64): void {
+    const isPending = (s: ConnectionStatus | undefined) =>
+      !!s &&
+      (s.type === 'AwaitingInit' ||
+        s.type === 'InitSent' ||
+        s.type === 'AcceptSent' ||
+        s.type === 'SdpExchange');
+
+    this._connectionStatuses.update(curr => {
+      if (peerB64) {
+        if (isPending(curr[peerB64])) curr[peerB64] = { type: 'Disconnected' };
+      } else {
+        for (const k of Object.keys(curr)) {
+          if (isPending(curr[k])) curr[k] = { type: 'Disconnected' };
+        }
+      }
+      return curr;
+    });
+    this._pendingInits = peerB64
+      ? Object.fromEntries(
+          Object.entries(this._pendingInits).filter(([k]) => k !== peerB64),
+        )
+      : {};
+    this._pendingAccepts = peerB64
+      ? Object.fromEntries(
+          Object.entries(this._pendingAccepts).filter(([k]) => k !== peerB64),
+        )
+      : {};
+  }
+
+  /**
+   * Per-peer peak audio level from the voice (signals) carrier.
+   * Range 0.0–1.0. Updated per decoded frame (~50/sec per peer).
+   * Plain Map — not reactive. Read by the audio-level-meter element.
+   */
+  get signalsAudioLevels(): Map<string, number> {
+    return voiceController.peerAudioLevels;
+  }
+
+  /** True iff the signals-carrier voice encoder is currently capturing. */
+  get voiceEncoderRunning(): boolean {
+    return this._voiceEncoderRunning;
+  }
+
+  /** Wall-clock ms of the last voice frame sent to each peer. */
+  get signalsLastSent(): Map<string, number> {
+    return voiceController.peerLastSentMs;
+  }
+
+  /** Wall-clock ms of the last voice frame received from each peer. */
+  get signalsLastRecv(): Map<string, number> {
+    return voiceController.peerLastRecvMs;
+  }
+
+  /** True iff a WebRTC video connection currently exists to this peer. */
+  hasWebrtcConnection(pubKeyB64: string): boolean {
+    return !!get(this._openConnections)[pubKeyB64];
+  }
+
+  /** Current OpenConnectionInfo for a peer, or undefined. */
+  openConnectionInfo(pubKeyB64: string): OpenConnectionInfo | undefined {
+    return get(this._openConnections)[pubKeyB64];
+  }
+
+  /**
+   * Per-peer WebRTC AnalyserNodes for reading incoming audio levels.
+   * Created when a peer stream arrives, removed on disconnect.
+   * The audio-level-meter element polls these at 10fps.
+   */
+  private _peerAnalysers = new Map<string, AnalyserNode>();
+  private _peerAnalyserBuffers = new Map<string, Uint8Array>();
+
+  /**
+   * Per-peer latency/quality stats for the signals carrier. Updated on
+   * each pong receive (RTT) and by VoiceController (jitter, loss).
+   * Plain Map — read by the peer-stats-panel element at its own poll rate.
+   */
+  signalsStats = new Map<string, import('./types').CarrierStats>();
+
+  /**
+   * Per-peer latency/quality stats for the WebRTC carrier. Updated by
+   * the periodic getStats() poll. Plain Map — not reactive.
+   */
+  webrtcStats = new Map<string, import('./types').CarrierStats>();
+
+  /**
+   * Rolling EWMA of signals-carrier RTT per peer. Smooths out noise
+   * from jitter on individual ping/pong round trips.
+   */
+  private _signalsRttEwma = new Map<string, number>();
+
+  /**
+   * Last-emitted quality bucket per peer, keyed by pubKeyB64. Value is
+   * a stable string like `"webrtc:ok:clean"`. Used to dedupe so that
+   * QualityBucketChange events only fire when the bucket actually changes
+   * rather than every poll cycle.
+   */
+  private _lastQualityBucket = new Map<string, string>();
+
+  /**
+   * Per-peer audibility-outage tracking. When our audioLink to this peer
+   * has been 'down' or 'negotiating' for ≥ OUTAGE_THRESHOLD_MS, *and* some
+   * third peer reports being audible to that target, we emit an
+   * AudibilityOutageStart event. The `emitted` flag guards against
+   * multiple Starts per outage and tells the End side whether to fire on
+   * recovery. Populated / drained by `_checkAudibilityOutages` on the
+   * 2s ping tick.
+   */
+  private _outageStates = new Map<string, { startedAt: number; emitted: boolean }>();
+
+  /**
+   * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
+   * Connected as: MediaStreamSource → AnalyserNode (no destination —
+   * the <video> element handles playback). Called from the peer-stream
+   * event handler.
+   */
+  setupPeerAudioAnalyser(pubKeyB64: string, stream: MediaStream): void {
+    // Clean up any existing analyser for this peer
+    this._peerAnalysers.delete(pubKeyB64);
+    this._peerAnalyserBuffers.delete(pubKeyB64);
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) return;
+
+    const ctx = this.micSource.ensureAudioContext();
+    if (!ctx) return;
+
+    try {
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      // Do NOT connect analyser to destination — <video> handles playback
+      this._peerAnalysers.set(pubKeyB64, analyser);
+      this._peerAnalyserBuffers.set(pubKeyB64, new Uint8Array(analyser.fftSize));
+    } catch (e) {
+      console.warn('Failed to create audio analyser for peer:', e);
+    }
+  }
+
+  /**
+   * Remove the AnalyserNode for a peer. Called on disconnect/leave.
+   */
+  removePeerAudioAnalyser(pubKeyB64: string): void {
+    this._peerAnalysers.delete(pubKeyB64);
+    this._peerAnalyserBuffers.delete(pubKeyB64);
+  }
+
+  /**
+   * Read the current peak audio level for a peer from the WebRTC
+   * AnalyserNode. Returns 0.0–1.0, or 0 if no analyser exists.
+   * Called by the audio-level-meter element at 10fps.
+   */
+  getWebrtcAudioLevel(pubKeyB64: string): number {
+    const analyser = this._peerAnalysers.get(pubKeyB64);
+    const buffer = this._peerAnalyserBuffers.get(pubKeyB64);
+    if (!analyser || !buffer) return 0;
+
+    analyser.getByteTimeDomainData(buffer);
+    let peak = 0;
+    for (let i = 0; i < buffer.length; i += 4) {
+      // Byte domain data is 0–255 centered at 128
+      const v = Math.abs(buffer[i] - 128) / 128;
+      if (v > peak) peak = v;
+    }
+    return peak;
+  }
+
+  setReceiverOverride(agentPubKeyB64: AgentPubKeyB64, moduleId: string | null): void {
+    this._receiverModuleOverrides.update(o => {
+      const next = { ...o };
+      if (moduleId) {
+        next[agentPubKeyB64] = moduleId;
+      } else {
+        delete next[agentPubKeyB64];
+      }
+      return next;
+    });
+  }
+
+  /**
+   * Fire a module's onPeerStateChange callback when a peer's *effective*
+   * active state actually transitions. "Effective active" means
+   * `envelope.active === true && phase !== 'acquiring'`; an envelope in
+   * `acquiring` is treated as not-yet-active for peer dispatch purposes,
+   * so transitions acquiring → active will fire the callback, and
+   * inactive → acquiring will not. Payload-only changes do not trigger.
+   */
+  private _dispatchPeerModuleTransition(
+    pubkeyB64: AgentPubKeyB64,
+    moduleId: string,
+    prev: ModuleStateEnvelope | null,
+    next: ModuleStateEnvelope | null,
+  ) {
+    const wasActive = !!prev?.active && prev?.phase !== 'acquiring';
+    const isActive = !!next?.active && next?.phase !== 'acquiring';
+    if (wasActive === isActive) return;
+    try {
+      getModule(moduleId)?.onPeerStateChange?.(pubkeyB64, prev, next, this);
+    } catch (e) {
+      console.warn(`onPeerStateChange threw for ${moduleId}:`, e);
+    }
+  }
+
+  /**
+   * Fire a module's onModulePayloadChange callback when the module is
+   * active on both sides of the transition AND the payload differs. Not
+   * fired when either side has `phase === 'acquiring'`.
+   */
+  private _dispatchPeerModulePayloadChange(
+    pubkeyB64: AgentPubKeyB64,
+    moduleId: string,
+    prev: ModuleStateEnvelope | null,
+    next: ModuleStateEnvelope | null,
+  ) {
+    if (!prev || !next) return;
+    if (!prev.active || !next.active) return;
+    if (prev.phase === 'acquiring' || next.phase === 'acquiring') return;
+    if (prev.payload === next.payload) return;
+    try {
+      getModule(moduleId)?.onModulePayloadChange?.(pubkeyB64, prev, next, this);
+    } catch (e) {
+      console.warn(`onModulePayloadChange threw for ${moduleId}:`, e);
+    }
+  }
+
+  handleModuleState(signal: Extract<RoomSignal, { type: 'Message' }>): void {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    try {
+      const envelope: ModuleStateEnvelope = JSON.parse(signal.payload);
+      const prev = get(this._peerModuleStates)[pubkeyB64]?.[envelope.moduleId] || null;
+      this._peerModuleStates.update(all => {
+        const updated = { ...all };
+        if (!updated[pubkeyB64]) updated[pubkeyB64] = {};
+        if (envelope.active) {
+          updated[pubkeyB64] = { ...updated[pubkeyB64], [envelope.moduleId]: envelope };
+        } else {
+          const agentModules = { ...updated[pubkeyB64] };
+          delete agentModules[envelope.moduleId];
+          updated[pubkeyB64] = agentModules;
+        }
+        return updated;
+      });
+      const next = envelope.active ? envelope : null;
+      this._dispatchPeerModuleTransition(pubkeyB64, envelope.moduleId, prev, next);
+      this._dispatchPeerModulePayloadChange(pubkeyB64, envelope.moduleId, prev, next);
+    } catch (e) {
+      console.warn('Failed to parse ModuleState payload:', e);
+    }
+  }
+
+  handleModuleData(signal: Extract<RoomSignal, { type: 'Message' }>): void {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    try {
+      const { moduleId, chunk } = JSON.parse(signal.payload);
+      const mod = getModule(moduleId);
+      mod?.onData?.(pubkeyB64, chunk);
+    } catch (e) {
+      console.warn('Failed to parse ModuleData payload:', e);
+    }
+  }
+
+  private async _broadcastModuleState(envelope: ModuleStateEnvelope): Promise<void> {
+    const agentsToNotify = Object.keys(get(this._knownAgents))
+      .filter(a => a !== this.myPubKeyB64)
+      .map(a => decodeHashFromBase64(a));
+    if (agentsToNotify.length > 0) {
+      try {
+        await this.roomClient.sendMessage(
+          agentsToNotify,
+          'ModuleState',
+          JSON.stringify(envelope)
+        );
+      } catch (e) {
+        console.error('Failed to send ModuleState signal:', e);
+      }
+    }
+  }
 
   // ********************************************************************************************
   //
@@ -1358,6 +2245,8 @@ export class StreamsStore {
         }
         return openConnections;
       });
+      // Set up audio analyser for level metering before firing the event
+      this.setupPeerAudioAnalyser(pubKeyB64, stream);
       // Always fire peer-stream so srcObject gets assigned to the <video> element
       this.eventCallback({
         type: 'peer-stream',
@@ -1424,6 +2313,29 @@ export class StreamsStore {
       }
     });
     peer.on('connect', async () => {
+      // Supersede guard: if a newer PeerConnection for this peer has
+      // already taken the _openConnections slot, we are a zombie that
+      // happened to complete ICE. Mutating shared state here would
+      // falsely mark the NEW connection as connected and addStream into
+      // the wrong peer. Log the skip for forensics and bail.
+      const currentOnConnect = get(this._openConnections)[pubKeyB64];
+      if (currentOnConnect && currentOnConnect.connectionId !== connectionId) {
+        this.logger.logCustomMessage(
+          `Superseded connect [${pubKeyB64.slice(0, 8)}]: ` +
+            `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnConnect.connectionId.slice(0, 8)} ` +
+            `— skipping (would have: marked connected=true, addStream'd mainStream, ` +
+            `fired peer-connected, set ConnectionStatus=Connected, logged CarrierSwitch signals->webrtc)`
+        );
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededConnect',
+          connectionId,
+          detail: `superseded-by=${currentOnConnect.connectionId}`,
+        });
+        peer.destroy();
+        return;
+      }
       console.log('#### CONNECTED with', pubKeyB64);
       this.logger.logAgentEvent({
         agent: pubKeyB64,
@@ -1431,6 +2343,17 @@ export class StreamsStore {
         event: 'Connected',
         connectionId,
       });
+      // Audio carrier just flipped from signals → webrtc for this peer.
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: Date.now(),
+        event: 'CarrierSwitch',
+        connectionId,
+        detail: 'signals->webrtc',
+      });
+      // Reset the quality bucket so the first webrtc stats sample is
+      // recorded (its bucket will differ from the old signals bucket).
+      this._lastQualityBucket.delete(pubKeyB64);
 
       delete this._pendingInits[pubKeyB64];
 
@@ -1508,12 +2431,58 @@ export class StreamsStore {
     peer.on('close', async () => {
       console.log('#### GOT CLOSE EVENT ####');
 
+      // Supersede guard: if the current _openConnections entry for this
+      // peer points at a DIFFERENT connectionId, this closing peer was
+      // already replaced. Running the normal cleanup path would delete
+      // the NEW connection's state (openConnections entry, _videoStreams,
+      // _staleCycles, audio analyser) and fire peer-disconnected on a
+      // live peer. Log what would have happened and bail. The new
+      // connection keeps operating; this peer's resources are already
+      // being freed (peer.destroy on line below is idempotent).
+      const currentOnClose = get(this._openConnections)[pubKeyB64];
+      if (currentOnClose && currentOnClose.connectionId !== connectionId) {
+        this.logger.logCustomMessage(
+          `Superseded close [${pubKeyB64.slice(0, 8)}]: ` +
+            `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnClose.connectionId.slice(0, 8)} ` +
+            `— skipping cleanup (would have: deleted _openConnections entry, deleted _videoStreams, ` +
+            `cleared _lastBytesReceived/_staleCycles/_reconcileAttemptCount, removed audio analyser, ` +
+            `set _lastDisconnectTime, set ConnectionStatus=Disconnected, ` +
+            `torn down outgoing screen share, fired peer-disconnected)`
+        );
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededClose',
+          connectionId,
+          detail: `superseded-by=${currentOnClose.connectionId}`,
+        });
+        peer.destroy();
+        return;
+      }
+
+      // If this peer was actually the audio carrier (i.e. the connection
+      // had fully connected), closing it flips the carrier back to
+      // signals. Connections that never reached `connected` were still
+      // on signals the whole time, so skip the switch event then.
+      const closingConn = currentOnClose;
+      const wasWebrtcCarrier = !!closingConn?.connected;
+
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'SimplePeerClose',
         connectionId,
       });
+      if (wasWebrtcCarrier) {
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'CarrierSwitch',
+          connectionId,
+          detail: 'webrtc->signals',
+        });
+      }
+      this._lastQualityBucket.delete(pubKeyB64);
       this._lastDisconnectTime[pubKeyB64] = Date.now();
 
       // Remove from existing streams
@@ -1540,10 +2509,12 @@ export class StreamsStore {
         return statuses;
       });
 
-      // Clean up health check state for this peer
+      // Clean up health check state and audio analyser for this peer
       delete this._lastBytesReceived[pubKeyB64];
       delete this._staleCycles[pubKeyB64];
       delete this._reconcileAttemptCount[pubKeyB64];
+      this.removePeerAudioAnalyser(pubKeyB64);
+      this.webrtcStats.delete(pubKeyB64);
 
       // Also tear down any outgoing screen share to this peer since they
       // have disconnected. Without this, the stale WebRTC connection may
@@ -1568,6 +2539,31 @@ export class StreamsStore {
     });
     peer.on('error', e => {
       console.log('#### GOT ERROR EVENT ####: ', e);
+
+      // Supersede guard (see peer.on('close') for the full rationale).
+      // An orphaned superseded peer's ICE eventually fails → error fires;
+      // without this guard, the ensuing cleanup would wipe the healthy
+      // new connection's state.
+      const currentOnError = get(this._openConnections)[pubKeyB64];
+      if (currentOnError && currentOnError.connectionId !== connectionId) {
+        this.logger.logCustomMessage(
+          `Superseded error [${pubKeyB64.slice(0, 8)}]: ` +
+            `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnError.connectionId.slice(0, 8)} ` +
+            `err=${e.message || e} — skipping cleanup (would have: deleted _openConnections entry, ` +
+            `deleted _videoStreams, removed audio analyser, torn down outgoing screen share, ` +
+            `set ConnectionStatus=Disconnected, fired peer-disconnected)`
+        );
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededError',
+          connectionId,
+          detail: `superseded-by=${currentOnError.connectionId}; err=${e.message || e}`,
+        });
+        peer.destroy();
+        return;
+      }
+
       peer.destroy();
 
       this.logger.logCustomMessage(
@@ -1603,15 +2599,17 @@ export class StreamsStore {
       });
 
       // Also tear down any outgoing screen share to this peer
-      const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-      if (outgoingScreenShare) {
-        outgoingScreenShare.peer.destroy();
+      const outgoingScreenShare2 = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
+      if (outgoingScreenShare2) {
+        outgoingScreenShare2.peer.destroy();
         this._screenShareConnectionsOutgoing.update(currentValue => {
           delete currentValue[pubKeyB64];
           return currentValue;
         });
         delete this._pendingScreenShareInits[pubKeyB64];
       }
+      this.removePeerAudioAnalyser(pubKeyB64);
+      this.webrtcStats.delete(pubKeyB64);
 
       this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
       this.eventCallback({
@@ -1883,10 +2881,13 @@ export class StreamsStore {
             ? get(this._screenShareConnectionStatuses)
             : undefined,
           knownAgents: get(this._knownAgents),
+          peerLinks: this._buildPeerLinks(),
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[agentB64]?.audio,
-          sharedWal: get(this._mySharedWal) ?? undefined,
+          moduleStates: Object.keys(get(this._myModuleStates)).length > 0
+            ? get(this._myModuleStates)
+            : undefined,
         },
       };
       try {
@@ -2237,6 +3238,142 @@ export class StreamsStore {
   }
 
   /**
+   * Bucket RTT and loss into coarse human-scale bands. The goal is
+   * log compression: every poll cycle the raw numbers wiggle, but the
+   * bucket changes only when quality actually shifts category. RTT bands
+   * are tuned for voice — >200ms is where duplex conversation starts to
+   * feel laggy; >400ms is walkie-talkie territory. Loss bands match the
+   * points where Opus concealment starts to be audible (1%) and where
+   * most listeners will complain (3%).
+   */
+  private _qualityBucket(
+    carrier: 'webrtc' | 'signals',
+    rttMs: number | null,
+    lossPercent: number | null,
+  ): string {
+    const rttBand =
+      rttMs === null ? 'unknown'
+      : rttMs <= 80 ? 'good'
+      : rttMs <= 200 ? 'ok'
+      : rttMs <= 400 ? 'poor'
+      : 'bad';
+    const lossBand =
+      lossPercent === null ? 'unknown'
+      : lossPercent < 1 ? 'clean'
+      : lossPercent <= 3 ? 'mild'
+      : 'lossy';
+    return `${carrier}:${rttBand}:${lossBand}`;
+  }
+
+  /**
+   * Emit a QualityBucketChange event iff the (carrier, rtt-band, loss-band)
+   * tuple for this peer has changed since the last emission. Called from
+   * both the WebRTC stats poll and the pong handler — whichever carrier is
+   * currently active drives the emission. Skip the initial transition from
+   * `unknown`-only buckets to avoid a spurious event on first sample.
+   */
+  private _maybeEmitQualityChange(
+    pubKeyB64: AgentPubKeyB64,
+    carrier: 'webrtc' | 'signals',
+    rttMs: number | null,
+    jitterMs: number | null,
+    lossPercent: number | null,
+  ) {
+    const bucket = this._qualityBucket(carrier, rttMs, lossPercent);
+    const last = this._lastQualityBucket.get(pubKeyB64);
+    if (bucket === last) return;
+    this._lastQualityBucket.set(pubKeyB64, bucket);
+    // Don't emit before we have any signal at all — a transition from
+    // (no data) to (no data) on carrier flip is not interesting.
+    if (rttMs === null && lossPercent === null) return;
+    const detail =
+      `${bucket}` +
+      (rttMs !== null ? ` rtt=${rttMs}ms` : '') +
+      (jitterMs !== null ? ` jit=${jitterMs}ms` : '') +
+      (lossPercent !== null ? ` loss=${lossPercent}%` : '');
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: Date.now(),
+      event: 'QualityBucketChange',
+      detail,
+    });
+  }
+
+  /**
+   * Scan every peer in the presence set for sustained audibility outages.
+   * The condition is: our audioLinkFor(peer) has been in 'down' or
+   * 'negotiating' for ≥30s AND at least one other peer's broadcast
+   * peerLinks reports *they* are audible to that same peer (webrtc or
+   * signals). That's the "a relay could fix this" signal — we skip
+   * flagging outages where no relay opportunity exists (the peer is
+   * actually unreachable from everyone, or we're the only observer).
+   *
+   * Called from pingAgents() every PING_INTERVAL (2s). The 30s threshold
+   * means a Start event fires no sooner than ~3 poll cycles after the
+   * link first goes bad. End fires on any transition back to an audible
+   * state ('webrtc', 'signals', 'muted', 'blocked', 'absent').
+   */
+  private _checkAudibilityOutages(): void {
+    const OUTAGE_THRESHOLD_MS = 30_000;
+    const now = Date.now();
+    const presence = this.globalPresenceSet();
+    const others = get(this._othersConnectionStatuses);
+
+    for (const peerB64 of presence) {
+      if (peerB64 === this.myPubKeyB64) continue;
+
+      const link = this.audioLinkFor(peerB64);
+      const isOutage = link === 'down' || link === 'negotiating';
+      const state = this._outageStates.get(peerB64);
+
+      if (isOutage) {
+        if (!state) {
+          this._outageStates.set(peerB64, { startedAt: now, emitted: false });
+          continue;
+        }
+        if (state.emitted) continue;
+        if (now - state.startedAt < OUTAGE_THRESHOLD_MS) continue;
+
+        // Relay opportunity: does any third peer report they can hear
+        // this target right now?
+        let relayVia: AgentPubKeyB64 | undefined;
+        for (const [otherB64, entry] of Object.entries(others)) {
+          if (otherB64 === this.myPubKeyB64 || otherB64 === peerB64) continue;
+          const theirView = entry.peerLinks?.[peerB64];
+          if (
+            theirView &&
+            (theirView.audioLink === 'webrtc' || theirView.audioLink === 'signals')
+          ) {
+            relayVia = otherB64;
+            break;
+          }
+        }
+        if (!relayVia) continue;
+
+        state.emitted = true;
+        const durationSec = Math.floor((now - state.startedAt) / 1000);
+        this.logger.logAgentEvent({
+          agent: peerB64,
+          timestamp: now,
+          event: 'AudibilityOutageStart',
+          detail: `${link} ${durationSec}s; relay-via=${relayVia.slice(0, 8)}`,
+        });
+      } else if (state) {
+        if (state.emitted) {
+          const durationSec = Math.floor((now - state.startedAt) / 1000);
+          this.logger.logAgentEvent({
+            agent: peerB64,
+            timestamp: now,
+            event: 'AudibilityOutageEnd',
+            detail: `${durationSec}s; recovered via ${link}`,
+          });
+        }
+        this._outageStates.delete(peerB64);
+      }
+    }
+  }
+
+  /**
    * Checks inbound RTP bytesReceived for each open connection.
    * If bytes haven't increased for 2+ consecutive cycles (4+ seconds at 2s ping interval),
    * the track is considered dead and we request the sender to refresh via data channel.
@@ -2254,17 +3391,80 @@ export class StreamsStore {
         const stats = await pc.getStats();
         let audioBytes = 0;
         let videoBytes = 0;
+        // Per-kind jitter/loss. Prefer audio for display when available
+        // (more time-sensitive); fall back to video otherwise.
+        let audioJitter: number | null = null;
+        let audioPacketsReceived = 0;
+        let audioPacketsLost = 0;
+        let videoJitter: number | null = null;
+        let videoPacketsReceived = 0;
+        let videoPacketsLost = 0;
+        let rttMs: number | null = null;
+        let candPairRttMs: number | null = null;
 
         stats.forEach((report: any) => {
           if (report.type === 'inbound-rtp') {
-            if (report.kind === 'audio' || report.mediaType === 'audio') {
+            const kind = report.kind || report.mediaType;
+            if (kind === 'audio') {
               audioBytes = report.bytesReceived || 0;
-            }
-            if (report.kind === 'video' || report.mediaType === 'video') {
+              if (typeof report.jitter === 'number') audioJitter = report.jitter;
+              audioPacketsReceived = report.packetsReceived || 0;
+              audioPacketsLost = report.packetsLost || 0;
+            } else if (kind === 'video') {
               videoBytes = report.bytesReceived || 0;
+              if (typeof report.jitter === 'number') videoJitter = report.jitter;
+              videoPacketsReceived = report.packetsReceived || 0;
+              videoPacketsLost = report.packetsLost || 0;
             }
           }
+          // RTT from remote-inbound-rtp (our outgoing direction).
+          if (report.type === 'remote-inbound-rtp' &&
+              typeof report.roundTripTime === 'number') {
+            rttMs = Math.round(report.roundTripTime * 1000);
+          }
+          // Fallback: candidate-pair gives ICE-level RTT.
+          if (report.type === 'candidate-pair' &&
+              report.state === 'succeeded' &&
+              typeof report.currentRoundTripTime === 'number') {
+            candPairRttMs = Math.round(report.currentRoundTripTime * 1000);
+          }
         });
+
+        if (rttMs === null) rttMs = candPairRttMs;
+
+        // Pick whichever kind has data. Audio is preferred when both
+        // are flowing. If neither, leave jitter/loss null.
+        const hasAudio = audioPacketsReceived + audioPacketsLost > 0;
+        const hasVideo = videoPacketsReceived + videoPacketsLost > 0;
+        const jitter = hasAudio
+          ? audioJitter
+          : (hasVideo ? videoJitter : null);
+        const pktsRecv = hasAudio
+          ? audioPacketsReceived
+          : (hasVideo ? videoPacketsReceived : 0);
+        const pktsLost = hasAudio
+          ? audioPacketsLost
+          : (hasVideo ? videoPacketsLost : 0);
+        const totalPackets = pktsRecv + pktsLost;
+
+        const jitterRounded = jitter !== null
+          ? Math.round((jitter as number) * 1000 * 10) / 10
+          : null;
+        const lossRounded = totalPackets > 0
+          ? Math.round((pktsLost / totalPackets) * 1000) / 10
+          : null;
+        this.webrtcStats.set(pubKeyB64, {
+          rttMs,
+          jitterMs: jitterRounded,
+          lossPercent: lossRounded,
+        });
+        this._maybeEmitQualityChange(
+          pubKeyB64,
+          'webrtc',
+          rttMs,
+          jitterRounded,
+          lossRounded,
+        );
 
         const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
         const stale = this._staleCycles[pubKeyB64] || { audio: 0, video: 0 };
@@ -2367,11 +3567,11 @@ export class StreamsStore {
           case 'DiagnosticResponse':
             this.handleDiagnosticResponse(signal);
             break;
-          case 'ShareWal':
-            this.handleShareWal(signal);
+          case 'ModuleState':
+            this.handleModuleState(signal);
             break;
-          case 'StopShareWal':
-            this.handleStopShareWal(signal);
+          case 'ModuleData':
+            this.handleModuleData(signal);
             break;
           default:
             console.warn('Unknown msg_type:', signal.msg_type);
@@ -2395,6 +3595,16 @@ export class StreamsStore {
 
     const streamInfo = getStreamInfo(this._videoStreams[pubkeyB64]);
 
+    // Extract the sender's ping timestamp so we can echo it back for RTT.
+    // Old peers send an empty payload — pingT0 stays undefined in that case.
+    let pingT0: number | undefined;
+    if (signal.payload && signal.payload.length > 0) {
+      try {
+        const parsed = JSON.parse(signal.payload);
+        if (typeof parsed?.t0 === 'number') pingT0 = parsed.t0;
+      } catch {}
+    }
+
     if (pubkeyB64 !== this.myPubKeyB64) {
       const metaData: PongMetaData<PongMetaDataV1> = {
         formatVersion: 1,
@@ -2404,10 +3614,14 @@ export class StreamsStore {
             ? get(this._screenShareConnectionStatuses)
             : undefined,
           knownAgents: get(this._knownAgents),
+          peerLinks: this._buildPeerLinks(),
           appVersion: __APP_VERSION__,
           streamInfo,
           audio: get(this._openConnections)[pubkeyB64]?.audio,
-          sharedWal: get(this._mySharedWal) ?? undefined,
+          pingT0,
+          moduleStates: Object.keys(get(this._myModuleStates)).length > 0
+            ? get(this._myModuleStates)
+            : undefined,
         },
       };
       await this.roomClient.sendMessage(
@@ -2471,6 +3685,31 @@ export class StreamsStore {
       timestamp: Date.now(),
       event: 'PeerLeave',
     });
+    this._lastQualityBucket.delete(pubkeyB64);
+    // If we were mid-outage for this peer, close it out — the peer is
+    // gone, not silently unreachable. Wouldn't fire via _checkAudibilityOutages
+    // because peer drops from the presence set on next tick.
+    const outage = this._outageStates.get(pubkeyB64);
+    if (outage?.emitted) {
+      const durationSec = Math.floor((Date.now() - outage.startedAt) / 1000);
+      this.logger.logAgentEvent({
+        agent: pubkeyB64,
+        timestamp: Date.now(),
+        event: 'AudibilityOutageEnd',
+        detail: `${durationSec}s; peer left`,
+      });
+    }
+    this._outageStates.delete(pubkeyB64);
+
+    // Clear lastSeen so agent immediately drops from _activeAgents (pane
+    // removal). Same observable as "never joined" — both surface as
+    // `absent` from this observer's view.
+    this._knownAgents.update(agents => {
+      if (agents[pubkeyB64]) {
+        agents[pubkeyB64] = { ...agents[pubkeyB64], lastSeen: undefined };
+      }
+      return agents;
+    });
 
     // Destroy video connection
     const openConn = get(this._openConnections)[pubkeyB64];
@@ -2504,11 +3743,19 @@ export class StreamsStore {
     this.updateConnectionStatus(pubkeyB64, { type: 'Disconnected' });
     this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
 
-    // Clean up any active WAL share from this peer
-    this._peerSharedWals.update(v => { delete v[pubkeyB64]; return v; });
+    // Clean up module states for this peer (capture pre-image for transition dispatch)
+    const peerModulesAtLeave = get(this._peerModuleStates)[pubkeyB64] || {};
+    this._peerModuleStates.update(all => {
+      const updated = { ...all };
+      delete updated[pubkeyB64];
+      return updated;
+    });
+    for (const [moduleId, envelope] of Object.entries(peerModulesAtLeave)) {
+      this._dispatchPeerModuleTransition(pubkeyB64, moduleId, envelope, null);
+    }
 
-    // Fire event so UI updates
-    this.eventCallback({ type: 'peer-disconnected', pubKeyB64: pubkeyB64, connectionId: '' });
+    // Fire event so UI updates (peer-leave = agent left the room, distinct from WebRTC disconnect)
+    this.eventCallback({ type: 'peer-leave', pubKeyB64: pubkeyB64 });
   }
 
   /**
@@ -2535,6 +3782,41 @@ export class StreamsStore {
       );
       this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
       metaDataExt = metaData;
+
+      // Compute signals-carrier RTT from the echoed ping timestamp.
+      // Smooth with EWMA so single-cycle jitter doesn't make the display
+      // jump around. Alpha = 0.3 gives ~3-sample effective window.
+      if (typeof metaData.data.pingT0 === 'number') {
+        const rtt = Date.now() - metaData.data.pingT0;
+        if (rtt >= 0 && rtt < 60000) {
+          const prev = this._signalsRttEwma.get(pubkeyB64) ?? rtt;
+          const next = Math.round(0.3 * rtt + 0.7 * prev);
+          this._signalsRttEwma.set(pubkeyB64, next);
+          const existing = this.signalsStats.get(pubkeyB64) ?? {
+            rttMs: null, jitterMs: null, lossPercent: null,
+          };
+          existing.rttMs = next;
+          this.signalsStats.set(pubkeyB64, existing);
+          // Only evaluate bucket on the signals path if signals is the
+          // active carrier for this peer — otherwise the webrtc poll is
+          // the source of truth and will emit if bucket changes.
+          const openConn = get(this._openConnections)[pubkeyB64];
+          if (!openConn?.connected) {
+            this._maybeEmitQualityChange(
+              pubkeyB64,
+              'signals',
+              existing.rttMs,
+              existing.jitterMs,
+              existing.lossPercent,
+            );
+          }
+        }
+      } else {
+        // Peer on old code — their pong doesn't echo pingT0 yet.
+        console.debug(
+          `[stats] No pingT0 in pong from ${pubkeyB64.slice(0, 8)} — remote may be on older code`
+        );
+      }
       this._othersConnectionStatuses.update(statuses => {
         const newStatuses = statuses;
         newStatuses[pubkeyB64] = {
@@ -2543,6 +3825,7 @@ export class StreamsStore {
           screenShareStatuses: metaData.data.screenShareConnectionStatuses,
           knownAgents: metaData.data.knownAgents,
           perceivedStreamInfo: metaData.data.streamInfo,
+          peerLinks: metaData.data.peerLinks,
         };
         return statuses;
       });
@@ -2578,28 +3861,51 @@ export class StreamsStore {
         }
         return knownAgents;
       });
-      // Handle shared WAL propagation for late-joiners
-      if (metaData.data.sharedWal) {
-        const currentPeerWals = get(this._peerSharedWals);
-        if (!currentPeerWals[pubkeyB64] || currentPeerWals[pubkeyB64].weaveUrl !== metaData.data.sharedWal.weaveUrl) {
-          this._peerSharedWals.update(v => {
-            v[pubkeyB64] = metaData.data.sharedWal!;
-            return v;
-          });
-          this.eventCallback({
-            type: 'peer-share-wal',
-            pubKeyB64: pubkeyB64,
-            payload: metaData.data.sharedWal,
-          });
+      // Reconcile module states from pong for late-joiners
+      if (metaData.data.moduleStates) {
+        const current = get(this._peerModuleStates)[pubkeyB64] || {};
+        const prevSnapshot = { ...current };
+        const incoming = metaData.data.moduleStates;
+        let changed = false;
+        const merged = { ...current };
+        for (const [moduleId, envelope] of Object.entries(incoming)) {
+          if (!merged[moduleId] ||
+              (envelope.updatedAt > merged[moduleId].updatedAt &&
+               (envelope.payload !== merged[moduleId].payload || envelope.active !== merged[moduleId].active))) {
+            merged[moduleId] = envelope;
+            changed = true;
+          }
+        }
+        // Remove modules no longer in pong (agent deactivated them)
+        for (const moduleId of Object.keys(merged)) {
+          if (!incoming[moduleId]) {
+            delete merged[moduleId];
+            changed = true;
+          }
+        }
+        if (changed) {
+          this._peerModuleStates.update(all => ({ ...all, [pubkeyB64]: merged }));
+          // Fire transition + payload-change callbacks for affected modules
+          const allIds = new Set([...Object.keys(prevSnapshot), ...Object.keys(merged)]);
+          for (const moduleId of allIds) {
+            const prevEnv = prevSnapshot[moduleId] || null;
+            const nextEnv = merged[moduleId] || null;
+            this._dispatchPeerModuleTransition(pubkeyB64, moduleId, prevEnv, nextEnv);
+            this._dispatchPeerModulePayloadChange(pubkeyB64, moduleId, prevEnv, nextEnv);
+          }
         }
       } else {
-        // Peer stopped sharing — clean up if we had them tracked
-        if (get(this._peerSharedWals)[pubkeyB64]) {
-          this._peerSharedWals.update(v => { delete v[pubkeyB64]; return v; });
-          this.eventCallback({
-            type: 'peer-stop-share-wal',
-            pubKeyB64: pubkeyB64,
+        // No module states in pong — clear any we had for this peer
+        const cleared = get(this._peerModuleStates)[pubkeyB64];
+        if (cleared && Object.keys(cleared).length > 0) {
+          this._peerModuleStates.update(all => {
+            const updated = { ...all };
+            delete updated[pubkeyB64];
+            return updated;
           });
+          for (const [moduleId, envelope] of Object.entries(cleared)) {
+            this._dispatchPeerModuleTransition(pubkeyB64, moduleId, envelope, null);
+          }
         }
       }
     } catch (e) {
@@ -2613,7 +3919,16 @@ export class StreamsStore {
      * sending the pong and there is no open connection yet with this agent and there is
      * no pending InitRequest from less than 5 seconds ago (and we therefore have to
      * assume that a remote signal got lost), send an InitRequest.
+     *
+     * Only initiate if the conversation module is active (i.e., we want WebRTC).
      */
+    const conversationActive = !!get(this._myModuleStates)['conversation'];
+
+    // Per-peer WebRTC override: if either side has disabled WebRTC for
+    // this link, skip the entire init/retry path. Audio will flow over
+    // Holochain remote signals automatically (Step 3 carrier routing).
+    const peerWebrtcDisabled = this.webrtcDisabled(pubkeyB64);
+
     // Clean up stale video connection if the underlying WebRTC is dead.
     // This allows the normal initiation flow to proceed for a re-joining peer.
     const existingConn = get(this._openConnections)[pubkeyB64];
@@ -2639,51 +3954,56 @@ export class StreamsStore {
     // alreadyOpen here does not include the case where SDP exchange is already ongoing
     // but no actual connection has happened yet
     const alreadyOpen = get(this._openConnections)[pubkeyB64];
-    const pendingInits = this._pendingInits[pubkeyB64];
-    if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
-      if (!pendingInits) {
-        console.log('#### SENDING FIRST INIT REQUEST.');
-        const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
-        if (lastDisconnect) {
-          const gap = Date.now() - lastDisconnect;
-          this.logger.logCustomMessage(
-            `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
-          );
-        }
-        const newConnectionId = uuidv4();
-        this._pendingInits[pubkeyB64] = [
-          { connectionId: newConnectionId, t0: now },
-        ];
-        await this.roomClient.sendMessage(
-          [signal.from_agent],
-          'InitRequest',
-          JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-        );
-        this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-      } else {
-        console.log(
-          `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
-        );
-        const latestInit = pendingInits.sort(
-          (init_a, init_b) => init_b.t0 - init_a.t0
-        )[0];
-        if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
+
+    // Only initiate/manage WebRTC video connections when conversation
+    // module is active AND WebRTC is not disabled for this peer.
+    if (conversationActive && !peerWebrtcDisabled && !this.webrtcGloballyDisabled) {
+      const pendingInits = this._pendingInits[pubkeyB64];
+      if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
+        if (!pendingInits) {
+          console.log('#### SENDING FIRST INIT REQUEST.');
+          const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
+          if (lastDisconnect) {
+            const gap = Date.now() - lastDisconnect;
+            this.logger.logCustomMessage(
+              `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
+            );
+          }
           const newConnectionId = uuidv4();
-          pendingInits.push({ connectionId: newConnectionId, t0: now });
-          this._pendingInits[pubkeyB64] = pendingInits;
+          this._pendingInits[pubkeyB64] = [
+            { connectionId: newConnectionId, t0: now },
+          ];
           await this.roomClient.sendMessage(
             [signal.from_agent],
             'InitRequest',
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
           );
           this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
+        } else {
+          console.log(
+            `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
+          );
+          const latestInit = pendingInits.sort(
+            (init_a, init_b) => init_b.t0 - init_a.t0
+          )[0];
+          if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
+            const newConnectionId = uuidv4();
+            pendingInits.push({ connectionId: newConnectionId, t0: now });
+            this._pendingInits[pubkeyB64] = pendingInits;
+            await this.roomClient.sendMessage(
+              [signal.from_agent],
+              'InitRequest',
+              JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
+            );
+            this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
+          }
         }
+      } else if (!alreadyOpen && !pendingInits) {
+        this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
+      } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
+        // If the connection is already open, reconcile with our expected stream state
+        this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
       }
-    } else if (!alreadyOpen && !pendingInits) {
-      this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
-    } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
-      // If the connection is already open, reconcile with our expected stream state
-      this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
     }
 
     // Check whether they have the right expectation of our audio state and if not,
@@ -2816,6 +4136,11 @@ export class StreamsStore {
      * Only accept init requests from agents who's pubkey is alphabetically  "higher" than ours
      */
     if (connection_type === 'video' && pubKey64 > this.myPubKeyB64) {
+      // Reject if WebRTC is globally disabled or disabled for this peer.
+      if (this.webrtcGloballyDisabled || this.webrtcDisabled(pubKey64)) {
+        console.log(`#### IGNORING INIT REQUEST from ${pubKey64.slice(0, 8)}: WebRTC disabled`);
+        return;
+      }
       console.log(
         '#### SENDING INIT ACCEPT. connection_type: ',
         connection_type
@@ -2951,6 +4276,12 @@ export class StreamsStore {
             );
           }
 
+          // Capture any prior openConnection for this peer so we can
+          // destroy it after installing the new entry. Without this, the
+          // old PC would linger until its own ICE failed, and its close
+          // handler (pre-guard) would wipe the new entry's state.
+          const priorOpenForInitAccept = get(this._openConnections)[pubKey64];
+
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
             openConnections[pubKey64] = {
@@ -2963,6 +4294,30 @@ export class StreamsStore {
             };
             return openConnections;
           });
+
+          // New entry is now installed. If there was a prior open
+          // connection with a different connectionId, destroy it. Its
+          // close handler will fire (possibly synchronously from
+          // destroy()), re-read _openConnections — which now has the new
+          // connectionId — and no-op via the supersede guard.
+          if (
+            priorOpenForInitAccept &&
+            priorOpenForInitAccept.connectionId !== connection_id
+          ) {
+            this.logger.logCustomMessage(
+              `Superseding [${pubKey64.slice(0, 8)}]: destroying prior open ` +
+                `connId=${priorOpenForInitAccept.connectionId.slice(0, 8)} ` +
+                `for new connId=${connection_id.slice(0, 8)} (initiator path)`
+            );
+            this.logger.logAgentEvent({
+              agent: pubKey64,
+              timestamp: Date.now(),
+              event: 'Superseded',
+              connectionId: priorOpenForInitAccept.connectionId,
+              detail: `superseded-by=${connection_id}; path=initiator`,
+            });
+            priorOpenForInitAccept.peer.destroy();
+          }
 
           delete this._pendingInits[pubKey64];
 
@@ -3106,6 +4461,13 @@ export class StreamsStore {
           console.log(
             '#### FOUND PENDING ACCEPT! Moving to open connections...'
           );
+
+          // Capture any prior openConnection so we can destroy it after
+          // installing the new entry. See handleInitAccept comment for
+          // the full rationale (close handler uses the supersede guard
+          // to no-op once the new entry is in place).
+          const priorOpenForSdp = get(this._openConnections)[pubkeyB64];
+
           this._openConnections.update(currentValue => {
             const openConnections = currentValue;
             openConnections[pubkeyB64] = {
@@ -3118,6 +4480,26 @@ export class StreamsStore {
             };
             return openConnections;
           });
+
+          if (
+            priorOpenForSdp &&
+            priorOpenForSdp.connectionId !== connection_id
+          ) {
+            this.logger.logCustomMessage(
+              `Superseding [${pubkeyB64.slice(0, 8)}]: destroying prior open ` +
+                `connId=${priorOpenForSdp.connectionId.slice(0, 8)} ` +
+                `for new connId=${connection_id.slice(0, 8)} (acceptor path)`
+            );
+            this.logger.logAgentEvent({
+              agent: pubkeyB64,
+              timestamp: Date.now(),
+              event: 'Superseded',
+              connectionId: priorOpenForSdp.connectionId,
+              detail: `superseded-by=${connection_id}; path=acceptor`,
+            });
+            priorOpenForSdp.peer.destroy();
+          }
+
           const otherPendingAccepts = pendingAcceptsForAgent.filter(
             pendingAccept => pendingAccept.connectionId !== connection_id
           );
@@ -3265,37 +4647,4 @@ export class StreamsStore {
     }
   }
 
-  // ===========================================================================================
-  // SHARE WAL SIGNAL HANDLERS
-  // ===========================================================================================
-
-  handleShareWal(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    try {
-      const payload: SharedWalPayload = JSON.parse(signal.payload);
-      this._peerSharedWals.update(current => {
-        current[pubkeyB64] = payload;
-        return current;
-      });
-      this.eventCallback({
-        type: 'peer-share-wal',
-        pubKeyB64: pubkeyB64,
-        payload,
-      });
-    } catch (e) {
-      console.warn('Failed to parse ShareWal payload:', e);
-    }
-  }
-
-  handleStopShareWal(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    this._peerSharedWals.update(current => {
-      delete current[pubkeyB64];
-      return current;
-    });
-    this.eventCallback({
-      type: 'peer-stop-share-wal',
-      pubKeyB64: pubkeyB64,
-    });
-  }
 }

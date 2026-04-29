@@ -22,13 +22,16 @@
     "hash": "weave hash-webhapp FIXME ./workdir/presence.webhapp"
   },
   "devDependencies": {
-    "@holochain/hc-spin": "^0.600.2-rc.0",
     "@holochain-playground/cli": "^0.1.1",
+    "@holochain/hc-spin": "^0.600.2-rc.0",
     "@theweave/cli": "^0.15.19",
     "concurrently": "^6.2.1",
     "rimraf": "^3.0.2"
   },
   "engines": {
     "npm": ">=7.0.0"
+  },
+  "dependencies": {
+    "emoji-picker-element": "^1.29.1"
   }
 }

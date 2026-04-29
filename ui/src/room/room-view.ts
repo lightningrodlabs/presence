@@ -21,12 +21,10 @@ import {
   mdiMicrophone,
   mdiMicrophoneOff,
   mdiMinus,
-  mdiMonitorScreenshot,
   mdiNoteEditOutline,
   mdiCubeOutline,
   mdiPaperclip,
   mdiPencilCircleOutline,
-  mdiPhoneRefresh,
   mdiHub,
   mdiDownload,
   mdiCloudDownloadOutline,
@@ -37,6 +35,7 @@ import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { localized, msg } from '@lit/localize';
 import { consume } from '@lit/context';
 import { repeat } from 'lit/directives/repeat.js';
+import { html as staticHtml, unsafeStatic } from 'lit/static-html.js';
 
 import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/icon-button/icon-button.js';
@@ -55,12 +54,18 @@ import { RoomStore } from './room-store';
 import './elements/attachment-element';
 import './elements/agent-connection-status';
 import './elements/agent-connection-status-icon';
+import './elements/audio-level-meter';
+import './elements/peer-stats-panel';
 import './elements/toggle-switch';
 import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
 import { PING_INTERVAL, StreamsStore } from '../streams-store';
-import { AgentInfo, ConnectionStatuses } from '../types';
+import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
 import { exportLogs } from '../logging';
+import { getAllModules, getModule, getShareModules } from './modules/registry';
+import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
+import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
+import './modules'; // side-effect: registers all modules
 
 declare const __APP_VERSION__: string;
 
@@ -138,6 +143,12 @@ export class RoomView extends LitElement {
     () => [this.streamsStore]
   );
 
+  _activeAgents = new StoreSubscriber(
+    this,
+    () => this.streamsStore._activeAgents,
+    () => [this.streamsStore]
+  );
+
   _receivedDiagnosticLogs = new StoreSubscriber(
     this,
     () => this.streamsStore._receivedDiagnosticLogs,
@@ -156,15 +167,21 @@ export class RoomView extends LitElement {
     () => [this.streamsStore]
   );
 
-  _mySharedWal = new StoreSubscriber(
+  _myModuleStates = new StoreSubscriber(
     this,
-    () => this.streamsStore._mySharedWal,
+    () => this.streamsStore._myModuleStates,
     () => [this.streamsStore]
   );
 
-  _peerSharedWals = new StoreSubscriber(
+  _peerModuleStates = new StoreSubscriber(
     this,
-    () => this.streamsStore._peerSharedWals,
+    () => this.streamsStore._peerModuleStates,
+    () => [this.streamsStore]
+  );
+
+  _receiverModuleOverrides = new StoreSubscriber(
+    this,
+    () => this.streamsStore._receiverModuleOverrides,
     () => [this.streamsStore]
   );
 
@@ -228,6 +245,12 @@ export class RoomView extends LitElement {
   @state()
   _reconnectAudio = new Audio('old-phone-ring-connect.mp3#t=0,3.5');
 
+  /** Tracks the previous set of active agent pubkeys for diffing.
+   * Used to detect signal-level presence changes (agent appear/disappear)
+   * and play join/leave sounds, independent of WebRTC state. */
+  private _prevActiveAgentKeys = new Set<string>();
+  private _activeAgentsUnsubscribe: (() => void) | null = null;
+
   @state()
   _showAttachmentsPanel = false;
 
@@ -269,6 +292,7 @@ export class RoomView extends LitElement {
 
   @state()
   _unsubscribe: (() => void) | undefined;
+
 
   closeClosables = () => {
     if (this._showAttachmentsPanel) {
@@ -355,7 +379,7 @@ export class RoomView extends LitElement {
           this.requestUpdate();
           await this.updateComplete;
           const myScreenVideo = this.shadowRoot?.getElementById(
-            'my-own-screen'
+            MY_OWN_SCREEN_VIDEO_ID
           ) as HTMLVideoElement;
           if (myScreenVideo) {
             myScreenVideo.autoplay = true;
@@ -364,20 +388,28 @@ export class RoomView extends LitElement {
           break;
         }
         case 'my-screen-share-off': {
-          if (this._maximizedVideo === 'my-own-screen') {
+          if (this._maximizedVideo === MY_OWN_SCREEN_VIDEO_ID) {
             this._maximizedVideo = undefined;
           }
           break;
         }
         case 'peer-connected': {
-          await this._joinAudio.play();
+          // Join sound now plays on signal-level presence (agent appears
+          // in _activeAgents), not on WebRTC connection establishment.
           break;
         }
         case 'peer-disconnected': {
-          if (this._maximizedVideo === event.connectionId) {
+          // WebRTC disconnect only — pane persists via _activeAgents.
+          // No audio or maximize clear needed.
+          break;
+        }
+        case 'peer-leave': {
+          // Agent left the room — clear maximize if they were maximized.
+          // Leave sound now plays on signal-level presence (agent
+          // disappears from _activeAgents), not here.
+          if (this._maximizedVideo === event.pubKeyB64) {
             this._maximizedVideo = undefined;
           }
-          await this._leaveAudio.play();
           break;
         }
         case 'peer-stream': {
@@ -385,7 +417,7 @@ export class RoomView extends LitElement {
           // so we add a timeout here.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
-              event.connectionId
+              `video-${event.pubKeyB64}`
             ) as HTMLVideoElement | undefined;
             if (videoEl) {
               videoEl.autoplay = true;
@@ -401,7 +433,7 @@ export class RoomView extends LitElement {
           // so we add a timeout here.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
-              event.connectionId
+              peerScreenVideoId(event.pubKeyB64)
             ) as HTMLVideoElement | undefined;
             console.log('&&&& Trying to set video element (screen share)');
             if (videoEl) {
@@ -412,14 +444,11 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-screen-share-disconnected': {
-          if (this._maximizedVideo === event.connectionId) {
+          // Maximize is now keyed by share-${moduleId}-${pubkey}, not connectionId.
+          // Clear maximize if this peer's screen share was maximized.
+          if (this._maximizedVideo === `share-screen-share-${event.pubKeyB64}`) {
             this._maximizedVideo = undefined;
           }
-          break;
-        }
-        case 'peer-share-wal':
-        case 'peer-stop-share-wal': {
-          this.requestUpdate();
           break;
         }
         default:
@@ -429,6 +458,29 @@ export class RoomView extends LitElement {
     this._leaveAudio.volume = 0.05;
     this._joinAudio.volume = 0.07;
     this._reconnectAudio.volume = 0.1;
+
+    // Subscribe to signal-level presence changes. Play join/leave sounds
+    // when agents appear/disappear in _activeAgents (driven by ping/pong),
+    // independent of WebRTC connection state. This means the user hears
+    // someone arrive the moment their pong lands, not when (or if) WebRTC
+    // establishes.
+    this._activeAgentsUnsubscribe = this.streamsStore._activeAgents.subscribe(
+      agents => {
+        const currentKeys = new Set(Object.keys(agents));
+        for (const key of currentKeys) {
+          if (!this._prevActiveAgentKeys.has(key)) {
+            this._joinAudio.play().catch(() => {});
+          }
+        }
+        for (const key of this._prevActiveAgentKeys) {
+          if (!currentKeys.has(key)) {
+            this._leaveAudio.play().catch(() => {});
+          }
+        }
+        this._prevActiveAgentKeys = currentKeys;
+      }
+    );
+
     this._roomInfo = await this.roomStore.client.getRoomInfo();
 
     this._weaveClient.assets.assetStore(this.wal).subscribe(status => {
@@ -436,6 +488,21 @@ export class RoomView extends LitElement {
       this.assetStoreContent = status;
       this.requestUpdate();
     });
+
+    // Auto-activate receiver-controlled modules that advertise state (e.g. clock timezone)
+    for (const mod of getAllModules()) {
+      if (mod.activationControl === 'receiver' && mod.defaultState) {
+        this.streamsStore.activateModule(mod.id);
+      }
+    }
+
+    // Auto-activate modules that should be on by default.
+    // The conversation module is always active — it owns mic/video state
+    // and carrier routing. The global WebRTC kill switch is a separate
+    // flag (webrtcGloballyDisabled) that suppresses WebRTC initiation
+    // without deactivating the module.
+    this.streamsStore.activateModule('conversation');
+    this.streamsStore.activateModule('reactions');
   }
 
   async addAttachment() {
@@ -471,7 +538,11 @@ export class RoomView extends LitElement {
       assetName,
       assetIconSrc,
     };
-    await this.streamsStore.shareWal(payload);
+    await this.streamsStore.activateModule('wal', JSON.stringify(payload));
+  }
+
+  async stopShareWal() {
+    await this.streamsStore.deactivateModule('wal');
   }
 
   openCustomEventLogDialog() {
@@ -492,9 +563,8 @@ export class RoomView extends LitElement {
   }
 
   updated(changedProperties: Map<string, unknown>) {
-    // Re-apply video srcObjects after layout changes (e.g. maximize/minimize).
-    // The display:contents transition can destroy video rendering context,
-    // so we force re-assign srcObject after the DOM settles.
+    // Re-apply video srcObjects after maximize/minimize, which destroys video
+    // rendering context via the display:contents transition.
     if (changedProperties.has('_maximizedVideo')) {
       setTimeout(() => this._reapplyVideoStreams(), 50);
     }
@@ -512,7 +582,7 @@ export class RoomView extends LitElement {
 
     // Own screen share
     restoreVideo(
-      this.shadowRoot?.getElementById('my-own-screen') as HTMLVideoElement | null,
+      this.shadowRoot?.getElementById(MY_OWN_SCREEN_VIDEO_ID) as HTMLVideoElement | null,
       this.streamsStore.screenShareStream,
     );
 
@@ -523,29 +593,21 @@ export class RoomView extends LitElement {
     );
 
     // Peer screen shares
-    for (const [pubkeyB64, conn] of Object.entries(this._screenShareConnectionsIncoming.value)) {
+    for (const [pubkeyB64] of Object.entries(this._screenShareConnectionsIncoming.value)) {
       restoreVideo(
-        this.shadowRoot?.getElementById(conn.connectionId) as HTMLVideoElement | null,
+        this.shadowRoot?.getElementById(peerScreenVideoId(pubkeyB64)) as HTMLVideoElement | null,
         this.streamsStore._screenShareStreams[pubkeyB64],
       );
     }
 
     // Peer video streams
-    for (const [pubkeyB64, conn] of Object.entries(this._openConnections.value)) {
+    for (const [pubkeyB64] of Object.entries(this._openConnections.value)) {
       restoreVideo(
-        this.shadowRoot?.getElementById(conn.connectionId) as HTMLVideoElement | null,
+        this.shadowRoot?.getElementById(`video-${pubkeyB64}`) as HTMLVideoElement | null,
         this.streamsStore._videoStreams[pubkeyB64],
       );
     }
   }
-
-  _onScreenShareResize = (e: Event) => {
-    const video = e.target as HTMLVideoElement;
-    const container = video.closest('.video-container') as HTMLElement;
-    if (container && video.videoWidth && video.videoHeight) {
-      container.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
-    }
-  };
 
   _onResizeStart = (e: MouseEvent | TouchEvent) => {
     e.preventDefault();
@@ -592,28 +654,30 @@ export class RoomView extends LitElement {
   disconnectedCallback(): void {
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this._unsubscribe) this._unsubscribe();
+    if (this._activeAgentsUnsubscribe) this._activeAgentsUnsubscribe();
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect();
   }
 
-  idToLayout(id: string, isScreenShare: boolean = false) {
+  idToLayout(id: string, isShared: boolean = false) {
     if (id === this._maximizedVideo) return 'maximized';
     if (this._maximizedVideo) return 'hidden';
-    const incomingScreenShareNum = Object.keys(
-      this._screenShareConnectionsIncoming.value
-    ).length;
-    const ownScreenShareNum = this.streamsStore.screenShareStream ? 1 : 0;
-    const totalScreenShares = incomingScreenShareNum + ownScreenShareNum;
-    const hasScreenShares = totalScreenShares > 0;
+    const activeShareCount = this._getActiveShares().length;
+    const hasShared = activeShareCount > 0;
 
+    // Phantom tiles (reported-by-others but not connected to us) render
+    // alongside active tiles in the same grid and must be counted toward
+    // layout sizing. Without this the layout class is computed for fewer
+    // tiles than actually render, and every tile is oversized.
+    const phantomCount = this.streamsStore.phantomAgents().length;
     const videoOnlyCount =
-      Object.keys(this._openConnections.value).length + 1;
-    const totalCount = videoOnlyCount + totalScreenShares;
+      Object.keys(this._activeAgents.value).length + 1 + phantomCount;
+    const totalCount = videoOnlyCount + activeShareCount;
 
     // In split mode, size items based on their panel's count
-    const num = isScreenShare
-      ? totalScreenShares
-      : hasScreenShares
+    const num = isShared
+      ? activeShareCount
+      : hasShared
         ? videoOnlyCount
         : totalCount;
 
@@ -658,30 +722,91 @@ export class RoomView extends LitElement {
 
   renderConnectionDetailsToggle() {
     return html`
-      <div class="row toggle-switch-container" style="align-items: center;">
-        <toggle-switch
-          class="toggle-switch ${this._showConnectionDetails ? 'active' : ''}"
-          .toggleState=${this._showConnectionDetails}
-          @click=${(e: Event) => {
-            e.stopPropagation();
-          }}
-          @toggle-on=${() => {
-            this._showConnectionDetails = true;
-          }}
-          @toggle-off=${() => {
-            this._showConnectionDetails = false;
-          }}
-        ></toggle-switch>
-        <span
-          class="secondary-font"
-          style="cursor: default; margin-left: 7px; ${this
-            ._showConnectionDetails
-            ? 'opacity: 0.8;'
-            : 'opacity: 0.5;'}"
-          >${this._showConnectionDetails
-            ? 'Hide connection details'
-            : 'Show connection details'}</span
-        >
+      <div class="row toggle-switch-container" style="align-items: center; gap: 16px;">
+        <div class="row" style="align-items: center;">
+          <toggle-switch
+            class="toggle-switch ${this._showConnectionDetails ? 'active' : ''}"
+            .toggleState=${this._showConnectionDetails}
+            @click=${(e: Event) => {
+              e.stopPropagation();
+            }}
+            @toggle-on=${() => {
+              this._showConnectionDetails = true;
+            }}
+            @toggle-off=${() => {
+              this._showConnectionDetails = false;
+            }}
+          ></toggle-switch>
+          <span
+            class="secondary-font"
+            style="cursor: default; margin-left: 7px; ${this
+              ._showConnectionDetails
+              ? 'opacity: 0.8;'
+              : 'opacity: 0.5;'}"
+            >${this._showConnectionDetails
+              ? 'Hide connection details'
+              : 'Show connection details'}</span
+          >
+        </div>
+        ${this._showConnectionDetails
+          ? html`
+            <div class="row" style="align-items: center;">
+              <toggle-switch
+                class="toggle-switch ${this.streamsStore.webrtcGloballyDisabled ? 'active' : ''}"
+                .toggleState=${this.streamsStore.webrtcGloballyDisabled}
+                @click=${(e: Event) => {
+                  e.stopPropagation();
+                }}
+                @toggle-on=${async () => {
+                  // Disable WebRTC globally: tear down all connections
+                  // and broadcast the flag so peers stop trying.
+                  // Conversation module stays active — mic still works
+                  // via signals carrier.
+                  this.streamsStore.webrtcGloballyDisabled = true;
+                  window.localStorage.setItem('disableAllWebrtc', 'true');
+                  this.streamsStore.logger.logAgentEvent({
+                    agent: this.streamsStore.myPubKeyB64,
+                    timestamp: Date.now(),
+                    event: 'MyWebrtcDisable',
+                    detail: 'global',
+                  });
+                  const openConns = this._openConnections.value || {};
+                  for (const pubKeyB64 of Object.keys(openConns)) {
+                    this.streamsStore.disconnectFromPeerVideo(pubKeyB64);
+                  }
+                  this.streamsStore.videoOff();
+                  // Clear any peers that were stuck mid-negotiation; the
+                  // close handler only fires for actually-open connections.
+                  this.streamsStore._clearPendingWebrtcStatus();
+                  await this.streamsStore._syncConversationPayload({ webrtcDisabled: true });
+                  this.requestUpdate();
+                }}
+                @toggle-off=${async () => {
+                  // Re-enable WebRTC. Broadcast so peers resume init.
+                  this.streamsStore.webrtcGloballyDisabled = false;
+                  window.localStorage.removeItem('disableAllWebrtc');
+                  this.streamsStore.logger.logAgentEvent({
+                    agent: this.streamsStore.myPubKeyB64,
+                    timestamp: Date.now(),
+                    event: 'MyWebrtcEnable',
+                    detail: 'global',
+                  });
+                  await this.streamsStore._syncConversationPayload({ webrtcDisabled: false });
+                  this.requestUpdate();
+                }}
+              ></toggle-switch>
+              <span
+                class="secondary-font"
+                style="cursor: default; margin-left: 7px; ${this.streamsStore.webrtcGloballyDisabled
+                  ? 'opacity: 0.8; color: #c72100;'
+                  : 'opacity: 0.5;'}"
+                >${this.streamsStore.webrtcGloballyDisabled
+                  ? 'WebRTC disabled'
+                  : 'Disable all WebRTC'}</span
+              >
+            </div>
+          `
+          : html``}
       </div>
     `;
   }
@@ -1037,6 +1162,13 @@ export class RoomView extends LitElement {
   }
 
   renderToggles() {
+    // Toolbar buttons are explicitly listed (and explicitly ordered) instead
+    // of being collected from getAllModules().filter(m => m.renderToolbarButton).
+    // Reasons: (1) the embedded webview blocks window.prompt() in some module
+    // toolbars (e.g. timer, wal), so each one needs bespoke activation glue
+    // here; (2) we care about left-to-right ordering of mic / video / hand /
+    // wal / screen / timer / hide-self / leave for muscle memory. Adding a
+    // new module's toolbar button means adding one line below, not nothing.
     return html`
       <div class="toggles-panel">
         ${this._showConnectionDetails
@@ -1333,63 +1465,35 @@ export class RoomView extends LitElement {
           </div>
         </sl-tooltip>
 
-        <sl-tooltip
-          content="${this.streamsStore.screenShareStream
-            ? msg('Stop Screen Sharing')
-            : msg('Share Screen')}"
-          hoist
-        >
-          <div
-            class="toggle-btn ${this.streamsStore.screenShareStream
-              ? ''
-              : 'btn-off'}"
-            tabindex="0"
-            @click=${async () => {
-              if (this.streamsStore.screenShareStream) {
-                await this.streamsStore.screenShareOff();
-              } else {
-                await this.streamsStore.screenShareOn();
-              }
-            }}
-            @keypress=${async (e: KeyboardEvent) => {
-              if (e.key === 'Enter') {
-                if (this.streamsStore.screenShareStream) {
-                  await this.streamsStore.screenShareOff();
-                } else {
-                  await this.streamsStore.screenShareOn();
-                }
-              }
-            }}
-          >
-            <sl-icon
-              class="toggle-btn-icon ${this.streamsStore.screenShareStream
-                ? ''
-                : 'btn-icon-off'}"
-              .src=${wrapPathInSvg(mdiMonitorScreenshot)}
-            ></sl-icon>
-          </div>
-        </sl-tooltip>
+        <!-- raise-hand toolbar button (between video and wal) -->
+        ${this._renderModuleToolbarButton('raise-hand')}
 
+        <!-- WAL bypasses _renderModuleToolbarButton because activation
+             routes through the WeaveClient asset picker, which lives on
+             room-view (not the module). -->
+        ${(() => {
+          const walActive = !!(this._myModuleStates.value || {})['wal'];
+          return html`
         <sl-tooltip
-          content="${this._mySharedWal.value
+          content="${walActive
             ? msg('Stop Sharing Asset')
             : msg('Share Asset')}"
           hoist
         >
           <div
-            class="toggle-btn ${this._mySharedWal.value ? '' : 'btn-off'}"
+            class="toggle-btn ${walActive ? '' : 'btn-off'}"
             tabindex="0"
             @click=${async () => {
-              if (this._mySharedWal.value) {
-                await this.streamsStore.stopShareWal();
+              if (walActive) {
+                await this.stopShareWal();
               } else {
                 await this.startShareWal();
               }
             }}
             @keypress=${async (e: KeyboardEvent) => {
               if (e.key === 'Enter') {
-                if (this._mySharedWal.value) {
-                  await this.streamsStore.stopShareWal();
+                if (walActive) {
+                  await this.stopShareWal();
                 } else {
                   await this.startShareWal();
                 }
@@ -1397,11 +1501,16 @@ export class RoomView extends LitElement {
             }}
           >
             <sl-icon
-              class="toggle-btn-icon ${this._mySharedWal.value ? '' : 'btn-icon-off'}"
+              class="toggle-btn-icon ${walActive ? '' : 'btn-icon-off'}"
               .src=${wrapPathInSvg(mdiCubeOutline)}
             ></sl-icon>
           </div>
         </sl-tooltip>
+        `;})()}
+
+        <!-- screen-share, timer -->
+        ${this._renderModuleToolbarButton('screen-share')}
+        ${this._renderModuleToolbarButton('timer')}
 
         <sl-tooltip
           content="${this._selfViewHidden
@@ -1518,6 +1627,7 @@ export class RoomView extends LitElement {
           </div>
         </sl-tooltip>
 
+
         <sl-tooltip content="${msg('Leave Call')}" hoist>
           <div
             class="btn-stop"
@@ -1536,6 +1646,377 @@ export class RoomView extends LitElement {
     `;
   }
 
+  // ===========================================================================================
+  // MODULE RENDERING HELPERS
+  // ===========================================================================================
+
+  /**
+   * Renders a module-switcher dropdown for a peer's pane.
+   * Lists available replace modules the receiver can switch to.
+   * Only shown when the peer has receiver-activated modules with renderReplace.
+   */
+  renderModuleSwitcher(pubkeyB64: AgentPubKeyB64, isMe = false) {
+    const peerModules = isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
+    const currentOverride = this._receiverModuleOverrides.value?.[pubkeyB64];
+
+    // Find modules with renderReplace that the receiver can switch to:
+    // - receiver-activated modules (always switchable when active)
+    // - sender-activated modules that also have an overlay (replace is an optional deeper view)
+    const hasReplace = (mod: NonNullable<ReturnType<typeof getModule>>) => !!mod.renderReplace || !!mod.replaceElement;
+    const hasOverlay = (mod: NonNullable<ReturnType<typeof getModule>>) => !!mod.renderOverlay || !!mod.overlayElement;
+    const switchableModules = Object.entries(peerModules)
+      .map(([moduleId, _envelope]) => getModule(moduleId))
+      .filter((mod): mod is NonNullable<typeof mod> =>
+        !!mod && hasReplace(mod) && (
+          mod.activationControl === 'receiver' ||
+          (mod.activationControl === 'sender' && hasOverlay(mod))
+        )
+      );
+
+    if (switchableModules.length === 0) return html``;
+
+    return html`
+      <sl-dropdown placement="top" distance="4" hoist>
+        <sl-icon-button
+          slot="trigger"
+          style="font-size: 20px; margin-left: 4px; margin-bottom: -5px;"
+          src=${wrapPathInSvg(switchableModules.length > 0 && currentOverride
+            ? (getModule(currentOverride)?.icon || mdiVideo)
+            : mdiVideo)}
+        ></sl-icon-button>
+        <sl-menu class="reconnect-menu secondary-font">
+          <sl-menu-item
+            class="reconnect-menu-item"
+            @click=${() => {
+              this.streamsStore.setReceiverOverride(pubkeyB64, null);
+              // Switching back to video creates a new <video> element — reapply srcObject
+              setTimeout(() => this._reapplyVideoStreams(), 100);
+            }}
+          >
+            <sl-icon slot="prefix" .src=${wrapPathInSvg(mdiVideo)} style="font-size: 16px;"></sl-icon>
+            Video/Audio${!currentOverride ? ' ✓' : ''}
+          </sl-menu-item>
+          ${switchableModules.map(mod => html`
+            <sl-menu-item
+              class="reconnect-menu-item"
+              @click=${() => this.streamsStore.setReceiverOverride(pubkeyB64, mod.id)}
+            >
+              <sl-icon slot="prefix" .src=${wrapPathInSvg(mod.icon)} style="font-size: 16px;"></sl-icon>
+              ${mod.label}${currentOverride === mod.id ? ' ✓' : ''}
+            </sl-menu-item>
+          `)}
+        </sl-menu>
+      </sl-dropdown>
+    `;
+  }
+
+  /**
+   * Determines the active replace module for an agent's pane.
+   * Priority: receiver override > sender-activated replace modules > null (default video).
+   * Returns { moduleId, html } or null if default video should show.
+   *
+   * If the module defines replaceElement, the returned html uses that custom element
+   * with data passed as properties (independent re-render boundary).
+   * Otherwise falls back to calling renderReplace() directly.
+   */
+  _getActiveReplaceModule(
+    pubkeyB64: AgentPubKeyB64,
+    context: ModuleRenderContext,
+  ): { moduleId: string; html: unknown } | null {
+    const modules = context.isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
+
+    const renderForModule = (mod: ReturnType<typeof getModule>, moduleState: ModuleStateEnvelope | null) => {
+      if (mod!.replaceElement) {
+        const tag = unsafeStatic(mod!.replaceElement);
+        return staticHtml`<${tag}
+          .agentPubKeyB64=${pubkeyB64}
+          .moduleState=${moduleState}
+          .context=${context}
+        ></${tag}>`;
+      }
+      return mod!.renderReplace!(pubkeyB64, moduleState, context);
+    };
+
+    // Check receiver override first (works for both receiver- and sender-activated modules)
+    const override = this._receiverModuleOverrides.value?.[pubkeyB64];
+    if (override) {
+      const mod = getModule(override);
+      if (mod?.renderReplace || mod?.replaceElement) {
+        const state = (modules as Record<string, ModuleStateEnvelope>)[override] || null;
+        return { moduleId: override, html: renderForModule(mod, state) };
+      }
+    }
+
+    // Check sender-activated replace-only modules (no overlay = forces replace)
+    for (const [moduleId, envelope] of Object.entries(modules)) {
+      const mod = getModule(moduleId);
+      if ((mod?.renderReplace || mod?.replaceElement) && !mod?.renderOverlay && !mod?.overlayElement && mod?.activationControl === 'sender' && envelope.active) {
+        return { moduleId, html: renderForModule(mod, envelope) };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Renders the standardized icon strip for all active modules on an agent's pane.
+   * Collects icons from all active modules, filters hidden ones, renders in a row.
+   */
+  private _renderModuleIcon(icon: ModuleIconDefinition) {
+    const stateInfo = icon.states[icon.currentState!];
+    if (icon.menuItems && icon.menuItems.length > 0) {
+      return html`
+        <sl-dropdown placement="top" distance="4" hoist>
+          <sl-icon
+            slot="trigger"
+            style="color: ${stateInfo.color || 'white'}; height: 30px; width: 30px; cursor: pointer;"
+            title="${stateInfo.tooltip || ''}"
+            .src=${wrapPathInSvg(stateInfo.icon)}
+          ></sl-icon>
+          <sl-menu class="reconnect-menu secondary-font">
+            ${icon.menuItems.map(item => html`
+              <sl-menu-item
+                class="reconnect-menu-item"
+                @click=${() => item.action()}
+              >${item.label}</sl-menu-item>
+            `)}
+          </sl-menu>
+        </sl-dropdown>
+      `;
+    }
+    const clickable = !!icon.onSelect;
+    return html`
+      <sl-icon
+        style="color: ${stateInfo.color || 'white'}; height: 30px; width: 30px;${clickable ? ' cursor: pointer;' : ''}"
+        title="${stateInfo.tooltip || ''}"
+        .src=${wrapPathInSvg(stateInfo.icon)}
+        @click=${clickable ? () => icon.onSelect!(icon.currentState!) : undefined}
+      ></sl-icon>
+    `;
+  }
+
+  _renderModuleToolbarButton(moduleId: string) {
+    const mod = getModule(moduleId);
+    if (!mod?.renderToolbarButton) return html``;
+    const myState = this._myModuleStates.value?.[moduleId] || null;
+    const toggle = async () => {
+      if (myState) {
+        await this.streamsStore.deactivateModule(moduleId);
+      } else {
+        await this.streamsStore.activateModule(moduleId);
+      }
+    };
+    return mod.renderToolbarButton(myState, toggle, this.streamsStore);
+  }
+
+  renderModuleIconStrip(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
+    const modules = context.isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
+    const allIcons: ModuleIconDefinition[] = [];
+
+    for (const [moduleId, envelope] of Object.entries(modules)) {
+      // Peer-facing acquiring envelopes are filtered at the dispatch surface:
+      // a self-view of a loading module can show a local "acquiring" badge,
+      // but peers should not yet believe the module is live.
+      if (!context.isMe && envelope.phase === 'acquiring') continue;
+      const mod = getModule(moduleId);
+      if (mod?.getStateIcons) {
+        allIcons.push(...mod.getStateIcons(pubkeyB64, envelope, context));
+      }
+    }
+
+    const visibleIcons = allIcons.filter(icon => icon.currentState !== undefined);
+    if (visibleIcons.length === 0) return html``;
+
+    return html`
+      ${visibleIcons.map(icon => this._renderModuleIcon(icon))}
+    `;
+  }
+
+  /**
+   * Renders all active overlay modules for an agent's pane.
+   */
+  private _renderOverlayForModule(
+    mod: ReturnType<typeof getModule>,
+    pubkeyB64: string,
+    envelope: ModuleStateEnvelope,
+    context: ModuleRenderContext,
+  ): unknown {
+    if (mod!.overlayElement) {
+      const tag = unsafeStatic(mod!.overlayElement);
+      return staticHtml`<${tag}
+        .agentPubKeyB64=${pubkeyB64}
+        .moduleState=${envelope}
+        .context=${context}
+      ></${tag}>`;
+    }
+    return mod!.renderOverlay!(pubkeyB64, envelope, context);
+  }
+
+  renderModuleOverlays(pubkeyB64: AgentPubKeyB64, context: ModuleRenderContext) {
+    const modules = context.isMe
+      ? (this._myModuleStates.value || {})
+      : (this._peerModuleStates.value?.[pubkeyB64] || {});
+    const overlays: unknown[] = [];
+
+    for (const [moduleId, envelope] of Object.entries(modules)) {
+      // Peer-facing acquiring envelopes are filtered here; self views still
+      // get to render a loading overlay if the module wants one.
+      if (!context.isMe && envelope.phase === 'acquiring') continue;
+      const mod = getModule(moduleId);
+      if (mod?.renderOverlay || mod?.overlayElement) {
+        overlays.push(this._renderOverlayForModule(mod, pubkeyB64, envelope, context));
+      }
+    }
+
+    return overlays;
+  }
+
+  /**
+   * Enumerate all active share-type module instances across self and peers.
+   * Returns one entry per (active share-module, agent) pair.
+   */
+  _getActiveShares(): Array<{
+    moduleId: string;
+    agentPubKeyB64: AgentPubKeyB64;
+    state: ModuleStateEnvelope;
+    isMe: boolean;
+  }> {
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const shareModuleIds = new Set(getShareModules().map(m => m.id));
+    const result: Array<{
+      moduleId: string;
+      agentPubKeyB64: AgentPubKeyB64;
+      state: ModuleStateEnvelope;
+      isMe: boolean;
+    }> = [];
+
+    // Self shares. Acquiring envelopes are included so the initiator's
+    // <video>/DOM hooks mount before the stream bytes arrive.
+    const myStates = this._myModuleStates.value || {};
+    for (const [moduleId, envelope] of Object.entries(myStates)) {
+      if (shareModuleIds.has(moduleId) && envelope.active) {
+        result.push({ moduleId, agentPubKeyB64: myPubKeyB64, state: envelope, isMe: true });
+      }
+    }
+
+    // Peer shares. Acquiring envelopes are skipped — peers should not see
+    // an "establishing connection…" tile for the initiator's picker gap.
+    const peerStates = this._peerModuleStates.value || {};
+    for (const [pubkeyB64, modules] of Object.entries(peerStates)) {
+      for (const [moduleId, envelope] of Object.entries(modules)) {
+        if (
+          shareModuleIds.has(moduleId) &&
+          envelope.active &&
+          envelope.phase !== 'acquiring'
+        ) {
+          result.push({ moduleId, agentPubKeyB64: pubkeyB64, state: envelope, isMe: false });
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Render a single share tile via the module's renderShare or shareElement.
+   */
+  private _renderShareForModule(
+    mod: NonNullable<ReturnType<typeof getModule>>,
+    pubkeyB64: string,
+    envelope: ModuleStateEnvelope,
+    context: ModuleRenderContext,
+  ): unknown {
+    if (mod.shareElement) {
+      const tag = unsafeStatic(mod.shareElement);
+      return staticHtml`<${tag}
+        .agentPubKeyB64=${pubkeyB64}
+        .moduleState=${envelope}
+        .context=${context}
+      ></${tag}>`;
+    }
+    if (mod.renderShare) {
+      return mod.renderShare(pubkeyB64, envelope, context);
+    }
+    return null;
+  }
+
+  /**
+   * Render the shared panel from active share-type modules. Each share tile
+   * is wrapped in shared-panel-frame and supports maximize via the
+   * `share-${moduleId}-${pubkey}` keying scheme.
+   */
+  renderSharedPanel() {
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const shares = this._getActiveShares();
+    if (shares.length === 0) return html``;
+
+    // Use repeat() with a stable key per share so Lit moves existing DOM
+    // nodes instead of recreating them when the share list reorders.
+    // Without this, locally adding a share (which inserts at the front)
+    // tears down peer screen-share <video> elements and loses srcObject.
+    return html`${repeat(
+      shares,
+      ({ moduleId, agentPubKeyB64 }) => `share-${moduleId}-${agentPubKeyB64}`,
+      ({ moduleId, agentPubKeyB64, state, isMe }) => {
+        const mod = getModule(moduleId);
+        if (!mod) return html``;
+        const shareKey = `share-${moduleId}-${agentPubKeyB64}`;
+        const layout = this.idToLayout(shareKey, true);
+        const wrapperClass = mod.shareWrapperClass ?? 'video-container screen-share';
+        const context: ModuleRenderContext = {
+          isMe,
+          connected: true,
+          circleView: false,
+          streamsStore: this.streamsStore,
+          myPubKeyB64,
+        };
+        const content = this._renderShareForModule(mod, agentPubKeyB64, state, context);
+        // Screen-share diagnostic overlay: legacy behavior gated by
+        // _showConnectionDetails. Kept as an inline special-case rather than
+        // a ModuleRenderContext extension because only screen-share needs
+        // per-tile connection statuses today.
+        const diagnosticsOverlay =
+          moduleId === 'screen-share' && this._showConnectionDetails
+            ? html`<div
+                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
+              >
+                ${this.renderAgentConnectionStatuses(
+                  isMe ? 'my-screen-share' : 'their-screen-share',
+                  isMe ? undefined : agentPubKeyB64,
+                )}
+              </div>`
+            : html``;
+        return html`
+          <div
+            class="${wrapperClass} shared-panel-frame ${layout}"
+            @dblclick=${() => this.toggleMaximized(shareKey)}
+          >
+            ${content}
+            ${diagnosticsOverlay}
+            <sl-icon
+              title="${this._maximizedVideo === shareKey ? 'minimize' : 'maximize'}"
+              .src=${this._maximizedVideo === shareKey
+                ? wrapPathInSvg(mdiFullscreenExit)
+                : wrapPathInSvg(mdiFullscreen)}
+              tabindex="0"
+              class="maximize-icon"
+              @click=${() => this.toggleMaximized(shareKey)}
+              @keypress=${(e: KeyboardEvent) => {
+                if (e.key === 'Enter') this.toggleMaximized(shareKey);
+              }}
+            ></sl-icon>
+          </div>
+        `;
+      },
+    )}`;
+  }
+
   /**
    * Renders connection statuses of agents with icons in a row.
    *
@@ -1543,6 +2024,158 @@ export class RoomView extends LitElement {
    * @param pubkeyb64
    * @returns
    */
+  /**
+   * Render a small volume bar for signals-carrier audio from a peer.
+   * Only shown when connection details are visible AND the peer has no
+   * WebRTC connection (audio is flowing via signals). Reads from the
+   * plain Map on voiceController — no reactive subscription, just
+   * piggybacks on the existing render cycle.
+   */
+  private _renderAudioLevelMeter(pubkeyB64: AgentPubKeyB64) {
+    // Hide when peer's mic is muted — no audio to show levels for
+    const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
+    if (peerConv) {
+      try {
+        const p = JSON.parse(peerConv.payload);
+        if (p.micMuted || p.muted) return html``;
+      } catch {}
+    }
+    return html`
+      <audio-level-meter style="margin-left:3px"
+        .streamsStore=${this.streamsStore}
+        .agentPubKeyB64=${pubkeyB64}
+      ></audio-level-meter>
+    `;
+  }
+
+  /**
+   * Render a per-peer "Disable WebRTC" toggle. Only shown when connection
+   * details are visible. When WebRTC is disabled for a peer, neither side
+   * initiates or accepts WebRTC — audio flows via signals automatically.
+   */
+  private _renderWebrtcToggle(pubkeyB64: AgentPubKeyB64) {
+    // Check who disabled WebRTC for this link. If the peer disabled it
+    // (globally or specifically for us), our toggle can't re-enable it
+    // — we disable the button and show a different message.
+    let disabledByPeer = false;
+    const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
+    if (peerConv) {
+      try {
+        const p = JSON.parse(peerConv.payload);
+        if (p.webrtcDisabled) disabledByPeer = true;
+        if (Array.isArray(p.disableWebrtcWith) &&
+            p.disableWebrtcWith.includes(this.streamsStore.myPubKeyB64)) {
+          disabledByPeer = true;
+        }
+      } catch {}
+    }
+
+    const disabledByMe = !disabledByPeer && this.streamsStore.webrtcDisabled(pubkeyB64);
+    const disabled = disabledByPeer || disabledByMe;
+
+    const tooltip = disabledByPeer
+      ? 'WebRTC disabled by agent'
+      : disabledByMe
+        ? 'WebRTC disabled - click to re-enable'
+        : 'Click to disable WebRTC for this peer';
+
+    const clickable = !disabledByPeer;
+    const color = disabled ? '#c72100' : '#7adc7a';
+    const cursor = clickable ? 'pointer' : 'not-allowed';
+    const opacity = clickable ? '1' : '0.5';
+
+    return html`
+      <sl-tooltip
+        hoist
+        class="tooltip-filled"
+        placement="top"
+        content="${tooltip}"
+      >
+        <sl-icon
+          style="color: ${color}; height: 24px; width: 24px; cursor: ${cursor}; opacity: ${opacity};"
+          .src=${disabled ? wrapPathInSvg(mdiVideoOff) : wrapPathInSvg(mdiVideo)}
+          @click=${() => {
+            if (clickable) {
+              this.streamsStore.toggleDisableWebrtc(pubkeyB64);
+            }
+          }}
+        ></sl-icon>
+      </sl-tooltip>
+    `;
+  }
+
+  /**
+   * Render a placeholder tile per agent in `phantomAgents()` — agents
+   * other peers report as in-room with a working audio link, but who we
+   * cannot see directly. Suppresses the normal tile chrome (no video
+   * element, no module overlays, no audio meter, no per-tile connection
+   * details) since none of that data exists for an unconnected peer.
+   * Lists the observers who DO see them so the user can tell whether
+   * the issue is the peer or our own connectivity.
+   */
+  private _renderPhantomTiles() {
+    const phantoms = this.streamsStore.phantomAgents();
+    if (phantoms.length === 0) return html``;
+    return html`${repeat(
+      phantoms,
+      pk => pk,
+      pk => {
+        const seeing = this.streamsStore.observersSeeing(pk);
+        const connected = this.streamsStore.observersConnectedTo(pk);
+        // Prefer the "connected via" framing when any observer has a
+        // working link; fall back to "last seen by" when presence is
+        // only ping-level (impolite close in progress, link broken
+        // everywhere).
+        const label = connected.length > 0 ? 'connected via' : 'last seen by';
+        const observers = seeing;
+        return html`
+          <div
+            class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
+            style="opacity: 0.7;"
+            title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not connected to you"
+          >
+            <avatar-with-nickname
+              .hideNickname=${true}
+              .agentPubKey=${decodeHashFromBase64(pk)}
+              style="width: 35%;"
+            ></avatar-with-nickname>
+            <div
+              class="secondary-font"
+              style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
+            >
+              reported in room — not connected to you
+            </div>
+            ${observers.length > 0
+              ? html`<div
+                  style="position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px;"
+                >
+                  <span
+                    class="secondary-font"
+                    style="color: #c3c9eb; font-size: 18px; opacity: 0.85;"
+                    >${label}</span
+                  >
+                  <div style="display: flex; flex-direction: row; gap: 4px;">
+                    ${repeat(
+                      observers,
+                      obs => obs,
+                      obs => html`<div
+                        style="width: 24px; height: 24px; display: inline-block;"
+                      >
+                        <avatar-with-nickname
+                          .hideNickname=${true}
+                          .agentPubKey=${decodeHashFromBase64(obs)}
+                        ></avatar-with-nickname>
+                      </div>`,
+                    )}
+                  </div>
+                </div>`
+              : html``}
+          </div>
+        `;
+      },
+    )}`;
+  }
+
   renderAgentConnectionStatuses(
     type: 'video' | 'my-video' | 'my-screen-share' | 'their-screen-share',
     pubkeyb64?: AgentPubKeyB64
@@ -1602,57 +2235,141 @@ export class RoomView extends LitElement {
       this.roomStore.client.client.myPubKey
     );
 
-    const nConnections = Object.values(connectionStatuses).filter(
-      status => status.type === 'Connected'
-    ).length;
+    // Observer's broadcast per-peer link snapshots (or undefined for
+    // my-video / my-screen-share where the observer is us).
+    const observerLinks: Record<AgentPubKeyB64, import('../types').PeerLinkSnapshot> | undefined =
+      type === 'my-video' || type === 'my-screen-share'
+        ? undefined
+        : this._othersConnectionStatuses.value[pubkeyb64!]?.peerLinks;
 
-    // if the info is older than >2.8 PING_INTERVAL, show the info opaque to indicated that it's outdated
-    const sortedStatuses = Object.entries(connectionStatuses).sort(
-      sortConnectionStatuses
-    );
+    // Count peers this observer can actually hear — AudioLink ∈
+    // {webrtc, signals}. Replaces the old WebRTC-Connected count, which
+    // undercounted signals-only peers and overcounted connected-but-silent
+    // links.
+    const audibleCount = (() => {
+      if (type === 'my-video') {
+        return Object.keys(connectionStatuses).filter(pk => {
+          const s = this.streamsStore.audioLinkFor(pk);
+          return s === 'webrtc' || s === 'signals';
+        }).length;
+      }
+      if (observerLinks) {
+        return Object.values(observerLinks).filter(
+          l => l.audioLink === 'webrtc' || l.audioLink === 'signals',
+        ).length;
+      }
+      return Object.values(connectionStatuses).filter(
+        s => s.type === 'Connected',
+      ).length;
+    })();
+
+    // Iteration set is the global presence union, with the observer
+    // themselves removed — an icon strip is "this observer's view of
+    // OTHERS", so the observer's own pubkey would render as e.g.
+    // "Gaston (Disconnected from Gaston)", which is meaningless.
+    const observerPubKey: AgentPubKeyB64 | undefined =
+      type === 'my-video' || type === 'my-screen-share'
+        ? myPubKeyB64
+        : pubkeyb64;
+    const presenceSet = this.streamsStore.globalPresenceSet();
+    const sortedStatuses = Array.from(presenceSet)
+      .filter(pk => pk !== observerPubKey)
+      .map(pk => [
+        pk,
+        connectionStatuses[pk] ?? { type: 'Disconnected' },
+      ] as [AgentPubKeyB64, import('../types').ConnectionStatus])
+      .sort(sortConnectionStatuses);
     return html`
-      <div class="row" style="align-items: center; flex-wrap: wrap;">
+      <div class="row" style="align-items: center; flex-wrap: wrap; line-height: 1;">
         ${repeat(
           sortedStatuses,
           ([pubkeyb64, _status]) => pubkeyb64,
           ([innerPubkey, status]) => {
             // Check whether the agent for which the statuses are rendered has only been told by others that
-            // the rendered agent exists
+            // the rendered agent exists. `type === 'told'` alone is insufficient:
+            // per types.ts AgentInfo, 'told' also covers "received a Pong from
+            // that agent themselves" — so it stays 'told' forever once we've
+            // had direct contact. Gate on `lastSeen === undefined` so the
+            // indicator clears as soon as a direct pong arrives (pong handler
+            // in streams-store stamps `lastSeen = Date.now()`; agents learned
+            // only via another peer's knownAgents metadata are written with
+            // `lastSeen: undefined`).
             const onlyToldAbout = !!(
               knownAgents &&
               knownAgents[innerPubkey] &&
-              knownAgents[innerPubkey].type === 'told'
+              knownAgents[innerPubkey].type === 'told' &&
+              knownAgents[innerPubkey].lastSeen === undefined
             );
 
             const lastSeen = knownAgents
               ? knownAgents[innerPubkey]?.lastSeen
               : undefined;
 
-            // Determine track status for this avatar
-            let audioStatus: 'on' | 'muted' | 'off' | undefined;
-            let videoStatus: 'on' | 'muted' | 'off' | undefined;
+            // Pair-wise (observer, observed) link. For my-video the
+            // observer is us — derive locally. For peer tiles, read the
+            // observer's broadcast peerLinks. Falls back to the
+            // perceivedStreamInfo-based derivation only when the observer
+            // is on older code and never broadcasts peerLinks.
+            let audioStatus:
+              | 'live'
+              | 'stale'
+              | 'muted'
+              | 'off'
+              | undefined;
+            let videoStatus: 'live' | 'muted' | 'off' | undefined;
+            let audioCarrier:
+              | 'webrtc'
+              | 'signals'
+              | 'none'
+              | undefined;
+            let audioLink: import('../types').AudioLinkState | undefined;
+            let lastSeenBucket:
+              | import('../types').LastSeenBucket
+              | undefined;
 
             if (type === 'my-video') {
-              // Our tile: show what we receive from each peer
-              const conn = this._openConnections.value[innerPubkey];
-              if (conn?.connected) {
-                audioStatus = conn.audio ? 'on' : 'off';
-                videoStatus = conn.video
-                  ? 'on'
-                  : conn.videoMuted
-                    ? 'muted'
-                    : 'off';
+              const snap = this.streamsStore.peerLinkFor(innerPubkey);
+              audioStatus = snap.audio;
+              videoStatus = snap.video;
+              audioCarrier = snap.carrier;
+              audioLink = snap.audioLink;
+              lastSeenBucket = this.streamsStore.lastSeenBucket(innerPubkey);
+            } else if (type === 'video') {
+              const snap = observerLinks?.[innerPubkey];
+              if (snap) {
+                audioStatus = snap.audio;
+                videoStatus = snap.video;
+                audioCarrier = snap.carrier;
+                audioLink = snap.audioLink;
+                lastSeenBucket = snap.lastSeen;
+              } else if (innerPubkey === myPubKeyB64) {
+                // Legacy fallback for peers on older code that don't
+                // broadcast peerLinks but do broadcast perceivedStreamInfo.
+                const legacyAudio = streamInfoToTrackStatus(
+                  perceivedStreamInfo,
+                  'audio',
+                );
+                const legacyVideo = streamInfoToTrackStatus(
+                  perceivedStreamInfo,
+                  'video',
+                );
+                audioStatus =
+                  legacyAudio === 'on'
+                    ? 'live'
+                    : legacyAudio === 'muted'
+                      ? 'muted'
+                      : legacyAudio === 'off'
+                        ? 'off'
+                        : undefined;
+                videoStatus =
+                  legacyVideo === 'on'
+                    ? 'live'
+                    : legacyVideo === 'muted'
+                      ? 'muted'
+                      : legacyVideo === 'off'
+                        ? 'off'
+                        : undefined;
               }
-            } else if (type === 'video' && innerPubkey === myPubKeyB64) {
-              // Peer's tile: show how they see OUR stream (only on our avatar)
-              audioStatus = streamInfoToTrackStatus(
-                perceivedStreamInfo,
-                'audio'
-              );
-              videoStatus = streamInfoToTrackStatus(
-                perceivedStreamInfo,
-                'video'
-              );
             }
 
             return html`<agent-connection-status-icon
@@ -1661,34 +2378,30 @@ export class RoomView extends LitElement {
                 : ''}"
               .agentPubKey=${decodeHashFromBase64(innerPubkey)}
               .connectionStatus=${status}
+              .audioLink=${audioLink}
               .onlyToldAbout=${onlyToldAbout}
               .lastSeen=${lastSeen}
+              .lastSeenBucket=${lastSeenBucket}
               .audioStatus=${audioStatus}
               .videoStatus=${videoStatus}
+              .audioCarrier=${audioCarrier}
             ></agent-connection-status-icon>`;
           }
         )}
         <span
           class="tertiary-font"
-          style="color: #c3c9eb; font-size: 24px; margin-left: 5px;"
-          >(${nConnections})</span
+          style="color: #c3c9eb; font-size: 18px; margin-left: 5px; line-height: 1;"
+          title="peers I can hear (webrtc + signals)"
+          >(${audibleCount})</span
         >
       </div>
     `;
   }
 
   render() {
-    const incomingScreenShares = Object.entries(this._screenShareConnectionsIncoming.value).filter(
-      ([_, conn]) => conn.direction === 'incoming'
-    );
-    const allSharedWals = {
-      ...(this._mySharedWal.value ? { [encodeHashToBase64(this.roomStore.client.client.myPubKey)]: this._mySharedWal.value } : {}),
-      ...(this._peerSharedWals.value || {}),
-    };
-    const sharedWalEntries = Object.entries(allSharedWals);
-    const hasScreenShares =
-      !!this.streamsStore.screenShareStream || incomingScreenShares.length > 0 || sharedWalEntries.length > 0;
-    const splitMode = hasScreenShares && !this._maximizedVideo;
+    const activeShares = this._getActiveShares();
+    const hasShared = activeShares.length > 0;
+    const splitMode = hasShared && !this._maximizedVideo;
     return html`
       <div
         class="custom-log-dialog"
@@ -1798,205 +2511,57 @@ export class RoomView extends LitElement {
       </div>
       <div class="videos-container${splitMode ? ' split-mode' : ''}">
         ${this._isResizing ? html`<div class="resize-overlay"></div>` : html``}
-        ${hasScreenShares ? html`
+        ${hasShared ? html`
         <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
-        <!-- My own screen first if screen sharing is enabled -->
-        <div
-          style="${this.streamsStore.screenShareStream ? '' : 'display: none;'}"
-          class="video-container screen-share shared-panel-frame ${this.idToLayout(
-            'my-own-screen',
-            true
-          )}"
-          @dblclick=${() => this.toggleMaximized('my-own-screen')}
-        >
-          <video
-            muted
-            id="my-own-screen"
-            class="video-el"
-            @resize=${this._onScreenShareResize}
-            @loadedmetadata=${this._onScreenShareResize}
-          ></video>
-
-          <!-- Connection states indicators -->
-          ${this._showConnectionDetails
-            ? html`<div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
-              >
-                ${this.renderAgentConnectionStatuses('my-screen-share')}
-              </div>`
-            : html``}
-
-          <!-- Avatar and nickname -->
-          <div
-            style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
-          >
-            <avatar-with-nickname
-              .size=${36}
-              .agentPubKey=${this.roomStore.client.client.myPubKey}
-              style="height: 36px;"
-            ></avatar-with-nickname>
-          </div>
-          <sl-icon
-            title="${this._maximizedVideo === 'my-own-screen'
-              ? 'minimize'
-              : 'maximize'}"
-            .src=${this._maximizedVideo === 'my-own-screen'
-              ? wrapPathInSvg(mdiFullscreenExit)
-              : wrapPathInSvg(mdiFullscreen)}
-            tabindex="0"
-            class="maximize-icon"
-            @click=${() => {
-              this.toggleMaximized('my-own-screen');
-            }}
-            @keypress=${(e: KeyboardEvent) => {
-              if (e.key === 'Enter') {
-                this.toggleMaximized('my-own-screen');
-              }
-            }}
-          ></sl-icon>
-        </div>
-        <!--Then other agents' screens -->
-
-        ${repeat(
-          Object.entries(this._screenShareConnectionsIncoming.value).filter(
-            ([_, conn]) => conn.direction === 'incoming'
-          ),
-          ([_pubkeyB64, conn]) => conn.connectionId,
-          ([pubkeyB64, conn]) => html`
-            <div
-              class="video-container screen-share shared-panel-frame ${this.idToLayout(
-                conn.connectionId,
-                true
-              )}"
-              @dblclick=${() => this.toggleMaximized(conn.connectionId)}
-            >
-              <video
-                style="${conn.connected ? '' : 'display: none;'}"
-                id="${conn.connectionId}"
-                class="video-el"
-                @resize=${this._onScreenShareResize}
-                @loadedmetadata=${this._onScreenShareResize}
-              ></video>
-              <div
-                style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
-              >
-                establishing connection...
-              </div>
-
-              <!-- Connection states indicators -->
-              ${this._showConnectionDetails
-                ? html`<div
-                    style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
-                  >
-                    ${this.renderAgentConnectionStatuses(
-                      'their-screen-share',
-                      pubkeyB64
-                    )}
-                  </div>`
-                : html``}
-
-              <!-- Avatar and nickname -->
-              <div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
-              >
-                <avatar-with-nickname
-                  .size=${36}
-                  .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                  style="height: 36px;"
-                ></avatar-with-nickname>
-                <sl-tooltip content="reconnect" class="tooltip-filled">
-                  <sl-icon-button
-                    class="phone-refresh"
-                    style="margin-left: 4px; margin-bottom: -5px;"
-                    src=${wrapPathInSvg(mdiPhoneRefresh)}
-                    @click=${() => {
-                      this.streamsStore.disconnectFromPeerScreen(pubkeyB64);
-                    }}
-                  ></sl-icon-button>
-                </sl-tooltip>
-              </div>
-              <sl-icon
-                title="${this._maximizedVideo === conn.connectionId
-                  ? 'minimize'
-                  : 'maximize'}"
-                .src=${this._maximizedVideo === conn.connectionId
-                  ? wrapPathInSvg(mdiFullscreenExit)
-                  : wrapPathInSvg(mdiFullscreen)}
-                tabindex="0"
-                class="maximize-icon"
-                @click=${() => {
-                  this.toggleMaximized(conn.connectionId);
-                }}
-                @keypress=${(e: KeyboardEvent) => {
-                  if (e.key === 'Enter') {
-                    this.toggleMaximized(conn.connectionId);
-                  }
-                }}
-              ></sl-icon>
-            </div>
-          `
-        )}
-
-        <!-- Shared WAL embeds -->
-        ${repeat(sharedWalEntries, ([agentB64]) => agentB64, ([agentB64, walPayload]) => {
-          const isMe = agentB64 === encodeHashToBase64(this.roomStore.client.client.myPubKey);
-          const walEmbedId = `shared-wal-${agentB64.slice(0, 8)}`;
-          const walLayout = this._maximizedVideo === walEmbedId ? 'maximized' : this._maximizedVideo ? 'hidden' : '';
-          return html`
-          <div class="shared-wal-container shared-panel-frame ${walLayout}"
-            @dblclick=${() => this.toggleMaximized(walEmbedId)}
-          >
-            <shared-wal-embed
-              .src=${walPayload.weaveUrl}
-              .closable=${isMe}
-              @close=${() => this.streamsStore.stopShareWal()}
-              style="flex: 1;"
-            ></shared-wal-embed>
-            <sl-icon
-              title="${this._maximizedVideo === walEmbedId ? 'minimize' : 'maximize'}"
-              .src=${this._maximizedVideo === walEmbedId
-                ? wrapPathInSvg(mdiFullscreenExit)
-                : wrapPathInSvg(mdiFullscreen)}
-              tabindex="0"
-              class="maximize-icon"
-              @click=${() => this.toggleMaximized(walEmbedId)}
-              @keypress=${(e: KeyboardEvent) => {
-                if (e.key === 'Enter') this.toggleMaximized(walEmbedId);
-              }}
-            ></sl-icon>
-            <div class="shared-wal-footer">
-              <avatar-with-nickname
-                .size=${36}
-                .agentPubKey=${decodeHashFromBase64(agentB64)}
-                style="height: 36px;"
-              ></avatar-with-nickname>
-            </div>
-          </div>
-        `})}
+        <!-- All shares: screen-share, WAL, timer, etc. -->
+        ${this.renderSharedPanel()}
 
         </div>
         ${splitMode ? html`<div class="resize-handle" @mousedown=${this._onResizeStart} @touchstart=${this._onResizeStart}></div>` : html``}
         ` : html``}
         <div class="${splitMode ? 'people-panel' : 'layout-transparent'}">
         <!-- My own video stream -->
+        ${(() => {
+          const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+          const myModuleContext: ModuleRenderContext = {
+            isMe: true,
+            connected: true,
+            circleView: this._circleView,
+            streamsStore: this.streamsStore,
+            myPubKeyB64,
+          };
+          const myActiveReplace = this._getActiveReplaceModule(myPubKeyB64, myModuleContext);
+          return html`
         <div
           style="${this._selfViewHidden ? 'display: none;' : ''}"
           class="video-container ${this.idToLayout('my-own-stream')}${this._circleView ? '' : ' square-view'}"
           @dblclick=${() => this.toggleMaximized('my-own-stream')}
         >
-          <video
-            muted
-            style="${this._camera
-              ? ''
-              : 'display: none;'}; transform: scaleX(-1);"
-            id="my-own-stream"
-            class="video-el"
-          ></video>
-          <avatar-with-nickname
-            .hideNickname=${true}
-            .agentPubKey=${this.roomStore.client.client.myPubKey}
-            style="width: 35%;${this._camera ? ' display: none;' : ''}"
-          ></avatar-with-nickname>
+          ${myActiveReplace
+            ? html`
+              <div class="module-replace-content">${myActiveReplace.html}</div>
+              <video
+                muted
+                style="display: none;"
+                id="my-own-stream"
+                class="video-el"
+              ></video>
+            `
+            : html`
+              <video
+                muted
+                style="${this._camera
+                  ? ''
+                  : 'display: none;'}; transform: scaleX(-1);"
+                id="my-own-stream"
+                class="video-el"
+              ></video>
+              <avatar-with-nickname
+                .hideNickname=${true}
+                .agentPubKey=${this.roomStore.client.client.myPubKey}
+                style="width: 35%;${this._camera ? ' display: none;' : ''}"
+              ></avatar-with-nickname>
+            `}
 
           <!-- Connection states indicators -->
           ${this._showConnectionDetails
@@ -2006,6 +2571,9 @@ export class RoomView extends LitElement {
                 ${this.renderAgentConnectionStatuses('my-video')}
               </div>`
             : html``}
+
+          <!-- Module overlays (self) -->
+          ${this.renderModuleOverlays(myPubKeyB64, myModuleContext)}
 
           <!-- Icons and Avatar/nickname for circle view (centered, stacked) -->
           ${this._circleView
@@ -2033,112 +2601,140 @@ export class RoomView extends LitElement {
                         }
                       }}
                     ></sl-icon>
-                    <sl-icon
-                      style="color: red; height: 30px; width: 30px; margin-left: 8px;${this._microphone ? ' display: none;' : ''}"
-                      .src=${wrapPathInSvg(mdiMicrophoneOff)}
-                    ></sl-icon>
+                    ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
                   </div>
-                  <avatar-with-nickname
-                    .size=${36}
-                    .hideAvatar=${!this._camera}
-                    .agentPubKey=${this.roomStore.client.client.myPubKey}
-                    style="height: 36px;"
-                  ></avatar-with-nickname>
+                  <div class="row" style="align-items: center;">
+                    <avatar-with-nickname
+                      .size=${36}
+                      .hideAvatar=${!this._camera}
+                      .agentPubKey=${this.roomStore.client.client.myPubKey}
+                      style="height: 36px;"
+                    ></avatar-with-nickname>
+                    ${this.renderModuleSwitcher(myPubKeyB64, true)}
+                  </div>
                 </div>
               `
             : html`
-                <sl-icon
-                  title="${this._maximizedVideo === 'my-own-stream'
-                    ? 'minimize'
-                    : 'maximize'}"
-                  .src=${this._maximizedVideo === 'my-own-stream'
-                    ? wrapPathInSvg(mdiFullscreenExit)
-                    : wrapPathInSvg(mdiFullscreen)}
-                  tabindex="0"
-                  class="maximize-icon"
-                  @click=${() => {
-                    this.toggleMaximized('my-own-stream');
-                  }}
-                  @keypress=${(e: KeyboardEvent) => {
-                    if (e.key === 'Enter') {
-                      this.toggleMaximized('my-own-stream');
-                    }
-                  }}
-                ></sl-icon>
-                <sl-icon
-                  class="tile-meta"
-                  style="position: absolute; bottom: 10px; left: 50px; color: red; height: 30px; width: 30px;${this._microphone ? ' display: none;' : ''}"
-                  .src=${wrapPathInSvg(mdiMicrophoneOff)}
-                ></sl-icon>
                 <div
                   class="tile-meta"
                   style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
                 >
+                  ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
                   <avatar-with-nickname
                     .size=${36}
                     .agentPubKey=${this.roomStore.client.client.myPubKey}
                     style="height: 36px;"
                   ></avatar-with-nickname>
+                  ${this.renderModuleSwitcher(myPubKeyB64, true)}
+                  <sl-icon
+                    title="${this._maximizedVideo === 'my-own-stream'
+                      ? 'minimize'
+                      : 'maximize'}"
+                    .src=${this._maximizedVideo === 'my-own-stream'
+                      ? wrapPathInSvg(mdiFullscreenExit)
+                      : wrapPathInSvg(mdiFullscreen)}
+                    tabindex="0"
+                    style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
+                    @click=${() => {
+                      this.toggleMaximized('my-own-stream');
+                    }}
+                    @keypress=${(e: KeyboardEvent) => {
+                      if (e.key === 'Enter') {
+                        this.toggleMaximized('my-own-stream');
+                      }
+                    }}
+                  ></sl-icon>
                 </div>
               `}
         </div>
+          `;
+        })()}
 
-        <!-- Video stream of others -->
+        <!-- Panes for present agents (driven by holochain presence, not WebRTC) -->
         ${repeat(
-          Object.entries(this._openConnections.value),
-          ([_pubkeyB64, conn]) => conn.connectionId,
-          ([pubkeyB64, conn]) => html`
-            <div
-              class="video-container ${this.idToLayout(conn.connectionId)}${this._circleView ? '' : ' square-view'}"
-              @dblclick=${() => this.toggleMaximized(conn.connectionId)}
-            >
-              <video
-                style="${conn.video ? '' : 'display: none;'}"
-                id="${conn.connectionId}"
-                class="video-el"
-              ></video>
-              <avatar-with-nickname
-                .hideNickname=${true}
-                .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
-              ></avatar-with-nickname>
-              <div
-                style="color: #b98484; ${conn.connected ? 'display: none' : ''}"
-              >
-                establishing connection...
-              </div>
-              <div
-                style="color: #b9a884; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
-              >
-                connecting media...
-              </div>
+          Object.entries(this._activeAgents.value),
+          ([pubkeyB64]) => pubkeyB64,
+          ([pubkeyB64]) => {
+            const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
+            const moduleContext: ModuleRenderContext = {
+              isMe: false,
+              connected: true,
+              circleView: this._circleView,
+              streamsStore: this.streamsStore,
+              myPubKeyB64: encodeHashToBase64(this.roomStore.client.client.myPubKey),
+              extra: { conn },
+            };
+            // Determine active replace module for this peer's pane
+            const activeReplaceModule = this._getActiveReplaceModule(pubkeyB64, moduleContext);
+            const videoElId = `video-${pubkeyB64}`;
 
-              <!-- Connection states indicators -->
+            return html`
+            <div
+              class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
+              @dblclick=${() => this.toggleMaximized(pubkeyB64)}
+            >
+              <!-- Replace content -->
+              ${activeReplaceModule
+                ? html`<div class="module-replace-content">${activeReplaceModule.html}</div>`
+                : conn
+                  ? html`
+                    <video
+                      style="${conn.video ? '' : 'display: none;'}"
+                      id="${videoElId}"
+                      class="video-el"
+                    ></video>
+                    <avatar-with-nickname
+                      .hideNickname=${true}
+                      .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                      style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
+                    ></avatar-with-nickname>
+                    <div
+                      style="color: #b9a884; font-size: 0.8em; ${conn.connected ? 'display: none' : ''}"
+                    >
+                      establishing video carrier...
+                    </div>
+                    <div
+                      style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
+                    >
+                      connecting media...
+                    </div>
+                  `
+                  : html`
+                    <avatar-with-nickname
+                      .hideNickname=${true}
+                      .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                      style="width: 35%;"
+                    ></avatar-with-nickname>
+                  `}
+              <!-- Hidden video element so srcObject assignment still works when a replace module is active -->
+              ${activeReplaceModule && conn
+                ? html`<video
+                    style="display: none;"
+                    id="${videoElId}"
+                    class="video-el"
+                  ></video>`
+                : html``}
+
+              <!-- Connection detail statuses (debug) -->
               ${this._showConnectionDetails
                 ? html`<div
-                    style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; background: none;"
+                    style="display: flex; flex-direction: column; align-items: flex-start; gap: 2px; position: absolute; top: 10px; left: 10px; background: none;"
                   >
-                    ${this._openConnections.value[pubkeyB64]?.relayed
-                      ? html`
-                          <sl-tooltip
-                            hoist
-                            class="tooltip-filled"
-                            placement="top"
-                            content="Relayed via TURN server"
-                            style="--sl-tooltip-background-color: #e7a008;"
-                          >
-                            <sl-icon
-                              style="font-size: 20px; color: #e7a008; margin-right: 4px;"
-                              .src=${wrapPathInSvg(mdiHub)}
-                            ></sl-icon>
-                          </sl-tooltip>
-                        `
-                      : html``}
-                    ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
+                    <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
+                      ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
+                      ${this._renderWebrtcToggle(pubkeyB64)}
+                    </div>
+                    <peer-stats-panel
+                      .streamsStore=${this.streamsStore}
+                      .agentPubKeyB64=${pubkeyB64}
+                    ></peer-stats-panel>
                   </div>`
                 : html``}
 
-              <!-- Icons and Avatar/nickname -->
+              <!-- Module overlays -->
+              ${this.renderModuleOverlays(pubkeyB64, moduleContext)}
+
+              <!-- Pane chrome: icons + avatar + maximize -->
               ${this._circleView
                 ? html`
                     <div
@@ -2147,72 +2743,34 @@ export class RoomView extends LitElement {
                     >
                       <div class="row" style="margin-bottom: 4px;">
                         <sl-icon
-                          title="${this._maximizedVideo === conn.connectionId
+                          title="${this._maximizedVideo === pubkeyB64
                             ? 'minimize'
                             : 'maximize'}"
-                          .src=${this._maximizedVideo === conn.connectionId
+                          .src=${this._maximizedVideo === pubkeyB64
                             ? wrapPathInSvg(mdiFullscreenExit)
                             : wrapPathInSvg(mdiFullscreen)}
                           tabindex="0"
                           style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
                           @click=${() => {
-                            this.toggleMaximized(conn.connectionId);
+                            this.toggleMaximized(pubkeyB64);
                           }}
                           @keypress=${(e: KeyboardEvent) => {
                             if (e.key === 'Enter') {
-                              this.toggleMaximized(conn.connectionId);
+                              this.toggleMaximized(pubkeyB64);
                             }
                           }}
                         ></sl-icon>
-                        <sl-icon
-                          style="color: red; height: 30px; width: 30px; margin-left: 8px;${conn.audio ? ' display: none;' : ''}"
-                          .src=${wrapPathInSvg(mdiMicrophoneOff)}
-                        ></sl-icon>
+                        ${this.renderModuleIconStrip(pubkeyB64, moduleContext)}
                       </div>
                       <div class="row" style="align-items: center;">
                         <avatar-with-nickname
                           .size=${36}
-                          .hideAvatar=${!conn.video}
+                          .hideAvatar=${!conn?.video}
                           .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                           style="height: 36px;"
                         ></avatar-with-nickname>
-                        ${conn.videoMuted || (conn.connected && !conn.video)
-                          ? html`
-                              <sl-dropdown placement="top" distance="4" hoist>
-                                <sl-icon-button
-                                  slot="trigger"
-                                  class="phone-refresh"
-                                  style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
-                                  src=${wrapPathInSvg(mdiPhoneRefresh)}
-                                ></sl-icon-button>
-                                <sl-menu class="reconnect-menu secondary-font">
-                                  <sl-menu-item
-                                    class="reconnect-menu-item"
-                                    @click=${() => {
-                                      this.streamsStore.refreshTracksForPeer(pubkeyB64);
-                                    }}
-                                  >Reset media</sl-menu-item>
-                                  <sl-menu-item
-                                    class="reconnect-menu-item"
-                                    @click=${() => {
-                                      this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                                    }}
-                                  >Full reconnect</sl-menu-item>
-                                </sl-menu>
-                              </sl-dropdown>
-                            `
-                          : html`
-                              <sl-tooltip content="reconnect" class="tooltip-filled">
-                                <sl-icon-button
-                                  class="phone-refresh"
-                                  style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
-                                  src=${wrapPathInSvg(mdiPhoneRefresh)}
-                                  @click=${() => {
-                                    this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                                  }}
-                                ></sl-icon-button>
-                              </sl-tooltip>
-                            `}
+                        ${this.renderModuleSwitcher(pubkeyB64)}
+                        ${this._renderAudioLevelMeter(pubkeyB64)}
                         ${this._showConnectionDetails
                           ? html`
                               <sl-tooltip
@@ -2224,7 +2782,7 @@ export class RoomView extends LitElement {
                                   style="margin-bottom: -5px;"
                                   @click=${() => {
                                     const videoEl = this.shadowRoot?.getElementById(
-                                      conn.connectionId
+                                      videoElId
                                     ) as HTMLVideoElement;
                                     if (videoEl) {
                                       const stream = videoEl.srcObject;
@@ -2251,13 +2809,9 @@ export class RoomView extends LitElement {
                                             active: (stream as MediaStream).active,
                                           }
                                         : null;
-
                                       navigator.clipboard.writeText(
                                         JSON.stringify(
-                                          {
-                                            stream: streamInfo,
-                                            tracks: tracksInfo,
-                                          },
+                                          { stream: streamInfo, tracks: tracksInfo },
                                           undefined,
                                           2
                                         )
@@ -2265,7 +2819,6 @@ export class RoomView extends LitElement {
                                     }
                                   }}
                                 ></sl-icon-button>
-                                <sl-tooltip></sl-tooltip>
                               </sl-tooltip>
                             `
                           : html``}
@@ -2273,75 +2826,36 @@ export class RoomView extends LitElement {
                     </div>
                   `
                 : html`
-                    <sl-icon
-                      title="${this._maximizedVideo === conn.connectionId
-                        ? 'minimize'
-                        : 'maximize'}"
-                      .src=${this._maximizedVideo === conn.connectionId
-                        ? wrapPathInSvg(mdiFullscreenExit)
-                        : wrapPathInSvg(mdiFullscreen)}
-                      tabindex="0"
-                      class="maximize-icon"
-                      @click=${() => {
-                        this.toggleMaximized(conn.connectionId);
-                      }}
-                      @keypress=${(e: KeyboardEvent) => {
-                        if (e.key === 'Enter') {
-                          this.toggleMaximized(conn.connectionId);
-                        }
-                      }}
-                    ></sl-icon>
-                    <sl-icon
-                      class="tile-meta"
-                      style="position: absolute; bottom: 10px; left: 50px; color: red; height: 30px; width: 30px;${conn.audio ? ' display: none;' : ''}"
-                      .src=${wrapPathInSvg(mdiMicrophoneOff)}
-                    ></sl-icon>
                     <div
                       class="tile-meta"
                       style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
                     >
+                      ${this.renderModuleIconStrip(pubkeyB64, moduleContext)}
                       <avatar-with-nickname
                         .size=${36}
                         .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                         style="height: 36px;"
                       ></avatar-with-nickname>
-                      ${conn.videoMuted || (conn.connected && !conn.video)
-                        ? html`
-                            <sl-dropdown placement="top" distance="4" hoist>
-                              <sl-icon-button
-                                slot="trigger"
-                                class="phone-refresh"
-                                style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
-                                src=${wrapPathInSvg(mdiPhoneRefresh)}
-                              ></sl-icon-button>
-                              <sl-menu class="reconnect-menu secondary-font">
-                                <sl-menu-item
-                                  class="reconnect-menu-item"
-                                  @click=${() => {
-                                    this.streamsStore.refreshTracksForPeer(pubkeyB64);
-                                  }}
-                                >Reset media</sl-menu-item>
-                                <sl-menu-item
-                                  class="reconnect-menu-item"
-                                  @click=${() => {
-                                    this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                                  }}
-                                >Full reconnect</sl-menu-item>
-                              </sl-menu>
-                            </sl-dropdown>
-                          `
-                        : html`
-                            <sl-tooltip content="reconnect" class="tooltip-filled">
-                              <sl-icon-button
-                                class="phone-refresh"
-                                style="margin-left: 4px; margin-bottom: -5px; font-size: 24px;"
-                                src=${wrapPathInSvg(mdiPhoneRefresh)}
-                                @click=${() => {
-                                  this.streamsStore.disconnectFromPeerVideo(pubkeyB64);
-                                }}
-                              ></sl-icon-button>
-                            </sl-tooltip>
-                          `}
+                      ${this.renderModuleSwitcher(pubkeyB64)}
+                      <sl-icon
+                        title="${this._maximizedVideo === pubkeyB64
+                          ? 'minimize'
+                          : 'maximize'}"
+                        .src=${this._maximizedVideo === pubkeyB64
+                          ? wrapPathInSvg(mdiFullscreenExit)
+                          : wrapPathInSvg(mdiFullscreen)}
+                        tabindex="0"
+                        style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
+                        @click=${() => {
+                          this.toggleMaximized(pubkeyB64);
+                        }}
+                        @keypress=${(e: KeyboardEvent) => {
+                          if (e.key === 'Enter') {
+                            this.toggleMaximized(pubkeyB64);
+                          }
+                        }}
+                      ></sl-icon>
+                      ${this._renderAudioLevelMeter(pubkeyB64)}
                       ${this._showConnectionDetails
                         ? html`
                             <sl-tooltip
@@ -2353,7 +2867,7 @@ export class RoomView extends LitElement {
                                 style="margin-bottom: -5px;"
                                 @click=${() => {
                                   const videoEl = this.shadowRoot?.getElementById(
-                                    conn.connectionId
+                                    videoElId
                                   ) as HTMLVideoElement;
                                   if (videoEl) {
                                     const stream = videoEl.srcObject;
@@ -2380,13 +2894,9 @@ export class RoomView extends LitElement {
                                           active: (stream as MediaStream).active,
                                         }
                                       : null;
-
                                     navigator.clipboard.writeText(
                                       JSON.stringify(
-                                        {
-                                          stream: streamInfo,
-                                          tracks: tracksInfo,
-                                        },
+                                        { stream: streamInfo, tracks: tracksInfo },
                                         undefined,
                                         2
                                       )
@@ -2394,15 +2904,15 @@ export class RoomView extends LitElement {
                                   }
                                 }}
                               ></sl-icon-button>
-                              <sl-tooltip></sl-tooltip>
                             </sl-tooltip>
                           `
                         : html``}
                     </div>
                   `}
             </div>
-          `
+          `}
         )}
+        ${this._renderPhantomTiles()}
         </div>
       </div>
       ${this.renderToggles()}
@@ -2429,19 +2939,27 @@ export class RoomView extends LitElement {
       >
         ${msg('Stop Screen Share')}
       </div>
+      ${(() => {
+        const walState = (this._myModuleStates.value || {})['wal'];
+        let walPayload: SharedWalPayload | null = null;
+        if (walState?.payload) {
+          try { walPayload = JSON.parse(walState.payload) as SharedWalPayload; } catch { /* empty */ }
+        }
+        return html`
       <div
         class="stop-share"
         tabindex="0"
-        style="${this._mySharedWal.value ? '' : 'display: none'}"
-        @click=${async () => this.streamsStore.stopShareWal()}
+        style="${walPayload ? '' : 'display: none'}"
+        @click=${async () => this.stopShareWal()}
         @keypress=${async (e: KeyboardEvent) => {
           if (e.key === 'Enter') {
-            await this.streamsStore.stopShareWal();
+            await this.stopShareWal();
           }
         }}
       >
-        ${msg('Stop Sharing Asset')}${this._mySharedWal.value?.assetName ? ` — ${this._mySharedWal.value.assetName}` : ''}
-      </div>
+        ${msg('Stop Sharing Asset')}${walPayload?.assetName ? ` — ${walPayload.assetName}` : ''}
+      </div>`;
+      })()}
     `;
   }
 
@@ -2719,6 +3237,32 @@ export class RoomView extends LitElement {
 
       .video-container:not(.square-view):not(.screen-share) {
         overflow: visible;
+      }
+
+      .module-replace-content {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        border-radius: inherit;
+        overflow: hidden;
+        z-index: 1;
+      }
+
+      .module-icon-strip {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .tile-meta {
+        z-index: 5;
+      }
+
+      .maximize-icon {
+        z-index: 3;
       }
 
       /* Hide overlay icons and names when tile is small */
@@ -3033,26 +3577,28 @@ export class RoomView extends LitElement {
         min-width: 0;
         max-height: 49cqh;
       }
-      .screen-share-panel .triplett,
-      .screen-share-panel .quartett {
-        width: min(49%, 49cqw);
+      /* Panel is column-stacked (flex-direction: column, nowrap); width is
+         supplied by the .screen-share-panel > * rule above. Per-count rules
+         only need to cap height. */
+      .screen-share-panel .triplett {
         min-width: 0;
-        max-height: 49cqh;
+        max-height: 32cqh;
+      }
+      .screen-share-panel .quartett {
+        min-width: 0;
+        max-height: 24cqh;
       }
       .screen-share-panel .sextett {
-        width: min(32%, 32cqw);
         min-width: 0;
-        max-height: 49cqh;
+        max-height: 16cqh;
       }
       .screen-share-panel .octett {
-        width: min(32%, 32cqw);
         min-width: 0;
-        max-height: 32cqh;
+        max-height: 12cqh;
       }
       .screen-share-panel .unlimited {
-        width: min(24%, 24cqw);
         min-width: 0;
-        max-height: 32cqh;
+        max-height: 9cqh;
       }
 
       /* People panel circle-mode: constrain width by height so
@@ -3299,6 +3845,11 @@ export class RoomView extends LitElement {
         font-size: 14px;
         color: #c3c9eb;
         padding: 2px 10px;
+        text-align: left;
+      }
+
+      .reconnect-menu-item::part(prefix) {
+        margin-inline-end: 8px;
       }
 
       .reconnect-menu-item::part(base):hover {

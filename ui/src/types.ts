@@ -101,11 +101,71 @@ export type SharedWalPayload = {
   assetIconSrc?: string;
 };
 
+/**
+ * User-facing per-peer audio link state. Distinct from `ConnectionStatus`
+ * (which is the pure WebRTC negotiation FSM): this rolls up reachability,
+ * WebRTC media liveness, signals-carrier flow, and peer intent into the
+ * single answer "can I hear this peer right now, and over what?"
+ *
+ * Runs in parallel with `ConnectionStatus`; the latter remains the source
+ * of truth for init/accept/SDP state.
+ */
+export type AudioLinkState =
+  /**
+   * From the observer's perspective, the agent is not currently in the
+   * room — no recent pong, regardless of whether they ever joined or
+   * intentionally left. Both cases collapse here because the user-facing
+   * answer is the same: this observer doesn't see them.
+   */
+  | 'absent'
+  | 'blocked'
+  | 'negotiating' // webrtc handshaking, no signals fallback flowing yet
+  | 'webrtc' // webrtc connected + recent media
+  | 'signals' // voice frames arriving via signals carrier
+  | 'muted' // peer reachable but intentionally silent
+  | 'down' // reachable, not muted, no working audio path
+  | 'unknown';
+
+/**
+ * Discrete freshness bucket for "last time I heard from this peer via
+ * signals." Broadcast instead of an absolute timestamp so clock skew
+ * between observers does not flip the color.
+ */
+export type LastSeenBucket = 'fresh' | 'stale' | 'gone' | 'unknown';
+
+/**
+ * One observer's snapshot of a single other peer's audio/video link state.
+ * Broadcast inside `PongMetaDataV1.peerLinks` so every peer can render
+ * "how X sees Y" — the pair-wise information that makes the details
+ * overlay genuinely relational rather than a repetition of the local
+ * view on each tile.
+ */
+export type PeerLinkSnapshot = {
+  audioLink: AudioLinkState;
+  carrier: 'webrtc' | 'signals' | 'none';
+  audio: 'live' | 'stale' | 'muted' | 'off';
+  video: 'live' | 'muted' | 'off';
+  lastSeen: LastSeenBucket;
+};
+
 export type PongMetaDataV1 = {
   connectionStatuses: ConnectionStatuses;
   screenShareConnectionStatuses?: ConnectionStatuses;
   knownAgents?: Record<AgentPubKeyB64, AgentInfo>;
+  /**
+   * Per-peer observation snapshot from this sender's perspective. Key is
+   * the observed peer's pubkey. Enables pair-wise UI ("X can't hear Y")
+   * without N² broadcasts — piggybacks on the existing pong.
+   */
+  peerLinks?: Record<AgentPubKeyB64, PeerLinkSnapshot>;
   appVersion?: string;
+  /**
+   * Echo of the t0 timestamp from the Ping that triggered this Pong.
+   * Used by the sender to compute signals-carrier RTT on receipt:
+   * `rtt = Date.now() - pingT0`. Clock skew is irrelevant since only
+   * the sender compares two timestamps from its own clock.
+   */
+  pingT0?: number;
   /**
    * Info about how we see the stream of the peer to
    * which we're sending this PongMetaData
@@ -121,8 +181,37 @@ export type PongMetaDataV1 = {
    * to be on or off
    */
   video?: boolean;
-  /** If this peer is currently sharing a WAL, included so late-joiners learn about it */
-  sharedWal?: SharedWalPayload;
+  /** Active module states for this agent, keyed by moduleId */
+  moduleStates?: Record<string, ModuleStateEnvelope>;
+};
+
+/**
+ * Per-peer latency/quality stats for a single carrier. Null = unknown
+ * or not yet measured. Rendered in the stats panel under the connection
+ * detail avatars.
+ */
+export type CarrierStats = {
+  rttMs: number | null;
+  jitterMs: number | null;
+  lossPercent: number | null;
+};
+
+/**
+ * Envelope for module state data sent over signals and included in pong metadata.
+ *
+ * `phase` lets a module reserve its local slot ("acquiring") so self-facing UI
+ * can mount — e.g. the <video> element for screen-share, or a loading-state
+ * mic icon — before peers are told anything is happening. Peer-facing dispatch
+ * surfaces (peer icon strip, peer overlays, onPeerStateChange) suppress
+ * acquiring envelopes; self-facing surfaces honor them. Default when omitted
+ * is 'active', so existing modules keep their current behavior unchanged.
+ */
+export type ModuleStateEnvelope = {
+  moduleId: string;
+  active: boolean;
+  payload: string;
+  updatedAt: number;
+  phase?: 'acquiring' | 'active';
 };
 
 export type ConnectionStatuses = Record<AgentPubKeyB64, ConnectionStatus>;
@@ -280,6 +369,10 @@ export type StoreEventPayload =
       connectionId: ConnectionId;
     }
   | {
+      type: 'peer-leave';
+      pubKeyB64: AgentPubKeyB64;
+    }
+  | {
       type: 'peer-screen-share-connected';
       pubKeyB64: AgentPubKeyB64;
       connectionId: ConnectionId;
@@ -288,15 +381,6 @@ export type StoreEventPayload =
       type: 'peer-screen-share-disconnected';
       pubKeyB64: AgentPubKeyB64;
       connectionId: ConnectionId;
-    }
-  | {
-      type: 'peer-share-wal';
-      pubKeyB64: AgentPubKeyB64;
-      payload: SharedWalPayload;
-    }
-  | {
-      type: 'peer-stop-share-wal';
-      pubKeyB64: AgentPubKeyB64;
     }
   | {
       type: 'error';

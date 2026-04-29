@@ -600,6 +600,25 @@ function simpleEventTypeToColor(
     case 'TrackUnmuteTimeout':
       return ['red', 'dash'];
 
+    // Carrier and quality
+    case 'CarrierSwitch':
+      return ['#b76fd9', undefined]; // purple — transport flip
+    case 'QualityBucketChange':
+      return ['#ff9b3c', 'dot']; // orange dot — quality band change
+
+    // Self-intent WebRTC toggles
+    case 'MyWebrtcDisable':
+      return ['#6a1f9a', 'dash']; // deep purple dash
+    case 'MyWebrtcEnable':
+      return ['#6a1f9a', undefined];
+
+    // Audibility outage — red markers so they pop on the graph.
+    // Start solid, End dotted so a pair reads as "bad stretch started / cleared".
+    case 'AudibilityOutageStart':
+      return ['#d9342b', undefined];
+    case 'AudibilityOutageEnd':
+      return ['#d9342b', 'dot'];
+
     default:
       return ['pink', undefined];
   }
@@ -671,6 +690,25 @@ function yEventType(event: SimpleEventType): [number, number] {
       return [-1.2, 1.2];
     case 'TrackUnmuteTimeout':
       return [-1.2, 1.2];
+
+    // Carrier / quality — draw as short markers in the connection-events band
+    case 'CarrierSwitch':
+      return [0, 1.5];
+    case 'QualityBucketChange':
+      return [-0.75, 0.75];
+
+    // Self-intent WebRTC toggles — share the MyAudioOn/MyVideoOn band
+    case 'MyWebrtcDisable':
+      return [0, 0.75];
+    case 'MyWebrtcEnable':
+      return [0, 0.75];
+
+    // Audibility outages — draw tall so they're hard to miss on the graph
+    case 'AudibilityOutageStart':
+      return [-1.5, 1.5];
+    case 'AudibilityOutageEnd':
+      return [-1.5, 1.5];
+
     default:
       return [0, 0.5];
   }

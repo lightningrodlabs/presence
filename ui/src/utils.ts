@@ -6,7 +6,9 @@ import {
   ProvisionedCell,
 } from '@holochain/client';
 import {
+  AudioLinkState,
   ConnectionStatus,
+  LastSeenBucket,
   StreamAndTrackInfo,
   TrackInfo,
 } from './types';
@@ -63,6 +65,85 @@ export function connectionStatusToColor(
       return '#c72100';
     default:
       return offlineColor;
+  }
+}
+
+/**
+ * Color for the avatar ring driven by the AudioLink FSM (parallel to the
+ * WebRTC negotiation FSM). Green means "can hear" via either carrier;
+ * amber flags genuine failure states that the old ring hid behind a green
+ * "Connected" indicator.
+ */
+export function audioLinkToColor(
+  state: AudioLinkState,
+  offlineColor = 'transparent',
+): string {
+  switch (state) {
+    case 'webrtc':
+      return '#48e708';
+    case 'signals':
+      return '#48a8e7'; // distinct shade so carrier is legible at a glance
+    case 'negotiating':
+      return 'blue';
+    case 'muted':
+      return 'gray';
+    case 'down':
+      return '#e07070';
+    case 'blocked':
+      return '#c72100';
+    case 'absent':
+    case 'unknown':
+    default:
+      return offlineColor;
+  }
+}
+
+export function audioLinkToText(state: AudioLinkState): string {
+  switch (state) {
+    case 'webrtc':
+      return 'audible (webrtc)';
+    case 'signals':
+      return 'audible (signals)';
+    case 'negotiating':
+      return 'negotiating...';
+    case 'muted':
+      return 'muted by peer';
+    case 'down':
+      return 'no audio path';
+    case 'blocked':
+      return 'blocked';
+    case 'absent':
+      return 'not in room';
+    case 'unknown':
+    default:
+      return 'unknown';
+  }
+}
+
+export function lastSeenBucketToColor(bucket: LastSeenBucket): string {
+  switch (bucket) {
+    case 'fresh':
+      return '#48e708';
+    case 'stale':
+      return '#ffd900';
+    case 'gone':
+    case 'unknown':
+    default:
+      return 'gray';
+  }
+}
+
+export function lastSeenBucketToText(bucket: LastSeenBucket): string {
+  switch (bucket) {
+    case 'fresh':
+      return 'signal received in the last 15s';
+    case 'stale':
+      return 'signal received in the last 30s';
+    case 'gone':
+      return 'no signal in the last 30s';
+    case 'unknown':
+    default:
+      return 'no signal received yet';
   }
 }
 
