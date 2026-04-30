@@ -75,25 +75,21 @@ Landed:
 
 State: `npm run -w ui test` passes 27/27. `tsc --noEmit` reports 77 errors in `streams-store.ts` — all of the form `Property 'peer' does not exist on type 'OpenConnectionInfo' / 'PendingAccept'`. The errors are intentional — they mark every call site that needs migration in Phase 1B.
 
-### Phase 1B — streams-store migration (NEXT)
+### Phase 1B — streams-store migration (DONE)
 
-Mechanical-but-substantial. The 77 type errors are the exhaustive list of work.
+Landed:
+- [x] **`createPeer` body migrated** to `_subscribeMediaTransport` event handlers — six `_handleMedia*` methods (signaling/connected/closed connection-state-change arms, remote-stream, remote-track, data-channel-message, error). Supersede guards keyed off `_openConnections[peer].connectionId`. `createPeer` deleted.
+- [x] **`createScreenSharePeer` body migrated** to `_subscribeScreenShareTransport`. The `initiator` flag selects between `_screenShareConnectionsOutgoing` (true) and `_screenShareConnectionsIncoming` (false). `createScreenSharePeer` deleted.
+- [x] **ICE diagnostic logging** preserved via the chosen escape-hatch path: added `getRTCPeerConnection(peer)` on `SimplePeerTransport` and a `_startMediaIceMonitor` method that hooks `iceconnectionstatechange` / `icegatheringstatechange` / `icecandidate` on the underlying `RTCPeerConnection` once `phase=signaling` fires. Health-check stats poll, stale-cleanup ICE peeks, and per-peer track recovery (`_tryReplaceTrackRecovery` operating on `RTCRtpSender.replaceTrack` directly to keep recovery scoped to a single peer) all use the same hatch.
+- [x] **`conn.peer.X` call sites swept** (≈50 places). Loop forms collapsed to single `this.mediaTransport.addTrack/removeTrack/replaceTrack` calls; single-peer destroys became `closeConnection(peerB64)`; sends became `mediaTransport.send(peerB64, ...)`; per-peer addStream at handshake replaced by `setLocalStream` (auto-attach on `ensureConnection`) plus per-track addTrack as on-connect fallback.
+- [x] **`_pendingAccepts` simplified**: peer field removed. `handleInitRequest` only reserves the connectionId; the actual peer is created lazily in `handleSdpData` via `mediaTransport.ensureConnection({ initiator: false, connectionId })` once the offer arrives. Stale-pending cleanup is now just dropping the entry.
+- [x] **`handleSdpData` updated** to route the three signal-target paths through `mediaTransport.processIncomingSignal`, `screenShareOutTransport.processIncomingSignal`, `screenShareInTransport.processIncomingSignal`. Each transport drops on connectionId mismatch silently.
+- [x] **`handleInitAccept` updated**: drops `createPeer` calls; transport's internal supersede handles old-peer destroy when a new connectionId is supplied.
+- [x] **`disconnect()` cleanup** delegates to `mediaTransport.destroy()` / `screenShareInTransport.destroy()` / `screenShareOutTransport.destroy()` — peer destroys cascade through the transport-emitted close events.
+- [x] **`_cloneStreamRecovery` simplified** to a transport `closeConnection` + reconnect fallback (clone-stream-and-re-add semantics relied on direct SimplePeer access; the pong-driven retry loop now picks up the new connection).
+- [x] **`import SimplePeer from 'simple-peer'`** removed from `streams-store.ts`. The package is now only referenced inside `src/transport/simplepeer/`.
 
-Tasks:
-1. **Migrate `createPeer` body** (lines ~2036–2622) into the `_subscribeMediaTransport` event handlers. Each `peer.on('connect'|'stream'|'track'|'data'|'close'|'error')` closure body becomes a switch arm in the dispatcher. Lookup state from `_openConnections[event.peer]`; validate with `connectionId` for the existing supersede-guard. Replace `this.createPeer(...)` call sites with `this.mediaTransport.ensureConnection(peerB64, { initiator, connectionId })`.
-   - **Note**: ICE diagnostic logging (lines 2052–2150 — `iceconnectionstatechange`, `icegatheringstatechange`, `icecandidate` listeners on `(peer as any)._pc`) currently relies on direct `RTCPeerConnection` access. Either drop temporarily (re-add at transport level later, or via FSM in Phase 2 which exposes transport state natively), or expose a `getRTCPeerConnection(peer)` escape hatch on `SimplePeerTransport` (leaky but pragmatic).
-2. **Migrate `createScreenSharePeer` body** similarly into `_subscribeScreenShareTransport(transport, initiator)`. The `initiator` flag selects which Svelte store to mutate.
-3. **Replace `conn.peer.X` call sites** (≈50 places — `tsc --noEmit` lists every one):
-   - Loop forms (`Object.values(_openConnections).forEach(conn => conn.peer.addTrack(...))`) collapse to single `this.mediaTransport.addTrack(track, stream)` calls (transport iterates internally).
-   - Single-peer destroys (`conn.peer.destroy()`) become `this.mediaTransport.closeConnection(peerB64)`.
-   - Sends (`conn.peer.send(...)`) become `this.mediaTransport.send(peerB64, ...)`.
-   - `conn.peer.addStream(this.mainStream)` at connection establishment becomes `this.mediaTransport.setLocalStream(this.mainStream)` once at startup, plus auto-attach on each `ensureConnection`.
-4. **Update `handleSdpData`** (lines 4411–4580): replace the three `peer.signal(JSON.parse(data))` sites with `this.mediaTransport.processIncomingSignal(...)`, `this.screenShareOutTransport.processIncomingSignal(...)`, `this.screenShareInTransport.processIncomingSignal(...)`. Each transport drops on connectionId mismatch silently.
-5. **Remove** the `import SimplePeer from 'simple-peer'` at the top of `streams-store.ts` once the last direct reference is gone.
-
-**Exit**: identical behavior, all SimplePeer access funneled through interface, tests green, `tsc --noEmit` clean, `npm run build` clean, manual 2-peer + 4-peer smoke test confirms `CarrierSwitch` / `QualityBucketChange` / `AudibilityOutage` still fire identically.
-
-**Risk**: ~200–400 LoC of focused edits in a 4400-LoC file with no integration test net. Best done in a fresh focused session, possibly broken into commits per concern (createPeer → handlers, screen-share → handlers, call-site sweep, handleSdpData).
+State: `tsc --noEmit` clean. `npm test` passes 27/27 (existing transport unit tests). `npm run build` clean. Manual smoke testing of `CarrierSwitch` / `QualityBucketChange` / `AudibilityOutage` event parity is the remaining verification step.
 
 ---
 

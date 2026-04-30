@@ -285,6 +285,19 @@ export class SimplePeerTransport implements PeerTransport {
     }
   }
 
+  /**
+   * Escape hatch: expose the underlying RTCPeerConnection so application
+   * code can attach diagnostic listeners (ICE state, candidate logging) and
+   * read raw stats reports. Leaky — Phase 2's FSM transport will not have
+   * this shape, so callers should funnel through getStats / getRTCPeerConnection
+   * via SimplePeer-typed references and migrate when the FSM lands.
+   */
+  getRTCPeerConnection(peer: AgentPubKeyB64): RTCPeerConnection | undefined {
+    const state = this._connections.get(peer);
+    if (!state) return undefined;
+    return (state.peer as unknown as { _pc?: RTCPeerConnection })._pc;
+  }
+
   async getStats(peer: AgentPubKeyB64): Promise<TransportStats | null> {
     const state = this._connections.get(peer);
     if (!state || state.phase !== 'connected') return null;
