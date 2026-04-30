@@ -11,7 +11,6 @@ import {
 } from '@holochain/client';
 import { WeaveClient } from '@theweave/api';
 import { createContext } from '@lit/context';
-import SimplePeer from 'simple-peer';
 
 export const weaveClientContext = createContext<WeaveClient>('we_client');
 
@@ -34,7 +33,6 @@ export type RTCMessage =
 
 export type OpenConnectionInfo = {
   connectionId: ConnectionId;
-  peer: SimplePeer.Instance;
   video: boolean;
   audio: boolean;
   connected: boolean;
@@ -60,11 +58,6 @@ export type PendingAccept = {
    * UUID to identify the connection
    */
   connectionId: ConnectionId;
-  /**
-   * Peer instance that was created with this accept. Gets destroyed if another Peer object makes it through
-   * to connected state instead for a connection with the same Agent.
-   */
-  peer: SimplePeer.Instance;
   /**
    * Timestamp when this PendingAccept was created, used for cleanup of stale entries.
    */

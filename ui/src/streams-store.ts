@@ -1,10 +1,11 @@
-import SimplePeer from 'simple-peer';
 import {
   AgentPubKey,
   AgentPubKeyB64,
   decodeHashFromBase64,
   encodeHashToBase64,
 } from '@holochain/client';
+import { SimplePeerTransport } from './transport';
+import type { TransportEvent } from './transport';
 import {
   derived,
   get,
@@ -147,6 +148,20 @@ export class StreamsStore {
    */
   private _webrtcMicHandle: MicAcquireResult | null = null;
 
+  /**
+   * WebRTC transports. Three instances by purpose:
+   *  - mediaTransport: bidirectional mic+camera (one connection per peer).
+   *  - screenShareOutTransport: outgoing screen share (we are the sharer).
+   *  - screenShareInTransport: incoming screen share (we are the recipient).
+   *
+   * All three signal over the same Holochain 'SdpData' message type;
+   * connectionId discriminates which transport a signal belongs to (each
+   * transport drops signals whose connectionId it doesn't recognise).
+   */
+  mediaTransport!: SimplePeerTransport;
+  screenShareOutTransport!: SimplePeerTransport;
+  screenShareInTransport!: SimplePeerTransport;
+
   constructor(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
@@ -213,6 +228,39 @@ export class StreamsStore {
       },
     );
 
+    // Construct transports. iceServers / trickleICE are getters so the
+    // transport always uses the current values (TURN credentials, trickle
+    // toggle, etc. can change at runtime).
+    const sendSdpData = (toAgent: AgentPubKey, connectionId: string, data: unknown) => {
+      this.roomClient.sendMessage(
+        [toAgent],
+        'SdpData',
+        JSON.stringify({ connection_id: connectionId, data: JSON.stringify(data) }),
+      );
+    };
+
+    const transportOpts = (
+      kind: 'media' | 'screen-out' | 'screen-in',
+    ) => ({
+      myAgentId: this.myPubKeyB64,
+      iceServers: () => this.iceConfig,
+      trickleICE: () => this.trickleICE,
+      onOutgoingSignal: (signal: { to: AgentPubKeyB64; connectionId: string; data: unknown }) => {
+        const toAgent = decodeHashFromBase64(signal.to);
+        sendSdpData(toAgent, signal.connectionId, signal.data);
+      },
+      _kind: kind, // unused at runtime, just for readability when debugging
+    });
+
+    this.mediaTransport = new SimplePeerTransport(transportOpts('media'));
+    this.screenShareOutTransport = new SimplePeerTransport(transportOpts('screen-out'));
+    this.screenShareInTransport = new SimplePeerTransport(transportOpts('screen-in'));
+
+    // Subscribe transport events to the application-level handlers.
+    this._subscribeMediaTransport();
+    this._subscribeScreenShareTransport(this.screenShareOutTransport, true);
+    this._subscribeScreenShareTransport(this.screenShareInTransport, false);
+
     navigator.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
@@ -250,6 +298,41 @@ export class StreamsStore {
     // (a boolean check + set size).
     this._signalsTargetsUnsub = this._signalsTargets.subscribe(() => {
       this._reconcileSignalsAudio();
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transport event subscription (Phase 1 — STUB)
+  //
+  // These methods will own the application-level handling currently inside
+  // createPeer's peer.on(...) closures: connection-state-change, remote-stream,
+  // remote-track, data-channel-message, error. The transport delivers each
+  // event with { peer: AgentPubKeyB64, connectionId } so we can perform the
+  // existing supersede-guard checks against _openConnections.
+  //
+  // For now they are no-ops so the constructor compiles. The migration is the
+  // next chunk of Phase 1: replace createPeer / createScreenSharePeer with
+  // calls to transport.ensureConnection, move every peer.on() handler body
+  // into the corresponding event handler below, and replace ~50 conn.peer.X
+  // call sites with transport.X / transport.send / transport.closeConnection.
+  // ---------------------------------------------------------------------------
+  private _subscribeMediaTransport(): void {
+    this.mediaTransport.onAny((_event: TransportEvent) => {
+      // TODO Phase 1: dispatch by _event.type into the existing handler logic
+      // currently inside createPeer's peer.on('connect'|'stream'|'track'|'data'|'close'|'error') closures.
+    });
+  }
+
+  private _subscribeScreenShareTransport(
+    transport: SimplePeerTransport,
+    initiator: boolean,
+  ): void {
+    transport.onAny((_event: TransportEvent) => {
+      void initiator;
+      // TODO Phase 1: dispatch by _event.type into the existing logic from
+      // createScreenSharePeer's peer.on(...) closures. The `initiator` flag
+      // selects whether to mutate _screenShareConnectionsOutgoing or
+      // _screenShareConnectionsIncoming.
     });
   }
 
