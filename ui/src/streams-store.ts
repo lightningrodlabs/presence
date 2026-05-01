@@ -2672,6 +2672,78 @@ export class StreamsStore {
   }
 
   /**
+   * Unified carrier selection — collapses `webrtcGloballyDisabled` and
+   * `webrtcImpl` into one of three user-facing choices:
+   *   - `'simplepeer'`: WebRTC enabled, simple-peer transport.
+   *   - `'fsm'`:        WebRTC enabled, hand-rolled FSM transport.
+   *   - `'signals'`:    WebRTC globally off, audio over Holochain signals only.
+   */
+  carrierMode(): 'simplepeer' | 'fsm' | 'signals' {
+    if (this.webrtcGloballyDisabled) return 'signals';
+    return this.myWebrtcImpl();
+  }
+
+  /**
+   * Apply a unified carrier mode. Tears down existing media connections
+   * so the next pong cycle re-establishes via the new selection. The
+   * conversation module's payload carries both `webrtcDisabled` and
+   * `webrtcImpl` so peers see the change in one broadcast.
+   */
+  async setCarrierMode(mode: 'simplepeer' | 'fsm' | 'signals'): Promise<void> {
+    const previous = this.carrierMode();
+    if (previous === mode) return;
+
+    if (mode === 'signals') {
+      this.webrtcGloballyDisabled = true;
+      window.localStorage.setItem('disableAllWebrtc', 'true');
+      this.logger.logAgentEvent({
+        agent: this.myPubKeyB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcDisable',
+        detail: 'global',
+      });
+      // Tear down all current media connections; videoOff() in addition
+      // because turning the camera off was the prior behavior of the
+      // global "Disable WebRTC" toggle and users expect it.
+      for (const pubKeyB64 of Object.keys(get(this._openConnections))) {
+        this.disconnectFromPeerVideo(pubKeyB64);
+      }
+      this.videoOff();
+      this._clearPendingWebrtcStatus();
+      await this._syncConversationPayload({ webrtcDisabled: true });
+      return;
+    }
+
+    // mode is 'simplepeer' or 'fsm'
+    if (this.webrtcGloballyDisabled) {
+      this.webrtcGloballyDisabled = false;
+      window.localStorage.removeItem('disableAllWebrtc');
+      this.logger.logAgentEvent({
+        agent: this.myPubKeyB64,
+        timestamp: Date.now(),
+        event: 'MyWebrtcEnable',
+        detail: 'global',
+      });
+    }
+    await this._syncConversationPayload({
+      webrtcDisabled: false,
+      webrtcImpl: mode,
+    });
+    this.logger.logAgentEvent({
+      agent: this.myPubKeyB64,
+      timestamp: Date.now(),
+      event: mode === 'fsm' ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
+      detail: `impl=${mode} (global)`,
+    });
+    // Force a re-establish so a flip between 'simplepeer' and 'fsm'
+    // takes effect immediately rather than waiting for the next
+    // natural reconnect.
+    for (const pubKeyB64 of Object.keys(get(this._openConnections))) {
+      this.disconnectFromPeerVideo(pubKeyB64);
+    }
+  }
+
+  /**
    * Toggle a peer in/out of `fsmWith`. Per-peer override that picks FSM
    * for that specific link without changing the global default. Tears
    * down the existing connection so the swap takes effect immediately.
@@ -3622,7 +3694,13 @@ export class StreamsStore {
     const openConnections = get(this._openConnections);
     for (const [pubKeyB64, connInfo] of Object.entries(openConnections)) {
       if (!connInfo.connected) continue;
-      if (!connInfo.video && !connInfo.audio) continue;
+      // Don't gate on remote tracks here — RTT is observable from
+      // candidate-pair.currentRoundTripTime (and from remote-inbound-rtp
+      // once we're sending) even when the remote has neither mic nor
+      // camera open. The per-kind dead-track detection further down has
+      // its own (connInfo.video / connInfo.audio) gates and self-skips
+      // when bytesReceived is 0, so removing the outer gate doesn't
+      // perturb that path.
 
       const pc = this._activeMediaTransportFor(pubKeyB64).getRTCPeerConnection(pubKeyB64);
       if (!pc) continue;

@@ -543,8 +543,18 @@ export class PeerConnectionFSM {
           trigger: `new peer session ${this._session.local}`,
           peerSessionId: this._session.local,
         });
-        if (ctx.localStream) {
-          this._addLocalStream(ctx.localStream);
+        // Fall back to the cached local stream when entering signaling
+        // without an explicit ctx.localStream — happens on the acceptor
+        // side, where handleRemoteSignal triggers the transition with no
+        // metadata but ConnectionManager.updateLocalStream has already
+        // populated `_localStream`. Without this fallback the answer is
+        // generated with no outgoing tracks and the remote sees us silent
+        // until a renegotiation kicks in.
+        {
+          const stream = ctx.localStream ?? this._localStream;
+          if (stream) {
+            this._addLocalStream(stream);
+          }
         }
         break;
 

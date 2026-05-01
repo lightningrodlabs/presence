@@ -749,91 +749,73 @@ export class RoomView extends LitElement {
           >
         </div>
         ${this._showConnectionDetails
-          ? html`
-            <div class="row" style="align-items: center;">
-              <toggle-switch
-                class="toggle-switch ${this.streamsStore.webrtcGloballyDisabled ? 'active' : ''}"
-                .toggleState=${this.streamsStore.webrtcGloballyDisabled}
-                @click=${(e: Event) => {
-                  e.stopPropagation();
-                }}
-                @toggle-on=${async () => {
-                  // Disable WebRTC globally: tear down all connections
-                  // and broadcast the flag so peers stop trying.
-                  // Conversation module stays active — mic still works
-                  // via signals carrier.
-                  this.streamsStore.webrtcGloballyDisabled = true;
-                  window.localStorage.setItem('disableAllWebrtc', 'true');
-                  this.streamsStore.logger.logAgentEvent({
-                    agent: this.streamsStore.myPubKeyB64,
-                    timestamp: Date.now(),
-                    event: 'MyWebrtcDisable',
-                    detail: 'global',
-                  });
-                  const openConns = this._openConnections.value || {};
-                  for (const pubKeyB64 of Object.keys(openConns)) {
-                    this.streamsStore.disconnectFromPeerVideo(pubKeyB64);
-                  }
-                  this.streamsStore.videoOff();
-                  // Clear any peers that were stuck mid-negotiation; the
-                  // close handler only fires for actually-open connections.
-                  this.streamsStore._clearPendingWebrtcStatus();
-                  await this.streamsStore._syncConversationPayload({ webrtcDisabled: true });
-                  this.requestUpdate();
-                }}
-                @toggle-off=${async () => {
-                  // Re-enable WebRTC. Broadcast so peers resume init.
-                  this.streamsStore.webrtcGloballyDisabled = false;
-                  window.localStorage.removeItem('disableAllWebrtc');
-                  this.streamsStore.logger.logAgentEvent({
-                    agent: this.streamsStore.myPubKeyB64,
-                    timestamp: Date.now(),
-                    event: 'MyWebrtcEnable',
-                    detail: 'global',
-                  });
-                  await this.streamsStore._syncConversationPayload({ webrtcDisabled: false });
-                  this.requestUpdate();
-                }}
-              ></toggle-switch>
-              <span
-                class="secondary-font"
-                style="cursor: default; margin-left: 7px; ${this.streamsStore.webrtcGloballyDisabled
-                  ? 'opacity: 0.8; color: #c72100;'
-                  : 'opacity: 0.5;'}"
-                >${this.streamsStore.webrtcGloballyDisabled
-                  ? 'WebRTC disabled'
-                  : 'Disable all WebRTC'}</span
-              >
-            </div>
-            <div class="row" style="align-items: center;">
-              <toggle-switch
-                class="toggle-switch ${this.streamsStore.myWebrtcImpl() === 'fsm' ? 'active' : ''}"
-                .toggleState=${this.streamsStore.myWebrtcImpl() === 'fsm'}
-                @click=${(e: Event) => {
-                  e.stopPropagation();
-                }}
-                @toggle-on=${async () => {
-                  await this.streamsStore.setWebrtcImpl('fsm');
-                  this.requestUpdate();
-                }}
-                @toggle-off=${async () => {
-                  await this.streamsStore.setWebrtcImpl('simplepeer');
-                  this.requestUpdate();
-                }}
-              ></toggle-switch>
-              <span
-                class="secondary-font"
-                style="cursor: default; margin-left: 7px; ${this.streamsStore.myWebrtcImpl() === 'fsm'
-                  ? 'opacity: 0.85; color: #7adc7a;'
-                  : 'opacity: 0.5;'}"
-                title="Developer toggle — switches the WebRTC implementation between simple-peer and the hand-rolled FSM. Symmetric union: if either side picks FSM, both use it."
-                >${this.streamsStore.myWebrtcImpl() === 'fsm'
-                  ? 'WebRTC: FSM transport'
-                  : 'Use FSM transport (dev)'}</span
-              >
-            </div>
-          `
+          ? this._renderCarrierSelector()
           : html``}
+      </div>
+    `;
+  }
+
+  /**
+   * 3-way carrier selector. Collapses the previous "Disable all WebRTC" +
+   * "Use FSM transport" toggles into a single control. Symmetric union
+   * still applies on the wire — picking 'fsm' here makes any peer with us
+   * also use FSM.
+   */
+  private _renderCarrierSelector() {
+    const mode = this.streamsStore.carrierMode();
+    const options: Array<{
+      value: 'simplepeer' | 'fsm' | 'signals';
+      label: string;
+      color: string;
+      title: string;
+    }> = [
+      {
+        value: 'simplepeer',
+        label: 'WebRTC (SP)',
+        color: '#7adc7a',
+        title: 'WebRTC via simple-peer (default)',
+      },
+      {
+        value: 'fsm',
+        label: 'WebRTC (FSM)',
+        color: '#7adc7a',
+        title: 'WebRTC via perfect-negotiation FSM',
+      },
+      {
+        value: 'signals',
+        label: 'Signals (audio-only)',
+        color: '#e7a008',
+        title: 'No WebRTC — audio flows via Holochain remote signals only',
+      },
+    ];
+    return html`
+      <div class="row" style="align-items: center; gap: 8px; flex-wrap: wrap;">
+        <span class="secondary-font" style="opacity: 0.7;">Carrier:</span>
+        ${options.map(opt => {
+          const active = mode === opt.value;
+          return html`
+            <button
+              class="secondary-font"
+              title=${opt.title}
+              style="
+                cursor: pointer;
+                padding: 3px 10px;
+                border-radius: 4px;
+                border: 1px solid ${active ? opt.color : 'rgba(255,255,255,0.15)'};
+                background: ${active ? `${opt.color}22` : 'transparent'};
+                color: ${active ? opt.color : '#c3c9eb'};
+                opacity: ${active ? 1 : 0.7};
+                font-weight: ${active ? 600 : 400};
+              "
+              @click=${async (e: Event) => {
+                e.stopPropagation();
+                if (active) return;
+                await this.streamsStore.setCarrierMode(opt.value);
+                this.requestUpdate();
+              }}
+            >${opt.label}</button>
+          `;
+        })}
       </div>
     `;
   }

@@ -135,6 +135,16 @@ export class FsmTransport implements PeerTransport {
       // transitions idle -> signaling on connect()/incoming-offer, but
       // ConnectionManager fires 'connection-created' before that).
       this._lastPhase.set(e.remoteAgent, 'idle');
+      // Ensure the cached local stream is propagated to acceptor-side FSMs.
+      // ConnectionManager.updateLocalStream skips idle FSMs entirely, so an
+      // FSM created by an incoming offer would otherwise enter signaling
+      // with no _localStream and generate an answer with no outgoing
+      // tracks. Calling addLocalStream while idle sets the field; the
+      // signaling transition's entry action then picks it up.
+      if (this._localStream) {
+        const fsm = this._manager.getFSM(e.remoteAgent);
+        if (fsm) fsm.addLocalStream(this._localStream);
+      }
     });
 
     this._manager.on('remote-stream', (e: any) => {
