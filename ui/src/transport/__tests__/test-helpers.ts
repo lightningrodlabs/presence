@@ -11,6 +11,45 @@ import type { AgentPubKeyB64 } from '@holochain/client';
 import type { OutgoingSignal, SimplePeerLike } from '../types';
 import type SimplePeer from 'simple-peer';
 
+/**
+ * Stand-in for SimplePeer's internal RTCPeerConnection. Exposes the
+ * fields and methods the SimplePeerTransport's ICE restart monitor
+ * touches (iceConnectionState, signalingState, restartIce,
+ * addEventListener / removeEventListener). Tests drive state changes
+ * via `setIceConnectionState`.
+ */
+export class FakePc {
+  public iceConnectionState: RTCIceConnectionState = 'new';
+  public signalingState: RTCSignalingState = 'stable';
+  public restartIceCalls = 0;
+  private _listeners = new Map<string, Set<(...args: any[]) => void>>();
+
+  addEventListener(event: string, listener: (...args: any[]) => void): void {
+    let set = this._listeners.get(event);
+    if (!set) {
+      set = new Set();
+      this._listeners.set(event, set);
+    }
+    set.add(listener);
+  }
+
+  removeEventListener(event: string, listener: (...args: any[]) => void): void {
+    this._listeners.get(event)?.delete(listener);
+  }
+
+  restartIce(): void {
+    this.restartIceCalls++;
+  }
+
+  /** Test-only: drive iceconnectionstatechange transitions. */
+  setIceConnectionState(state: RTCIceConnectionState): void {
+    this.iceConnectionState = state;
+    const set = this._listeners.get('iceconnectionstatechange');
+    if (!set) return;
+    for (const l of Array.from(set)) l();
+  }
+}
+
 export class MockSimplePeer implements SimplePeerLike {
   public readonly options: SimplePeer.Options;
   public destroyed = false;
@@ -24,6 +63,11 @@ export class MockSimplePeer implements SimplePeerLike {
   }> = [];
   public addedStreams: MediaStream[] = [];
   public signaledIn: unknown[] = [];
+
+  /** Mirrors simple-peer's internal RTCPeerConnection. Synchronously
+   *  populated so SimplePeerTransport's ICE restart monitor can attach
+   *  on the first poll attempt instead of running its retry loop. */
+  public _pc: FakePc = new FakePc();
 
   private _listeners = new Map<string, Set<(...args: any[]) => void>>();
 

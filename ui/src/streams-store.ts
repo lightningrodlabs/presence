@@ -1455,6 +1455,9 @@ export class StreamsStore {
     this.screenShareOutTransport.destroy();
     this.videoOff();
     this.audioOff();
+    // videoOff allocates a keepalive track if not already; on disconnect
+    // there are no peers to swap it onto, so just release the resources.
+    this._releaseVideoKeepalive();
     // Stop the voice encoder if running, then unbind the controller
     // (tears down both send and receive state).
     if (this._voiceEncoderRunning) {
@@ -1676,10 +1679,10 @@ export class StreamsStore {
     const deviceId = get(this._videoInputId);
     if (this.mainStream) {
       if (this.mainStream.getVideoTracks()[0]) {
-        console.log('### CASE A');
+        // Camera track already on mainStream — just re-enable it.
+        // (Rare path; videoOff stops & removes the camera track.)
         this.mainStream.getVideoTracks()[0].enabled = true;
       } else {
-        console.log('### CASE B');
         let videoStream: MediaStream | undefined;
         try {
           videoStream = await navigator.mediaDevices.getUserMedia({
@@ -1717,13 +1720,24 @@ export class StreamsStore {
         this.eventCallback({
           type: 'my-video-on',
         });
+        // If there's a keepalive sender on each peer (left there by
+        // videoOff), swap it for the real camera track via replaceTrack
+        // — preserves the existing RTCRtpSender / m-line and avoids a
+        // renegotiation. Otherwise (no prior video sender) addTrack
+        // creates a new one with the standard renegotiation flow.
+        const keepalive = this._videoKeepaliveTrack;
         for (const t of this._allMediaTransports()) {
           try {
-            t.addTrack(videoTrack, this.mainStream);
+            if (keepalive) {
+              t.replaceTrack(keepalive, videoTrack, this.mainStream);
+            } else {
+              t.addTrack(videoTrack, this.mainStream);
+            }
           } catch (e: any) {
-            console.error(`Failed to add video track: ${e.toString()}`);
+            console.error(`Failed to attach video track: ${e.toString()}`);
           }
         }
+        if (keepalive) this._releaseVideoKeepalive();
       }
     } else {
       try {
@@ -1775,45 +1789,118 @@ export class StreamsStore {
     });
   }
 
+  /**
+   * Lazily build a 1x1 black canvas captureStream as a NAT-keepalive
+   * video track. Idempotent — returns the existing track if already built.
+   * The track is intentionally minimal (1 fps, 1x1) — its only job is to
+   * keep RTP packets flowing so the candidate-pair NAT mapping stays warm.
+   */
+  private _ensureVideoKeepaliveTrack(): MediaStreamTrack | null {
+    if (this._videoKeepaliveTrack && this._videoKeepaliveTrack.readyState === 'live') {
+      return this._videoKeepaliveTrack;
+    }
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 2;
+      canvas.height = 2;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      const stream = (canvas as HTMLCanvasElement & {
+        captureStream: (frameRate?: number) => MediaStream;
+      }).captureStream(1);
+      const track = stream.getVideoTracks()[0];
+      if (!track) return null;
+      this._videoKeepaliveCanvas = canvas;
+      this._videoKeepaliveStream = stream;
+      this._videoKeepaliveTrack = track;
+      return track;
+    } catch (e: any) {
+      console.warn('Failed to create video keepalive track:', e?.message ?? e);
+      return null;
+    }
+  }
+
+  private _releaseVideoKeepalive(): void {
+    if (this._videoKeepaliveTrack) {
+      try { this._videoKeepaliveTrack.stop(); } catch {}
+    }
+    this._videoKeepaliveTrack = null;
+    this._videoKeepaliveStream = null;
+    this._videoKeepaliveCanvas = null;
+  }
+
   videoOff() {
-    if (this.mainStream) {
-      const videoTracks = this.mainStream.getVideoTracks();
-      videoTracks.forEach(track => {
-        // eslint-disable-next-line no-param-reassign
-        track.stop();
-      });
+    if (!this.mainStream) return;
+    const videoTracks = this.mainStream.getVideoTracks();
+    if (videoTracks.length === 0) return;
+
+    // Build a black-frame keepalive track and swap it onto every peer's
+    // existing video sender via replaceTrack (no renegotiation, same
+    // RTCRtpSender, same SDP m-line). This is the fix for the NAT
+    // cooldown failure mode: with audio also muted, dropping the video
+    // sender entirely (the previous behaviour) starved RTP egress, the
+    // remote NAT aged out the candidate-pair mapping, and ICE went
+    // disconnected -> failed.
+    const keepaliveTrack = this._ensureVideoKeepaliveTrack();
+    const stream = this.mainStream;
+
+    if (keepaliveTrack) {
+      for (const cameraTrack of videoTracks) {
+        for (const t of this._allMediaTransports()) {
+          try {
+            t.replaceTrack(cameraTrack, keepaliveTrack, stream);
+          } catch (e) {
+            console.warn('videoOff: replaceTrack failed:', e);
+          }
+        }
+      }
+    } else {
+      // No keepalive available (canvas / captureStream unsupported) —
+      // fall back to the old behaviour of dropping the sender. This
+      // path is the source of the NAT cooldown bug; in supported
+      // browsers the keepalive path above is taken.
       for (const t of this._allMediaTransports()) {
         try {
           videoTracks.forEach(track => {
-            t.removeTrack(track, this.mainStream!);
+            t.removeTrack(track, stream);
           });
         } catch (e) {
           console.warn('Could not remove video track from peers: ', e);
         }
       }
-      Object.keys(get(this._openConnections)).forEach(peerB64 => {
-        const msg: RTCMessage = {
-          type: 'action',
-          message: 'video-off',
-        };
-        try {
-          this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
-        } catch (e) {
-          console.warn('Could not send video-off message to peer: ', e);
-        }
-      });
-      this.mainStream.getVideoTracks().forEach(track => {
-        this.mainStream!.removeTrack(track);
-      });
-      this.logger.logAgentEvent({
-        agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-        timestamp: Date.now(),
-        event: 'MyVideoOff',
-      });
-      this.eventCallback({
-        type: 'my-video-off',
-      });
     }
+
+    // Stop the camera and remove from mainStream regardless of which
+    // path above ran. The keepalive track stays on the peer senders;
+    // mainStream truthfully reflects "user is not sharing video".
+    videoTracks.forEach(track => {
+      try { track.stop(); } catch {}
+      try { stream.removeTrack(track); } catch {}
+    });
+
+    Object.keys(get(this._openConnections)).forEach(peerB64 => {
+      const msg: RTCMessage = {
+        type: 'action',
+        message: 'video-off',
+      };
+      try {
+        this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
+      } catch (e) {
+        console.warn('Could not send video-off message to peer: ', e);
+      }
+    });
+
+    this.logger.logAgentEvent({
+      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      timestamp: Date.now(),
+      event: 'MyVideoOff',
+    });
+    this.eventCallback({
+      type: 'my-video-off',
+    });
   }
 
   async changeAudioInput(deviceId: string) {
@@ -2149,6 +2236,23 @@ export class StreamsStore {
    * perspective
    */
   mainStreamClones: MediaStream[] = [];
+
+  /**
+   * Black-frame video track used as a NAT-keepalive replacement for the
+   * camera track when the user turns video off. Generated from a 1x1
+   * canvas captured at low fps. Lives ONLY on per-peer senders (via
+   * replaceTrack); deliberately NOT on mainStream so local UI does not
+   * render it and getVideoTracks() consumers continue to see "no video".
+   *
+   * Why: with audio muted (track.enabled = false) some NAT/codec combos
+   * stop emitting RTP entirely, the candidate-pair mapping ages out, and
+   * ICE goes disconnected -> failed within ~10s on srflx-srflx paths
+   * with no relay candidate. Keeping a low-bitrate video sender alive
+   * keeps RTP egress flowing and the NAT mapping warm.
+   */
+  private _videoKeepaliveTrack: MediaStreamTrack | null = null;
+  private _videoKeepaliveCanvas: HTMLCanvasElement | null = null;
+  private _videoKeepaliveStream: MediaStream | null = null;
 
   /**
    * Tracks the last time reconcileVideoStreamState was triggered per agent,

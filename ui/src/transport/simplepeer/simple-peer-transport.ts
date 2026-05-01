@@ -47,6 +47,11 @@ type PerPeerState = {
   /** The stream most recently attached via setLocalStream / addTrack ops.
    *  Used to know what to attach when a fresh peer is created. */
   attachedStream: MediaStream | null;
+  /** ICE restart bookkeeping. Populated once the underlying _pc becomes
+   *  visible. See `_setupIceRestartMonitor` for rationale. */
+  iceMonitorCleanup?: () => void;
+  iceRestartTimer?: ReturnType<typeof setTimeout>;
+  iceRestartCount: number;
 };
 
 /** Test seam: factory for SimplePeer instances. */
@@ -62,6 +67,32 @@ const TERMINAL_PHASES: ReadonlySet<ConnectionPhase> = new Set([
   'closed',
   'failed',
 ]);
+
+/**
+ * How long to wait in iceConnectionState 'disconnected' before attempting
+ * pc.restartIce(). Must be shorter than the time it takes the browser to
+ * promote 'disconnected' to 'failed' (default ICE consent timeout ~30s,
+ * but observed ~10s on srflx-srflx paths). simple-peer auto-destroys on
+ * 'failed', so we have to act before that to keep the socket alive.
+ */
+const ICE_RESTART_DISCONNECTED_GRACE_MS = 5000;
+
+/**
+ * Maximum number of in-place pc.restartIce() attempts per peer state
+ * before falling through to simple-peer's own destroy-on-failed path
+ * (which lets streams-store re-create the peer from scratch). Mirrors
+ * FSM transport's ICE_RESTART_MAX_ATTEMPTS.
+ */
+const ICE_RESTART_MAX_ATTEMPTS = 3;
+
+/**
+ * How often to poll for SimplePeer's internal _pc to become available
+ * after construction. simple-peer assigns _pc during construction but
+ * tests / mocks may not — we poll briefly and give up. Total budget:
+ * ~1s (20 attempts x 50ms).
+ */
+const PC_POLL_INTERVAL_MS = 50;
+const PC_POLL_MAX_ATTEMPTS = 20;
 
 export class SimplePeerTransport implements PeerTransport {
   private _myAgentId: AgentPubKeyB64;
@@ -136,10 +167,12 @@ export class SimplePeerTransport implements PeerTransport {
       phase: 'signaling',
       initiator,
       attachedStream: null,
+      iceRestartCount: 0,
     };
 
     this._connections.set(peer, state);
     this._wirePeerEvents(peer, state);
+    this._setupIceRestartMonitor(peer, state);
 
     // Auto-attach the canonical local stream, if any.
     if (this._localStream) {
@@ -441,6 +474,7 @@ export class SimplePeerTransport implements PeerTransport {
       if (isCurrent) {
         this._connections.delete(peerB64);
       }
+      this._teardownIceRestartMonitor(state);
       this._emit({
         type: 'connection-state-change',
         peer: peerB64,
@@ -476,6 +510,7 @@ export class SimplePeerTransport implements PeerTransport {
     if (isCurrent) {
       this._connections.delete(peer);
     }
+    this._teardownIceRestartMonitor(state);
 
     try {
       state.peer.destroy();
@@ -492,6 +527,130 @@ export class SimplePeerTransport implements PeerTransport {
       phase: 'closed',
       previous,
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // ICE restart monitor
+  //
+  // simple-peer auto-destroys on iceConnectionState === 'failed', which on
+  // srflx-srflx paths after a NAT mapping ages out can be ~10s after the
+  // candidate-pair first goes 'disconnected'. Each destroy means streams-store
+  // builds a brand-new SimplePeer / new socket / new STUN gather — same
+  // fragile setup, just different ports. With no relay candidate available,
+  // the new attempt frequently lands on the same broken path.
+  //
+  // We watch iceConnectionState directly and call pc.restartIce() during
+  // the disconnected window, BEFORE simple-peer destroys. restartIce() sets
+  // the negotiationneeded flag; simple-peer's own negotiate() then emits a
+  // fresh offer with new ICE credentials via the standard 'signal' path.
+  // The RTCPeerConnection, DTLS session, and local UDP socket all survive.
+  //
+  // After ICE_RESTART_MAX_ATTEMPTS we stop intervening and let simple-peer's
+  // failed -> destroy path run, so a genuinely broken connection still gets
+  // recreated. Mirrors the FSM transport's ice-restart / full-reconnect
+  // strategy from peer-connection-fsm.ts.
+  // ---------------------------------------------------------------------------
+
+  private _setupIceRestartMonitor(peerB64: AgentPubKeyB64, state: PerPeerState): void {
+    // Poll for _pc to appear. simple-peer assigns it during construction but
+    // some test mocks (and possibly some browsers) may delay it briefly.
+    const tryAttach = (attemptsLeft: number): void => {
+      if (TERMINAL_PHASES.has(state.phase)) return;
+      const pc = (state.peer as unknown as { _pc?: RTCPeerConnection })._pc;
+      if (!pc || typeof pc.addEventListener !== 'function') {
+        if (attemptsLeft <= 0) return;
+        setTimeout(() => tryAttach(attemptsLeft - 1), PC_POLL_INTERVAL_MS);
+        return;
+      }
+      this._attachIceListener(peerB64, state, pc);
+    };
+    tryAttach(PC_POLL_MAX_ATTEMPTS);
+  }
+
+  private _attachIceListener(
+    peerB64: AgentPubKeyB64,
+    state: PerPeerState,
+    pc: RTCPeerConnection
+  ): void {
+    const onStateChange = (): void => {
+      if (TERMINAL_PHASES.has(state.phase)) return;
+      const ice = pc.iceConnectionState;
+
+      if (ice === 'connected' || ice === 'completed') {
+        // Recovered (initial connect or post-restart). Reset budget so a
+        // future flap gets a fresh ICE_RESTART_MAX_ATTEMPTS allowance.
+        if (state.iceRestartTimer) {
+          clearTimeout(state.iceRestartTimer);
+          state.iceRestartTimer = undefined;
+        }
+        state.iceRestartCount = 0;
+      } else if (ice === 'disconnected') {
+        // Schedule a restart attempt after the grace window. Coalesce —
+        // 'disconnected' can fire multiple times during a flap.
+        if (state.iceRestartTimer) return;
+        state.iceRestartTimer = setTimeout(() => {
+          state.iceRestartTimer = undefined;
+          if (TERMINAL_PHASES.has(state.phase)) return;
+          if (pc.iceConnectionState !== 'disconnected') return;
+          this._tryRestartIce(peerB64, state, pc);
+        }, ICE_RESTART_DISCONNECTED_GRACE_MS);
+      } else {
+        // 'new' / 'checking' / 'failed' / 'closed' — cancel any pending
+        // restart attempt. 'failed' / 'closed' will be handled by
+        // simple-peer's own close path (we can't preempt its synchronous
+        // destroy on 'failed').
+        if (state.iceRestartTimer) {
+          clearTimeout(state.iceRestartTimer);
+          state.iceRestartTimer = undefined;
+        }
+      }
+    };
+
+    pc.addEventListener('iceconnectionstatechange', onStateChange);
+    state.iceMonitorCleanup = () => {
+      try {
+        pc.removeEventListener('iceconnectionstatechange', onStateChange);
+      } catch {
+        // pc may be in a state where listener removal throws; ignore.
+      }
+    };
+  }
+
+  private _tryRestartIce(
+    peerB64: AgentPubKeyB64,
+    state: PerPeerState,
+    pc: RTCPeerConnection
+  ): void {
+    if (state.iceRestartCount >= ICE_RESTART_MAX_ATTEMPTS) {
+      // Budget exhausted — let simple-peer's failed-handler tear it down.
+      return;
+    }
+    if (pc.signalingState !== 'stable') {
+      // Mid-negotiation; restartIce here would race with the in-flight
+      // offer/answer. Skip — if ICE recovers via the in-flight negotiation
+      // we don't need to restart anyway.
+      return;
+    }
+    state.iceRestartCount++;
+    try {
+      // pc.restartIce() flips the needs-renegotiation flag; simple-peer's
+      // negotiationneeded handler creates a fresh offer with new ICE
+      // credentials and emits it on 'signal'.
+      pc.restartIce();
+    } catch (e) {
+      console.warn(`SimplePeerTransport: restartIce failed for ${peerB64}:`, e);
+    }
+  }
+
+  private _teardownIceRestartMonitor(state: PerPeerState): void {
+    if (state.iceRestartTimer) {
+      clearTimeout(state.iceRestartTimer);
+      state.iceRestartTimer = undefined;
+    }
+    if (state.iceMonitorCleanup) {
+      state.iceMonitorCleanup();
+      state.iceMonitorCleanup = undefined;
+    }
   }
 
   private _emit(event: TransportEvent): void {

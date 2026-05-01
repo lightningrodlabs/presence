@@ -359,6 +359,134 @@ describe('SimplePeerTransport — data channel & events', () => {
   });
 });
 
+describe('SimplePeerTransport — ICE restart on disconnected', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  function setupForIce() {
+    return setup();
+  }
+
+  it('calls pc.restartIce() after the disconnected grace expires', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    // Simulate a healthy connect, then a disconnected flap.
+    pc.setIceConnectionState('connected');
+    pc.setIceConnectionState('disconnected');
+
+    // Within the grace window, no restart yet.
+    vi.advanceTimersByTime(4999);
+    expect(pc.restartIceCalls).toBe(0);
+
+    // After the grace expires, restartIce fires.
+    vi.advanceTimersByTime(2);
+    expect(pc.restartIceCalls).toBe(1);
+  });
+
+  it('cancels the restart attempt if ICE recovers within the grace window', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    pc.setIceConnectionState('connected');
+    pc.setIceConnectionState('disconnected');
+    vi.advanceTimersByTime(2000);
+    pc.setIceConnectionState('connected');
+
+    // Run out the rest of the grace window — no restart should fire.
+    vi.advanceTimersByTime(10_000);
+    expect(pc.restartIceCalls).toBe(0);
+  });
+
+  it('coalesces back-to-back disconnected events into a single restart', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    pc.setIceConnectionState('connected');
+    pc.setIceConnectionState('disconnected');
+    pc.setIceConnectionState('disconnected');
+    pc.setIceConnectionState('disconnected');
+
+    vi.advanceTimersByTime(6000);
+    expect(pc.restartIceCalls).toBe(1);
+  });
+
+  it('caps in-place restarts at ICE_RESTART_MAX_ATTEMPTS', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    // Simulate three full disconnect-then-connect-then-disconnect cycles
+    // WITHOUT a successful 'connected' transition between them — the
+    // counter resets only on connected/completed.
+    pc.setIceConnectionState('connected'); // reset baseline
+    for (let i = 0; i < 5; i++) {
+      pc.setIceConnectionState('disconnected');
+      vi.advanceTimersByTime(6000);
+      // back to checking (e.g. restart in progress) — no reset
+      pc.setIceConnectionState('checking');
+    }
+
+    expect(pc.restartIceCalls).toBe(3);
+  });
+
+  it('resets the restart budget after a successful reconnection', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    pc.setIceConnectionState('connected');
+
+    // First flap — uses 1 restart.
+    pc.setIceConnectionState('disconnected');
+    vi.advanceTimersByTime(6000);
+    expect(pc.restartIceCalls).toBe(1);
+
+    // ICE recovers (real or via the restart) — budget should reset.
+    pc.setIceConnectionState('connected');
+
+    // Three more flaps after recovery — all three restarts allowed.
+    for (let i = 0; i < 5; i++) {
+      pc.setIceConnectionState('disconnected');
+      vi.advanceTimersByTime(6000);
+      pc.setIceConnectionState('checking');
+    }
+
+    expect(pc.restartIceCalls).toBe(1 + 3);
+  });
+
+  it('skips restart when signalingState is not stable', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    pc.setIceConnectionState('connected');
+    pc.signalingState = 'have-local-offer';
+    pc.setIceConnectionState('disconnected');
+    vi.advanceTimersByTime(6000);
+
+    expect(pc.restartIceCalls).toBe(0);
+  });
+
+  it('detaches the listener after the peer is closed', () => {
+    const { transport, peers } = setupForIce();
+    transport.ensureConnection(PEER_B);
+    const pc = peers[0]._pc;
+
+    pc.setIceConnectionState('connected');
+    transport.closeConnection(PEER_B, 'test');
+
+    pc.setIceConnectionState('disconnected');
+    vi.advanceTimersByTime(10_000);
+
+    expect(pc.restartIceCalls).toBe(0);
+  });
+});
+
 describe('SimplePeerTransport — two transports via FakeSignalingChannel', () => {
   it('signals exchanged between two transports route to the right peer', async () => {
     const channel = new FakeSignalingChannel();
