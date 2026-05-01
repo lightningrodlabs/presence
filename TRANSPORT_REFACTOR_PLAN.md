@@ -111,15 +111,22 @@ State: `tsc --noEmit` clean. `npm test` 176/176 green. `npm run build` clean. Ma
 
 ---
 
-## Phase 3 — Automated failure toggle
+## Phase 3 — Automated failure toggle (DONE)
 
-**Goal**: when one WebRTC implementation fails, automatically try the other for that peer.
+Landed:
+- [x] **`peerImpl` map** replaces `fsmWith` in the conversation payload — `Record<AgentPubKeyB64, 'simplepeer' | 'fsm'>` so per-peer overrides can pin either direction. Backwards-compat parsing promotes legacy `fsmWith` entries to `peerImpl[peer] = 'fsm'` automatically.
+- [x] **Resolution rules** (`resolveWebrtcImpl` in `ui/src/transport/auto-flip-policy.ts`): both-side overrides agree → that value; both override and disagree → `'simplepeer'` wins (broader compat, less reconnect machinery, lets the auto-toggle pin a failing link unilaterally); one side overrides → that value; neither overrides → symmetric union of globals (FSM if either picks FSM).
+- [x] **Auto-toggle hook**: `_checkAudibilityOutages` calls `_maybeAutoFlipImpl(peer)` at the same point it emits `AudibilityOutageStart`. The decision is gated by the pure `decideAutoFlip` policy in `auto-flip-policy.ts`:
+   - already on signals → noop;
+   - inside the per-peer cooldown window (60s) → noop;
+   - flip count ≥ max attempts (3) → fallback (pin to signals via `disableWebrtcWith`);
+   - otherwise → flip the impl (FSM ↔ simple-peer).
+- [x] **Anti-ping-pong**: `_lastAutoFlipMs` and `_autoFlipCount` per-peer maps on the store. Both sides observing the same outage at the same moment land on the same impl thanks to the simplepeer-wins tiebreaker; subsequent flips wait out the cooldown.
+- [x] **Logs-graph**: new `WebrtcImplFlip` `SimpleEventType`. Manual flips log `prev->next; reason=manual`; auto-flips log `reason=auto-outage`; exhaustion logs `exhausted after N flips; pinning to signals`. `setPeerImpl(peer, impl, reason)` is the single entry point.
+- [x] **`onModulePayloadChange` reacts to remote flips**: reads my peerImpl for the peer alongside the prev/next conversation payload and recomputes effective impl on both sides via `webrtcImplForGiven`. Tears down the connection only when the effective impl actually changed, so a peer flipping their unrelated `peerImpl[other_agent]` field doesn't trigger spurious teardowns.
+- [x] **Tests**: 16 new pure-policy tests for `decideAutoFlip` and `resolveWebrtcImpl` (cooldown, max-flip, exhaustion, signals fallback, tiebreaker, override precedence). Total suite: **222/222** green.
 
-Tasks:
-1. Failure signal: `AudibilityOutage` fires (≥30s `down`/`negotiating` to a peer reachable by a third observer) AND we're not currently using `signals` carrier (signals doesn't have an "other impl").
-2. Toggle logic: flip `webrtcImpl` for that peer in conversation payload, transport selector picks it up, swap happens.
-3. Anti-ping-pong: per-peer toggle cooldown (60s); track toggle count and stop after N flips, fall back to signals.
-4. Per-peer toggle history surfaced in logs-graph for debugging.
+State: `tsc --noEmit` clean. `npm run build` clean. The integration smoke test (induce a connection failure on one impl and watch the other take over within ~30–60s) is the remaining verification before Phase 4.
 
 **Exit**: induce a connection failure (e.g. block one transport's signaling), watch the other take over within a bounded window.
 

@@ -6,6 +6,7 @@ import {
 } from '@holochain/client';
 import { SimplePeerTransport, FsmTransport } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
+import { decideAutoFlip, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import {
   derived,
   get,
@@ -400,20 +401,51 @@ export class StreamsStore {
 
   /**
    * Effective WebRTC implementation for the link between us and `peerB64`.
-   * Symmetric union: if either side has chosen 'fsm' (globally via
-   * `webrtcImpl` or per-peer via `fsmWith`), the link uses FSM. This
-   * mirrors how `disableWebrtcWith` is union'd in `webrtcDisabled()`.
+   *
+   * Resolution order:
+   *  1. If either side has set a per-peer override (`peerImpl[other]`), the
+   *     override applies. If both sides override and disagree,
+   *     `'simplepeer'` wins (broader compat, less reconnect machinery).
+   *  2. Otherwise the global default applies — `'fsm'` if either side has
+   *     `webrtcImpl: 'fsm'`, else `'simplepeer'`.
+   *
+   * The "simplepeer wins on conflict" rule exists so the Phase 3 auto-
+   * toggle can pin a failing link to simplepeer unilaterally and have
+   * that decision stick even if the peer had chosen fsm on their side.
    */
   webrtcImplFor(peerB64: AgentPubKeyB64): 'simplepeer' | 'fsm' {
     const myConv = get(this._myModuleStates)['conversation'];
     const myPayload = myConv ? parseConversationPayload(myConv) : null;
-    if (myPayload?.webrtcImpl === 'fsm') return 'fsm';
-    if (myPayload?.fsmWith.includes(peerB64)) return 'fsm';
     const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
     const peerPayload = peerConv ? parseConversationPayload(peerConv) : null;
-    if (peerPayload?.webrtcImpl === 'fsm') return 'fsm';
-    if (peerPayload?.fsmWith.includes(this.myPubKeyB64)) return 'fsm';
-    return 'simplepeer';
+    return this.webrtcImplForGiven(
+      myPayload?.webrtcImpl ?? 'simplepeer',
+      myPayload?.peerImpl?.[peerB64],
+      peerPayload?.webrtcImpl ?? 'simplepeer',
+      peerPayload?.peerImpl?.[this.myPubKeyB64],
+    );
+  }
+
+  /** Pure resolver for `webrtcImplFor` — exposed so other modules
+   *  (e.g. `onModulePayloadChange`) can compute prev/next impls from
+   *  arbitrary payload snapshots without re-reading the live stores.
+   *  Thin wrapper over the standalone helper in
+   *  `./transport/auto-flip-policy.ts`. */
+  webrtcImplForGiven(
+    myGlobal: 'simplepeer' | 'fsm',
+    myOverride: 'simplepeer' | 'fsm' | undefined,
+    peerGlobal: 'simplepeer' | 'fsm',
+    peerOverride: 'simplepeer' | 'fsm' | undefined,
+  ): 'simplepeer' | 'fsm' {
+    return resolveWebrtcImpl(myGlobal, myOverride, peerGlobal, peerOverride);
+  }
+
+  /** Read our own peerImpl map. Defaults to {} if conversation isn't
+   *  active or the field is missing. */
+  myPeerImpl(): Record<AgentPubKeyB64, 'simplepeer' | 'fsm'> {
+    const existing = get(this._myModuleStates)['conversation'];
+    const payload = existing ? parseConversationPayload(existing) : null;
+    return payload?.peerImpl ?? {};
   }
 
   /** Per-peer media transport choice for a NEW connection — driven by the
@@ -2744,29 +2776,124 @@ export class StreamsStore {
   }
 
   /**
-   * Toggle a peer in/out of `fsmWith`. Per-peer override that picks FSM
-   * for that specific link without changing the global default. Tears
-   * down the existing connection so the swap takes effect immediately.
+   * Set or clear a per-peer impl override (`peerImpl[peerB64]`).
+   *
+   * `impl === null` clears the override; the link falls back to the
+   * global `webrtcImpl` symmetric-union resolution. Tears down the
+   * existing media connection so the swap takes effect on the next
+   * pong cycle. `reason` is recorded in the `WebrtcImplFlip` log event
+   * so the auto-toggle path and manual flips can be distinguished in
+   * logs-graph.
    */
-  async toggleFsmFor(peerB64: AgentPubKeyB64): Promise<void> {
+  async setPeerImpl(
+    peerB64: AgentPubKeyB64,
+    impl: 'simplepeer' | 'fsm' | null,
+    reason: 'manual' | 'auto-outage' = 'manual',
+  ): Promise<void> {
     const existing = get(this._myModuleStates)['conversation'];
     const payload: ConversationPayload = existing
       ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
       : { ...DEFAULT_CONVERSATION_PAYLOAD };
-    const idx = payload.fsmWith.indexOf(peerB64);
-    if (idx >= 0) {
-      payload.fsmWith = payload.fsmWith.filter(p => p !== peerB64);
+    const prevOverride = payload.peerImpl[peerB64];
+    const nextPeerImpl: Record<AgentPubKeyB64, 'simplepeer' | 'fsm'> = { ...payload.peerImpl };
+    if (impl === null) {
+      delete nextPeerImpl[peerB64];
     } else {
-      payload.fsmWith = [...payload.fsmWith, peerB64];
+      nextPeerImpl[peerB64] = impl;
     }
+    payload.peerImpl = nextPeerImpl;
     this.logger.logAgentEvent({
       agent: peerB64,
       timestamp: Date.now(),
-      event: idx >= 0 ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
-      detail: idx >= 0 ? 'fsm-per-peer off' : 'fsm-per-peer on',
+      event: 'WebrtcImplFlip',
+      detail: `${prevOverride ?? 'inherit'}->${impl ?? 'inherit'}; reason=${reason}`,
     });
     await this._syncConversationPayload(payload);
     this.disconnectFromPeerVideo(peerB64);
+  }
+
+  // ===========================================================================================
+  // PHASE 3 — Automated failure toggle bookkeeping
+  // ===========================================================================================
+
+  /** Cooldown (ms) between auto-toggle flips for the same peer. Prevents
+   *  ping-pong when both sides observe an outage and try to flip
+   *  simultaneously. */
+  private static readonly AUTO_FLIP_COOLDOWN_MS = 60_000;
+
+  /** Maximum number of auto-toggle flips per peer per session before
+   *  giving up on WebRTC for that link and pinning to signals. */
+  private static readonly AUTO_FLIP_MAX_ATTEMPTS = 3;
+
+  /** Wall-clock time of the last auto-flip for each peer, keyed by
+   *  pubkey. Read by `_maybeAutoFlipImpl` to enforce the cooldown. */
+  private _lastAutoFlipMs = new Map<AgentPubKeyB64, number>();
+
+  /** Auto-flip count per peer (this session). Once it hits
+   *  `AUTO_FLIP_MAX_ATTEMPTS`, the next outage falls back to signals
+   *  via `disableWebrtcWith` instead of flipping again. */
+  private _autoFlipCount = new Map<AgentPubKeyB64, number>();
+
+  /**
+   * Phase 3 auto-toggle. Called from `_checkAudibilityOutages` at the
+   * point where an `AudibilityOutageStart` is about to be emitted, with
+   * a confirmed relay opportunity (a third peer can hear the target).
+   *
+   * Decision tree:
+   *   - We're already on signals for this link (no other webrtc impl
+   *     to flip to) → no-op, let the outage event fire.
+   *   - Cooldown active (< AUTO_FLIP_COOLDOWN_MS since last flip) →
+   *     no-op, the previous flip hasn't had time to settle.
+   *   - Flip count exceeded → pin the link to signals via
+   *     `disableWebrtcWith`. Future outages won't trigger more flips.
+   *   - Otherwise → flip the impl (FSM ↔ simple-peer) and record the
+   *     attempt.
+   *
+   * The flip is broadcast in the conversation payload; the peer's
+   * `onModulePayloadChange` tears down their side of the connection
+   * so both sides reconnect on the new impl in lockstep.
+   */
+  private async _maybeAutoFlipImpl(peerB64: AgentPubKeyB64): Promise<void> {
+    const now = Date.now();
+    const decision = decideAutoFlip({
+      currentImpl: this.webrtcImplFor(peerB64),
+      onSignals: this.webrtcGloballyDisabled || this.webrtcDisabled(peerB64),
+      now,
+      lastFlipMs: this._lastAutoFlipMs.get(peerB64),
+      flipCount: this._autoFlipCount.get(peerB64) ?? 0,
+      cooldownMs: StreamsStore.AUTO_FLIP_COOLDOWN_MS,
+      maxAttempts: StreamsStore.AUTO_FLIP_MAX_ATTEMPTS,
+    });
+
+    if (decision.action === 'noop') return;
+
+    if (decision.action === 'fallback') {
+      // Exhausted — pin this peer link to signals. The user can
+      // re-enable manually via the per-peer toggle in the UI.
+      const flipCount = this._autoFlipCount.get(peerB64) ?? 0;
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: now,
+        event: 'WebrtcImplFlip',
+        detail: `exhausted after ${flipCount} flips; pinning to signals`,
+      });
+      const existing = get(this._myModuleStates)['conversation'];
+      const payload: ConversationPayload = existing
+        ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
+        : { ...DEFAULT_CONVERSATION_PAYLOAD };
+      if (!payload.disableWebrtcWith.includes(peerB64)) {
+        payload.disableWebrtcWith = [...payload.disableWebrtcWith, peerB64];
+        await this._syncConversationPayload(payload);
+        this.disconnectFromPeerVideo(peerB64);
+        this._clearPendingWebrtcStatus(peerB64);
+      }
+      return;
+    }
+
+    // decision.action === 'flip'
+    this._lastAutoFlipMs.set(peerB64, now);
+    this._autoFlipCount.set(peerB64, (this._autoFlipCount.get(peerB64) ?? 0) + 1);
+    await this.setPeerImpl(peerB64, decision.nextImpl, 'auto-outage');
   }
 
   /**
@@ -3670,6 +3797,12 @@ export class StreamsStore {
           event: 'AudibilityOutageStart',
           detail: `${link} ${durationSec}s; relay-via=${relayVia.slice(0, 8)}`,
         });
+        // Phase 3: try the other webrtc impl for this peer. Cooldown
+        // and max-flip guards inside _maybeAutoFlipImpl prevent
+        // ping-pong; pinning to signals is the terminal fallback.
+        // Fire-and-forget — _syncConversationPayload's broadcast and
+        // teardown are independent of the outage scan loop.
+        void this._maybeAutoFlipImpl(peerB64);
       } else if (state) {
         if (state.emitted) {
           const durationSec = Math.floor((now - state.startedAt) / 1000);

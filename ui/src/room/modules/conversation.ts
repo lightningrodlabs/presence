@@ -41,11 +41,12 @@ import type { StreamsStore } from '../../streams-store';
 // =========================================================================
 
 /** WebRTC implementation choice broadcast in the conversation payload.
- *  Symmetric union: the effective implementation for a link is `'fsm'`
- *  if either side picks it, else `'simplepeer'`. This avoids a
- *  signaling-channel mismatch (Sdp vs SdpFsm). Default `'simplepeer'`
- *  preserves existing behavior for peers running older code that omits
- *  the field. */
+ *  Symmetric union over the global `webrtcImpl` field: the effective
+ *  default for a link is `'fsm'` if either side picks it, else
+ *  `'simplepeer'`. Per-link overrides via `peerImpl` (below) take
+ *  precedence over the global default. This avoids a signaling-channel
+ *  mismatch (Sdp vs SdpFsm). Default `'simplepeer'` preserves existing
+ *  behavior for peers running older code that omits the field. */
 export type WebrtcImpl = 'simplepeer' | 'fsm';
 
 export interface ConversationPayload {
@@ -65,12 +66,15 @@ export interface ConversationPayload {
   disableWebrtcWith: AgentPubKeyB64[];
   /** Preferred WebRTC implementation for this agent's links. */
   webrtcImpl: WebrtcImpl;
-  /** Per-peer overrides — peers in this list use the FSM implementation
-   *  even when `webrtcImpl` is `'simplepeer'`. Used by the developer
-   *  settings UI to flip a single peer without changing the global
-   *  default. Symmetric union: if either side names the other, FSM is
-   *  used for that link. */
-  fsmWith: AgentPubKeyB64[];
+  /** Per-peer impl override. Each entry pins the impl for that one link
+   *  regardless of global `webrtcImpl`. Symmetric union: if both sides
+   *  set an override for the same link and the values disagree,
+   *  `'simplepeer'` wins (the more conservative default — broader
+   *  browser compatibility, less reconnect machinery). Used both by the
+   *  developer per-peer toggle and by the Phase 3 automated failure
+   *  toggle, which flips a peer's override when an `AudibilityOutage`
+   *  fires on the current impl. */
+  peerImpl: Record<AgentPubKeyB64, WebrtcImpl>;
 }
 
 export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
@@ -78,7 +82,7 @@ export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
   webrtcDisabled: false,
   disableWebrtcWith: [],
   webrtcImpl: 'simplepeer',
-  fsmWith: [],
+  peerImpl: {},
 };
 
 export function parseConversationPayload(
@@ -88,6 +92,21 @@ export function parseConversationPayload(
   try {
     const raw = JSON.parse(envelope.payload);
     const webrtcImpl: WebrtcImpl = raw.webrtcImpl === 'fsm' ? 'fsm' : 'simplepeer';
+    const peerImpl: Record<AgentPubKeyB64, WebrtcImpl> = {};
+    if (raw.peerImpl && typeof raw.peerImpl === 'object') {
+      for (const [k, v] of Object.entries(raw.peerImpl)) {
+        if (typeof k === 'string' && (v === 'simplepeer' || v === 'fsm')) {
+          peerImpl[k] = v;
+        }
+      }
+    }
+    // Backwards compat: pre-Phase-3 payloads encoded per-peer overrides
+    // as a `fsmWith` array. Promote those into peerImpl.
+    if (Array.isArray(raw.fsmWith)) {
+      for (const x of raw.fsmWith) {
+        if (typeof x === 'string' && !peerImpl[x]) peerImpl[x] = 'fsm';
+      }
+    }
     return {
       micMuted: raw.micMuted !== undefined ? !!raw.micMuted : !!raw.muted,
       webrtcDisabled: !!raw.webrtcDisabled,
@@ -97,9 +116,7 @@ export function parseConversationPayload(
           ? raw.signalsOnlyWith.filter((x: unknown) => typeof x === 'string')
           : [],
       webrtcImpl,
-      fsmWith: Array.isArray(raw.fsmWith)
-        ? raw.fsmWith.filter((x: unknown) => typeof x === 'string')
-        : [],
+      peerImpl,
     };
   } catch {
     return null;
@@ -221,19 +238,26 @@ const conversationModule: ModuleDefinition = {
       return;
     }
 
-    // Detect a webrtcImpl flip for this link via symmetric union. When the
-    // effective implementation changes (because the peer changed
-    // webrtcImpl/fsmWith), tear down any existing connection so the next
-    // pong-driven retry establishes via the newly-selected impl. This is
-    // the intended swap path for the developer-facing per-peer transport
-    // toggle (Phase 2).
-    const prevPrefersFsm =
-      prevPayload.webrtcImpl === 'fsm' ||
-      prevPayload.fsmWith.includes(myPubKey);
-    const nextPrefersFsm =
-      nextPayload.webrtcImpl === 'fsm' ||
-      nextPayload.fsmWith.includes(myPubKey);
-    if (prevPrefersFsm !== nextPrefersFsm) {
+    // Detect a webrtcImpl flip for this link. When the effective
+    // implementation changes (because the peer flipped its global
+    // webrtcImpl, or set/cleared a peerImpl override against us, or the
+    // Phase 3 auto-toggle ran on their side), tear down any existing
+    // connection so the next pong-driven retry establishes via the
+    // newly-selected impl.
+    const myPeerImplMap = streamsStore.myPeerImpl();
+    const prevImpl = streamsStore.webrtcImplForGiven(
+      streamsStore.myWebrtcImpl(),
+      myPeerImplMap[agentPubKeyB64],
+      prevPayload.webrtcImpl,
+      prevPayload.peerImpl?.[myPubKey],
+    );
+    const nextImpl = streamsStore.webrtcImplForGiven(
+      streamsStore.myWebrtcImpl(),
+      myPeerImplMap[agentPubKeyB64],
+      nextPayload.webrtcImpl,
+      nextPayload.peerImpl?.[myPubKey],
+    );
+    if (prevImpl !== nextImpl) {
       streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
     }
   },

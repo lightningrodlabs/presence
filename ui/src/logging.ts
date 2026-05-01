@@ -82,6 +82,7 @@ export type SimpleEventType =
   | 'SimplePeerTrack'
   | 'FsmError'
   | 'FsmClose'
+  | 'WebrtcImplFlip'
   | 'PeerAudioOnSignal'
   | 'PeerAudioOffSignal'
   | 'PeerVideoOnSignal'
