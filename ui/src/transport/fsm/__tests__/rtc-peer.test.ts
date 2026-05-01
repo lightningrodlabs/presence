@@ -14,6 +14,7 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   connectionTimeoutMs: 7000,
   sdpExchangeTimeoutMs: 15000,
   dtlsStallTimeoutMs: 5000,
+  iceDisconnectedGraceMs: 15000,
   role: 'mesh',
 };
 

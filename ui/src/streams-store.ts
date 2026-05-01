@@ -64,6 +64,26 @@ const STUN_SERVERS: RTCIceServer[] = [
 const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
+ * How long an established peer may sit in iceConnectionState 'disconnected'
+ * before stale-cleanup tears it down. WebRTC treats 'disconnected' as
+ * recoverable: it keeps probing the active candidate pair and may transition
+ * back to 'connected' if the path heals (e.g. brief packet loss, NAT mapping
+ * that resettles). Tearing down at the first 'disconnected' aborts that
+ * recovery and forces a full InitRequest/SDP/ICE cycle on both sides; with
+ * no relay candidate available, the new attempt frequently lands on the same
+ * broken path and fails the same way. We give ICE this window to recover
+ * before giving up. 'failed' and 'closed' are still acted on immediately.
+ *
+ * Note: when a peer is using the FSM transport, the FSM itself runs an
+ * internal grace of the same duration (configurable via
+ * ConnectionConfig.iceDisconnectedGraceMs, default 15s). The two graces are
+ * independent — both delay teardown — so the streams-store grace is also
+ * needed to prevent stale-cleanup from destroying an FSM-managed peer
+ * mid-recovery.
+ */
+const ICE_DISCONNECTED_GRACE_MS = 15000;
+
+/**
  * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent
  */
 const INIT_RETRY_THRESHOLD = 5000;
@@ -482,7 +502,14 @@ export class StreamsStore {
     transport.onAny((event: TransportEvent) => {
       switch (event.type) {
         case 'connection-state-change':
-          if (event.phase === 'connected') {
+          if (event.phase === 'signaling' && initiator) {
+            // Watch the outgoing-screen-share peer's ICE state so the
+            // stale-cleanup paths can apply a grace period symmetric
+            // with the video peer behavior. Only the outgoing
+            // (initiator) side is tracked because the existing stale-
+            // cleanup checks only target _screenShareConnectionsOutgoing.
+            this._startScreenShareIceMonitor(event.peer, transport);
+          } else if (event.phase === 'connected') {
             this._handleScreenShareConnected(event.peer, event.connectionId, initiator);
           } else if (event.phase === 'closed') {
             this._handleScreenShareClosed(event.peer, event.connectionId, initiator);
@@ -525,6 +552,14 @@ export class StreamsStore {
         this.logger.logCustomMessage(
           `ICE [${pubKeyB64.slice(0, 8)}]: ${state} connId=${connectionId.slice(0, 8)}`
         );
+        // Maintain the invariant: an entry exists iff iceState is
+        // currently 'disconnected'. The cleanup paths use a grace
+        // period before treating 'disconnected' as terminal.
+        if (state === 'disconnected') {
+          this._iceDisconnectedAt[pubKeyB64] = Date.now();
+        } else {
+          delete this._iceDisconnectedAt[pubKeyB64];
+        }
         if (state === 'failed' || state === 'disconnected') {
           try {
             const transport = (pc.getSenders()[0]?.transport as any)?.iceTransport;
@@ -557,6 +592,34 @@ export class StreamsStore {
           this.logger.logCustomMessage(
             `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${c.type} ${c.protocol} ${c.address}:${c.port}`
           );
+        }
+      });
+    };
+    attach();
+  }
+
+  /**
+   * Watch the underlying RTCPeerConnection of an outgoing screen-share
+   * peer so the stale-cleanup paths can apply the grace period.
+   * Maintains the invariant on `_screenShareIceDisconnectedAt`: an entry
+   * exists iff iceState is currently 'disconnected'.
+   */
+  private _startScreenShareIceMonitor(
+    pubKeyB64: AgentPubKeyB64,
+    transport: SimplePeerTransport,
+  ): void {
+    const attach = () => {
+      const pc = transport.getRTCPeerConnection(pubKeyB64);
+      if (!pc) {
+        setTimeout(attach, 100);
+        return;
+      }
+      pc.addEventListener('iceconnectionstatechange', () => {
+        const state = pc.iceConnectionState;
+        if (state === 'disconnected') {
+          this._screenShareIceDisconnectedAt[pubKeyB64] = Date.now();
+        } else {
+          delete this._screenShareIceDisconnectedAt[pubKeyB64];
         }
       });
     };
@@ -757,6 +820,7 @@ export class StreamsStore {
     delete this._lastBytesReceived[pubKeyB64];
     delete this._staleCycles[pubKeyB64];
     delete this._reconcileAttemptCount[pubKeyB64];
+    delete this._iceDisconnectedAt[pubKeyB64];
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
 
@@ -1120,6 +1184,10 @@ export class StreamsStore {
       delete currentValue[pubKeyB64];
       return currentValue;
     });
+
+    if (initiator) {
+      delete this._screenShareIceDisconnectedAt[pubKeyB64];
+    }
 
     if (!initiator) {
       this.eventCallback({
@@ -2093,6 +2161,26 @@ export class StreamsStore {
    * used to log the retry gap when a new InitRequest is created.
    */
   _lastDisconnectTime: Record<AgentPubKeyB64, number> = {};
+
+  /**
+   * Tracks the timestamp at which a video peer's iceConnectionState most
+   * recently entered 'disconnected', for the grace-period recovery window
+   * in stale cleanup. Set in the iceconnectionstatechange listener attached
+   * by `_startMediaIceMonitor`; the invariant is that an entry exists iff
+   * the underlying RTCPeerConnection's iceConnectionState is currently
+   * 'disconnected'. Cleared on entry to any other ICE state, on close-
+   * cleanup, and on the supersede paths (where the close handler is
+   * short-circuited by the supersede guard).
+   */
+  _iceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
+
+  /**
+   * As _iceDisconnectedAt, but for outgoing screen-share peers. Kept
+   * separate because a single agent can have both a video connection and
+   * an outgoing screen-share connection in flight with independent ICE
+   * states; one going 'disconnected' must not affect the other's grace.
+   */
+  _screenShareIceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
 
   /**
    * Tracks how many consecutive reconciliation attempts have been made per agent,
@@ -4090,12 +4178,19 @@ export class StreamsStore {
       // screen share connection immediately rather than waiting for
       // the next Pong cycle.
       if (this.screenShareStream) {
-        // Clean up stale outgoing connection if WebRTC state is dead
+        // Clean up stale outgoing connection if WebRTC state is dead.
+        // 'disconnected' is treated as recoverable for ICE_DISCONNECTED_GRACE_MS
+        // (see ICE_DISCONNECTED_GRACE_MS rationale).
         const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
         if (outgoing) {
           const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
           const iceState = pc?.iceConnectionState;
-          if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+          const disconnectedAt = this._screenShareIceDisconnectedAt[pubkeyB64];
+          const disconnectedExceededGrace =
+            iceState === 'disconnected' &&
+            !!disconnectedAt &&
+            Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
+          if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
             this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
             this._screenShareConnectionsOutgoing.update(v => {
               delete v[pubkeyB64];
@@ -4382,12 +4477,27 @@ export class StreamsStore {
 
     // Clean up stale video connection if the underlying WebRTC is dead.
     // This allows the normal initiation flow to proceed for a re-joining peer.
+    //
+    // 'disconnected' is treated as recoverable for a grace period: WebRTC
+    // keeps probing the active candidate pair and may transition back to
+    // 'connected' if the path heals. Tearing down on the first 'disconnected'
+    // both aborts that recovery locally and (because the new InitRequest we
+    // would send next supersedes the peer's connection too) interrupts the
+    // peer's recovery as well, producing the symptom of "media flows
+    // briefly then suddenly reconnects" repeatedly. We only tear down on
+    // 'failed'/'closed' immediately; 'disconnected' must persist past
+    // ICE_DISCONNECTED_GRACE_MS.
     const existingConn = get(this._openConnections)[pubkeyB64];
     if (existingConn) {
       const activeTransport = this._activeMediaTransportFor(pubkeyB64);
       const pc = activeTransport.getRTCPeerConnection(pubkeyB64);
       const iceState = pc?.iceConnectionState;
-      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+      const disconnectedAt = this._iceDisconnectedAt[pubkeyB64];
+      const disconnectedExceededGrace =
+        iceState === 'disconnected' &&
+        !!disconnectedAt &&
+        Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
+      if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
         console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
         this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState}`);
         this.logger.logAgentEvent({
@@ -4493,7 +4603,14 @@ export class StreamsStore {
     if (outgoingScreenShare) {
       const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
       const iceState = pc?.iceConnectionState;
-      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+      // 'disconnected' is treated as recoverable for ICE_DISCONNECTED_GRACE_MS
+      // (see ICE_DISCONNECTED_GRACE_MS rationale).
+      const disconnectedAt = this._screenShareIceDisconnectedAt[pubkeyB64];
+      const disconnectedExceededGrace =
+        iceState === 'disconnected' &&
+        !!disconnectedAt &&
+        Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
+      if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
         console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
         this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
         this._screenShareConnectionsOutgoing.update(currentValue => {
@@ -4746,6 +4863,12 @@ export class StreamsStore {
               connectionId: priorOpenForInitAccept.connectionId,
               detail: `superseded-by=${connection_id}; path=initiator`,
             });
+            // The prior peer's close handler will hit the supersede
+            // guard in _handleMediaClosed and return early without
+            // running cleanup, so any _iceDisconnectedAt entry from the
+            // old connection would leak. The new peer's ICE listener
+            // will set/clear based on its own state transitions.
+            delete this._iceDisconnectedAt[pubKey64];
             // Transport's ensureConnection has already closed the old peer.
           }
 
@@ -4984,6 +5107,12 @@ export class StreamsStore {
               connectionId: priorOpenForSdp.connectionId,
               detail: `superseded-by=${connection_id}; path=acceptor`,
             });
+            // The prior peer's close handler will hit the supersede
+            // guard in _handleMediaClosed and return early without
+            // running cleanup, so any _iceDisconnectedAt entry from the
+            // old connection would leak. The new peer's ICE listener
+            // will set/clear based on its own state transitions.
+            delete this._iceDisconnectedAt[pubkeyB64];
           }
 
           delete this._pendingAccepts[pubkeyB64];

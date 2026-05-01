@@ -843,6 +843,11 @@ export class PeerConnectionFSM {
       if (iceState === 'connected' || iceState === 'completed') {
         this._iceConnected = true;
         this._iceConnectedAt = Date.now();
+        // Maintain the invariant that 'ice-disconnected-grace' is pending
+        // iff iceConnectionState is currently 'disconnected'. If we
+        // arrived here from a 'disconnected' flicker during the grace
+        // window, the connection healed on its own — no reconnect needed.
+        this._clearTimer('ice-disconnected-grace');
         // ICE connected — DTLS watchdog takes over from the flat connection-timeout
         if (this._state === 'connecting') {
           const timerCount = this._timers.filter(t => t.name === 'connection-timeout').length;
@@ -860,11 +865,51 @@ export class PeerConnectionFSM {
         }
         this._startDtlsWatchdog();
         this._checkCompositeReadiness();
-      } else if (iceState === 'disconnected' || iceState === 'failed') {
+      } else if (iceState === 'disconnected') {
+        // 'disconnected' is recoverable: the browser keeps probing the
+        // active candidate pair and may return to 'connected' on its own.
+        // For an established connection, give it iceDisconnectedGraceMs
+        // before treating this as a transport failure. DTLS survives ICE
+        // blips per spec — leave its watchdog (if any) running.
+        //
+        // Outside `connected` (e.g. during initial 'connecting'), we
+        // keep the prior immediate-failure behaviour: there's no
+        // established connection worth preserving and a 15s wait would
+        // just delay legitimate retries.
+        this._iceConnected = false;
+        if (this._state === 'connected') {
+          // Restart on each entry — flicker disconnected→connected→
+          // disconnected gets a fresh window each time, matching the
+          // streams-store fix's `Date.now()`-on-every-event semantics.
+          this._startTimer(
+            'ice-disconnected-grace',
+            this._config.iceDisconnectedGraceMs,
+            () => {
+              if (this._destroyed) return;
+              // Healed during the window — handler for 'connected'
+              // already cleared the timer; this is just defensive.
+              if (this._iceConnected) return;
+              this._iceConnectedAt = null;
+              this._cancelDtlsWatchdog();
+              this._handleTransportFailure('ice-disconnected');
+            },
+          );
+        } else {
+          this._iceConnectedAt = null;
+          this._cancelDtlsWatchdog();
+          this._handleTransportFailure('ice-disconnected');
+        }
+      } else if (iceState === 'failed') {
+        // 'failed' is terminal at the ICE layer — bypass any grace.
         this._iceConnected = false;
         this._iceConnectedAt = null;
+        this._clearTimer('ice-disconnected-grace');
         this._cancelDtlsWatchdog();
-        this._handleTransportFailure(iceState === 'failed' ? 'ice-failed' : 'ice-disconnected');
+        this._handleTransportFailure('ice-failed');
+      } else {
+        // 'new' / 'checking' / 'closed' — maintain the invariant by
+        // clearing any pending grace timer.
+        this._clearTimer('ice-disconnected-grace');
       }
     });
 

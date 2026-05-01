@@ -138,10 +138,15 @@ describe('PeerConnectionFSM', () => {
       expect(connectedTransition!.trigger).toContain('composite readiness');
     });
 
-    it('connected → reconnecting on ICE disconnection', async () => {
+    it('connected → reconnecting on ICE disconnection (after grace)', async () => {
       const ctx = await getConnectedFSM();
 
       ctx.mockPc.simulateIceConnectionState('disconnected');
+      // 'disconnected' is recoverable — FSM stays in connected during grace
+      expect(ctx.fsm.state).toBe('connected');
+
+      // Advance past iceDisconnectedGraceMs (default 15_000)
+      vi.advanceTimersByTime(15_001);
 
       expect(ctx.fsm.state).toBe('reconnecting');
     });
@@ -151,6 +156,7 @@ describe('PeerConnectionFSM', () => {
 
       ctx.mockPc.simulateIceConnectionState('failed');
 
+      // 'failed' bypasses the grace
       expect(ctx.fsm.state).toBe('reconnecting');
     });
 
@@ -307,6 +313,8 @@ describe('PeerConnectionFSM', () => {
       const ctx = await getConnectedFSM();
 
       ctx.mockPc.simulateIceConnectionState('disconnected');
+      // Grace window — FSM stays in connected
+      vi.advanceTimersByTime(15_001);
       expect(ctx.fsm.state).toBe('reconnecting');
 
       // First attempt: delay 0ms for attempt 0
@@ -314,10 +322,11 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.mockPc.restartIce).toHaveBeenCalled();
     });
 
-    it('reconnection succeeds when ICE recovers', async () => {
+    it('reconnection succeeds when ICE recovers (after grace expires)', async () => {
       const ctx = await getConnectedFSM();
 
       ctx.mockPc.simulateIceConnectionState('disconnected');
+      vi.advanceTimersByTime(15_001);
       expect(ctx.fsm.state).toBe('reconnecting');
 
       // Trigger reconnect attempt
@@ -381,6 +390,7 @@ describe('PeerConnectionFSM', () => {
       if (dc?.simulateOpen) dc.simulateOpen();
 
       ctx.mockPc.simulateIceConnectionState('disconnected');
+      vi.advanceTimersByTime(15_001); // grace expires
       expect(ctx.fsm.state).toBe('reconnecting');
 
       // Attempt 0 (ICE restart)
@@ -396,7 +406,8 @@ describe('PeerConnectionFSM', () => {
       const ctx = await getConnectedFSM();
 
       ctx.mockPc.simulateIceConnectionState('disconnected');
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(15_001); // grace expires → reconnecting
+      vi.advanceTimersByTime(1); // first reconnect attempt
 
       // Recover
       ctx.mockPc.simulateIceConnectionState('connected');
@@ -436,11 +447,14 @@ describe('PeerConnectionFSM', () => {
       const ctx = await getConnectedFSM();
 
       ctx.mockPc.simulateIceConnectionState('disconnected');
+      // Advance past grace; the cascading reconnect-attempt (delay=0)
+      // fires too, so the first attempt has begun by the time we read.
+      vi.advanceTimersByTime(15_001);
 
       const vm = ctx.fsm.viewModel;
       expect(vm.phase).toBe('reconnecting');
       expect(vm.retry).not.toBeNull();
-      expect(vm.retry!.attemptNumber).toBe(0);
+      expect(vm.retry!.attemptNumber).toBe(1);
       expect(vm.retry!.maxAttempts).toBe(10);
       expect(vm.statusText).toContain('Reconnecting');
     });
@@ -931,6 +945,185 @@ describe('PeerConnectionFSM', () => {
       );
       // Should have two "stall #1" entries: one before success, one after reset
       expect(allStall1s.length).toBe(2);
+    });
+  });
+
+  describe('ICE disconnected grace period', () => {
+    it('stays in connected immediately after ICE → disconnected', async () => {
+      const ctx = await getConnectedFSM();
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+
+      // No transition yet — grace window pending
+      expect(ctx.fsm.state).toBe('connected');
+    });
+
+    it('does not transition before grace window expires', async () => {
+      const ctx = await getConnectedFSM();
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+
+      vi.advanceTimersByTime(14_999);
+
+      expect(ctx.fsm.state).toBe('connected');
+    });
+
+    it('transitions to reconnecting after grace expires', async () => {
+      const ctx = await getConnectedFSM();
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+
+      vi.advanceTimersByTime(15_001);
+
+      expect(ctx.fsm.state).toBe('reconnecting');
+    });
+
+    it('stays in connected if ICE recovers within grace', async () => {
+      const ctx = await getConnectedFSM();
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+      vi.advanceTimersByTime(5_000);
+
+      // ICE heals on its own
+      ctx.mockPc.simulateIceConnectionState('connected');
+
+      // Advance past where the grace would have fired
+      vi.advanceTimersByTime(20_000);
+
+      expect(ctx.fsm.state).toBe('connected');
+      // No reconnect was scheduled
+      expect(ctx.mockPc.restartIce).not.toHaveBeenCalled();
+    });
+
+    it('ICE → failed during grace bypasses grace and transitions immediately', async () => {
+      const ctx = await getConnectedFSM();
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+      vi.advanceTimersByTime(5_000);
+      expect(ctx.fsm.state).toBe('connected');
+
+      ctx.mockPc.simulateIceConnectionState('failed');
+
+      // Immediate — no further timer advancement needed
+      expect(ctx.fsm.state).toBe('reconnecting');
+    });
+
+    it('flicker disconnected→connected→disconnected restarts the grace window', async () => {
+      const ctx = await getConnectedFSM();
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+      vi.advanceTimersByTime(10_000); // 10s into first grace
+      ctx.mockPc.simulateIceConnectionState('connected');
+      vi.advanceTimersByTime(2_000);
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+
+      // 12s elapsed total since first disconnect; if grace had not been
+      // restarted, we'd be 3s past expiry. Verify we're still connected.
+      vi.advanceTimersByTime(10_000);
+      expect(ctx.fsm.state).toBe('connected');
+
+      // 5s more — total 15s001ms since the second 'disconnected'
+      vi.advanceTimersByTime(5_001);
+      expect(ctx.fsm.state).toBe('reconnecting');
+    });
+
+    it('grace timer is cleared on FSM destroy', async () => {
+      const ctx = await getConnectedFSM();
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+      expect(ctx.fsm.state).toBe('connected');
+
+      ctx.fsm.destroy();
+
+      // Advance past where grace would have fired — no errors, no new transitions
+      const transitionsBefore = ctx.transitionLog.length;
+      vi.advanceTimersByTime(60_000);
+
+      // No new transitions emitted post-destroy
+      expect(ctx.transitionLog.length).toBe(transitionsBefore);
+    });
+
+    it('grace timer is cleared on close()', async () => {
+      const ctx = await getConnectedFSM();
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+
+      ctx.fsm.close('user left');
+      expect(ctx.fsm.state).toBe('closed');
+
+      // The grace fires — should be a no-op since FSM is closed
+      vi.advanceTimersByTime(20_000);
+
+      // Still closed, never transitioned through reconnecting
+      expect(ctx.fsm.state).toBe('closed');
+      const reconnectingTransitions = ctx.transitionLog.filter(
+        t => t.toState === 'reconnecting'
+      );
+      expect(reconnectingTransitions.length).toBe(0);
+    });
+
+    it('grace timer is cleared when full reconnect creates a new peer', async () => {
+      // Use a policy that goes straight to full reconnect
+      const ctx = createFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({
+          maxAttempts: 10,
+          iceRestartMaxAttempts: 0,
+        }),
+      });
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+      // Grace expires → reconnecting → full reconnect (new peer session)
+      vi.advanceTimersByTime(15_001);
+      vi.advanceTimersByTime(1); // first reconnect attempt
+      // The state-transition into reconnecting calls _clearAllTimers() so
+      // the new peer's listeners start fresh; verify advancing more time
+      // doesn't produce a phantom failure transition from a stale grace.
+      const transitionCount = ctx.transitionLog.length;
+      vi.advanceTimersByTime(20_000);
+
+      // No phantom transition from a stale grace timer firing on the
+      // destroyed peer — _clearAllTimers() cancelled it.
+      const phantomFailures = ctx.transitionLog
+        .slice(transitionCount)
+        .filter(t => t.trigger.includes('ice-disconnected'));
+      expect(phantomFailures.length).toBe(0);
+    });
+
+    it('respects custom iceDisconnectedGraceMs in config', async () => {
+      const ctx = createFSM({
+        config: { ...DEFAULT_CONFIG, iceDisconnectedGraceMs: 3_000 },
+      });
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+      vi.advanceTimersByTime(2_999);
+      expect(ctx.fsm.state).toBe('connected');
+
+      vi.advanceTimersByTime(2);
+      expect(ctx.fsm.state).toBe('reconnecting');
+    });
+
+    it('connecting → ICE disconnected acts immediately (no grace)', async () => {
+      // Outside `connected`, the grace is intentionally bypassed: there's
+      // no established connection to preserve and a 15s wait would just
+      // delay legitimate retries during initial setup.
+      const ctx = createFSM();
+      ctx.fsm.connect();
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      ctx.mockPc.simulateIceConnectionState('disconnected');
+
+      // _handleTransportFailure during 'connecting' transitions to
+      // 'disconnected' (FSM phase, not iceState) — see fsm code.
+      expect(ctx.fsm.state).toBe('disconnected');
     });
   });
 });

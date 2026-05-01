@@ -238,6 +238,17 @@ export type ConnectionConfig = {
   connectionTimeoutMs: number;
   sdpExchangeTimeoutMs: number;
   dtlsStallTimeoutMs: number;
+  /**
+   * How long an established peer may sit in iceConnectionState 'disconnected'
+   * before we treat it as a transport failure and enter `reconnecting`. WebRTC
+   * keeps probing the active candidate pair while 'disconnected' and may
+   * return to 'connected' if the path heals; tearing down on the first
+   * 'disconnected' aborts that recovery and (because the resulting reconnect
+   * supersedes the peer's still-recovering connection) often lands the new
+   * attempt on the same broken path. 'failed' bypasses this grace.
+   * Only applied while FSM phase is `connected`.
+   */
+  iceDisconnectedGraceMs: number;
   role: ConnectionRole;
 };
 
@@ -250,6 +261,7 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
   connectionTimeoutMs: 7_000,
   sdpExchangeTimeoutMs: 15_000,
   dtlsStallTimeoutMs: 5_000,
+  iceDisconnectedGraceMs: 15_000,
   role: 'mesh',
 };
 
