@@ -805,6 +805,33 @@ export class RoomView extends LitElement {
                   : 'Disable all WebRTC'}</span
               >
             </div>
+            <div class="row" style="align-items: center;">
+              <toggle-switch
+                class="toggle-switch ${this.streamsStore.myWebrtcImpl() === 'fsm' ? 'active' : ''}"
+                .toggleState=${this.streamsStore.myWebrtcImpl() === 'fsm'}
+                @click=${(e: Event) => {
+                  e.stopPropagation();
+                }}
+                @toggle-on=${async () => {
+                  await this.streamsStore.setWebrtcImpl('fsm');
+                  this.requestUpdate();
+                }}
+                @toggle-off=${async () => {
+                  await this.streamsStore.setWebrtcImpl('simplepeer');
+                  this.requestUpdate();
+                }}
+              ></toggle-switch>
+              <span
+                class="secondary-font"
+                style="cursor: default; margin-left: 7px; ${this.streamsStore.myWebrtcImpl() === 'fsm'
+                  ? 'opacity: 0.85; color: #7adc7a;'
+                  : 'opacity: 0.5;'}"
+                title="Developer toggle — switches the WebRTC implementation between simple-peer and the hand-rolled FSM. Symmetric union: if either side picks FSM, both use it."
+                >${this.streamsStore.myWebrtcImpl() === 'fsm'
+                  ? 'WebRTC: FSM transport'
+                  : 'Use FSM transport (dev)'}</span
+              >
+            </div>
           `
           : html``}
       </div>

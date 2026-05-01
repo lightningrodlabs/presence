@@ -80,6 +80,8 @@ export type SimpleEventType =
   | 'SimplePeerClose'
   | 'SimplePeerStream'
   | 'SimplePeerTrack'
+  | 'FsmError'
+  | 'FsmClose'
   | 'PeerAudioOnSignal'
   | 'PeerAudioOffSignal'
   | 'PeerVideoOnSignal'

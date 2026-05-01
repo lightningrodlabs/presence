@@ -40,6 +40,14 @@ import type { StreamsStore } from '../../streams-store';
 // Payload
 // =========================================================================
 
+/** WebRTC implementation choice broadcast in the conversation payload.
+ *  Symmetric union: the effective implementation for a link is `'fsm'`
+ *  if either side picks it, else `'simplepeer'`. This avoids a
+ *  signaling-channel mismatch (Sdp vs SdpFsm). Default `'simplepeer'`
+ *  preserves existing behavior for peers running older code that omits
+ *  the field. */
+export type WebrtcImpl = 'simplepeer' | 'fsm';
+
 export interface ConversationPayload {
   /** True when user's mic is muted (track.enabled = false). */
   micMuted: boolean;
@@ -55,12 +63,22 @@ export interface ConversationPayload {
    * Symmetric union: if either side lists the other, WebRTC is off.
    */
   disableWebrtcWith: AgentPubKeyB64[];
+  /** Preferred WebRTC implementation for this agent's links. */
+  webrtcImpl: WebrtcImpl;
+  /** Per-peer overrides — peers in this list use the FSM implementation
+   *  even when `webrtcImpl` is `'simplepeer'`. Used by the developer
+   *  settings UI to flip a single peer without changing the global
+   *  default. Symmetric union: if either side names the other, FSM is
+   *  used for that link. */
+  fsmWith: AgentPubKeyB64[];
 }
 
 export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
   micMuted: true,
   webrtcDisabled: false,
   disableWebrtcWith: [],
+  webrtcImpl: 'simplepeer',
+  fsmWith: [],
 };
 
 export function parseConversationPayload(
@@ -69,6 +87,7 @@ export function parseConversationPayload(
   if (!envelope || !envelope.active) return null;
   try {
     const raw = JSON.parse(envelope.payload);
+    const webrtcImpl: WebrtcImpl = raw.webrtcImpl === 'fsm' ? 'fsm' : 'simplepeer';
     return {
       micMuted: raw.micMuted !== undefined ? !!raw.micMuted : !!raw.muted,
       webrtcDisabled: !!raw.webrtcDisabled,
@@ -77,6 +96,10 @@ export function parseConversationPayload(
         : Array.isArray(raw.signalsOnlyWith)
           ? raw.signalsOnlyWith.filter((x: unknown) => typeof x === 'string')
           : [],
+      webrtcImpl,
+      fsmWith: Array.isArray(raw.fsmWith)
+        ? raw.fsmWith.filter((x: unknown) => typeof x === 'string')
+        : [],
     };
   } catch {
     return null;
@@ -193,9 +216,24 @@ const conversationModule: ModuleDefinition = {
       nextPayload.webrtcDisabled ||
       nextPayload.disableWebrtcWith.includes(myPubKey);
 
-    if (wasDisabled === isDisabled) return;
+    if (wasDisabled !== isDisabled && isDisabled) {
+      streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
+      return;
+    }
 
-    if (isDisabled) {
+    // Detect a webrtcImpl flip for this link via symmetric union. When the
+    // effective implementation changes (because the peer changed
+    // webrtcImpl/fsmWith), tear down any existing connection so the next
+    // pong-driven retry establishes via the newly-selected impl. This is
+    // the intended swap path for the developer-facing per-peer transport
+    // toggle (Phase 2).
+    const prevPrefersFsm =
+      prevPayload.webrtcImpl === 'fsm' ||
+      prevPayload.fsmWith.includes(myPubKey);
+    const nextPrefersFsm =
+      nextPayload.webrtcImpl === 'fsm' ||
+      nextPayload.fsmWith.includes(myPubKey);
+    if (prevPrefersFsm !== nextPrefersFsm) {
       streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
     }
   },

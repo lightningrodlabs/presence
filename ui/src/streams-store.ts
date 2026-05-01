@@ -4,8 +4,8 @@ import {
   decodeHashFromBase64,
   encodeHashToBase64,
 } from '@holochain/client';
-import { SimplePeerTransport } from './transport';
-import type { TransportEvent } from './transport';
+import { SimplePeerTransport, FsmTransport } from './transport';
+import type { TransportEvent, PeerTransport } from './transport';
 import {
   derived,
   get,
@@ -161,6 +161,14 @@ export class StreamsStore {
   mediaTransport!: SimplePeerTransport;
   screenShareOutTransport!: SimplePeerTransport;
   screenShareInTransport!: SimplePeerTransport;
+  /**
+   * FSM-flavored media transport (Phase 2). Selected per-peer via the
+   * conversation module's `webrtcImpl` / `fsmWith` payload, with symmetric
+   * union (if either side picks `'fsm'`, both use it). Signals flow on
+   * the `SdpFsm` Holochain message type so the SimplePeer/FSM signaling
+   * channels can't collide. Screen share stays SimplePeer-only for now.
+   */
+  mediaTransportFsm!: FsmTransport;
 
   constructor(
     roomStore: RoomStore,
@@ -256,8 +264,30 @@ export class StreamsStore {
     this.screenShareOutTransport = new SimplePeerTransport(transportOpts('screen-out'));
     this.screenShareInTransport = new SimplePeerTransport(transportOpts('screen-in'));
 
+    // FSM media transport. Outgoing signals carry an FSM-shaped envelope
+    // (type/payload) wrapped on the wire as 'SdpFsm'; incoming 'SdpFsm'
+    // signals route here via handleSdpFsm.
+    this.mediaTransportFsm = new FsmTransport({
+      myAgentId: this.myPubKeyB64,
+      iceServers: () => this.iceConfig,
+      trickleICE: () => this.trickleICE,
+      onOutgoingSignal: (signal) => {
+        const toAgent = decodeHashFromBase64(signal.to);
+        this.roomClient.sendMessage(
+          [toAgent],
+          'SdpFsm',
+          JSON.stringify({
+            connection_id: signal.connectionId,
+            peer_session_id: signal.peerSessionId,
+            data: signal.data,
+          }),
+        );
+      },
+    });
+
     // Subscribe transport events to the application-level handlers.
     this._subscribeMediaTransport();
+    this._subscribeMediaFsmTransport();
     this._subscribeScreenShareTransport(this.screenShareOutTransport, true);
     this._subscribeScreenShareTransport(this.screenShareInTransport, false);
 
@@ -313,30 +343,104 @@ export class StreamsStore {
   // ---------------------------------------------------------------------------
   private _subscribeMediaTransport(): void {
     this.mediaTransport.onAny((event: TransportEvent) => {
-      switch (event.type) {
-        case 'connection-state-change':
-          if (event.phase === 'signaling') {
-            this._startMediaIceMonitor(event.peer, event.connectionId);
-          } else if (event.phase === 'connected') {
-            this._handleMediaConnected(event.peer, event.connectionId);
-          } else if (event.phase === 'closed') {
-            this._handleMediaClosed(event.peer, event.connectionId);
-          }
-          break;
-        case 'remote-stream':
-          this._handleMediaRemoteStream(event.peer, event.connectionId, event.stream);
-          break;
-        case 'remote-track':
-          this._handleMediaRemoteTrack(event.peer, event.connectionId, event.track);
-          break;
-        case 'data-channel-message':
-          this._handleMediaDataChannelMessage(event.peer, event.data);
-          break;
-        case 'error':
-          this._handleMediaError(event.peer, event.connectionId, event.error);
-          break;
-      }
+      this._dispatchMediaEvent(event, 'simplepeer');
     });
+  }
+
+  private _subscribeMediaFsmTransport(): void {
+    this.mediaTransportFsm.onAny((event: TransportEvent) => {
+      this._dispatchMediaEvent(event, 'fsm');
+    });
+  }
+
+  private _dispatchMediaEvent(event: TransportEvent, impl: 'simplepeer' | 'fsm'): void {
+    switch (event.type) {
+      case 'connection-state-change':
+        if (event.phase === 'signaling') {
+          this._startMediaIceMonitor(event.peer, event.connectionId, impl);
+          // FSM acceptor path: an incoming offer creates an FSM state without
+          // streams-store knowing in advance. Install the openConnections
+          // entry now so subsequent connect/stream events have a slot to
+          // mutate. SimplePeer-acceptor and initiator paths install the
+          // entry directly in handleSdpData / handleInitAccept; we don't
+          // overwrite an existing entry.
+          if (impl === 'fsm' && !get(this._openConnections)[event.peer]) {
+            this._openConnections.update(currentValue => {
+              currentValue[event.peer] = {
+                connectionId: event.connectionId,
+                video: false,
+                audio: false,
+                connected: false,
+                direction: 'duplex',
+              };
+              return currentValue;
+            });
+            this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
+          }
+        } else if (event.phase === 'connected') {
+          this._handleMediaConnected(event.peer, event.connectionId, impl);
+        } else if (event.phase === 'closed') {
+          this._handleMediaClosed(event.peer, event.connectionId, impl);
+        }
+        break;
+      case 'remote-stream':
+        this._handleMediaRemoteStream(event.peer, event.connectionId, event.stream);
+        break;
+      case 'remote-track':
+        this._handleMediaRemoteTrack(event.peer, event.connectionId, event.track);
+        break;
+      case 'data-channel-message':
+        this._handleMediaDataChannelMessage(event.peer, event.data);
+        break;
+      case 'error':
+        this._handleMediaError(event.peer, event.connectionId, event.error, impl);
+        break;
+    }
+  }
+
+  /**
+   * Effective WebRTC implementation for the link between us and `peerB64`.
+   * Symmetric union: if either side has chosen 'fsm' (globally via
+   * `webrtcImpl` or per-peer via `fsmWith`), the link uses FSM. This
+   * mirrors how `disableWebrtcWith` is union'd in `webrtcDisabled()`.
+   */
+  webrtcImplFor(peerB64: AgentPubKeyB64): 'simplepeer' | 'fsm' {
+    const myConv = get(this._myModuleStates)['conversation'];
+    const myPayload = myConv ? parseConversationPayload(myConv) : null;
+    if (myPayload?.webrtcImpl === 'fsm') return 'fsm';
+    if (myPayload?.fsmWith.includes(peerB64)) return 'fsm';
+    const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
+    const peerPayload = peerConv ? parseConversationPayload(peerConv) : null;
+    if (peerPayload?.webrtcImpl === 'fsm') return 'fsm';
+    if (peerPayload?.fsmWith.includes(this.myPubKeyB64)) return 'fsm';
+    return 'simplepeer';
+  }
+
+  /** Per-peer media transport choice for a NEW connection — driven by the
+   *  conversation module's webrtcImpl/fsmWith negotiation. */
+  private _mediaTransportFor(peerB64: AgentPubKeyB64): SimplePeerTransport | FsmTransport {
+    return this.webrtcImplFor(peerB64) === 'fsm'
+      ? this.mediaTransportFsm
+      : this.mediaTransport;
+  }
+
+  /** Per-peer media transport that currently hosts the live connection.
+   *  Use for sends, closes, and ICE peeks where we need the transport
+   *  that actually owns the peer state (which may differ from the
+   *  webrtcImpl-driven choice if a flip is in flight). Falls back to the
+   *  configured choice when no live connection exists. */
+  private _activeMediaTransportFor(peerB64: AgentPubKeyB64): SimplePeerTransport | FsmTransport {
+    if (this.mediaTransportFsm.hasConnection(peerB64)) return this.mediaTransportFsm;
+    if (this.mediaTransport.hasConnection(peerB64)) return this.mediaTransport;
+    return this._mediaTransportFor(peerB64);
+  }
+
+  /** Media transports to fan out broadcast-shaped operations onto
+   *  (setLocalStream, addTrack, removeTrack, replaceTrack, destroy).
+   *  Each transport's addTrack/etc. iterates its own connection map; calling
+   *  both covers every peer regardless of which impl is selected. */
+  private _allMediaTransports(): Array<SimplePeerTransport | FsmTransport> {
+    return [this.mediaTransport, this.mediaTransportFsm];
   }
 
   private _subscribeScreenShareTransport(
@@ -369,13 +473,17 @@ export class StreamsStore {
 
   /**
    * Watch RTCPeerConnection ICE state for forensic logging. The transport
-   * does not surface ICE-level events on its interface (Phase 2's FSM
-   * transport will expose richer connection state natively); for now we
-   * reach in via the SimplePeer-only escape hatch and attach listeners.
+   * does not surface ICE-level events on its interface; we reach in via
+   * the per-impl escape hatch and attach listeners.
    */
-  private _startMediaIceMonitor(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+  private _startMediaIceMonitor(
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    impl: 'simplepeer' | 'fsm',
+  ): void {
+    const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
     const attach = () => {
-      const pc = this.mediaTransport.getRTCPeerConnection(pubKeyB64);
+      const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
         setTimeout(attach, 100);
         return;
@@ -423,7 +531,12 @@ export class StreamsStore {
     attach();
   }
 
-  private _handleMediaConnected(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+  private _handleMediaConnected(
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    impl: 'simplepeer' | 'fsm',
+  ): void {
+    const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
     // Supersede guard: an old peer that completed ICE after being replaced
     // would otherwise mutate the new connection's slot.
     const currentOnConnect = get(this._openConnections)[pubKeyB64];
@@ -456,13 +569,13 @@ export class StreamsStore {
       event: 'Connected',
       connectionId,
     });
-    // Audio carrier flipped from signals → webrtc for this peer.
+    // Audio carrier flipped from signals → webrtc (impl-specific) for this peer.
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: Date.now(),
       event: 'CarrierSwitch',
       connectionId,
-      detail: 'signals->webrtc',
+      detail: `signals->${impl}`,
     });
     this._lastQualityBucket.delete(pubKeyB64);
 
@@ -481,7 +594,7 @@ export class StreamsStore {
     if (this.mainStream) {
       try {
         for (const track of this.mainStream.getTracks()) {
-          this.mediaTransport.addTrack(track, this.mainStream);
+          transport.addTrack(track, this.mainStream);
         }
         this.logger.logCustomMessage(
           `addStream on-connect [${pubKeyB64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks`
@@ -502,7 +615,7 @@ export class StreamsStore {
     // relay (TURN) usage so the UI can flag it.
     setTimeout(async () => {
       try {
-        const pc = this.mediaTransport.getRTCPeerConnection(pubKeyB64);
+        const pc = transport.getRTCPeerConnection(pubKeyB64);
         if (!pc) return;
         const stats = await pc.getStats();
         let isRelayed = false;
@@ -540,7 +653,11 @@ export class StreamsStore {
     }, 2000);
   }
 
-  private _handleMediaClosed(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+  private _handleMediaClosed(
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    impl: 'simplepeer' | 'fsm',
+  ): void {
     console.log('#### GOT CLOSE EVENT ####');
 
     // Supersede guard: the current entry for this peer points at a
@@ -572,7 +689,7 @@ export class StreamsStore {
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: Date.now(),
-      event: 'SimplePeerClose',
+      event: impl === 'fsm' ? 'FsmClose' : 'SimplePeerClose',
       connectionId,
     });
     if (wasWebrtcCarrier) {
@@ -581,7 +698,7 @@ export class StreamsStore {
         timestamp: Date.now(),
         event: 'CarrierSwitch',
         connectionId,
-        detail: 'webrtc->signals',
+        detail: `${impl}->signals`,
       });
     }
     this._lastQualityBucket.delete(pubKeyB64);
@@ -828,7 +945,9 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
     error: Error,
+    impl: 'simplepeer' | 'fsm',
   ): void {
+    const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
     console.log('#### GOT ERROR EVENT ####: ', error);
 
     // Supersede guard (see _handleMediaClosed for the full rationale).
@@ -851,13 +970,14 @@ export class StreamsStore {
       return;
     }
 
+    const errLabel = impl === 'fsm' ? 'FsmError' : 'SimplePeerError';
     this.logger.logCustomMessage(
-      `SimplePeerError [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
+      `${errLabel} [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
     );
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: Date.now(),
-      event: 'SimplePeerError',
+      event: errLabel,
       connectionId,
     });
 
@@ -890,10 +1010,11 @@ export class StreamsStore {
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
 
-    // Drive transport close so SimplePeer is fully torn down. The resulting
-    // close event hits _handleMediaClosed but our supersede guard lets the
-    // already-removed _openConnections entry skip duplicate work.
-    this.mediaTransport.closeConnection(pubKeyB64, 'error event');
+    // Drive transport close so the underlying peer is fully torn down.
+    // The resulting close event hits _handleMediaClosed but our supersede
+    // guard lets the already-removed _openConnections entry skip
+    // duplicate work.
+    transport.closeConnection(pubKeyB64, 'error event');
 
     this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
     this.eventCallback({
@@ -1124,17 +1245,19 @@ export class StreamsStore {
     if (newTrack && !oldTrack) {
       if (!this.mainStream) {
         this.mainStream = new MediaStream();
-        this.mediaTransport.setLocalStream(this.mainStream);
+        for (const t of this._allMediaTransports()) t.setLocalStream(this.mainStream);
       }
       // Drop any stale audio track (shouldn't happen, but cheap to guard).
       this.mainStream.getAudioTracks().forEach(t => {
         this.mainStream!.removeTrack(t);
       });
       this.mainStream.addTrack(newTrack);
-      try {
-        this.mediaTransport.addTrack(newTrack, this.mainStream);
-      } catch (e: any) {
-        console.warn('MicSource open: transport.addTrack failed:', e.message);
+      for (const t of this._allMediaTransports()) {
+        try {
+          t.addTrack(newTrack, this.mainStream);
+        } catch (e: any) {
+          console.warn('MicSource open: transport.addTrack failed:', e.message);
+        }
       }
       return;
     }
@@ -1145,10 +1268,12 @@ export class StreamsStore {
         try { this.mainStream.removeTrack(oldTrack); } catch {}
         try { this.mainStream.addTrack(newTrack); } catch {}
       }
-      try {
-        this.mediaTransport.replaceTrack(oldTrack, newTrack, this.mainStream!);
-      } catch (e: any) {
-        console.warn('MicSource device-change: transport.replaceTrack failed:', e.message);
+      for (const t of this._allMediaTransports()) {
+        try {
+          t.replaceTrack(oldTrack, newTrack, this.mainStream!);
+        } catch (e: any) {
+          console.warn('MicSource device-change: transport.replaceTrack failed:', e.message);
+        }
       }
       return;
     }
@@ -1158,10 +1283,12 @@ export class StreamsStore {
       if (this.mainStream) {
         try { this.mainStream.removeTrack(oldTrack); } catch {}
       }
-      try {
-        this.mediaTransport.removeTrack(oldTrack, this.mainStream!);
-      } catch (e: any) {
-        console.warn('MicSource close: transport.removeTrack failed:', e.message);
+      for (const t of this._allMediaTransports()) {
+        try {
+          t.removeTrack(oldTrack, this.mainStream!);
+        } catch (e: any) {
+          console.warn('MicSource close: transport.removeTrack failed:', e.message);
+        }
       }
     }
   }
@@ -1223,6 +1350,7 @@ export class StreamsStore {
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     // Close all connections and stop all streams
     this.mediaTransport.destroy();
+    this.mediaTransportFsm.destroy();
     this.screenShareInTransport.destroy();
     this.screenShareOutTransport.destroy();
     this.videoOff();
@@ -1414,7 +1542,7 @@ export class StreamsStore {
         message: 'change-video-input',
       };
       try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
+        this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
       } catch (e: any) {
         console.error(
           "Failed to send 'change-video-input' message to peer: ",
@@ -1489,10 +1617,12 @@ export class StreamsStore {
         this.eventCallback({
           type: 'my-video-on',
         });
-        try {
-          this.mediaTransport.addTrack(videoTrack, this.mainStream);
-        } catch (e: any) {
-          console.error(`Failed to add video track: ${e.toString()}`);
+        for (const t of this._allMediaTransports()) {
+          try {
+            t.addTrack(videoTrack, this.mainStream);
+          } catch (e: any) {
+            console.error(`Failed to add video track: ${e.toString()}`);
+          }
         }
       }
     } else {
@@ -1509,16 +1639,18 @@ export class StreamsStore {
         });
         return;
       }
-      this.mediaTransport.setLocalStream(this.mainStream);
+      for (const t of this._allMediaTransports()) t.setLocalStream(this.mainStream);
       this.eventCallback({
         type: 'my-video-on',
       });
-      try {
-        for (const track of this.mainStream.getTracks()) {
-          this.mediaTransport.addTrack(track, this.mainStream);
+      for (const t of this._allMediaTransports()) {
+        try {
+          for (const track of this.mainStream.getTracks()) {
+            t.addTrack(track, this.mainStream);
+          }
+        } catch (e: any) {
+          console.error(`Failed to add video track: ${e.toString()}`);
         }
-      } catch (e: any) {
-        console.error(`Failed to add video track: ${e.toString()}`);
       }
     }
 
@@ -1536,7 +1668,7 @@ export class StreamsStore {
         message: 'video-on',
       };
       try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
+        this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
       } catch (e) {
         console.warn('Could not send video-on message to peer: ', e);
       }
@@ -1550,12 +1682,14 @@ export class StreamsStore {
         // eslint-disable-next-line no-param-reassign
         track.stop();
       });
-      try {
-        videoTracks.forEach(track => {
-          this.mediaTransport.removeTrack(track, this.mainStream!);
-        });
-      } catch (e) {
-        console.warn('Could not remove video track from peers: ', e);
+      for (const t of this._allMediaTransports()) {
+        try {
+          videoTracks.forEach(track => {
+            t.removeTrack(track, this.mainStream!);
+          });
+        } catch (e) {
+          console.warn('Could not remove video track from peers: ', e);
+        }
       }
       Object.keys(get(this._openConnections)).forEach(peerB64 => {
         const msg: RTCMessage = {
@@ -1563,7 +1697,7 @@ export class StreamsStore {
           message: 'video-off',
         };
         try {
-          this.mediaTransport.send(peerB64, JSON.stringify(msg));
+          this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
         } catch (e) {
           console.warn('Could not send video-off message to peer: ', e);
         }
@@ -1601,7 +1735,7 @@ export class StreamsStore {
         message: 'change-audio-input',
       };
       try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
+        this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
       } catch (e: any) {
         console.error(
           "Failed to send 'change-audio-input' message to peer: ",
@@ -1659,7 +1793,7 @@ export class StreamsStore {
         message: 'audio-on',
       };
       try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
+        this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
       } catch (e: any) {
         console.error(
           "Failed to send 'audio-on' message to peer: ",
@@ -1716,7 +1850,7 @@ export class StreamsStore {
         message: 'audio-off',
       };
       try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
+        this._activeMediaTransportFor(peerB64).send(peerB64, JSON.stringify(msg));
       } catch (e: any) {
         console.error(
           'Failed to send audio-off message to peer: ',
@@ -1797,7 +1931,7 @@ export class StreamsStore {
 
   disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64) {
     if (get(this._openConnections)[pubKeyB64]) {
-      this.mediaTransport.closeConnection(pubKeyB64, 'disconnectFromPeerVideo');
+      this._activeMediaTransportFor(pubKeyB64).closeConnection(pubKeyB64, 'disconnectFromPeerVideo');
     }
   }
 
@@ -2508,6 +2642,62 @@ export class StreamsStore {
   }
 
   /**
+   * Set the global default WebRTC implementation in the conversation
+   * module's payload. Existing connections are torn down so the next
+   * pong cycle re-establishes them via the newly-selected impl.
+   * Symmetric union still applies — if the peer has 'fsm' set, the link
+   * uses FSM regardless of our preference.
+   */
+  async setWebrtcImpl(impl: 'simplepeer' | 'fsm'): Promise<void> {
+    await this._syncConversationPayload({ webrtcImpl: impl });
+    this.logger.logAgentEvent({
+      agent: this.myPubKeyB64,
+      timestamp: Date.now(),
+      event: impl === 'fsm' ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
+      detail: `impl=${impl} (global)`,
+    });
+    // Tear down all existing media connections so they re-establish
+    // via the newly-selected impl on the next pong cycle.
+    for (const peerB64 of Object.keys(get(this._openConnections))) {
+      this.disconnectFromPeerVideo(peerB64);
+    }
+  }
+
+  /** Read the current global webrtcImpl preference from our conversation
+   *  payload. Defaults to 'simplepeer'. */
+  myWebrtcImpl(): 'simplepeer' | 'fsm' {
+    const existing = get(this._myModuleStates)['conversation'];
+    const payload = existing ? parseConversationPayload(existing) : null;
+    return payload?.webrtcImpl ?? 'simplepeer';
+  }
+
+  /**
+   * Toggle a peer in/out of `fsmWith`. Per-peer override that picks FSM
+   * for that specific link without changing the global default. Tears
+   * down the existing connection so the swap takes effect immediately.
+   */
+  async toggleFsmFor(peerB64: AgentPubKeyB64): Promise<void> {
+    const existing = get(this._myModuleStates)['conversation'];
+    const payload: ConversationPayload = existing
+      ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
+      : { ...DEFAULT_CONVERSATION_PAYLOAD };
+    const idx = payload.fsmWith.indexOf(peerB64);
+    if (idx >= 0) {
+      payload.fsmWith = payload.fsmWith.filter(p => p !== peerB64);
+    } else {
+      payload.fsmWith = [...payload.fsmWith, peerB64];
+    }
+    this.logger.logAgentEvent({
+      agent: peerB64,
+      timestamp: Date.now(),
+      event: idx >= 0 ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
+      detail: idx >= 0 ? 'fsm-per-peer off' : 'fsm-per-peer on',
+    });
+    await this._syncConversationPayload(payload);
+    this.disconnectFromPeerVideo(peerB64);
+  }
+
+  /**
    * Force a peer's WebRTC `ConnectionStatus` to `Disconnected` if it is
    * currently in any negotiation phase. The close handler clears Connected
    * statuses on its own; pending Init/Accept/SDP states have no equivalent
@@ -3099,7 +3289,7 @@ export class StreamsStore {
     videoTrack: MediaStreamTrack | undefined
   ): boolean {
     try {
-      const pc = this.mediaTransport.getRTCPeerConnection(pubkey);
+      const pc = this._activeMediaTransportFor(pubkey).getRTCPeerConnection(pubkey);
       if (!pc) return false;
 
       const senders = pc.getSenders();
@@ -3155,7 +3345,7 @@ export class StreamsStore {
     if (!this.mainStream) return;
     console.warn(`Falling back to reconnect-based recovery for ${pubkey.slice(0, 8)}`);
     this.logger.logCustomMessage(`Reconnect recovery [${pubkey.slice(0, 8)}]`);
-    this.mediaTransport.closeConnection(pubkey, 'clone-recovery fallback');
+    this._activeMediaTransportFor(pubkey).closeConnection(pubkey, 'clone-recovery fallback');
   }
 
   /**
@@ -3434,7 +3624,7 @@ export class StreamsStore {
       if (!connInfo.connected) continue;
       if (!connInfo.video && !connInfo.audio) continue;
 
-      const pc = this.mediaTransport.getRTCPeerConnection(pubKeyB64);
+      const pc = this._activeMediaTransportFor(pubKeyB64).getRTCPeerConnection(pubKeyB64);
       if (!pc) continue;
 
       try {
@@ -3554,7 +3744,7 @@ export class StreamsStore {
             message: 'request-track-refresh',
           };
           try {
-            this.mediaTransport.send(pubKeyB64, JSON.stringify(msg));
+            this._activeMediaTransportFor(pubKeyB64).send(pubKeyB64, JSON.stringify(msg));
             // Reset stale count to avoid spamming
             this._staleCycles[pubKeyB64] = { audio: 0, video: 0 };
           } catch (e: any) {
@@ -3607,6 +3797,9 @@ export class StreamsStore {
             break;
           case 'SdpData':
             await this.handleSdpData(signal);
+            break;
+          case 'SdpFsm':
+            this.handleSdpFsm(signal);
             break;
           case 'LeaveUi':
             await this.handleLeaveUi(signal);
@@ -3763,7 +3956,7 @@ export class StreamsStore {
 
     // Destroy video connection
     if (get(this._openConnections)[pubkeyB64]) {
-      this.mediaTransport.closeConnection(pubkeyB64, 'peer left');
+      this._activeMediaTransportFor(pubkeyB64).closeConnection(pubkeyB64, 'peer left');
       this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
     }
 
@@ -3980,7 +4173,8 @@ export class StreamsStore {
     // This allows the normal initiation flow to proceed for a re-joining peer.
     const existingConn = get(this._openConnections)[pubkeyB64];
     if (existingConn) {
-      const pc = this.mediaTransport.getRTCPeerConnection(pubkeyB64);
+      const activeTransport = this._activeMediaTransportFor(pubkeyB64);
+      const pc = activeTransport.getRTCPeerConnection(pubkeyB64);
       const iceState = pc?.iceConnectionState;
       if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
         console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
@@ -3991,7 +4185,7 @@ export class StreamsStore {
           event: 'StaleCleanup',
           connectionId: existingConn.connectionId,
         });
-        this.mediaTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
+        activeTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
         this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
         delete this._pendingInits[pubkeyB64];
         delete this._videoStreams[pubkeyB64];
@@ -4062,7 +4256,7 @@ export class StreamsStore {
           message: 'audio-off',
         };
         try {
-          this.mediaTransport.send(pubkeyB64, JSON.stringify(msg));
+          this._activeMediaTransportFor(pubkeyB64).send(pubkeyB64, JSON.stringify(msg));
         } catch (e: any) {
           console.error(
             'Failed to send audio-off message to peer: ',
@@ -4295,22 +4489,28 @@ export class StreamsStore {
           const priorOpenForInitAccept = get(this._openConnections)[pubKey64];
 
           // Make sure the transport has the latest local stream cached
-          // so the initial offer includes our tracks.
+          // so the initial offer includes our tracks. Set on both impls
+          // so a future swap doesn't lose the stream.
           if (this.mainStream) {
-            this.mediaTransport.setLocalStream(this.mainStream);
+            for (const t of this._allMediaTransports()) t.setLocalStream(this.mainStream);
             this.logger.logCustomMessage(
               `addStream pre-SDP [${pubKey64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks (initiator)`
             );
           }
 
-          this.mediaTransport.ensureConnection(pubKey64, {
+          // Route to the right transport for this peer. The FSM allocates
+          // its own connectionId (the InitAccept connectionId is ignored
+          // by FsmTransport); use the returned id as the source of truth
+          // for openConnections tracking.
+          const transport = this._mediaTransportFor(pubKey64);
+          const effectiveConnId = transport.ensureConnection(pubKey64, {
             initiator: true,
             connectionId: connection_id,
           });
 
           this._openConnections.update(currentValue => {
             currentValue[pubKey64] = {
-              connectionId: connection_id,
+              connectionId: effectiveConnId,
               video: false,
               audio: false,
               connected: false,
@@ -4351,7 +4551,7 @@ export class StreamsStore {
               );
               const conn = get(this._openConnections)[pubKey64];
               if (conn && !conn.connected) {
-                this.mediaTransport.closeConnection(pubKey64, 'SDP exchange timeout');
+                this._activeMediaTransportFor(pubKey64).closeConnection(pubKey64, 'SDP exchange timeout');
                 this._openConnections.update(current => {
                   delete current[pubKey64];
                   return current;
@@ -4420,6 +4620,42 @@ export class StreamsStore {
         }
       }
     }
+  }
+
+  /**
+   * Handle an SdpFsm signal — feeds the FSM media transport.
+   *
+   * The FSM creates per-peer state on the first incoming offer (no pendingAccept
+   * dance is needed); subsequent offers/answers/candidates route to the
+   * existing FSM. The wire payload is `{ connection_id, peer_session_id, data: { type, payload } }`.
+   * The openConnections entry is created lazily in the connection-state-change
+   * handler when the FSM transitions to 'signaling' for a peer not already
+   * tracked. Initiator-side openConnections entries are still installed by
+   * handleInitAccept (with the FSM-allocated connectionId returned from
+   * ensureConnection).
+   */
+  handleSdpFsm(signal: Extract<RoomSignal, { type: 'Message' }>): void {
+    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
+    let parsed: { connection_id: string; peer_session_id?: number; data: unknown };
+    try {
+      parsed = JSON.parse(signal.payload);
+    } catch (e) {
+      console.warn(`SdpFsm parse error from ${pubkeyB64.slice(0, 8)}:`, e);
+      return;
+    }
+    this.logger.logAgentEvent({
+      agent: pubkeyB64,
+      timestamp: Date.now(),
+      event: 'SdpData',
+      connectionId: parsed.connection_id,
+      detail: 'fsm',
+    });
+    this.mediaTransportFsm.processIncomingSignal({
+      from: pubkeyB64,
+      connectionId: parsed.connection_id,
+      peerSessionId: parsed.peer_session_id,
+      data: parsed.data,
+    });
   }
 
   /**

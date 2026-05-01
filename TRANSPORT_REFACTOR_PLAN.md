@@ -93,20 +93,21 @@ State: `tsc --noEmit` clean. `npm test` passes 27/27 (existing transport unit te
 
 ---
 
-## Phase 2 — FSM as second transport, manual per-peer selection
+## Phase 2 — FSM as second transport, manual per-peer selection (DONE)
 
-**Goal**: both implementations work, manually selectable per peer.
+Landed:
+- [x] **FSM source cherry-picked** from `feat/webrtc-state-machine` into `ui/src/transport/fsm/*` — `connection-manager.ts`, `peer-connection-fsm.ts`, `rtc-peer.ts`, `reconnect-policy.ts`, `holochain-signaling-adapter.ts`, `types.ts`, `index.ts`, plus the four `__tests__/` files. 149 FSM tests run alongside the 27 SimplePeer transport tests = 176 total green.
+- [x] **`FsmTransport` wrapper** at `ui/src/transport/fsm/fsm-transport.ts` adapts `ConnectionManager` to the `PeerTransport` interface. Owns an inline `SignalingAdapter` that bridges to the application's `onOutgoingSignal` callback / `processIncomingSignal` entrypoint. Exposes the same `getRTCPeerConnection(peer)` escape hatch as `SimplePeerTransport` so streams-store ICE diagnostics, stats poll, and per-peer track recovery work uniformly.
+- [x] **Signaling channel separation**: SimplePeer continues over Holochain `Sdp` messages; FSM uses a new `SdpFsm` message type. `streams-store.handleSdpFsm` parses the FSM-shaped envelope (`{ connection_id, peer_session_id, data: { type, payload } }`) and forwards via `mediaTransportFsm.processIncomingSignal`. No zome change needed — `msg_type` is opaque to the backend.
+- [x] **Conversation payload extended** with `webrtcImpl: 'simplepeer' | 'fsm'` (default `'simplepeer'`) and `fsmWith: AgentPubKeyB64[]` for per-peer overrides. `parseConversationPayload` accepts older payloads that omit the fields.
+- [x] **Symmetric-union routing**: `streamsStore.webrtcImplFor(peerB64)` returns `'fsm'` if either side chose FSM (globally via `webrtcImpl` or per-peer via `fsmWith`). `_mediaTransportFor(peer)` selects the new-connection transport; `_activeMediaTransportFor(peer)` returns whichever transport currently hosts the live connection (used for sends, closes, and ICE peeks during a flip in flight).
+- [x] **`onModulePayloadChange` transport-swap**: when the effective `prefersFsm` flips, the existing media connection is torn down via `disconnectFromPeerVideo`. The next pong cycle re-establishes through the newly-selected transport.
+- [x] **UI toggle**: global "Use FSM transport (dev)" switch added to the connection-details settings panel next to "Disable all WebRTC". `streamsStore.setWebrtcImpl()` flips the conversation payload and tears down all media connections in one shot. (Per-peer `toggleFsmFor` helper is in place; per-peer UI surface is left for a later session — global toggle covers Phase 2's "manually selectable" exit criterion via the symmetric-union union with peer state.)
+- [x] **`CarrierSwitch` event detail extended** — `_handleMediaConnected`/`_handleMediaClosed` emit `signals->simplepeer`, `signals->fsm`, `simplepeer->signals`, `fsm->signals` based on the impl that owns the connection. New `FsmClose` / `FsmError` log event types added to `SimpleEventType` so logs-graph can disambiguate.
+- [x] Broadcast operations (`setLocalStream`, `addTrack`, `removeTrack`, `replaceTrack`, `destroy`) fan out via `_allMediaTransports()` so future ensureConnections on either transport auto-attach the current stream and tracks. Per-peer operations (`send`, `closeConnection`, `getRTCPeerConnection`) route via `_activeMediaTransportFor()`.
+- [x] Screen-share connections continue to use SimplePeer only — keeps Phase 2 scoped to media. SFU work in Phase 6 will introduce FSM-relay topology there.
 
-Tasks:
-1. Import `ui/src/connection/*` from `feat/webrtc-state-machine` as `ui/src/transport/fsm/*`. Adapt to `PeerTransport` interface.
-2. Separate signaling channel: SimplePeer keeps `Sdp`, FSM uses `SdpFsm`. `HolochainSignalingAdapter` instantiated separately per transport.
-3. Conversation module payload extension: `webrtcImpl: 'simplepeer' | 'fsm'`, default `simplepeer`. Symmetric union — if either side picks `fsm`, both use it (avoids signaling-channel mismatch).
-4. Transport selector reads payload, routes `ensureConnection` to the right transport.
-5. `onModulePayloadChange` swaps transports: close on old, ensure on new.
-6. UI: developer-only toggle in settings panel for forcing per-peer transport choice.
-7. `CarrierSwitch` values extended to `'simplepeer' | 'fsm' | 'signals'`.
-
-**Exit**: can flip a peer's transport from settings UI, see CarrierSwitch + QualityBucketChange events flow correctly for both, no regressions on `simplepeer` default.
+State: `tsc --noEmit` clean. `npm test` 176/176 green. `npm run build` clean. Manual two-peer toggle test (one or both sides flip "Use FSM transport (dev)" and verify a fresh `signals->fsm` `CarrierSwitch` followed by `QualityBucketChange` events) is the remaining verification before checkpointing.
 
 ---
 
