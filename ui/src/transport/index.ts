@@ -12,6 +12,7 @@ export type {
   TransportStats,
   Unsubscribe,
 } from './types';
+export { DEFAULT_ICE_SERVERS } from './types';
 
 export { SimplePeerTransport } from './simplepeer/simple-peer-transport';
 export { FsmTransport } from './fsm/fsm-transport';

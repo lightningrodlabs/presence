@@ -4,7 +4,7 @@ import {
   decodeHashFromBase64,
   encodeHashToBase64,
 } from '@holochain/client';
-import { SimplePeerTransport, FsmTransport } from './transport';
+import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import {
@@ -52,18 +52,6 @@ import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
 
 declare const __APP_VERSION__: string;
-
-const STUN_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:global.stun.twilio.com:3478' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  {
-    urls: [
-      'stun:stun.l.google.com:19302',
-      'stun:stun1.l.google.com:19302',
-      'stun:stun2.l.google.com:19302',
-    ],
-  },
-];
 
 /**
  * Timeout in ms for the SDP exchange phase. If a connection does not progress
@@ -1792,7 +1780,7 @@ export class StreamsStore {
   }
 
   get iceConfig(): RTCIceServer[] {
-    const servers: RTCIceServer[] = [...STUN_SERVERS];
+    const servers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
     if (this.turnUrl) {
       servers.push({
         urls: this.turnUrl,

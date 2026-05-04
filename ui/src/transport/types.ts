@@ -253,3 +253,21 @@ export interface SimplePeerLike {
 /** Identifier for which transport implementation is in use for a peer.
  *  Matches the planned `webrtcImpl` field on the conversation module payload. */
 export type TransportImpl = 'simplepeer' | 'fsm';
+
+/**
+ * Default ICE/STUN servers used by every transport implementation. Single
+ * source of truth: streams-store passes this into both SimplePeerTransport and
+ * FsmTransport at construction, and FSM's DEFAULT_CONFIG falls back to it
+ * when no `iceServers` getter is wired in (tests).
+ */
+export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:global.stun.twilio.com:3478' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  {
+    urls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun2.l.google.com:19302',
+    ],
+  },
+];

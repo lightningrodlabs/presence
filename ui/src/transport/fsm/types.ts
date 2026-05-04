@@ -11,6 +11,8 @@
 // Re-export AgentPubKeyB64 for convenience within the connection module
 export type { AgentPubKeyB64 } from '@holochain/client';
 
+import { DEFAULT_ICE_SERVERS } from '../types';
+
 // ---------------------------------------------------------------------------
 // Layer 1 — Application Connection State
 // ---------------------------------------------------------------------------
@@ -253,10 +255,7 @@ export type ConnectionConfig = {
 };
 
 export const DEFAULT_CONFIG: ConnectionConfig = {
-  iceServers: [
-    { urls: 'stun:global.stun.twilio.com:3478' },
-    { urls: 'stun:stun.l.google.com:19302' },
-  ],
+  iceServers: DEFAULT_ICE_SERVERS,
   trickleICE: true,
   connectionTimeoutMs: 7_000,
   sdpExchangeTimeoutMs: 15_000,
