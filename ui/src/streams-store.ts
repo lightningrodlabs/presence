@@ -49,6 +49,9 @@ import { MicSource, MicAcquireResult } from './mic-source';
 import { CameraSource, CameraAcquireResult } from './camera-source';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
+import { transcriptionController } from './room/modules/transcription';
+import type { TranscriptEntry } from './room/modules/transcription';
+import type { WeaveClient } from '@theweave/api';
 import { getStreamInfo } from './utils';
 
 declare const __APP_VERSION__: string;
@@ -191,6 +194,18 @@ export class StreamsStore {
   private _signalsTargetsUnsub: (() => void) | null = null;
 
   /**
+   * Per-speaker transcript accumulator, written by the transcription
+   * module's receive-side handler (and by the local ASR pipeline
+   * routing its own finals through the same path so `myPubKey`
+   * entries land here too). Consumers: the exit-time "Save
+   * transcript?" dialog and, later, the transcript panel.
+   *
+   * Keyed by speaker AgentPubKeyB64. Entries within a speaker are
+   * ordered by `tStart`.
+   */
+  _transcriptLog: Writable<Map<AgentPubKeyB64, TranscriptEntry[]>> = writable(new Map());
+
+  /**
    * Release handle held by the WebRTC audio path. Populated on `audioOn`,
    * cleared on full release. `audioOff` does NOT release — it just calls
    * `micSource.setMuted(true)` so the track stays alive for fast
@@ -230,14 +245,26 @@ export class StreamsStore {
    */
   mediaTransportFsm!: FsmTransport;
 
+  /**
+   * The Weave client this store runs inside. Used by the transcription
+   * controller to reach `weaveClient.localModels.asr`; may be extended
+   * to other WeaveClient features later. Presence always runs inside
+   * Weave today, so this is non-optional — what *is* optional is
+   * `weaveClient.localModels` itself, which is undefined on older Moss
+   * installations without the ASR pipeline.
+   */
+  weaveClient: WeaveClient;
+
   constructor(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
-    logger: PresenceLogger
+    logger: PresenceLogger,
+    weaveClient: WeaveClient
   ) {
     this.roomStore = roomStore;
     this.screenSourceSelection = screenSourceSelection;
     this.logger = logger;
+    this.weaveClient = weaveClient;
     const roomClient = roomStore.client;
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
@@ -389,6 +416,13 @@ export class StreamsStore {
     // disconnect().
     voiceController.bind(this);
     filmstripController.bind(this);
+
+    // Bind the transcription controller. Like voice, the receive side
+    // (accumulating incoming transcript frames) runs unconditionally;
+    // the send side (local ASR capture) is gated by whether this
+    // agent has opted into transcription — driven by the transcription
+    // module's activate/deactivate hooks.
+    transcriptionController.bind(this);
 
     // Subscribe to _signalsTargets changes. When the set transitions
     // between empty and non-empty while the mic / camera is held, start
@@ -1667,12 +1701,14 @@ export class StreamsStore {
   static async connect(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
-    logger: PresenceLogger
+    logger: PresenceLogger,
+    weaveClient: WeaveClient
   ): Promise<StreamsStore> {
     const streamsStore = new StreamsStore(
       roomStore,
       screenSourceSelection,
-      logger
+      logger,
+      weaveClient
     );
 
     // Wait for allAgents to load before first ping so we actually have peers to contact
@@ -1741,6 +1777,7 @@ export class StreamsStore {
       this._filmstripEncoderRunning = false;
     }
     filmstripController.unbind();
+    transcriptionController.unbind();
     if (this._signalsTargetsUnsub) {
       this._signalsTargetsUnsub();
       this._signalsTargetsUnsub = null;

@@ -172,6 +172,11 @@ export class PresenceApp extends LitElement {
   _trickleICE = JSON.parse(window.localStorage.getItem('trickleICE') ?? 'true');
 
   @state()
+  _autoAcceptTranscription = JSON.parse(
+    window.localStorage.getItem('autoAcceptTranscriptionRequests') ?? 'false'
+  );
+
+  @state()
   _turnUrl = window.localStorage.getItem('turnUrl') ?? '';
 
   @state()
@@ -879,6 +884,25 @@ export class PresenceApp extends LitElement {
             class="secondary-font"
             style="color: #c3c9eb; margin-left: 10px; font-size: 18px;"
             >trickle ICE (ON by default)</span
+          >
+        </div>
+        <div class="row items-center" style="margin-top: 8px;">
+          <toggle-switch
+            class="toggle-switch ${this._autoAcceptTranscription ? 'active' : ''}"
+            .toggleState=${this._autoAcceptTranscription}
+            @toggle-on=${() => {
+              this._autoAcceptTranscription = true;
+              window.localStorage.setItem('autoAcceptTranscriptionRequests', 'true');
+            }}
+            @toggle-off=${() => {
+              this._autoAcceptTranscription = false;
+              window.localStorage.setItem('autoAcceptTranscriptionRequests', 'false');
+            }}
+          ></toggle-switch>
+          <span
+            class="secondary-font"
+            style="color: #c3c9eb; margin-left: 10px; font-size: 18px;"
+            >auto-accept transcription requests</span
           >
         </div>
         <div style="margin-top: 16px; width: 100%;">

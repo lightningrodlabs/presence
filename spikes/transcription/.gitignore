@@ -1,0 +1,6 @@
+# Whisper model weights — re-downloadable from upstream, large.
+asr-roundtrip/models/*.bin
+# Captured sample WAVs — user-specific, not source.
+asr-roundtrip/sample.wav
+asr-roundtrip/*.wav
+asr-roundtrip/transcript-*.txt
