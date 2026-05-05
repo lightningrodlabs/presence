@@ -83,7 +83,8 @@ export class RoomContainer extends LitElement {
     this.streamsStore = await StreamsStore.connect(
       this.roomStore,
       () => this.weaveClient.userSelectScreen(),
-      this._presenceLogger
+      this._presenceLogger,
+      this.weaveClient
     );
 
     // Disconnected while connecting streams — disconnectedCallback ran before

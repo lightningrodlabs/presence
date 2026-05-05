@@ -1,3 +1,4 @@
+import type { LocalModelsApi } from '@theweave/api';
 /**
  * StreamsStoreDeps — the ambient world `StreamsStore` runs against, as one
  * injected record (Phase 6 item 1).
@@ -91,4 +92,7 @@ export type StreamsStoreDeps = {
   bus: SignalBus;
   transportFactory: TransportFactory;
   mediaDevices: MediaDevicesDep;
+  /** The host's local-model surface (`WeaveClient.localModels`), when the
+   *  host provides one. Consumed only by the transcription controller. */
+  localModels?: LocalModelsApi;
 };

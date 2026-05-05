@@ -11,3 +11,4 @@ import './timer';
 import './screen-share';
 import './voice';
 import './video-filmstrip';
+import './transcription';

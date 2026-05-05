@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Transcription Spike 0a — Capture</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 640px;
+      margin: 2em auto;
+      padding: 1em;
+      color: #222;
+    }
+    h1 { font-size: 1.2em; }
+    button {
+      font-size: 1em;
+      padding: 0.5em 1em;
+      margin-right: 0.5em;
+    }
+    button:disabled { opacity: 0.5; }
+    #status {
+      margin-top: 1em;
+      padding: 0.8em;
+      background: #f4f4f4;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      font-family: ui-monospace, monospace;
+      font-size: 0.85em;
+      min-height: 6em;
+    }
+    #level {
+      margin-top: 0.5em;
+      height: 8px;
+      background: #ddd;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    #level > div {
+      height: 100%;
+      width: 0;
+      background: #4a9;
+      transition: width 60ms linear;
+    }
+  </style>
+</head>
+<body>
+  <h1>Transcription Spike 0a — Capture pipeline</h1>
+  <p>
+    Validates the <code>MediaStreamTrackProcessor</code> → PCM16/16kHz/mono
+    path the transcription module will use. Click Start, speak for
+    ~15–30 seconds, click Stop to download a WAV.
+  </p>
+  <div>
+    <button id="start">Start recording</button>
+    <button id="stop" disabled>Stop &amp; download</button>
+  </div>
+  <div id="level"><div></div></div>
+  <pre id="status">(idle)</pre>
+  <script src="capture.js" type="module"></script>
+</body>
+</html>
