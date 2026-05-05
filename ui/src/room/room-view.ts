@@ -56,7 +56,13 @@ import './elements/agent-connection-status';
 import './elements/agent-connection-status-icon';
 import './elements/audio-level-meter';
 import './elements/peer-stats-panel';
+import './elements/peer-filmstrip';
 import './elements/toggle-switch';
+import {
+  filmstripController,
+  FILMSTRIP_FPS_OPTIONS,
+  FilmstripFps,
+} from './modules/video-filmstrip';
 import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
 import { PING_INTERVAL, StreamsStore } from '../streams-store';
@@ -783,11 +789,12 @@ export class RoomView extends LitElement {
       },
       {
         value: 'signals',
-        label: 'Signals (audio-only)',
+        label: 'Signals',
         color: '#e7a008',
-        title: 'No WebRTC — audio flows via Holochain remote signals only',
+        title: 'No WebRTC — audio (Opus) and low-bandwidth video (JPEG filmstrip) flow via Holochain remote signals',
       },
     ];
+    const currentFps = filmstripController.getFps();
     return html`
       <div class="row" style="align-items: center; gap: 8px; flex-wrap: wrap;">
         <span class="secondary-font" style="opacity: 0.7;">Carrier:</span>
@@ -816,6 +823,34 @@ export class RoomView extends LitElement {
             >${opt.label}</button>
           `;
         })}
+        <span
+          class="secondary-font"
+          style="opacity: 0.7; margin-left: 8px;"
+          title="Filmstrip frame rate when video flows over signals"
+        >fps:</span>
+        <select
+          class="secondary-font"
+          title="Filmstrip frame rate (sender). Higher fps = more bandwidth."
+          style="
+            cursor: pointer;
+            padding: 3px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: transparent;
+            color: #c3c9eb;
+            font-family: inherit;
+          "
+          .value=${String(currentFps)}
+          @change=${(e: Event) => {
+            const fps = Number((e.target as HTMLSelectElement).value) as FilmstripFps;
+            filmstripController.setFps(fps);
+            this.requestUpdate();
+          }}
+        >
+          ${FILMSTRIP_FPS_OPTIONS.map(
+            v => html`<option value=${v} ?selected=${v === currentFps}>${v}</option>`
+          )}
+        </select>
       </div>
     `;
   }
@@ -2697,6 +2732,11 @@ export class RoomView extends LitElement {
                       .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                       style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
                     ></avatar-with-nickname>
+                    ${!conn.video
+                      ? html`<peer-filmstrip
+                          .agentPubKeyB64=${pubkeyB64}
+                        ></peer-filmstrip>`
+                      : html``}
                     <div
                       style="color: #b9a884; font-size: 0.8em; ${conn.connected ? 'display: none' : ''}"
                     >
@@ -2714,6 +2754,9 @@ export class RoomView extends LitElement {
                       .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                       style="width: 35%;"
                     ></avatar-with-nickname>
+                    <peer-filmstrip
+                      .agentPubKeyB64=${pubkeyB64}
+                    ></peer-filmstrip>
                   `}
               <!-- Hidden video element so srcObject assignment still works when a replace module is active -->
               ${activeReplaceModule && conn

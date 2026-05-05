@@ -46,7 +46,9 @@ import { RoomClient } from './room/room-client';
 import { RoomStore } from './room/room-store';
 import { PresenceLogger } from './logging';
 import { MicSource, MicAcquireResult } from './mic-source';
+import { CameraSource, CameraAcquireResult } from './camera-source';
 import { voiceController } from './room/modules/voice';
+import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
 
 declare const __APP_VERSION__: string;
@@ -151,12 +153,34 @@ export class StreamsStore {
   micSource: MicSource;
 
   /**
+   * Transport-agnostic camera owner. Mirrors `micSource` for video.
+   * Consumers (WebRTC video, the `video-filmstrip` module) acquire a
+   * track from it rather than calling getUserMedia themselves. See
+   * ui/src/camera-source.ts for the full rationale.
+   *
+   * Note: unlike MicSource, the binding does NOT do peer-side fanout in
+   * its open/close branches. videoOn/videoOff own the keepalive-aware
+   * peer wiring directly because the keepalive replaceTrack pattern
+   * (NAT-keepalive on videoOff, replaceTrack on videoOn) doesn't fit
+   * cleanly into a generic open/close handler.
+   */
+  cameraSource: CameraSource;
+
+  /**
    * Whether the voice encoder is currently running (sending audio to
    * peers without WebRTC via Holochain signals). Driven by
    * `_reconcileSignalsAudio` — starts when mic is held AND at least one
    * peer is in `_signalsTargets`; stops when either condition drops.
    */
   private _voiceEncoderRunning = false;
+
+  /**
+   * Whether the filmstrip encoder is currently running (sending video
+   * clips to peers via signals). Driven by `_reconcileSignalsVideo` —
+   * starts when the camera is held AND at least one peer is in
+   * `_signalsTargets`; stops when either drops.
+   */
+  private _filmstripEncoderRunning = false;
 
   /** Unsubscribe from the _signalsTargets subscription. */
   private _signalsTargetsUnsub: (() => void) | null = null;
@@ -168,6 +192,16 @@ export class StreamsStore {
    * re-enable without WebRTC renegotiation.
    */
   private _webrtcMicHandle: MicAcquireResult | null = null;
+
+  /**
+   * Release handle held by the WebRTC video path. Populated on `videoOn`,
+   * cleared on `videoOff`. Unlike audio, video off IS the release path —
+   * the existing semantics stop the camera (LED off when refcount hits
+   * 0), so there's no mute-vs-off split. Held alongside the keepalive
+   * track on the senders, which stays put across videoOff/videoOn cycles
+   * to preserve the m-line / RTCRtpSender.
+   */
+  private _webrtcCameraHandle: CameraAcquireResult | null = null;
 
   /**
    * WebRTC transports. Three instances by purpose:
@@ -335,20 +369,29 @@ export class StreamsStore {
       },
     });
 
-    // Bind the voice controller to this store permanently so the receive
-    // side (decoder + playback) works regardless of whether the local mic
-    // is on. The send side (encoder) is gated separately by
-    // _reconcileSignalsAudio. Unbind happens in disconnect().
+    this.cameraSource = new CameraSource({
+      getDeviceId: () => get(this._videoInputId),
+      setDeviceId: id => this._videoInputId.set(id),
+      onTrackChange: (newTrack, oldTrack) => {
+        this._onCameraTrackChange(newTrack, oldTrack);
+      },
+    });
+
+    // Bind controllers permanently so the receive side (decoders /
+    // playback) works regardless of whether the local mic / camera is
+    // on. Send sides are gated by the reconcilers. Unbind happens in
+    // disconnect().
     voiceController.bind(this);
+    filmstripController.bind(this);
 
     // Subscribe to _signalsTargets changes. When the set transitions
-    // between empty and non-empty while the mic is held, start or stop
-    // the voice encoder so audio automatically flows to peers without
-    // WebRTC. The subscription fires on every _activeAgents or
-    // _openConnections change, but _reconcileSignalsAudio is cheap
-    // (a boolean check + set size).
+    // between empty and non-empty while the mic / camera is held, start
+    // or stop the corresponding signals-carrier encoder. The subscription
+    // fires on every _activeAgents or _openConnections change; the
+    // reconcilers are cheap (a boolean check + set size).
     this._signalsTargetsUnsub = this._signalsTargets.subscribe(() => {
       this._reconcileSignalsAudio();
+      this._reconcileSignalsVideo();
     });
   }
 
@@ -1319,6 +1362,35 @@ export class StreamsStore {
   }
 
   /**
+   * Start or stop the filmstrip encoder based on whether the camera is
+   * held AND at least one peer needs video via signals. Mirrors
+   * `_reconcileSignalsAudio`. Called from the _signalsTargets
+   * subscription and from videoOn/videoOff.
+   *
+   * Trigger uses `_webrtcCameraHandle` (not `cameraSource.consumerCount`)
+   * to avoid the trivial cycle where the filmstrip controller's own
+   * acquire would keep the gate true forever.
+   */
+  private _reconcileSignalsVideo(): void {
+    const cameraHeld = !!this._webrtcCameraHandle;
+    const hasTargets = get(this._signalsTargets).size > 0;
+    const shouldRun = cameraHeld && hasTargets;
+
+    if (shouldRun && !this._filmstripEncoderRunning) {
+      filmstripController.startCapture().then(ok => {
+        if (!ok) {
+          this._filmstripEncoderRunning = false;
+          console.warn('Filmstrip encoder failed to start');
+        }
+      });
+      this._filmstripEncoderRunning = true;
+    } else if (!shouldRun && this._filmstripEncoderRunning) {
+      filmstripController.stopCapture().catch(() => {});
+      this._filmstripEncoderRunning = false;
+    }
+  }
+
+  /**
    * Handles MicSource track lifecycle events. Branches on the (new, old)
    * pair because opening, replacing, and closing all have different
    * implications for `mainStream`, `mainStreamClones`, and peer fanout.
@@ -1390,6 +1462,75 @@ export class StreamsStore {
           console.warn('MicSource close: transport.removeTrack failed:', e.message);
         }
       }
+    }
+  }
+
+  /**
+   * Handles CameraSource track lifecycle events.
+   *
+   * Differs from _onMicTrackChange: this handler does NOT do peer-side
+   * fanout. videoOn / videoOff own that directly because the keepalive
+   * replaceTrack pattern (1x1 black canvas captureStream stays on the
+   * sender across videoOff/videoOn so RTP keeps flowing for NAT mapping)
+   * does not fit cleanly into a generic open/close handler.
+   *
+   *   - open         (newTrack, null)   : add to mainStream. videoOn does
+   *                                       the keepalive-aware peer attach
+   *                                       after acquire returns.
+   *   - device-change (newTrack, oldTrack): swap on mainStream and on
+   *                                       transports via replaceTrack.
+   *                                       changeVideoInput delegates to
+   *                                       cameraSource.changeDevice; this
+   *                                       branch keeps the senders pointed
+   *                                       at the new device's track.
+   *   - close         (null, oldTrack)  : remove from mainStream only.
+   *                                       videoOff has already swapped the
+   *                                       sender to keepalive before
+   *                                       releasing the WebRTC handle.
+   */
+  private _onCameraTrackChange(
+    newTrack: MediaStreamTrack | null,
+    oldTrack: MediaStreamTrack | null,
+  ): void {
+    // --- open ---
+    if (newTrack && !oldTrack) {
+      if (!this.mainStream) {
+        this.mainStream = new MediaStream();
+        for (const t of this._allMediaTransports()) t.setLocalStream(this.mainStream);
+      }
+      // Drop any stale video track (shouldn't happen, but cheap guard).
+      this.mainStream.getVideoTracks().forEach(t => {
+        this.mainStream!.removeTrack(t);
+      });
+      this.mainStream.addTrack(newTrack);
+      // No peer fanout here — videoOn does the keepalive-aware
+      // replaceTrack-vs-addTrack decision once acquire() returns.
+      return;
+    }
+
+    // --- device change ---
+    if (newTrack && oldTrack) {
+      if (this.mainStream) {
+        try { this.mainStream.removeTrack(oldTrack); } catch {}
+        try { this.mainStream.addTrack(newTrack); } catch {}
+      }
+      for (const t of this._allMediaTransports()) {
+        try {
+          t.replaceTrack(oldTrack, newTrack, this.mainStream!);
+        } catch (e: any) {
+          console.warn('CameraSource device-change: transport.replaceTrack failed:', e.message);
+        }
+      }
+      return;
+    }
+
+    // --- close ---
+    if (!newTrack && oldTrack) {
+      if (this.mainStream) {
+        try { this.mainStream.removeTrack(oldTrack); } catch {}
+      }
+      // No peer fanout — videoOff has already replaceTrack'd the camera
+      // out for the keepalive (or removeTrack'd if keepalive failed).
     }
   }
 
@@ -1465,6 +1606,11 @@ export class StreamsStore {
       this._voiceEncoderRunning = false;
     }
     voiceController.unbind();
+    if (this._filmstripEncoderRunning) {
+      filmstripController.stopCapture().catch(() => {});
+      this._filmstripEncoderRunning = false;
+    }
+    filmstripController.unbind();
     if (this._signalsTargetsUnsub) {
       this._signalsTargetsUnsub();
       this._signalsTargetsUnsub = null;
@@ -1476,6 +1622,11 @@ export class StreamsStore {
       this._webrtcMicHandle = null;
     }
     this.micSource.dispose();
+    if (this._webrtcCameraHandle) {
+      try { this._webrtcCameraHandle.release(); } catch {}
+      this._webrtcCameraHandle = null;
+    }
+    this.cameraSource.dispose();
     this.screenShareOff();
     this.mainStream = null;
     this.screenShareStream = null;
@@ -1633,12 +1784,16 @@ export class StreamsStore {
   }
 
   async changeVideoInput(deviceId: string) {
-    this._videoInputId.set(deviceId);
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
       timestamp: Date.now(),
       event: 'ChangeMyVideoInput',
     });
+    // CameraSource owns the device-switch path: it stores the new id,
+    // opens a new track if a consumer holds the camera, and fires
+    // _onCameraTrackChange's device-change branch to replaceTrack on
+    // mainStream and on every transport. Mirrors changeAudioInput.
+    await this.cameraSource.changeDevice(deviceId);
     Object.keys(get(this._openConnections)).forEach(peerB64 => {
       const msg: RTCMessage = {
         type: 'action',
@@ -1653,122 +1808,49 @@ export class StreamsStore {
         );
       }
     });
-    const videoTrack = this.mainStream?.getVideoTracks()[0];
-    if (videoTrack && videoTrack.enabled) {
-      await this.videoOff();
-      await this.videoOn();
-    }
   }
 
   async videoOn() {
-    // Camera needs WebRTC — video doesn't go over the signals carrier.
-    // Implicitly re-enable WebRTC if the user has it globally disabled,
-    // otherwise turning the camera on would silently fail to reach any
-    // peer and be deeply confusing.
-    if (this.webrtcGloballyDisabled) {
-      this.webrtcGloballyDisabled = false;
-      window.localStorage.removeItem('disableAllWebrtc');
-      this.logger.logAgentEvent({
-        agent: this.myPubKeyB64,
-        timestamp: Date.now(),
-        event: 'MyWebrtcEnable',
-        detail: 'global (implicit: videoOn)',
-      });
-      await this._syncConversationPayload({ webrtcDisabled: false });
-    }
-    const deviceId = get(this._videoInputId);
-    if (this.mainStream) {
-      if (this.mainStream.getVideoTracks()[0]) {
-        // Camera track already on mainStream — just re-enable it.
-        // (Rare path; videoOff stops & removes the camera track.)
-        this.mainStream.getVideoTracks()[0].enabled = true;
-      } else {
-        let videoStream: MediaStream | undefined;
-        try {
-          videoStream = await navigator.mediaDevices.getUserMedia({
-            video: deviceId ? { deviceId } : true,
-          });
-        } catch (e: any) {
-          const error = `Failed to get media devices (video): ${e.toString()}`;
-          console.error(error);
-          this.eventCallback({
-            type: 'error',
-            error,
-          });
-          return;
-        }
-        if (!videoStream) {
-          const error = 'Video stream undefined after getUserMedia.';
-          console.error(error);
-          this.eventCallback({
-            type: 'error',
-            error,
-          });
-          return;
-        }
-        const videoTrack = videoStream.getVideoTracks()[0];
-        if (!videoTrack) {
-          const error = 'No video track found on video stream.';
-          console.error(error);
-          this.eventCallback({
-            type: 'error',
-            error,
-          });
-          return;
-        }
-        this.mainStream.addTrack(videoTrack);
-        this.eventCallback({
-          type: 'my-video-on',
-        });
-        // If there's a keepalive sender on each peer (left there by
-        // videoOff), swap it for the real camera track via replaceTrack
-        // — preserves the existing RTCRtpSender / m-line and avoids a
-        // renegotiation. Otherwise (no prior video sender) addTrack
-        // creates a new one with the standard renegotiation flow.
-        const keepalive = this._videoKeepaliveTrack;
-        for (const t of this._allMediaTransports()) {
-          try {
-            if (keepalive) {
-              t.replaceTrack(keepalive, videoTrack, this.mainStream);
-            } else {
-              t.addTrack(videoTrack, this.mainStream);
-            }
-          } catch (e: any) {
-            console.error(`Failed to attach video track: ${e.toString()}`);
-          }
-        }
-        if (keepalive) this._releaseVideoKeepalive();
-      }
-    } else {
-      try {
-        this.mainStream = await navigator.mediaDevices.getUserMedia({
-          video: deviceId ? { deviceId } : true,
-        });
-      } catch (e: any) {
-        const error = `Failed to get media devices (video): ${e.toString()}`;
+    // Acquire the camera via CameraSource. The acquire call triggers
+    // _onCameraTrackChange's open branch, which adds the track to
+    // mainStream (lazily creating it) and calls setLocalStream on each
+    // transport. Peer-side track attachment is done here, with the
+    // keepalive-aware replaceTrack-vs-addTrack decision.
+    if (!this._webrtcCameraHandle) {
+      const handle = await this.cameraSource.acquire({ id: 'webrtc' });
+      if (!handle) {
+        const error = 'Failed to acquire camera for WebRTC video';
         console.error(error);
-        this.eventCallback({
-          type: 'error',
-          error,
-        });
+        this.eventCallback({ type: 'error', error });
         return;
       }
-      for (const t of this._allMediaTransports()) t.setLocalStream(this.mainStream);
-      this.eventCallback({
-        type: 'my-video-on',
-      });
+      this._webrtcCameraHandle = handle;
+
+      // If there's a keepalive sender on each peer (left there by
+      // videoOff), swap it for the real camera track via replaceTrack
+      // — preserves the existing RTCRtpSender / m-line and avoids a
+      // renegotiation. Otherwise (no prior video sender) addTrack creates
+      // a new one with the standard renegotiation flow.
+      const keepalive = this._videoKeepaliveTrack;
+      const videoTrack = handle.track;
       for (const t of this._allMediaTransports()) {
         try {
-          for (const track of this.mainStream.getTracks()) {
-            t.addTrack(track, this.mainStream);
+          if (keepalive) {
+            t.replaceTrack(keepalive, videoTrack, this.mainStream!);
+          } else {
+            t.addTrack(videoTrack, this.mainStream!);
           }
         } catch (e: any) {
-          console.error(`Failed to add video track: ${e.toString()}`);
+          console.error(`Failed to attach video track: ${e.toString()}`);
         }
       }
+      if (keepalive) this._releaseVideoKeepalive();
+      this.eventCallback({ type: 'my-video-on' });
     }
 
-    // Log event
+    // Start the filmstrip encoder if peers need signals-carried video.
+    this._reconcileSignalsVideo();
+
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
       timestamp: Date.now(),
@@ -1833,9 +1915,9 @@ export class StreamsStore {
   }
 
   videoOff() {
+    if (!this._webrtcCameraHandle) return;
     if (!this.mainStream) return;
     const videoTracks = this.mainStream.getVideoTracks();
-    if (videoTracks.length === 0) return;
 
     // Build a black-frame keepalive track and swap it onto every peer's
     // existing video sender via replaceTrack (no renegotiation, same
@@ -1873,13 +1955,21 @@ export class StreamsStore {
       }
     }
 
-    // Stop the camera and remove from mainStream regardless of which
-    // path above ran. The keepalive track stays on the peer senders;
-    // mainStream truthfully reflects "user is not sharing video".
-    videoTracks.forEach(track => {
-      try { track.stop(); } catch {}
-      try { stream.removeTrack(track); } catch {}
-    });
+    // Release the WebRTC camera handle. If the filmstrip encoder is also
+    // holding the camera, the device stays open until the reconciler
+    // below releases that handle too. Otherwise CameraSource refcount
+    // hits 0 and the device closes (LED off). _onCameraTrackChange's
+    // close branch removes the (now-stopped) camera track from
+    // mainStream — by then the keepalive sender is already in place on
+    // every peer, so the close branch does no peer fanout.
+    try { this._webrtcCameraHandle.release(); } catch {}
+    this._webrtcCameraHandle = null;
+
+    // Stop the filmstrip encoder. Clicking videoOff means the user
+    // doesn't want video flowing in any carrier. Without this, the
+    // filmstrip handle would keep the camera open and the LED on after
+    // a "video off" click.
+    this._reconcileSignalsVideo();
 
     Object.keys(get(this._openConnections)).forEach(peerB64 => {
       const msg: RTCMessage = {
@@ -2900,7 +2990,8 @@ export class StreamsStore {
    * `webrtcImpl` into one of three user-facing choices:
    *   - `'simplepeer'`: WebRTC enabled, simple-peer transport.
    *   - `'fsm'`:        WebRTC enabled, hand-rolled FSM transport.
-   *   - `'signals'`:    WebRTC globally off, audio over Holochain signals only.
+   *   - `'signals'`:    WebRTC globally off, audio (Opus) and low-bandwidth
+   *                     video (JPEG filmstrip) over Holochain signals.
    */
   carrierMode(): 'simplepeer' | 'fsm' | 'signals' {
     if (this.webrtcGloballyDisabled) return 'signals';
