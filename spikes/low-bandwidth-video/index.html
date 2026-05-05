@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Low-bandwidth video encoder bake-off</title>
+  <style>
+    body { font-family: ui-monospace, monospace; background: #1a1a1a; color: #ddd; padding: 16px; margin: 0; }
+    h2 { margin: 0 0 8px 0; }
+    p { color: #aaa; max-width: 70ch; }
+    .row { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+    .panel { background: #2a2a2a; border-radius: 4px; padding: 12px; }
+    .panel h3 { margin: 0 0 8px 0; font-size: 13px; color: #9cf; }
+    .out, video { width: 240px; height: 180px; background: #000; display: block; image-rendering: pixelated; }
+    #filmstrip-out { background-size: 100% 800%; background-repeat: no-repeat; }
+    table { border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 4px 10px; text-align: right; border: 1px solid #444; }
+    th { background: #333; text-align: left; }
+    td.fmt { text-align: left; color: #9cf; }
+    button { padding: 8px 16px; background: #4a8; color: white; border: 0; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 13px; }
+    button:disabled { background: #555; cursor: default; }
+    #status { margin-left: 12px; color: #fc8; }
+    .err { color: #f88; }
+    label { font-size: 13px; color: #aaa; margin-right: 12px; }
+    input[type=number] { width: 60px; background: #1a1a1a; color: #ddd; border: 1px solid #444; padding: 2px 4px; font-family: inherit; }
+  </style>
+</head>
+<body>
+
+  <h2>Low-bandwidth video encoder bake-off</h2>
+  <p>
+    Capture N frames at 1000/period ms, downscaled to W×H, encoded three ways.
+    Same source frames go into every encoder; stats are rolling average of last 5 clips.
+    Goal: pick the format that minimizes (bytes, encode time) at acceptable quality
+    for the Holochain-signals fallback path described in
+    <code>LOW_BANDWIDTH_VIDEO_PLAN.md</code>.
+  </p>
+
+  <div class="row">
+    <div class="panel">
+      <h3>Controls</h3>
+      <label>W <input type="number" id="param-w" value="120" min="32" max="320"></label>
+      <label>H <input type="number" id="param-h" value="90" min="24" max="240"></label>
+      <label>frames <input type="number" id="param-n" value="8" min="2" max="30"></label>
+      <label>period ms <input type="number" id="param-p" value="250" min="50" max="1000"></label>
+      <label>JPEG q <input type="number" id="param-q" value="0.6" min="0.1" max="1" step="0.05"></label>
+      <label>AVC kbps <input type="number" id="param-bk" value="100" min="20" max="2000"></label>
+      <br><br>
+      <button id="start">Start</button>
+      <span id="status">idle</span>
+    </div>
+
+    <div class="panel">
+      <h3>Source preview</h3>
+      <video id="src" autoplay playsinline muted></video>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <h3>GIF (gifenc)</h3>
+      <img id="gif-out" class="out">
+    </div>
+    <div class="panel">
+      <h3>JPEG filmstrip</h3>
+      <div id="filmstrip-out" class="out"></div>
+    </div>
+    <div class="panel">
+      <h3>WebCodecs avc1 (all keyframes)</h3>
+      <canvas id="wc-out" class="out" width="120" height="90"></canvas>
+    </div>
+  </div>
+
+  <div class="panel" style="display: inline-block;">
+    <h3>Stats — rolling avg of last 5 clips</h3>
+    <table id="stats">
+      <thead>
+        <tr>
+          <th>format</th>
+          <th>bytes</th>
+          <th>encode ms</th>
+          <th>decode ms</th>
+          <th>kbps @ 1.5s clip</th>
+          <th>clips</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <script type="module">
+    // unpkg serves gifenc's real ESM bundle with proper named exports;
+    // esm.sh's wrapper lost them.
+    import { GIFEncoder, quantize, applyPalette } from 'https://unpkg.com/gifenc@1.0.3/dist/gifenc.esm.js';
+
+    const $ = (id) => document.getElementById(id);
+    const video = $('src');
+    const startBtn = $('start');
+    const statusEl = $('status');
+    const gifOut = $('gif-out');
+    const filmstripOut = $('filmstrip-out');
+    const wcCanvas = $('wc-out');
+    const wcCtx = wcCanvas.getContext('2d');
+    const tbody = document.querySelector('#stats tbody');
+
+    let running = false;
+
+    const ROLLING = 5;
+    const stats = {
+      gif:        { bytes: [], encode: [], decode: [], clips: 0 },
+      filmstrip:  { bytes: [], encode: [], decode: [], clips: 0 },
+      webcodecs:  { bytes: [], encode: [], decode: [], clips: 0, error: null },
+    };
+
+    let filmstripBlobUrl = null;
+    let gifBlobUrl = null;
+    let filmstripAnim = null;
+    let wcAnim = null;
+    let wcDecodedFrames = [];
+
+    startBtn.onclick = async () => {
+      if (running) return;
+      startBtn.disabled = true;
+      statusEl.textContent = 'requesting camera…';
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 320, height: 240 },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+      } catch (e) {
+        statusEl.innerHTML = `<span class="err">camera error: ${e.message}</span>`;
+        startBtn.disabled = false;
+        return;
+      }
+      running = true;
+      statusEl.textContent = 'capturing…';
+      loop().catch(e => {
+        statusEl.innerHTML = `<span class="err">loop error: ${e.message}</span>`;
+        console.error(e);
+      });
+    };
+
+    async function loop() {
+      while (running) {
+        const W = clamp(parseInt($('param-w').value), 32, 320);
+        const H = clamp(parseInt($('param-h').value), 24, 240);
+        const N = clamp(parseInt($('param-n').value), 2, 30);
+        const P = clamp(parseInt($('param-p').value), 50, 1000);
+        const Q = clamp(parseFloat($('param-q').value), 0.1, 1.0);
+        const Bk = clamp(parseInt($('param-bk').value), 20, 2000);
+
+        // Resize the filmstrip CSS so background-size still shows one frame at a time
+        filmstripOut.style.backgroundSize = `100% ${N * 100}%`;
+
+        // Capture N RGBA frames at the requested size and rate.
+        const captureCanvas = new OffscreenCanvas(W, H);
+        const cctx = captureCanvas.getContext('2d', { willReadFrequently: true });
+        const frames = [];
+        for (let i = 0; i < N; i++) {
+          cctx.drawImage(video, 0, 0, W, H);
+          frames.push(cctx.getImageData(0, 0, W, H));
+          await sleep(P);
+        }
+
+        // Run all three encoders against the same frames in parallel.
+        const [gifR, filmR, wcR] = await Promise.all([
+          encodeGif(frames, W, H, P).catch(e => ({ error: e })),
+          encodeFilmstrip(frames, W, H, N, Q, P).catch(e => ({ error: e })),
+          encodeWebCodecs(frames, W, H, Bk, P).catch(e => ({ error: e })),
+        ]);
+
+        record('gif', gifR);
+        record('filmstrip', filmR);
+        record('webcodecs', wcR);
+        renderStats();
+      }
+    }
+
+    // ----- GIF (gifenc) ---------------------------------------------------
+
+    async function encodeGif(frames, W, H, P) {
+      const t0 = performance.now();
+      const gif = GIFEncoder();
+      for (const frame of frames) {
+        const palette = quantize(frame.data, 256);
+        const indexed = applyPalette(frame.data, palette);
+        gif.writeFrame(indexed, W, H, { palette, delay: P });
+      }
+      gif.finish();
+      const bytes = gif.bytes();
+      const encodeMs = performance.now() - t0;
+
+      const blob = new Blob([bytes], { type: 'image/gif' });
+      const url = URL.createObjectURL(blob);
+      const t1 = performance.now();
+      const probe = new Image();
+      probe.src = url;
+      await probe.decode();
+      const decodeMs = performance.now() - t1;
+
+      if (gifBlobUrl) URL.revokeObjectURL(gifBlobUrl);
+      gifBlobUrl = url;
+      gifOut.src = url;
+
+      return { bytes: bytes.byteLength, encodeMs, decodeMs };
+    }
+
+    // ----- JPEG filmstrip (vertically stacked, animated by background-position)
+
+    async function encodeFilmstrip(frames, W, H, N, Q, P) {
+      const t0 = performance.now();
+      const stripCanvas = new OffscreenCanvas(W, H * N);
+      const sctx = stripCanvas.getContext('2d');
+      for (let i = 0; i < N; i++) {
+        sctx.putImageData(frames[i], 0, i * H);
+      }
+      const blob = await stripCanvas.convertToBlob({ type: 'image/jpeg', quality: Q });
+      const encodeMs = performance.now() - t0;
+
+      const url = URL.createObjectURL(blob);
+      const t1 = performance.now();
+      const probe = new Image();
+      probe.src = url;
+      await probe.decode();
+      const decodeMs = performance.now() - t1;
+
+      if (filmstripBlobUrl) URL.revokeObjectURL(filmstripBlobUrl);
+      filmstripBlobUrl = url;
+      filmstripOut.style.backgroundImage = `url(${url})`;
+
+      // Re-arm the CSS step animation against the new strip.
+      if (filmstripAnim) clearInterval(filmstripAnim);
+      let idx = 0;
+      filmstripAnim = setInterval(() => {
+        // For N frames stretched to 100% × (N*100%): show frame i at
+        // background-position-y = i / (N - 1) * 100%.
+        const y = N > 1 ? (idx / (N - 1)) * 100 : 0;
+        filmstripOut.style.backgroundPositionY = `${y}%`;
+        idx = (idx + 1) % N;
+      }, P);
+
+      return { bytes: blob.size, encodeMs, decodeMs };
+    }
+
+    // ----- WebCodecs avc1, all keyframes (independent decode per frame) ---
+
+    async function encodeWebCodecs(frames, W, H, kbps, P) {
+      if (typeof VideoEncoder === 'undefined') {
+        throw new Error('VideoEncoder not supported');
+      }
+
+      const t0 = performance.now();
+      const chunks = [];
+      const encoder = new VideoEncoder({
+        output: (chunk) => {
+          const buf = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buf);
+          chunks.push({ type: chunk.type, timestamp: chunk.timestamp, data: buf });
+        },
+        error: e => { throw e; },
+      });
+      encoder.configure({
+        codec: 'avc1.42E01E',
+        width: W, height: H,
+        bitrate: kbps * 1000,
+        framerate: Math.round(1000 / P),
+        latencyMode: 'realtime',
+        avc: { format: 'annexb' },
+      });
+
+      for (let i = 0; i < frames.length; i++) {
+        const bm = await createImageBitmap(frames[i]);
+        const vf = new VideoFrame(bm, { timestamp: i * P * 1000 });
+        encoder.encode(vf, { keyFrame: true });
+        vf.close();
+        bm.close();
+      }
+      await encoder.flush();
+      encoder.close();
+
+      const bytes = chunks.reduce((s, c) => s + c.data.byteLength, 0);
+      const encodeMs = performance.now() - t0;
+
+      // Decode roundtrip — measure end-to-end including queue latency.
+      const t1 = performance.now();
+      const decoded = [];
+      const decoder = new VideoDecoder({
+        output: (frame) => decoded.push(frame),
+        error: e => { throw e; },
+      });
+      decoder.configure({ codec: 'avc1.42E01E', optimizeForLatency: true });
+      for (const c of chunks) {
+        decoder.decode(new EncodedVideoChunk({
+          type: c.type, timestamp: c.timestamp, data: c.data,
+        }));
+      }
+      await decoder.flush();
+      decoder.close();
+      const decodeMs = performance.now() - t1;
+
+      // Swap render: clear old animation + close old frames, install new.
+      if (wcAnim) clearInterval(wcAnim);
+      for (const f of wcDecodedFrames) { try { f.close(); } catch {} }
+      wcDecodedFrames = decoded;
+
+      if (wcCanvas.width !== W) wcCanvas.width = W;
+      if (wcCanvas.height !== H) wcCanvas.height = H;
+
+      let idx = 0;
+      wcAnim = setInterval(() => {
+        const f = wcDecodedFrames[idx % wcDecodedFrames.length];
+        if (f) wcCtx.drawImage(f, 0, 0, wcCanvas.width, wcCanvas.height);
+        idx++;
+      }, P);
+
+      return { bytes, encodeMs, decodeMs };
+    }
+
+    // ----- stats bookkeeping ---------------------------------------------
+
+    function record(name, r) {
+      const s = stats[name];
+      if (r.error) {
+        s.error = r.error.message || String(r.error);
+        return;
+      }
+      s.error = null;
+      s.bytes.push(r.bytes);
+      s.encode.push(r.encodeMs);
+      s.decode.push(r.decodeMs);
+      if (s.bytes.length > ROLLING) { s.bytes.shift(); s.encode.shift(); s.decode.shift(); }
+      s.clips++;
+    }
+
+    function avg(arr) {
+      if (arr.length === 0) return null;
+      return arr.reduce((a, b) => a + b, 0) / arr.length;
+    }
+
+    function fmt(n, digits) {
+      if (n === null || n === undefined || Number.isNaN(n)) return '—';
+      return n.toFixed(digits);
+    }
+
+    function renderStats() {
+      const rows = [];
+      for (const name of ['gif', 'filmstrip', 'webcodecs']) {
+        const s = stats[name];
+        if (s.error) {
+          rows.push(`<tr><td class="fmt">${name}</td><td colspan="5" class="err">${s.error}</td></tr>`);
+          continue;
+        }
+        const b = avg(s.bytes), e = avg(s.encode), d = avg(s.decode);
+        const kbps = b !== null ? (b * 8 / 1500) : null;
+        rows.push(`<tr>
+          <td class="fmt">${name}</td>
+          <td>${fmt(b, 0)}</td>
+          <td>${fmt(e, 1)}</td>
+          <td>${fmt(d, 1)}</td>
+          <td>${fmt(kbps, 1)}</td>
+          <td>${s.clips}</td>
+        </tr>`);
+      }
+      tbody.innerHTML = rows.join('');
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    renderStats();
+  </script>
+</body>
+</html>
