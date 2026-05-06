@@ -1,6 +1,7 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import type { StreamsStore } from '../../streams-store';
+import { filmstripController } from '../modules/video-filmstrip';
 
 /**
  * Small semi-transparent panel showing per-peer carrier stats.
@@ -33,10 +34,19 @@ export class PeerStatsPanel extends LitElement {
   private _lastJitter: number | null = null;
   private _lastLoss: number | null = null;
   private _lastFlow: 'both' | 'tx' | 'rx' | 'idle' | 'muted' = 'idle';
+  // Video filmstrip stats (only shown when present — i.e. when this peer
+  // is currently sending us a filmstrip).
+  private _lastVidFps: number | null = null;
+  private _lastVidJitter: number | null = null;
+  private _lastVidTransit: number | null = null;
+  private _lastVidBuf: number | null = null;
+  private _lastVidLoss: number | null = null;
 
   static styles = css`
     :host {
-      display: inline-block;
+      display: inline-flex;
+      flex-direction: column;
+      gap: 2px;
       vertical-align: middle;
       font-size: 13px;
       line-height: 1;
@@ -50,6 +60,7 @@ export class PeerStatsPanel extends LitElement {
       border-radius: 4px;
       color: #c3c9eb;
       white-space: nowrap;
+      align-self: flex-start;
     }
     .label {
       opacity: 0.6;
@@ -81,6 +92,7 @@ export class PeerStatsPanel extends LitElement {
       this._lastFlow === 'idle' ? '#e07070'
       : this._lastFlow === 'muted' ? '#c3c9eb'
       : '#7adc7a';
+    const hasVid = this._lastVidFps !== null;
     return html`
       <div class="panel">
         <span class="carrier">${carrierLabel}</span>
@@ -95,6 +107,16 @@ export class PeerStatsPanel extends LitElement {
         <span><span class="label">jit</span> <span class="value">${fmt(this._lastJitter, 'ms')}</span></span>
         <span><span class="label">loss</span> <span class="value">${fmt(this._lastLoss, '%')}</span></span>
       </div>
+      ${hasVid ? html`
+        <div class="panel" title="video filmstrip stats">
+          <span class="carrier">vid</span>
+          <span><span class="label">fps</span> <span class="value">${fmt(this._lastVidFps, '')}</span></span>
+          <span><span class="label">jit</span> <span class="value">${fmt(this._lastVidJitter, 'ms')}</span></span>
+          <span><span class="label">tr</span> <span class="value">${fmt(this._lastVidTransit, 'ms')}</span></span>
+          <span><span class="label">buf</span> <span class="value">${fmt(this._lastVidBuf, '')}</span></span>
+          <span><span class="label">loss</span> <span class="value">${fmt(this._lastVidLoss, '%')}</span></span>
+        </div>
+      ` : html``}
     `;
   }
 
@@ -160,13 +182,28 @@ export class PeerStatsPanel extends LitElement {
       if (link === 'muted') flow = 'muted';
     }
 
+    // Video filmstrip stats (only for peers actively sending us video).
+    // We pull from the controller's map; the controller clears the map
+    // on _clearPeerDisplay so when video stops the row disappears.
+    const vid = filmstripController.signalsVideoStats.get(this.agentPubKeyB64);
+    const vidFps = vid?.fpsActual ?? null;
+    const vidJitter = vid?.jitterMs ?? null;
+    const vidTransit = vid?.transitMs ?? null;
+    const vidBuf = vid?.bufferDepth ?? null;
+    const vidLoss = vid?.lossPercent ?? null;
+
     if (
       carrier !== this._lastCarrier ||
       impl !== this._lastImpl ||
       rtt !== this._lastRtt ||
       jitter !== this._lastJitter ||
       loss !== this._lastLoss ||
-      flow !== this._lastFlow
+      flow !== this._lastFlow ||
+      vidFps !== this._lastVidFps ||
+      vidJitter !== this._lastVidJitter ||
+      vidTransit !== this._lastVidTransit ||
+      vidBuf !== this._lastVidBuf ||
+      vidLoss !== this._lastVidLoss
     ) {
       this._lastCarrier = carrier;
       this._lastImpl = impl;
@@ -174,6 +211,11 @@ export class PeerStatsPanel extends LitElement {
       this._lastJitter = jitter;
       this._lastLoss = loss;
       this._lastFlow = flow;
+      this._lastVidFps = vidFps;
+      this._lastVidJitter = vidJitter;
+      this._lastVidTransit = vidTransit;
+      this._lastVidBuf = vidBuf;
+      this._lastVidLoss = vidLoss;
       this.requestUpdate();
     }
   };

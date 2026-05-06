@@ -262,7 +262,19 @@ export class CameraSource {
     }
   }
 
-  private _videoConstraints(deviceId: string | undefined): MediaTrackConstraints | true {
-    return deviceId ? { deviceId } : true;
+  private _videoConstraints(deviceId: string | undefined): MediaTrackConstraints {
+    // Explicit frameRate constraint matters when the camera is consumed
+    // ONLY via MediaStreamTrackProcessor (e.g. the video-filmstrip
+    // module in signals carrier mode). WebRTC's RTCRtpSender negotiates
+    // its own frame-rate hints and the camera adapts; a track-processor
+    // consumer doesn't, so without an explicit `ideal` here the camera
+    // stays at whatever low default the device picks (some cameras
+    // settle at 5 fps when no consumer is asking for more). 30 fps is
+    // both sufficient for the filmstrip's max 8 fps sample rate and
+    // standard for video calls.
+    return {
+      frameRate: { ideal: 30, min: 15 },
+      ...(deviceId ? { deviceId } : {}),
+    };
   }
 }

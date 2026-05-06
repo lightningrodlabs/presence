@@ -31,15 +31,7 @@ import type { CameraAcquireResult } from '../../camera-source';
  * handle here; the device closes via cameraSource refcount.
  */
 
-// Square capture (source center-cropped to a square) so the frame fits
-// the square peer pane without aspect-ratio distortion. A 4:3 source
-// shown in a 1:1 container would otherwise vertically stretch the face
-// when the strip's background-size is set to 100% × N*100%.
-const CAPTURE_SIDE = 96;
-const CAPTURE_WIDTH = CAPTURE_SIDE;
-const CAPTURE_HEIGHT = CAPTURE_SIDE;
 const DEFAULT_CAPTURE_PERIOD_MS = 250; // 4 fps
-const JPEG_QUALITY = 0.6;
 
 /**
  * Target clip cadence — one filmstrip is sent roughly every CLIP_TARGET_MS,
@@ -50,8 +42,14 @@ const JPEG_QUALITY = 0.6;
  */
 const CLIP_TARGET_MS = 1000;
 
-/** Sender frame rates the UI exposes via setFps(). */
-export const FILMSTRIP_FPS_OPTIONS = [1, 2, 4, 8] as const;
+/**
+ * Sender frame rates the UI exposes via setFps(). 8 fps was tested but
+ * proved unreliable (the encode pipeline can't keep up consistently
+ * once you add receiver-side decode + display); 6 is the practical
+ * ceiling. Keeping evenly-spaced options between gives users useful
+ * trade-off granularity.
+ */
+export const FILMSTRIP_FPS_OPTIONS = [1, 2, 3, 4, 5, 6] as const;
 export type FilmstripFps = typeof FILMSTRIP_FPS_OPTIONS[number];
 
 /** How long to keep a stale received filmstrip showing before TTL'ing it. */
@@ -67,7 +65,15 @@ const RECEIVE_TTL_MS = 3000;
  */
 const URL_REVOKE_DELAY_MS = 10000;
 
-interface FilmstripPayload {
+/**
+ * Wire format. `kind` distinguishes a clip payload (default, the
+ * filmstrip case) from an explicit "stop" payload that tells the
+ * receiver the sender has turned video off and the receiver should
+ * clear its display immediately. Older peers without `kind` are
+ * treated as 'clip' for backwards compat.
+ */
+interface FilmstripClipPayload {
+  kind?: 'clip';
   seq: number;
   ts: number; // wall-clock ms when sent
   w: number;  // single-frame width
@@ -76,6 +82,23 @@ interface FilmstripPayload {
   p: number;  // playback period ms
   data: string; // base64-encoded JPEG filmstrip
 }
+interface FilmstripStopPayload {
+  kind: 'stop';
+  seq: number;
+  ts: number;
+}
+type FilmstripPayload = FilmstripClipPayload | FilmstripStopPayload;
+
+/**
+ * How long the receiver displays a peer's last clip with no new clips
+ * arriving before falling back to "no video" (clears the bg-image so
+ * the avatar shows through). 5 s is far longer than the 1 s clip
+ * cadence + any reasonable jitter, so this only fires when the sender
+ * has actually stopped (without managing to send a stop signal — e.g.
+ * the sender's tab crashed). Normal stops use the explicit stop
+ * payload and clear immediately.
+ */
+const RECEIVE_INACTIVITY_TTL_MS = 5000;
 
 export interface FilmstripFrame {
   /** Blob URL of the JPEG filmstrip. Revoked ~1 s after replacement. */
@@ -91,6 +114,47 @@ export interface FilmstripFrame {
 interface PeerFilmstripState {
   latest: FilmstripFrame | null;
   lastSeq: number;
+  /** Wall-clock ms of the previous arrival (for inter-arrival jitter). */
+  lastArrivalMs: number;
+  /** EWMA of |inter-arrival - CLIP_TARGET_MS|, in ms. */
+  jitterEwma: number;
+  /** EWMA of (Date.now() - payload.ts), in ms — conductor transit time. */
+  transitEwma: number;
+  /** Bytes received in the current rolling window. */
+  bytesReceived: number;
+  /** Clips received in the current rolling window. */
+  clipsReceived: number;
+  /** Clips inferred lost (seq gaps) in the current rolling window. */
+  clipsLost: number;
+  /** Wall-clock ms of the rolling window start. */
+  windowStartMs: number;
+  /** Inactivity TTL timer — clears the display if no clip arrives in time. */
+  inactivityTimer: number | null;
+}
+
+/**
+ * Per-peer signals-video stats. Updated by the receive side on a 1 s
+ * rolling window. Read by the stats panel.
+ */
+export interface VideoSignalsStats {
+  /** EWMA of clip inter-arrival deviation from CLIP_TARGET_MS, ms. */
+  jitterMs: number | null;
+  /** Loss percent over the rolling window (0–100). */
+  lossPercent: number | null;
+  /** Bandwidth over the rolling window, kilobits per second. */
+  kbps: number | null;
+  /** Effective frames-per-second (clips/sec × frames/clip) at receive. */
+  fpsActual: number | null;
+  /** Receiver-side queue depth (frames buffered, set by the element). */
+  bufferDepth: number | null;
+  /**
+   * EWMA of conductor transit time (`Date.now() - payload.ts`), in ms.
+   * On a single machine this is approximately the time from sender's
+   * sendModuleData call to receiver's onData callback. Diagnostic for
+   * pinpointing whether sender pump or conductor routing is the
+   * bottleneck.
+   */
+  transitMs: number | null;
 }
 
 class FilmstripController {
@@ -98,14 +162,18 @@ class FilmstripController {
 
   // ----- send side -----
   private cameraHandle: CameraAcquireResult | null = null;
-  private captureVideo: HTMLVideoElement | null = null;
   /**
-   * Monotonic generation counter for the capture pipeline. Bumped on
-   * every (re)build — start, stop, device change. The pump loop captures
-   * its generation on entry and exits when the counter moves out from
-   * under it. Same defense voice.ts uses against overlapping pump loops.
+   * Web Worker hosting the capture pump. We delegate the whole pump
+   * (MediaStreamTrackProcessor read loop + drawImage + JPEG encode) to
+   * the worker because Chrome's main-thread MediaStreamTrackProcessor
+   * gets rate-limited by main-thread congestion and `drawImage` of a
+   * VideoFrame is GPU-readback-slow. The worker version, per spec, is
+   * not gated by main-thread work and gets the camera's full frame
+   * rate. The main thread receives encoded JPEG bytes via postMessage
+   * and ships them via sendModuleData (the Holochain client lives on
+   * the main thread).
    */
-  private pipelineGeneration = 0;
+  private worker: Worker | null = null;
   private seq = 0;
 
   /**
@@ -118,7 +186,47 @@ class FilmstripController {
 
   // ----- receive side -----
   private peers = new Map<string, PeerFilmstripState>();
-  private subscribers = new Map<string, Set<(frame: FilmstripFrame) => void>>();
+  /**
+   * Subscriber callback receives `FilmstripFrame` on each new clip and
+   * `null` when the sender has explicitly stopped or the inactivity TTL
+   * has fired — receivers use null to clear their display.
+   */
+  private subscribers = new Map<string, Set<(frame: FilmstripFrame | null) => void>>();
+
+  // ----- per-peer carrier stats -----
+
+  /**
+   * Wall-clock ms of the last filmstrip clip we sent TO this peer.
+   * Updated in the pump per peer. Mirrors VoiceController.peerLastSentMs.
+   */
+  peerLastSentMs = new Map<string, number>();
+
+  /**
+   * Wall-clock ms of the last filmstrip clip we received FROM this peer.
+   * Updated in receiveFrame.
+   */
+  peerLastRecvMs = new Map<string, number>();
+
+  /**
+   * Per-peer signals-video stats. Updated by `receiveFrame` on a ~1 s
+   * rolling window. The stats panel reads this map; peer-filmstrip
+   * elements publish their buffer depth here via `setBufferDepth`.
+   */
+  signalsVideoStats = new Map<string, VideoSignalsStats>();
+
+  /**
+   * Update the buffer-depth field of a peer's stats. Called by the
+   * peer-filmstrip element when its queue grows or drains, so the
+   * stats panel can surface it without polling the element.
+   */
+  setBufferDepth(agentPubKeyB64: string, depth: number): void {
+    const existing: VideoSignalsStats = this.signalsVideoStats.get(agentPubKeyB64) ?? {
+      jitterMs: null, lossPercent: null, kbps: null, fpsActual: null,
+      bufferDepth: null, transitMs: null,
+    };
+    existing.bufferDepth = depth;
+    this.signalsVideoStats.set(agentPubKeyB64, existing);
+  }
 
   bind(store: StreamsStore) {
     this.store = store;
@@ -127,12 +235,19 @@ class FilmstripController {
   unbind() {
     this.stopCapture().catch(() => {});
     for (const [, state] of this.peers) {
+      if (state.inactivityTimer !== null) {
+        window.clearTimeout(state.inactivityTimer);
+        state.inactivityTimer = null;
+      }
       if (state.latest) {
         try { URL.revokeObjectURL(state.latest.url); } catch {}
       }
     }
     this.peers.clear();
     this.subscribers.clear();
+    this.peerLastSentMs.clear();
+    this.peerLastRecvMs.clear();
+    this.signalsVideoStats.clear();
     this.store = null;
   }
 
@@ -145,9 +260,7 @@ class FilmstripController {
     const handle = await this.store.cameraSource.acquire({
       id: 'video-filmstrip',
       onTrackChanged: (newTrack) => {
-        this.onCameraTrackChanged(newTrack).catch(e =>
-          console.error('video-filmstrip: onCameraTrackChanged failed', e)
-        );
+        this._sendTrackToWorker(newTrack);
       },
     });
     if (!handle) {
@@ -156,59 +269,124 @@ class FilmstripController {
     }
     this.cameraHandle = handle;
 
-    const video = document.createElement('video');
-    video.muted = true;
-    video.playsInline = true;
-    video.srcObject = new MediaStream([handle.track]);
-    // Mount hidden in the DOM. Off-DOM <video> elements get decoder
-    // throttling in some browsers — the codec advances slowly or stalls
-    // when there's no rendering surface, which manifests as drawImage
-    // repeatedly grabbing the same frame at fast capture intervals.
-    // A 1px positioned element keeps the decoder fed without affecting
-    // layout.
-    video.style.position = 'fixed';
-    video.style.left = '-9999px';
-    video.style.top = '0';
-    video.style.width = '1px';
-    video.style.height = '1px';
-    video.style.opacity = '0';
-    video.style.pointerEvents = 'none';
-    document.body.appendChild(video);
+    // Hint to Chrome that this is real-time motion video. Default is
+    // unset; setting 'motion' biases the pipeline toward smooth frame
+    // rate over per-frame quality.
+    try { (handle.track as any).contentHint = 'motion'; } catch {}
 
+    // Diagnostic — what did the camera negotiate?
     try {
-      await video.play();
-    } catch (e) {
-      console.error('video-filmstrip: video.play() rejected', e);
-      try { video.remove(); } catch {}
+      const settings = handle.track.getSettings?.();
+      console.log('[filmstrip tx] track settings:', settings);
+    } catch {}
+
+    if (!this._spawnWorker()) {
       try { handle.release(); } catch {}
       this.cameraHandle = null;
       return false;
     }
-    this.captureVideo = video;
-
-    this.pipelineGeneration += 1;
-    const gen = this.pipelineGeneration;
-    this.pumpCapture(gen).catch(e =>
-      console.error('video-filmstrip: pump error', e)
-    );
+    this._sendTrackToWorker(handle.track);
     return true;
   }
 
-  /**
-   * Called by CameraSource when the shared track is replaced (device
-   * change). Rebuild the video element's source MediaStream — the
-   * existing pump loop continues, just reading from the new track. seq
-   * does not reset, so peers' sequence-deduping keeps working across
-   * the boundary.
-   */
-  private async onCameraTrackChanged(newTrack: MediaStreamTrack): Promise<void> {
-    if (!this.captureVideo) return;
-    this.captureVideo.srcObject = new MediaStream([newTrack]);
+  private _spawnWorker(): boolean {
     try {
-      await this.captureVideo.play();
+      this.worker = new Worker(
+        new URL('./filmstrip-worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      this.worker.onmessage = (e) => this._onWorkerMessage(e);
+      this.worker.onerror = (e) => {
+        console.error('video-filmstrip worker error:', e.message);
+      };
+      return true;
     } catch (e) {
-      console.error('video-filmstrip: play() rejected after device change', e);
+      console.error('video-filmstrip: failed to spawn worker', e);
+      return false;
     }
+  }
+
+  /**
+   * Build a MediaStreamTrackProcessor on the main thread (where the
+   * track lives) and transfer just the readable stream of VideoFrames
+   * to the worker. MediaStreamTrack itself isn't transferable in many
+   * Chromium versions without a feature flag, but ReadableStream is
+   * universally transferable. The throttling we were trying to avoid
+   * was caused by main-thread *consumption* of the readable, not its
+   * creation — the worker draining it solves that.
+   */
+  private _sendTrackToWorker(track: MediaStreamTrack): void {
+    if (!this.worker) return;
+    const g: any = globalThis as any;
+    if (!g.MediaStreamTrackProcessor) {
+      console.error('video-filmstrip: MediaStreamTrackProcessor not available');
+      return;
+    }
+    let processor: any;
+    try {
+      processor = new g.MediaStreamTrackProcessor({ track, maxBufferSize: 30 });
+    } catch (e) {
+      console.error('video-filmstrip: failed to create MediaStreamTrackProcessor', e);
+      return;
+    }
+    const readable: ReadableStream = processor.readable;
+    this.worker.postMessage(
+      {
+        type: 'start',
+        readable,
+        capturePeriodMs: this._capturePeriodMs,
+      },
+      [readable as unknown as Transferable]
+    );
+  }
+
+  private _onWorkerMessage(e: MessageEvent): void {
+    const msg = e.data;
+    if (!msg || typeof msg !== 'object') return;
+    switch (msg.type) {
+      case 'clip':
+        this._handleClipFromWorker(msg);
+        break;
+      case 'stats':
+        console.log(
+          `[filmstrip tx] clips/s=${msg.clipsPerSec.toFixed(2)} ` +
+          `bw=${msg.kbps.toFixed(1)}kbps cycle=${msg.cycleMs.toFixed(0)}ms ` +
+          `reads=${msg.reads.toFixed(1)}/s ` +
+          `avgGap=${msg.avgGapMs.toFixed(0)}ms maxGap=${msg.maxGapMs.toFixed(0)}ms`
+        );
+        break;
+      case 'trackSettings':
+        console.log('[filmstrip tx] track settings:', msg.settings);
+        break;
+      case 'error':
+        console.error('[filmstrip worker]', msg.message);
+        break;
+    }
+  }
+
+  private _handleClipFromWorker(msg: {
+    bytes: ArrayBuffer;
+    w: number; h: number; n: number; p: number;
+    capturedAt: number;
+  }): void {
+    if (!this.store) return;
+    const targets = get(this.store._signalsTargets);
+    if (targets.size === 0) return;
+
+    const buf = new Uint8Array(msg.bytes);
+    const payload: FilmstripClipPayload = {
+      seq: this.seq++,
+      ts: msg.capturedAt,
+      w: msg.w, h: msg.h, n: msg.n, p: msg.p,
+      data: bytesToBase64(buf),
+    };
+    const sentAt = Date.now();
+    for (const peer of targets) {
+      this.peerLastSentMs.set(peer, sentAt);
+    }
+    this.store
+      .sendModuleData('video-filmstrip', JSON.stringify(payload), targets)
+      .catch(() => {});
   }
 
   /**
@@ -223,25 +401,47 @@ class FilmstripController {
   }
 
   /**
-   * Set the sender frame rate. Takes effect on the next clip (does not
-   * tear down the current capture loop — the pump reads the period
-   * fresh per clip).
+   * Set the sender frame rate. Takes effect on the next clip — the
+   * worker reads the period fresh per clip and tells the next sample
+   * apart from the previous by absolute wall-clock time, so changes
+   * apply at the next clip boundary (≤ 1 s).
    */
   setFps(fps: FilmstripFps): void {
     if (!(FILMSTRIP_FPS_OPTIONS as readonly number[]).includes(fps)) return;
     this._capturePeriodMs = Math.round(1000 / fps);
+    if (this.worker) {
+      this.worker.postMessage({
+        type: 'setFps',
+        capturePeriodMs: this._capturePeriodMs,
+      });
+    }
   }
 
   async stopCapture(): Promise<void> {
-    // Invalidate any in-flight pump loop.
-    this.pipelineGeneration += 1;
-    if (this.captureVideo) {
-      try {
-        this.captureVideo.pause();
-        this.captureVideo.srcObject = null;
-        this.captureVideo.remove();
-      } catch {}
-      this.captureVideo = null;
+    // Send an explicit stop payload to peers we've been transmitting
+    // to, so they clear their display immediately rather than waiting
+    // for the inactivity TTL to fire.
+    if (this.store && this.peerLastSentMs.size > 0) {
+      const recentTargets = new Set(this.peerLastSentMs.keys());
+      const stopPayload: FilmstripStopPayload = {
+        kind: 'stop',
+        seq: this.seq++,
+        ts: Date.now(),
+      };
+      this.store
+        .sendModuleData('video-filmstrip', JSON.stringify(stopPayload), recentTargets)
+        .catch(() => {});
+    }
+    this.peerLastSentMs.clear();
+
+    // Tell the worker to stop, then terminate it. terminate() is
+    // synchronous and abruptly kills the worker, which is fine — the
+    // 'stop' message gives it a chance to cancel any in-flight read()
+    // cleanly first.
+    if (this.worker) {
+      try { this.worker.postMessage({ type: 'stop' }); } catch {}
+      try { this.worker.terminate(); } catch {}
+      this.worker = null;
     }
     if (this.cameraHandle) {
       try { this.cameraHandle.release(); } catch {}
@@ -250,117 +450,6 @@ class FilmstripController {
     this.seq = 0;
   }
 
-  private async pumpCapture(gen: number): Promise<void> {
-    const W = CAPTURE_WIDTH;
-    const H = CAPTURE_HEIGHT;
-
-    // HTMLCanvasElement (not OffscreenCanvas) — the project's TS lib
-    // (es2017 + dom) doesn't fully cover OffscreenCanvas. The runtime
-    // cost is identical for our main-thread use case.
-    const captureCanvas = document.createElement('canvas');
-    captureCanvas.width = W;
-    captureCanvas.height = H;
-    const cctx = captureCanvas.getContext('2d');
-    if (!cctx) return;
-
-    while (
-      gen === this.pipelineGeneration &&
-      this.cameraHandle &&
-      this.captureVideo
-    ) {
-      // Read the period (and derived frame count) fresh every clip so
-      // setFps() takes effect on the next clip boundary (≤ 1 s away).
-      // N = fps, so the clip duration is approximately CLIP_TARGET_MS
-      // (1 s) at every fps setting. At 1 fps a clip is a single-frame
-      // snapshot per second; at 8 fps it's an 8-frame loop per second.
-      const cycleStart = performance.now();
-      const P = this._capturePeriodMs;
-      const N = Math.max(1, Math.round(CLIP_TARGET_MS / P));
-
-      const stripCanvas = document.createElement('canvas');
-      stripCanvas.width = W;
-      stripCanvas.height = H * N;
-      const sctx = stripCanvas.getContext('2d');
-      if (!sctx) return;
-
-      // Capture N frames spaced P apart. The last frame is captured
-      // immediately before encode/send so the freshest sample has
-      // minimal end-to-end latency. Inter-frame sleep happens BEFORE
-      // the capture to spread the N captures across the clip duration
-      // (rather than bunching them up at the start with a long tail
-      // sleep, which would delay the latest frame by P*(N-1) ms).
-      //
-      // Use the 9-arg drawImage to center-crop the camera source to a
-      // square before scaling to W×H. Without this, a 4:3 or 16:9
-      // source stretched directly into a square frame produces visibly
-      // squashed faces on the receiver.
-      for (let i = 0; i < N; i++) {
-        if (i > 0) {
-          await sleep(P);
-          if (gen !== this.pipelineGeneration) return;
-        }
-        try {
-          const vw = this.captureVideo.videoWidth || W;
-          const vh = this.captureVideo.videoHeight || H;
-          const side = Math.min(vw, vh);
-          const sx = (vw - side) / 2;
-          const sy = (vh - side) / 2;
-          cctx.drawImage(this.captureVideo, sx, sy, side, side, 0, 0, W, H);
-          sctx.drawImage(captureCanvas, 0, i * H);
-        } catch (e) {
-          // Video may have been torn down between iterations.
-        }
-      }
-
-      const blob = await new Promise<Blob | null>(resolve => {
-        stripCanvas.toBlob(b => resolve(b), 'image/jpeg', JPEG_QUALITY);
-      });
-      if (gen !== this.pipelineGeneration) return;
-      if (!this.store) {
-        await this._padCycle(cycleStart, gen);
-        continue;
-      }
-      if (!blob) {
-        console.error('video-filmstrip: toBlob returned null');
-        await this._padCycle(cycleStart, gen);
-        continue;
-      }
-
-      // _signalsTargets is a derived store updated by the same wiring as
-      // voice — pull it fresh per clip. If empty, skip the network
-      // roundtrip; the reconciler will stop us shortly.
-      const targets = get(this.store._signalsTargets);
-      if (targets.size > 0) {
-        const buf = new Uint8Array(await blob.arrayBuffer());
-        const payload: FilmstripPayload = {
-          seq: this.seq++,
-          ts: Date.now(),
-          w: W, h: H, n: N, p: P,
-          data: bytesToBase64(buf),
-        };
-        this.store
-          .sendModuleData('video-filmstrip', JSON.stringify(payload), targets)
-          .catch(() => {});
-      }
-
-      await this._padCycle(cycleStart, gen);
-    }
-  }
-
-  /**
-   * Sleep until CLIP_TARGET_MS has elapsed since `cycleStart`, so the
-   * pump emits ~1 clip/sec at every fps. Without this, low-fps clips
-   * (which finish capture quickly) would loop-burst the encoder.
-   */
-  private async _padCycle(cycleStart: number, gen: number): Promise<void> {
-    const elapsed = performance.now() - cycleStart;
-    const remaining = CLIP_TARGET_MS - elapsed;
-    if (remaining > 0) {
-      await sleep(remaining);
-    }
-    // Caller checks generation after we return.
-    void gen;
-  }
 
   // ----- receive side -----------------------------------------------------
 
@@ -374,18 +463,103 @@ class FilmstripController {
 
     let state = this.peers.get(agentPubKeyB64);
     if (!state) {
-      state = { latest: null, lastSeq: 0 };
+      state = {
+        latest: null,
+        lastSeq: 0,
+        lastArrivalMs: 0,
+        jitterEwma: 0,
+        transitEwma: 0,
+        bytesReceived: 0,
+        clipsReceived: 0,
+        clipsLost: 0,
+        windowStartMs: Date.now(),
+        inactivityTimer: null,
+      };
       this.peers.set(agentPubKeyB64, state);
     }
     if (payload.seq <= state.lastSeq && state.lastSeq !== 0) {
       // out-of-order or duplicate; cheap drop
       return;
     }
+
+    // Explicit stop signal — sender turned video off. Clear the
+    // display immediately rather than waiting for the inactivity TTL.
+    if (payload.kind === 'stop') {
+      state.lastSeq = payload.seq;
+      this._clearPeerDisplay(agentPubKeyB64);
+      return;
+    }
+
+    const now = Date.now();
+    this.peerLastRecvMs.set(agentPubKeyB64, now);
+
+    // --- stats accounting ---
+    // Loss: any seq gap > 0 implies missed clips.
+    if (state.lastSeq !== 0) {
+      const gap = payload.seq - state.lastSeq - 1;
+      if (gap > 0) state.clipsLost += gap;
+    }
+    state.clipsReceived += 1;
+
+    // Jitter: EWMA of |inter-arrival - CLIP_TARGET_MS| where CLIP_TARGET_MS
+    // is the sender's nominal cadence. alpha = 0.2 — slightly faster
+    // smoothing than voice's 0.1 because video clips are 50× slower so
+    // we have far fewer samples per second to integrate.
+    if (state.lastArrivalMs > 0) {
+      const interval = now - state.lastArrivalMs;
+      const deviation = Math.abs(interval - CLIP_TARGET_MS);
+      state.jitterEwma = 0.2 * deviation + 0.8 * state.jitterEwma;
+    }
+    state.lastArrivalMs = now;
+
+    // Transit time: how long the signal took from sender's send to
+    // receiver's onData. Both Date.now() values are wall-clock — on the
+    // same machine the clocks are identical so this is approximately
+    // the conductor's signal-routing latency. EWMA at alpha = 0.2.
+    const transit = now - payload.ts;
+    state.transitEwma = state.transitEwma === 0
+      ? transit
+      : 0.2 * transit + 0.8 * state.transitEwma;
+
     state.lastSeq = payload.seq;
 
     const bytes = base64ToBytes(payload.data);
+    state.bytesReceived += bytes.byteLength;
     const blob = new Blob([bytes], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
+
+    // Publish stats on a ~1 s cadence. With clip cadence ~1 s, this
+    // window captures roughly one clip arrival per emission.
+    if (now - state.windowStartMs >= 1000 && this.store) {
+      const elapsedMs = now - state.windowStartMs;
+      const total = state.clipsReceived + state.clipsLost;
+      const loss = total > 0 ? (state.clipsLost / total) * 100 : 0;
+      const kbps = (state.bytesReceived * 8) / elapsedMs;
+      const fpsActual = (state.clipsReceived * payload.n * 1000) / elapsedMs;
+      const stats: VideoSignalsStats = {
+        jitterMs: Math.round(state.jitterEwma * 10) / 10,
+        lossPercent: Math.round(loss * 10) / 10,
+        kbps: Math.round(kbps * 10) / 10,
+        fpsActual: Math.round(fpsActual * 10) / 10,
+        bufferDepth:
+          this.signalsVideoStats.get(agentPubKeyB64)?.bufferDepth ?? null,
+        transitMs: Math.round(state.transitEwma * 10) / 10,
+      };
+      this.signalsVideoStats.set(agentPubKeyB64, stats);
+      // Also log so a user testing in DevTools can see the numbers
+      // without wiring up the panel yet. One line per peer per second.
+      console.log(
+        `[filmstrip rx ${agentPubKeyB64.slice(0, 8)}] ` +
+        `jitter=${stats.jitterMs}ms transit=${stats.transitMs}ms ` +
+        `loss=${stats.lossPercent}% ` +
+        `bw=${stats.kbps}kbps fps=${stats.fpsActual} ` +
+        `buf=${stats.bufferDepth ?? '-'}`
+      );
+      state.bytesReceived = 0;
+      state.clipsReceived = 0;
+      state.clipsLost = 0;
+      state.windowStartMs = now;
+    }
 
     // Revoke prior URL after a short delay (in case any consumer is
     // mid-read on the old one).
@@ -406,11 +580,69 @@ class FilmstripController {
     };
     state.latest = frame;
 
+    // Reset the inactivity TTL on every clip arrival. If the sender
+    // genuinely stops without sending an explicit stop payload (e.g.
+    // tab closed unexpectedly), the timer fires and clears the display.
+    if (state.inactivityTimer !== null) {
+      window.clearTimeout(state.inactivityTimer);
+    }
+    state.inactivityTimer = window.setTimeout(() => {
+      this._clearPeerDisplay(agentPubKeyB64);
+    }, RECEIVE_INACTIVITY_TTL_MS);
+
     const subs = this.subscribers.get(agentPubKeyB64);
     if (subs) {
       for (const cb of subs) {
         try { cb(frame); } catch (e) {
           console.error('video-filmstrip: subscriber callback threw', e);
+        }
+      }
+    }
+  }
+
+  /**
+   * Clear the receiver-side display state for a peer and notify
+   * subscribers with `null`. Called on explicit stop payloads and on
+   * inactivity TTL.
+   *
+   * Also resets seq + jitter tracking so that when the sender restarts
+   * (its pump resets `seq` to 0 in stopCapture), incoming clips with
+   * seq=0,1,2,… aren't dropped by the dedup check
+   * `payload.seq <= state.lastSeq`. Stats counters are reset too so the
+   * first new window doesn't include a phantom 1-second gap left over
+   * from the stop.
+   */
+  private _clearPeerDisplay(agentPubKeyB64: string): void {
+    const state = this.peers.get(agentPubKeyB64);
+    if (!state) return;
+    if (state.inactivityTimer !== null) {
+      window.clearTimeout(state.inactivityTimer);
+      state.inactivityTimer = null;
+    }
+    if (state.latest) {
+      const oldUrl = state.latest.url;
+      setTimeout(() => {
+        try { URL.revokeObjectURL(oldUrl); } catch {}
+      }, URL_REVOKE_DELAY_MS);
+      state.latest = null;
+    }
+    state.lastSeq = 0;
+    state.lastArrivalMs = 0;
+    state.jitterEwma = 0;
+    state.transitEwma = 0;
+    state.bytesReceived = 0;
+    state.clipsReceived = 0;
+    state.clipsLost = 0;
+    state.windowStartMs = Date.now();
+
+    // Drop the published stats so the stats panel hides its video row.
+    this.signalsVideoStats.delete(agentPubKeyB64);
+
+    const subs = this.subscribers.get(agentPubKeyB64);
+    if (subs) {
+      for (const cb of subs) {
+        try { cb(null); } catch (e) {
+          console.error('video-filmstrip: subscriber callback threw on clear', e);
         }
       }
     }
@@ -423,7 +655,7 @@ class FilmstripController {
    */
   subscribe(
     agentPubKeyB64: string,
-    callback: (frame: FilmstripFrame) => void,
+    callback: (frame: FilmstripFrame | null) => void,
   ): () => void {
     let set = this.subscribers.get(agentPubKeyB64);
     if (!set) {
@@ -465,10 +697,6 @@ class FilmstripController {
 const controller = new FilmstripController();
 
 export { controller as filmstripController };
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
 
 function bytesToBase64(bytes: Uint8Array): string {
   // Chunk the conversion to avoid String.fromCharCode call-stack limits

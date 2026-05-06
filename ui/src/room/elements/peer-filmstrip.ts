@@ -6,47 +6,63 @@ import {
 } from '../modules/video-filmstrip';
 
 /**
- * Self-updating filmstrip overlay for one peer.
+ * Self-updating filmstrip overlay for one peer with a playback jitter
+ * buffer.
  *
- * Subscribes to the FilmstripController for `agentPubKeyB64`. When a
- * filmstrip arrives (JPEG with N frames stacked vertically), it sets
- * the JPEG as a CSS background-image with `background-size: 100% Nx00%`,
- * then steps `background-position-y` at the original sample period —
- * the seatcamp animation pattern. CSS does the work; we just rotate
- * the offset.
+ * On clip arrival, push that clip's N frames onto a queue. A single
+ * setTimeout chain pops one frame every period and displays it,
+ * regardless of when clips arrive. This decouples display timing from
+ * receive timing — the visible playback is at constant cadence even
+ * when clip arrivals jitter.
  *
- * Lifecycle: shows the last received filmstrip until the element is
- * unmounted by the parent (which mounts us only when WebRTC video is
- * NOT live — `!conn.video`). Intentionally has NO inactivity TTL: a
- * 2 s clip cadence with normal signal jitter will routinely exceed any
- * reasonable TTL, and the alternative — flashing the avatar through
- * between clips — looks broken. A frozen last-loop is the better
- * "sender stalled" fallback. If the sender stops entirely, the parent
- * will swap us out (e.g. WebRTC reconnects, peer leaves).
+ * Trade-off: latency. Initial playback waits for `BUFFER_CLIPS` clips
+ * to accumulate so a slow clip arrival doesn't underrun immediately.
+ * After playback has started, underrun (queue drains before the next
+ * clip arrives) freezes on the last frame; the next clip arrival
+ * resumes playback immediately (no re-buffering).
+ *
+ * Buffer cap: if clips arrive faster than they're consumed (e.g. signal
+ * burst after a network gap), drop OLDEST frames first so the latency
+ * doesn't grow unbounded.
  *
  * Positioned `position: absolute; inset: 0` so the parent video-container
- * mounts it as an overlay; render is a no-op until the first frame
- * arrives, so the avatar shows through until then.
+ * mounts it as an overlay; the .strip is transparent until the first
+ * frame is displayed, so the avatar shows through until then.
  */
+
+/**
+ * Initial buffer depth, in clips. Setting playback to start once we
+ * have BUFFER_CLIPS clips' worth of frames means the queue stays around
+ * (BUFFER_CLIPS - 1) clips deep in steady state, giving us up to
+ * (BUFFER_CLIPS - 1) clip-cadence-worth of clip-arrival jitter
+ * tolerance before underrun. With a 1 s clip cadence, BUFFER_CLIPS = 2
+ * absorbs ~1 s of jitter at the cost of ~1 s of added startup latency.
+ */
+const BUFFER_CLIPS = 2;
+
+/**
+ * Hard cap on queue depth, in clips. Drops oldest frames if exceeded.
+ * Prevents unbounded growth from sender bursts (e.g. clips queued by a
+ * network gap arrive together).
+ */
+const MAX_BUFFER_CLIPS = 4;
+
+interface QueuedFrame {
+  url: string;
+  index: number;
+  count: number;
+  periodMs: number;
+}
 
 @customElement('peer-filmstrip')
 export class PeerFilmstrip extends LitElement {
   @property({ type: String })
   agentPubKeyB64 = '';
 
-  /**
-   * Latest frame, set imperatively (NOT via @state) so Lit does not
-   * re-render the .strip div when a new clip arrives. Re-renders here
-   * cause a brief paint where the new bg-image hasn't taken effect yet
-   * and the avatar (in the parent's light DOM) flashes through. With
-   * imperative DOM updates the bg-image swap is atomic on the existing
-   * div — no rebuild, no flash.
-   */
-  private _frame: FilmstripFrame | null = null;
-
-  private _unsubscribe: (() => void) | null = null;
+  private _queue: QueuedFrame[] = [];
+  private _started = false;
   private _animTimer: number | null = null;
-  private _frameIndex = 0;
+  private _unsubscribe: (() => void) | null = null;
 
   static styles = css`
     :host {
@@ -118,11 +134,11 @@ export class PeerFilmstrip extends LitElement {
       this._unsubscribe = null;
     }
     if (this._animTimer !== null) {
-      window.clearInterval(this._animTimer);
+      window.clearTimeout(this._animTimer);
       this._animTimer = null;
     }
-    this._frame = null;
-    this._frameIndex = 0;
+    this._queue = [];
+    this._started = false;
     // Clear the imperative bg-image so a stale image from a previous
     // peer doesn't linger if `agentPubKeyB64` is reassigned without an
     // immediate replay-subscribe.
@@ -130,79 +146,113 @@ export class PeerFilmstrip extends LitElement {
     if (el) el.style.backgroundImage = '';
   }
 
-  private async _onFrame(frame: FilmstripFrame): Promise<void> {
+  private async _onFrame(frame: FilmstripFrame | null): Promise<void> {
+    // null = sender stopped (explicit stop signal or inactivity TTL).
+    // Drain the queue, stop animation, clear bg-image so the avatar
+    // shows through.
+    if (frame === null) {
+      if (this._animTimer !== null) {
+        window.clearTimeout(this._animTimer);
+        this._animTimer = null;
+      }
+      this._queue = [];
+      this._started = false;
+      const el = this.renderRoot.querySelector('.strip') as HTMLDivElement | null;
+      if (el) el.style.backgroundImage = '';
+      filmstripController.setBufferDepth(this.agentPubKeyB64, 0);
+      return;
+    }
+
     // Pre-decode the new JPEG so when we swap the bg-image the browser
-    // already has the pixel data ready. Without this the swap can paint
-    // an empty bg for one frame while the new image decodes (visible as
-    // an avatar-flash through the transparent host).
+    // already has the pixel data ready and the swap is atomic. Without
+    // this, the swap can paint an empty bg for one frame while the new
+    // image decodes (visible as an avatar-flash through the host).
     try {
       const probe = new Image();
       probe.src = frame.url;
       await probe.decode();
     } catch {
-      // Decode rejected (rare — corrupt JPEG, revoked URL). Fall through
-      // and let the browser handle it the normal way.
+      // Decode rejected (rare — corrupt JPEG, revoked URL). Fall through.
     }
-    // The element may have been unmounted while we awaited decode; bail
-    // if a teardown happened in the meantime.
+    // The element may have been unmounted while we awaited decode.
     if (!this._unsubscribe) return;
-    // A newer frame may also have started decoding — check that this
-    // frame is still the latest before applying it.
-    const latest = filmstripController.getLatest(this.agentPubKeyB64);
-    if (latest && latest.url !== frame.url) return;
 
-    this._frame = frame;
-    this._frameIndex = 0;
-    const el = this.renderRoot.querySelector('.strip') as HTMLDivElement | null;
-    if (el) {
-      el.style.backgroundImage = `url(${frame.url})`;
-      el.style.backgroundSize = `100% ${frame.frameCount * 100}%`;
-      el.style.backgroundPositionY = '0%';
+    // Push N entries (one per frame) into the queue. The setTimeout
+    // chain consumes them at periodMs intervals.
+    for (let i = 0; i < frame.frameCount; i++) {
+      this._queue.push({
+        url: frame.url,
+        index: i,
+        count: frame.frameCount,
+        periodMs: frame.periodMs,
+      });
     }
-    this._restartAnim(frame);
-  }
 
-  private _restartAnim(frame: FilmstripFrame): void {
-    if (this._animTimer !== null) {
-      window.clearInterval(this._animTimer);
-      this._animTimer = null;
+    // Cap the queue depth — drop oldest if a sender burst pushed us
+    // over MAX_BUFFER_CLIPS. Preferring to lose old frames keeps the
+    // displayed video as close to real-time as the cap allows.
+    const max = MAX_BUFFER_CLIPS * frame.frameCount;
+    while (this._queue.length > max) {
+      this._queue.shift();
     }
-    if (frame.frameCount <= 1) return;
-    // Step through frames 0..N-1 once, then stop. Holding on the last
-    // frame until the next clip arrives is the correct behaviour: the
-    // sender captures roughly one clip's worth of video per CLIP_TARGET_MS,
-    // so playback that takes the same wall-clock time and then waits is
-    // the natural reproduction. Looping would replay the same frames
-    // when a clip is delayed by network jitter — visible as a stutter
-    // rather than a brief freeze.
-    this._animTimer = window.setInterval(() => {
-      const f = this._frame;
-      if (!f) return;
-      if (this._frameIndex >= f.frameCount - 1) {
-        if (this._animTimer !== null) {
-          window.clearInterval(this._animTimer);
-          this._animTimer = null;
-        }
-        return;
+
+    // Publish buffer depth to the controller's stats so the panel /
+    // console log can show it.
+    filmstripController.setBufferDepth(this.agentPubKeyB64, this._queue.length);
+
+    if (!this._started) {
+      // Initial buffering: wait for BUFFER_CLIPS clips before the first
+      // frame is displayed. Adds startup latency, gains jitter tolerance.
+      const target = BUFFER_CLIPS * frame.frameCount;
+      if (this._queue.length >= target) {
+        this._started = true;
+        this._popAndSchedule();
       }
-      this._frameIndex += 1;
-      this._applyFrameIndex();
-    }, frame.periodMs);
+    } else if (this._animTimer === null) {
+      // Resuming after underrun. Don't re-buffer — the user has already
+      // seen the freeze; pushing them through more wait is worse than
+      // resuming with whatever just arrived.
+      this._popAndSchedule();
+    }
   }
 
-  private _applyFrameIndex(): void {
+  /**
+   * Pop one frame from the queue, display it, and schedule the next
+   * tick. If the queue is empty, leave the timer null so a new clip's
+   * `_onFrame` can resume playback. The displayed frame stays on
+   * screen during the underrun (frozen on last shown frame).
+   */
+  private _popAndSchedule(): void {
+    const next = this._queue.shift();
+    if (!next) return;
+    this._applyFrame(next);
+    filmstripController.setBufferDepth(this.agentPubKeyB64, this._queue.length);
+    this._animTimer = window.setTimeout(() => {
+      this._animTimer = null;
+      this._popAndSchedule();
+    }, next.periodMs);
+  }
+
+  private _applyFrame(f: QueuedFrame): void {
     const el = this.renderRoot.querySelector('.strip') as HTMLDivElement | null;
-    if (!el || !this._frame) return;
-    const N = this._frame.frameCount;
+    if (!el) return;
+    // Only update bg-image when the source clip changes — avoids
+    // unnecessary style writes when stepping through frames within the
+    // same clip. background-size depends on N too, so update both.
+    const desiredBg = `url("${f.url}")`;
+    if (el.style.backgroundImage !== desiredBg) {
+      el.style.backgroundImage = `url(${f.url})`;
+      el.style.backgroundSize = `100% ${f.count * 100}%`;
+    }
     el.style.backgroundPositionY =
-      N > 1 ? `${(this._frameIndex / (N - 1)) * 100}%` : '0%';
+      f.count > 1 ? `${(f.index / (f.count - 1)) * 100}%` : '0%';
   }
 
   render() {
-    // Static template — always renders an empty .strip div. _onFrame
-    // sets bg-image imperatively. Until the first clip arrives the
+    // Static template — always renders an empty .strip div. _applyFrame
+    // sets bg-image imperatively. Until the first clip is displayed the
     // .strip is transparent, so the parent's avatar shows through; once
-    // a clip lands, the .strip stays painted with the latest bg-image
+    // playback starts, the .strip stays painted with the current bg-image
     // until the host is unmounted.
     return html`<div class="strip"></div>`;
   }
