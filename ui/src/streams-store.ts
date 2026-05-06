@@ -2742,11 +2742,20 @@ export class StreamsStore {
     else if (conn?.connected && conn.audio) audio = 'stale';
     else audio = 'off';
 
-    const video: PeerLinkSnapshot['video'] = conn?.video
-      ? 'live'
-      : conn?.videoMuted
-        ? 'muted'
-        : 'off';
+    // Video is 'live' if WebRTC has an active video track OR we've
+    // received a filmstrip clip from this peer within the freshness
+    // window (signals carrier carrying low-bandwidth video).
+    const FILMSTRIP_LIVE_WINDOW_MS = 3000;
+    const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
+    const filmstripLive =
+      lastFilmstripMs !== undefined &&
+      Date.now() - lastFilmstripMs < FILMSTRIP_LIVE_WINDOW_MS;
+    const video: PeerLinkSnapshot['video'] =
+      conn?.video || filmstripLive
+        ? 'live'
+        : conn?.videoMuted
+          ? 'muted'
+          : 'off';
 
     return {
       audioLink,
@@ -3017,13 +3026,15 @@ export class StreamsStore {
         event: 'MyWebrtcDisable',
         detail: 'global',
       });
-      // Tear down all current media connections; videoOff() in addition
-      // because turning the camera off was the prior behavior of the
-      // global "Disable WebRTC" toggle and users expect it.
+      // Tear down all current WebRTC media connections. Camera is left
+      // alone — with the video-filmstrip module on the signals carrier,
+      // the camera continues to feed video to peers; turning it off
+      // would defeat the point of the new fallback. The reconciler
+      // notices _signalsTargets becoming non-empty and starts the
+      // filmstrip encoder against the still-acquired camera.
       for (const pubKeyB64 of Object.keys(get(this._openConnections))) {
         this.disconnectFromPeerVideo(pubKeyB64);
       }
-      this.videoOff();
       this._clearPendingWebrtcStatus();
       await this._syncConversationPayload({ webrtcDisabled: true });
       return;
