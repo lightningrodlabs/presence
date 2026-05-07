@@ -52,6 +52,17 @@ const CLIP_TARGET_MS = 1000;
 export const FILMSTRIP_FPS_OPTIONS = [1, 2, 3, 4, 5, 6] as const;
 export type FilmstripFps = typeof FILMSTRIP_FPS_OPTIONS[number];
 
+/**
+ * Sender capture resolutions (square, in pixels per frame). Larger =
+ * crisper image but more bytes/sec on the wire. The receiver caps
+ * display at ~150% of capture size, so increasing this also increases
+ * the display size.
+ */
+export const FILMSTRIP_CAPTURE_SIZES = [48, 64, 96, 128, 160, 192] as const;
+export type FilmstripCaptureSize = typeof FILMSTRIP_CAPTURE_SIZES[number];
+
+const DEFAULT_CAPTURE_SIDE = 96;
+
 /** How long to keep a stale received filmstrip showing before TTL'ing it. */
 const RECEIVE_TTL_MS = 3000;
 
@@ -183,6 +194,13 @@ class FilmstripController {
    * at the original rate.
    */
   private _capturePeriodMs = DEFAULT_CAPTURE_PERIOD_MS;
+
+  /**
+   * Square edge length (px) of each captured frame. Settable via
+   * `setCaptureSide()`. Larger = crisper picture but more bytes per
+   * clip; should be tuned to network conditions.
+   */
+  private _captureSide: number = DEFAULT_CAPTURE_SIDE;
 
   // ----- receive side -----
   private peers = new Map<string, PeerFilmstripState>();
@@ -335,6 +353,7 @@ class FilmstripController {
         type: 'start',
         readable,
         capturePeriodMs: this._capturePeriodMs,
+        captureSide: this._captureSide,
       },
       [readable as unknown as Transferable]
     );
@@ -413,6 +432,28 @@ class FilmstripController {
       this.worker.postMessage({
         type: 'setFps',
         capturePeriodMs: this._capturePeriodMs,
+      });
+    }
+  }
+
+  getCaptureSide(): FilmstripCaptureSize {
+    const s = this._captureSide as FilmstripCaptureSize;
+    return (FILMSTRIP_CAPTURE_SIZES as readonly number[]).includes(s)
+      ? s
+      : DEFAULT_CAPTURE_SIDE as FilmstripCaptureSize;
+  }
+
+  /**
+   * Set the sender capture-frame edge length (px). Takes effect on the
+   * next clip. Larger = crisper image, more bytes/sec.
+   */
+  setCaptureSide(side: FilmstripCaptureSize): void {
+    if (!(FILMSTRIP_CAPTURE_SIZES as readonly number[]).includes(side)) return;
+    this._captureSide = side;
+    if (this.worker) {
+      this.worker.postMessage({
+        type: 'setCaptureSide',
+        captureSide: side,
       });
     }
   }

@@ -61,7 +61,9 @@ import './elements/toggle-switch';
 import {
   filmstripController,
   FILMSTRIP_FPS_OPTIONS,
+  FILMSTRIP_CAPTURE_SIZES,
   FilmstripFps,
+  FilmstripCaptureSize,
 } from './modules/video-filmstrip';
 import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
@@ -238,6 +240,25 @@ export class RoomView extends LitElement {
 
   @state()
   _maximizedVideo: string | undefined; // id of the maximized video if any
+
+  /**
+   * Set of peers currently displaying a filmstrip clip. Updated by
+   * peer-filmstrip's onActiveChange callback. Used to hide the avatar
+   * behind the filmstrip while video is flowing — without this, any
+   * transparent moment in the bg-image swap lets the avatar flash
+   * through, especially noticeable cross-machine.
+   */
+  @state()
+  _filmstripActivePeers: Set<string> = new Set();
+
+  private _onFilmstripActive(peerB64: string, active: boolean): void {
+    const next = new Set(this._filmstripActivePeers);
+    if (active) next.add(peerB64);
+    else next.delete(peerB64);
+    if (next.size !== this._filmstripActivePeers.size) {
+      this._filmstripActivePeers = next;
+    }
+  }
 
   @state()
   _displayError: string | undefined;
@@ -795,6 +816,7 @@ export class RoomView extends LitElement {
       },
     ];
     const currentFps = filmstripController.getFps();
+    const currentSize = filmstripController.getCaptureSide();
     return html`
       <div class="row" style="align-items: center; gap: 8px; flex-wrap: wrap;">
         <span class="secondary-font" style="opacity: 0.7;">Carrier:</span>
@@ -849,6 +871,34 @@ export class RoomView extends LitElement {
         >
           ${FILMSTRIP_FPS_OPTIONS.map(
             v => html`<option value=${v} ?selected=${v === currentFps}>${v}</option>`
+          )}
+        </select>
+        <span
+          class="secondary-font"
+          style="opacity: 0.7; margin-left: 8px;"
+          title="Filmstrip capture resolution (px square). Higher = crisper, more bandwidth."
+        >px:</span>
+        <select
+          class="secondary-font"
+          title="Filmstrip capture resolution. Higher = crisper picture, more bytes/sec."
+          style="
+            cursor: pointer;
+            padding: 3px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: transparent;
+            color: #c3c9eb;
+            font-family: inherit;
+          "
+          .value=${String(currentSize)}
+          @change=${(e: Event) => {
+            const size = Number((e.target as HTMLSelectElement).value) as FilmstripCaptureSize;
+            filmstripController.setCaptureSide(size);
+            this.requestUpdate();
+          }}
+        >
+          ${FILMSTRIP_CAPTURE_SIZES.map(
+            v => html`<option value=${v} ?selected=${v === currentSize}>${v}</option>`
           )}
         </select>
       </div>
@@ -2712,31 +2762,63 @@ export class RoomView extends LitElement {
             const activeReplaceModule = this._getActiveReplaceModule(pubkeyB64, moduleContext);
             const videoElId = `video-${pubkeyB64}`;
 
+            // Avatar visibility:
+            //   - conn undefined (signals mode, no WebRTC peer):       show
+            //   - conn defined && !conn.connected (still establishing): hide
+            //                                                          (status text below shows instead)
+            //   - conn defined && conn.connected && !conn.video:       show
+            //   - conn defined && conn.connected && conn.video:        hide (WebRTC video covers it)
+            // Hide the avatar when WebRTC video is live OR when the
+            // filmstrip is currently displaying a clip from this peer.
+            // Hiding while filmstrip is active prevents the avatar
+            // from flashing through any transparent moment in the
+            // bg-image swap.
+            const filmstripActive = this._filmstripActivePeers.has(pubkeyB64);
+            const avatarHidden = filmstripActive
+              ? true
+              : conn
+                ? !conn.connected || !!conn.video
+                : false;
             return html`
             <div
               class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
               @dblclick=${() => this.toggleMaximized(pubkeyB64)}
             >
-              <!-- Replace content -->
+              <!--
+                Avatar and peer-filmstrip are rendered at FIXED positions in
+                this template (not inside the conditional branches below) so
+                Lit preserves them across renders. When conn flickers between
+                defined and undefined during WebRTC reconnect attempts, the
+                conditional sections rebuild, but these two elements stay
+                mounted — no unmount/remount window during which the avatar
+                or container background would flash through.
+              -->
+              <avatar-with-nickname
+                .hideNickname=${true}
+                .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                style="width: 35%;${avatarHidden ? ' display: none;' : ''}"
+              ></avatar-with-nickname>
+              <peer-filmstrip
+                .agentPubKeyB64=${pubkeyB64}
+                .onActiveChange=${(active: boolean) => this._onFilmstripActive(pubkeyB64, active)}
+              ></peer-filmstrip>
+
+              <!--
+                Conditional content is layered on top of the always-mounted
+                avatar+filmstrip in DOM order. WebRTC video (when active)
+                covers the filmstrip; replace-module covers everything via
+                .module-replace-content's z-index.
+              -->
               ${activeReplaceModule
                 ? html`<div class="module-replace-content">${activeReplaceModule.html}</div>`
-                : conn
-                  ? html`
+                : html``}
+              ${conn
+                ? html`
                     <video
                       style="${conn.video ? '' : 'display: none;'}"
                       id="${videoElId}"
                       class="video-el"
                     ></video>
-                    <avatar-with-nickname
-                      .hideNickname=${true}
-                      .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                      style="width: 35%;${!conn.connected || conn.video ? ' display: none;' : ''}"
-                    ></avatar-with-nickname>
-                    ${!conn.video
-                      ? html`<peer-filmstrip
-                          .agentPubKeyB64=${pubkeyB64}
-                        ></peer-filmstrip>`
-                      : html``}
                     <div
                       style="color: #b9a884; font-size: 0.8em; ${conn.connected ? 'display: none' : ''}"
                     >
@@ -2748,23 +2830,6 @@ export class RoomView extends LitElement {
                       connecting media...
                     </div>
                   `
-                  : html`
-                    <avatar-with-nickname
-                      .hideNickname=${true}
-                      .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                      style="width: 35%;"
-                    ></avatar-with-nickname>
-                    <peer-filmstrip
-                      .agentPubKeyB64=${pubkeyB64}
-                    ></peer-filmstrip>
-                  `}
-              <!-- Hidden video element so srcObject assignment still works when a replace module is active -->
-              ${activeReplaceModule && conn
-                ? html`<video
-                    style="display: none;"
-                    id="${videoElId}"
-                    class="video-el"
-                  ></video>`
                 : html``}
 
               <!-- Connection detail statuses (debug) -->

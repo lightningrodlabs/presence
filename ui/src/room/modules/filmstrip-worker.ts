@@ -32,7 +32,7 @@
  * on the main thread).
  */
 
-const CAPTURE_SIDE = 96;
+const DEFAULT_CAPTURE_SIDE = 96;
 const CLIP_TARGET_MS = 1000;
 const JPEG_QUALITY = 0.6;
 
@@ -40,29 +40,43 @@ interface StartMessage {
   type: 'start';
   readable: ReadableStream;
   capturePeriodMs: number;
+  captureSide: number;
 }
 interface SetFpsMessage {
   type: 'setFps';
   capturePeriodMs: number;
 }
+interface SetCaptureSideMessage {
+  type: 'setCaptureSide';
+  captureSide: number;
+}
 interface StopMessage {
   type: 'stop';
 }
-type WorkerInputMessage = StartMessage | SetFpsMessage | StopMessage;
+type WorkerInputMessage =
+  | StartMessage
+  | SetFpsMessage
+  | SetCaptureSideMessage
+  | StopMessage;
 
 let captureReader: ReadableStreamDefaultReader<any> | null = null;
 let pipelineGeneration = 0;
 let capturePeriodMs = 250;
+let captureSide = DEFAULT_CAPTURE_SIDE;
 
 self.onmessage = (e: MessageEvent<WorkerInputMessage>) => {
   const msg = e.data;
   switch (msg.type) {
     case 'start':
       capturePeriodMs = msg.capturePeriodMs;
+      captureSide = msg.captureSide;
       startCapture(msg.readable);
       break;
     case 'setFps':
       capturePeriodMs = msg.capturePeriodMs;
+      break;
+    case 'setCaptureSide':
+      captureSide = msg.captureSide;
       break;
     case 'stop':
       stopCapture();
@@ -103,8 +117,10 @@ function stopCapture(): void {
 }
 
 async function pumpCapture(gen: number): Promise<void> {
-  const W = CAPTURE_SIDE;
-  const H = CAPTURE_SIDE;
+  // W/H read fresh per clip so setCaptureSide() takes effect on the
+  // next clip boundary. Bound below.
+  let W = captureSide;
+  let H = captureSide;
 
   // Per-clip state. Types use `any` because the project's TS lib
   // (es2017 + dom) doesn't fully cover OffscreenCanvas /
@@ -154,6 +170,10 @@ async function pumpCapture(gen: number): Promise<void> {
       const N = Math.max(1, Math.round(CLIP_TARGET_MS / P));
 
       if (!stripCanvas || framesInClip === 0) {
+        // Re-read W/H from the live captureSide each clip so a
+        // setCaptureSide() applies on the next clip boundary.
+        W = captureSide;
+        H = captureSide;
         stripCanvas = new (self as any).OffscreenCanvas(W, H * N);
         sctx = stripCanvas.getContext('2d');
         framesInClip = 0;
