@@ -38,12 +38,14 @@ describe('resolveWebrtcImpl — symmetric union with per-peer overrides', () => 
     expect(resolveWebrtcImpl('simplepeer', 'fsm', 'simplepeer', 'fsm')).toBe('fsm');
   });
 
-  it('disagreeing overrides resolve to simplepeer (conservative tiebreaker)', () => {
-    // The Phase 3 auto-toggle relies on this — pinning a failing link
-    // to simplepeer should stick even if the peer's last decision was fsm.
-    expect(resolveWebrtcImpl('fsm', 'simplepeer', 'fsm', 'fsm')).toBe('simplepeer');
+  it('disagreeing overrides resolve to fsm (marginal-NAT-favoring tiebreaker)', () => {
+    // When auto-flip drives the two sides into disagreement the link is
+    // already in a regime where the FSM's Perfect-Negotiation /
+    // session-ID / backoff machinery is most likely to help. See
+    // WEBRTC_CARRIER_ANALYSIS.md.
+    expect(resolveWebrtcImpl('fsm', 'simplepeer', 'fsm', 'fsm')).toBe('fsm');
     expect(resolveWebrtcImpl('simplepeer', 'fsm', 'simplepeer', 'simplepeer')).toBe(
-      'simplepeer',
+      'fsm',
     );
   });
 

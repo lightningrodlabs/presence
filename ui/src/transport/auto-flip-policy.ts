@@ -70,9 +70,12 @@ export function decideAutoFlip(input: AutoFlipInputs): AutoFlipDecision {
  *
  * Resolution order:
  *   1. If both sides set an override and they agree, use it.
- *   2. If both sides set an override and disagree, `'simplepeer'` wins
- *      (broader compat, less reconnect machinery — also lets the
- *      auto-toggle pin a link to simplepeer unilaterally).
+ *   2. If both sides set an override and disagree, `'fsm'` wins. The FSM
+ *      carrier implements Perfect Negotiation, session-ID stale-signal
+ *      rejection, and quadratic backoff — the three patterns that the
+ *      industry identifies as load-bearing on marginal NAT paths, which
+ *      is exactly the regime in which an auto-flip-driven disagreement
+ *      tends to land. See WEBRTC_CARRIER_ANALYSIS.md.
  *   3. If only one side has an override, that override applies.
  *   4. Otherwise the global default applies — `'fsm'` if either side
  *      has `webrtcImpl: 'fsm'`, else `'simplepeer'`.
@@ -85,7 +88,7 @@ export function resolveWebrtcImpl(
 ): 'simplepeer' | 'fsm' {
   if (myOverride && peerOverride) {
     if (myOverride === peerOverride) return myOverride;
-    return 'simplepeer';
+    return 'fsm';
   }
   if (myOverride) return myOverride;
   if (peerOverride) return peerOverride;

@@ -467,14 +467,12 @@ export class StreamsStore {
    *
    * Resolution order:
    *  1. If either side has set a per-peer override (`peerImpl[other]`), the
-   *     override applies. If both sides override and disagree,
-   *     `'simplepeer'` wins (broader compat, less reconnect machinery).
+   *     override applies. If both sides override and disagree, `'fsm'` wins
+   *     — it has the marginal-NAT machinery (Perfect Negotiation, session-
+   *     ID stale-signal rejection, quadratic backoff) that auto-flip-driven
+   *     disagreements tend to need. See WEBRTC_CARRIER_ANALYSIS.md.
    *  2. Otherwise the global default applies — `'fsm'` if either side has
    *     `webrtcImpl: 'fsm'`, else `'simplepeer'`.
-   *
-   * The "simplepeer wins on conflict" rule exists so the Phase 3 auto-
-   * toggle can pin a failing link to simplepeer unilaterally and have
-   * that decision stick even if the peer had chosen fsm on their side.
    */
   webrtcImplFor(peerB64: AgentPubKeyB64): 'simplepeer' | 'fsm' {
     const myConv = get(this._myModuleStates)['conversation'];
@@ -584,6 +582,13 @@ export class StreamsStore {
     impl: 'simplepeer' | 'fsm',
   ): void {
     const key = `${pubKeyB64}:${connectionId}`;
+    // Stake t0 on the first signaling transition for this (peer, connId).
+    // Done before the attach-gate so re-entries during a pc-not-ready
+    // retry race still anchor t0 at the actual signaling boundary rather
+    // than at the moment pc finally appears.
+    if (!this._iceTimings[key]) {
+      this._iceTimings[key] = { t0: Date.now(), impl };
+    }
     const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
     const attach = () => {
       // Gate inside attach (not at function entry) so a re-entry from a
@@ -604,6 +609,14 @@ export class StreamsStore {
         this.logger.logCustomMessage(
           `ICE [${pubKeyB64.slice(0, 8)}]: ${state} connId=${connectionId.slice(0, 8)}`
         );
+        // First entry to 'connected' (or 'completed') marks the ICE-only
+        // milestone — DTLS may still be in flight. Record once; later
+        // disconnect/recover cycles must not overwrite the initial timing.
+        const t = this._iceTimings[key];
+        if (t && t.tIceConnected === undefined && (state === 'connected' || state === 'completed')) {
+          t.tIceConnected = Date.now();
+        }
+        if (t) t.finalIceState = state;
         // Maintain the invariant: an entry exists iff iceState is
         // currently 'disconnected'. The cleanup paths use a grace
         // period before treating 'disconnected' as terminal.
@@ -636,6 +649,14 @@ export class StreamsStore {
           this.logger.logCustomMessage(
             `ICE candidates summary [${pubKeyB64.slice(0, 8)}]: relay=${hasRelay}`
           );
+          // Stamp gather-complete timing on first transition; the SDP
+          // can re-gather on ICE restart but the establishment-latency
+          // metric refers to the initial gather only.
+          const t = this._iceTimings[key];
+          if (t && t.tGatherComplete === undefined) {
+            t.tGatherComplete = Date.now();
+            t.relay = hasRelay;
+          }
         }
       });
       pc.addEventListener('icecandidate', (event: RTCPeerConnectionIceEvent) => {
@@ -658,6 +679,58 @@ export class StreamsStore {
    */
   private _stopMediaIceMonitor(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
     this._iceMonitorsAttached.delete(`${pubKeyB64}:${connectionId}`);
+    delete this._iceTimings[`${pubKeyB64}:${connectionId}`];
+  }
+
+  /**
+   * Emit a single `IceEstablishment` event with the captured milestone
+   * latencies for this (peer, connectionId). No-op if already emitted,
+   * or if no timing entry exists (e.g. close arrived before any
+   * signaling event — defensive). The carrier identity travels in the
+   * detail string so a single log query can A/B the two carriers.
+   */
+  private _emitIceEstablishment(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+    const key = `${pubKeyB64}:${connectionId}`;
+    const t = this._iceTimings[key];
+    if (!t || t.emitted) return;
+    t.emitted = true;
+    const now = Date.now();
+    const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
+    const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
+    const connect = now - t.t0;
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: now,
+      event: 'IceEstablishment',
+      connectionId,
+      detail: `impl=${t.impl} ice=${ice} gather=${gather} connect=${connect} relay=${t.relay ?? 'unknown'}`,
+    });
+  }
+
+  /**
+   * Counterpart to `_emitIceEstablishment`: emit on close-before-connect
+   * so failure-side latency is also captured. Distinguished from the
+   * success event by name and by carrying the final ICE state so the
+   * log analysis can attribute failures (stuck-in-checking vs failed
+   * vs closed-during-gather). No-op if the establishment event already
+   * fired for this connection.
+   */
+  private _emitIceNeverConnected(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+    const key = `${pubKeyB64}:${connectionId}`;
+    const t = this._iceTimings[key];
+    if (!t || t.emitted) return;
+    t.emitted = true;
+    const now = Date.now();
+    const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
+    const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
+    const elapsed = now - t.t0;
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: now,
+      event: 'IceNeverConnected',
+      connectionId,
+      detail: `impl=${t.impl} ice=${ice} gather=${gather} elapsed=${elapsed} relay=${t.relay ?? 'unknown'} finalIceState=${t.finalIceState ?? 'none'}`,
+    });
   }
 
   /**
@@ -721,6 +794,7 @@ export class StreamsStore {
       event: 'Connected',
       connectionId,
     });
+    this._emitIceEstablishment(pubKeyB64, connectionId);
     // Audio carrier flipped from signals → webrtc (impl-specific) for this peer.
     this.logger.logAgentEvent({
       agent: pubKeyB64,
@@ -884,6 +958,11 @@ export class StreamsStore {
     delete this._staleCycles[pubKeyB64];
     delete this._reconcileAttemptCount[pubKeyB64];
     delete this._iceDisconnectedAt[pubKeyB64];
+    // Capture failure-side latency before _stopMediaIceMonitor wipes
+    // the timing entry. _emitIceNeverConnected no-ops if the
+    // establishment event already fired (i.e. this is a normal close
+    // after a successful connect).
+    this._emitIceNeverConnected(pubKeyB64, connectionId);
     this._stopMediaIceMonitor(pubKeyB64, connectionId);
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
@@ -1169,6 +1248,9 @@ export class StreamsStore {
     }
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
+    // Capture failure-side latency before _stopMediaIceMonitor wipes
+    // the timing entry. Mirrors the _handleMediaClosed path.
+    this._emitIceNeverConnected(pubKeyB64, connectionId);
     this._stopMediaIceMonitor(pubKeyB64, connectionId);
 
     // Drive transport close so the underlying peer is fully torn down.
@@ -2401,6 +2483,24 @@ export class StreamsStore {
    * is logged N times for N signaling transitions on the same pc.
    */
   _iceMonitorsAttached = new Set<string>();
+
+  /**
+   * Per-(peer, connectionId) establishment timings, captured for forensic
+   * A/B-ing of the two WebRTC carriers on marginal links. Emitted as a
+   * single `IceEstablishment` SimpleEvent on phase='connected', or as
+   * `IceNeverConnected` if the connection closes first. See
+   * WEBRTC_CARRIER_ANALYSIS.md for the analysis goal. Key format
+   * `<peerB64>:<connectionId>`, matching `_iceMonitorsAttached`.
+   */
+  _iceTimings: Record<string, {
+    t0: number;
+    impl: 'simplepeer' | 'fsm';
+    tIceConnected?: number;
+    tGatherComplete?: number;
+    relay?: boolean;
+    finalIceState?: string;
+    emitted?: boolean;
+  }> = {};
 
   /**
    * As _iceDisconnectedAt, but for outgoing screen-share peers. Kept

@@ -128,7 +128,23 @@ export type SimpleEventType =
   | 'Superseded'          // write-side: prior conn destroyed at supersede
   | 'SupersededClose'     // read-side: 'close' fired on a superseded peer
   | 'SupersededError'     // read-side: 'error' fired on a superseded peer
-  | 'SupersededConnect';  // read-side: 'connect' fired on a superseded peer
+  | 'SupersededConnect'   // read-side: 'connect' fired on a superseded peer
+  // Establishment-latency forensics, emitted once per (peer, connectionId)
+  // when the transport reaches phase='connected'. The detail field carries
+  // milestone latencies measured from the first signaling event:
+  //   impl=<simplepeer|fsm> ice=<ms> gather=<ms> connect=<ms> relay=<bool>
+  // 'ice' is time-to-first-iceConnectionState-connected (DTLS not yet up).
+  // 'gather' is time-to-iceGatheringState-complete.
+  // 'connect' is time-to-carrier-reported transport-connected.
+  // 'relay' is whether the local SDP advertised any typ=relay candidate.
+  // Used to A/B carriers on real links — FSM should show a higher
+  // non-relay rate and lower median 'ice' on marginal NATs.
+  | 'IceEstablishment'
+  // Counterpart when the connection closes before reaching connected.
+  // Detail format mirrors IceEstablishment but with partial timings and
+  // adds finalIceState=<state> so log-analysis can attribute the failure
+  // (e.g. stuck in 'checking' vs flipped to 'failed').
+  | 'IceNeverConnected';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
