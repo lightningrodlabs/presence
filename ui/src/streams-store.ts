@@ -5481,13 +5481,20 @@ export class StreamsStore {
     const sdpType = data && typeof data === 'object' && 'type' in data && data.type
       ? data.type
       : 'candidate';
-    this._logSdpDataEvent(pubkeyB64, parsed.connection_id, `fsm-${sdpType}`);
+    // processIncomingSignal first so a fresh-from-remote offer creates the
+    // local FSM before we ask for its connectionId.
     this.mediaTransportFsm.processIncomingSignal({
       from: pubkeyB64,
       connectionId: parsed.connection_id,
       peerSessionId: parsed.peer_session_id,
       data: parsed.data,
     });
+    // Log with the LOCAL FSM's connectionId so SdpData entries correlate
+    // with ICE, Connected, FsmClose etc. The wire payload's connection_id
+    // is the SENDER's local id; without this remapping a single FSM
+    // session would show up under two different ids in the timeline.
+    const localConnId = this.mediaTransportFsm.getConnectionId(pubkeyB64) ?? parsed.connection_id;
+    this._logSdpDataEvent(pubkeyB64, localConnId, `fsm-${sdpType}`);
   }
 
   /**
