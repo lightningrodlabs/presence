@@ -488,11 +488,15 @@ export class PresenceLogger {
     const agentMetadataLogs = this.agentPongMetadataLogs[agent] || [];
     const latestMetadata = agentMetadataLogs[agentMetadataLogs.length - 1];
 
-    // We don't want to store the `knownAgents` field because it contains `lastSeen`
-    // which changes too frequently and therefore the metadata would always change
-    // and the timeseries gets cluttered too much
+    // Strip fields that change every pong so the dedup compare sees the
+    // payload as equal across cycles where no actual state changed.
+    // `knownAgents` has a per-pong `lastSeen` heartbeat. `pingT0` is the
+    // sender's outgoing ping timestamp echoed back for live RTT — it
+    // differs on every pong and otherwise defeats dedup completely
+    // (one entry per pong, ~1.9KB each).
     const cleanedData = structuredClone(data); // Make a clone to not delete the field on the original object
     delete cleanedData.knownAgents;
+    delete cleanedData.pingT0;
 
     // Compare current info with info of latest log and if its equal, update the
     // `t_last` timestamp and `n_pongs` value only, otherwise push a new
@@ -548,8 +552,11 @@ export class PresenceLogger {
 
   /**
    * Get all agent events from the current session newer than `sinceMs` milliseconds ago.
+   * Default window is 15 minutes — long enough to capture a session of
+   * trial-and-error configuration changes when diagnosing marginal
+   * STUN/ICE conditions.
    */
-  getRecentAgentEvents(sinceMs: number = 300_000): Record<AgentPubKeyB64, SimpleEvent[]> {
+  getRecentAgentEvents(sinceMs: number = 900_000): Record<AgentPubKeyB64, SimpleEvent[]> {
     const cutoff = Date.now() - sinceMs;
     const result: Record<AgentPubKeyB64, SimpleEvent[]> = {};
     Object.entries(this.agentEvents).forEach(([agent, events]) => {
@@ -563,8 +570,9 @@ export class PresenceLogger {
 
   /**
    * Get all custom logs from the current session newer than `sinceMs` milliseconds ago.
+   * Default window matches getRecentAgentEvents (15 minutes).
    */
-  getRecentCustomLogs(sinceMs: number = 300_000): CustomLog[] {
+  getRecentCustomLogs(sinceMs: number = 900_000): CustomLog[] {
     const cutoff = Date.now() - sinceMs;
     return this.customLogs.filter(log => log.timestamp >= cutoff);
   }

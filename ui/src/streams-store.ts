@@ -583,13 +583,22 @@ export class StreamsStore {
     connectionId: string,
     impl: 'simplepeer' | 'fsm',
   ): void {
+    const key = `${pubKeyB64}:${connectionId}`;
     const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
     const attach = () => {
+      // Gate inside attach (not at function entry) so a re-entry from a
+      // second `signaling` transition keeps polling for pc when the first
+      // call is still retrying. Claiming the key before pc is ready
+      // would let later transitions short-circuit, and on LAN ICE
+      // completes faster than the 100ms retry interval — the listener
+      // would attach after every relevant state change had already fired.
+      if (this._iceMonitorsAttached.has(key)) return;
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
         setTimeout(attach, 100);
         return;
       }
+      this._iceMonitorsAttached.add(key);
       pc.addEventListener('iceconnectionstatechange', () => {
         const state = pc.iceConnectionState;
         this.logger.logCustomMessage(
@@ -642,6 +651,16 @@ export class StreamsStore {
   }
 
   /**
+   * Release the attach-once bookkeeping for a (peer, connectionId) pair.
+   * Called from the close handler so a future reconnect with a fresh
+   * connectionId re-attaches listeners. The underlying pc is GC'd by
+   * the transport; no explicit removeEventListener is needed.
+   */
+  private _stopMediaIceMonitor(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+    this._iceMonitorsAttached.delete(`${pubKeyB64}:${connectionId}`);
+  }
+
+  /**
    * Watch the underlying RTCPeerConnection of an outgoing screen-share
    * peer so the stale-cleanup paths can apply the grace period.
    * Maintains the invariant on `_screenShareIceDisconnectedAt`: an entry
@@ -679,12 +698,6 @@ export class StreamsStore {
     // would otherwise mutate the new connection's slot.
     const currentOnConnect = get(this._openConnections)[pubKeyB64];
     if (currentOnConnect && currentOnConnect.connectionId !== connectionId) {
-      this.logger.logCustomMessage(
-        `Superseded connect [${pubKeyB64.slice(0, 8)}]: ` +
-          `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnConnect.connectionId.slice(0, 8)} ` +
-          `— skipping (would have: marked connected=true, attached mainStream, ` +
-          `fired peer-connected, set ConnectionStatus=Connected, logged CarrierSwitch signals->webrtc)`
-      );
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
@@ -701,6 +714,7 @@ export class StreamsStore {
       return;
     }
     console.log('#### CONNECTED with', pubKeyB64);
+    this._flushSdpAggregatesForConnection(connectionId);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: Date.now(),
@@ -803,14 +817,6 @@ export class StreamsStore {
     // we must NOT wipe its state.
     const currentOnClose = get(this._openConnections)[pubKeyB64];
     if (currentOnClose && currentOnClose.connectionId !== connectionId) {
-      this.logger.logCustomMessage(
-        `Superseded close [${pubKeyB64.slice(0, 8)}]: ` +
-          `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnClose.connectionId.slice(0, 8)} ` +
-          `— skipping cleanup (would have: deleted _openConnections entry, deleted _videoStreams, ` +
-          `cleared _lastBytesReceived/_staleCycles/_reconcileAttemptCount, removed audio analyser, ` +
-          `set _lastDisconnectTime, set ConnectionStatus=Disconnected, ` +
-          `torn down outgoing screen share, fired peer-disconnected)`
-      );
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
@@ -821,8 +827,22 @@ export class StreamsStore {
       return;
     }
 
+    // Duplicate-close guard: the first close already deleted
+    // _openConnections[peer], cleared analyser/stats, and fired
+    // peer-disconnected. A second close event for the same connectionId
+    // would emit a redundant SimplePeerClose/FsmClose and re-fire
+    // peer-disconnected on consumers.
+    if (!currentOnClose) {
+      this._stopMediaIceMonitor(pubKeyB64, connectionId);
+      return;
+    }
+
     const closingConn = currentOnClose;
     const wasWebrtcCarrier = !!closingConn?.connected;
+
+    // Flush any in-flight SdpData bursts for this connection so the
+    // summary lands before the close event in the timeline.
+    this._flushSdpAggregatesForConnection(connectionId);
 
     this.logger.logAgentEvent({
       agent: pubKeyB64,
@@ -864,6 +884,7 @@ export class StreamsStore {
     delete this._staleCycles[pubKeyB64];
     delete this._reconcileAttemptCount[pubKeyB64];
     delete this._iceDisconnectedAt[pubKeyB64];
+    this._stopMediaIceMonitor(pubKeyB64, connectionId);
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
 
@@ -1092,13 +1113,6 @@ export class StreamsStore {
     // Supersede guard (see _handleMediaClosed for the full rationale).
     const currentOnError = get(this._openConnections)[pubKeyB64];
     if (currentOnError && currentOnError.connectionId !== connectionId) {
-      this.logger.logCustomMessage(
-        `Superseded error [${pubKeyB64.slice(0, 8)}]: ` +
-          `connId=${connectionId.slice(0, 8)} superseded-by=${currentOnError.connectionId.slice(0, 8)} ` +
-          `err=${error.message || error} — skipping cleanup (would have: deleted _openConnections entry, ` +
-          `deleted _videoStreams, removed audio analyser, torn down outgoing screen share, ` +
-          `set ConnectionStatus=Disconnected, fired peer-disconnected)`
-      );
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
@@ -1109,15 +1123,22 @@ export class StreamsStore {
       return;
     }
 
+    // Duplicate-error guard: first error already tore the connection
+    // down. Subsequent error events for the same connectionId would
+    // re-emit the same structured event and re-fire peer-disconnected.
+    if (!currentOnError) {
+      this._stopMediaIceMonitor(pubKeyB64, connectionId);
+      return;
+    }
+
     const errLabel = impl === 'fsm' ? 'FsmError' : 'SimplePeerError';
-    this.logger.logCustomMessage(
-      `${errLabel} [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
-    );
+    this._flushSdpAggregatesForConnection(connectionId);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: Date.now(),
       event: errLabel,
       connectionId,
+      detail: error.message || String(error),
     });
 
     delete this._videoStreams[pubKeyB64];
@@ -1148,11 +1169,11 @@ export class StreamsStore {
     }
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
+    this._stopMediaIceMonitor(pubKeyB64, connectionId);
 
     // Drive transport close so the underlying peer is fully torn down.
-    // The resulting close event hits _handleMediaClosed but our supersede
-    // guard lets the already-removed _openConnections entry skip
-    // duplicate work.
+    // The resulting close event hits _handleMediaClosed and our
+    // duplicate-close guard short-circuits it (entry is already removed).
     transport.closeConnection(pubKeyB64, 'error event');
 
     this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
@@ -1781,6 +1802,9 @@ export class StreamsStore {
 
     // Scan for sustained audibility outages with a relay opportunity
     this._checkAudibilityOutages();
+
+    // Flush any SdpData bursts that ended without a follow-up event.
+    this._flushStaleSdpAggregates();
   }
 
   async changeVideoInput(deviceId: string) {
@@ -2369,6 +2393,16 @@ export class StreamsStore {
   _iceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
 
   /**
+   * (peer, connectionId) pairs that already have ICE listeners attached.
+   * The FSM transitions through `signaling` more than once during
+   * renegotiation, and `_dispatchMediaEvent` re-enters
+   * `_startMediaIceMonitor` each time — without this guard, every
+   * iceconnectionstatechange/icegatheringstatechange/icecandidate event
+   * is logged N times for N signaling transitions on the same pc.
+   */
+  _iceMonitorsAttached = new Set<string>();
+
+  /**
    * As _iceDisconnectedAt, but for outgoing screen-share peers. Kept
    * separate because a single agent can have both a video connection and
    * an outgoing screen-share connection in flight with independent ICE
@@ -2539,9 +2573,17 @@ export class StreamsStore {
   _receivedDiagnosticLogs: Writable<Record<AgentPubKeyB64, import('./types').DiagnosticSnapshot>> = writable({});
 
   /**
-   * Tracks pending diagnostic requests (for UI timeout display)
+   * Peers a diagnostic request is in-flight for. Value carries the
+   * current retry attempt (1-based). Removed on response receipt or
+   * when retries are exhausted (and moved to `_failedDiagnosticRequests`).
    */
-  _pendingDiagnosticRequests: Set<AgentPubKeyB64> = new Set();
+  _pendingDiagnosticRequests: Writable<Record<AgentPubKeyB64, { attempts: number; startedAt: number }>> = writable({});
+
+  /**
+   * Peers that exhausted retries with no response. UI surfaces these
+   * so the user can see partial coverage and (optionally) re-try.
+   */
+  _failedDiagnosticRequests: Writable<Record<AgentPubKeyB64, true>> = writable({});
 
   // ===========================================================================================
   // MODULE SYSTEM
@@ -3309,6 +3351,27 @@ export class StreamsStore {
   private _outageStates = new Map<string, { startedAt: number; emitted: boolean }>();
 
   /**
+   * Aggregation state for SdpData events, keyed by `${peer}:${connId}:${sdpType}`.
+   * FSM Perfect-Negotiation glare can fire hundreds of offer/answer pairs
+   * per second on the same connection; ICE trickle on simplepeer fires
+   * dozens of `candidate` events. The first event in a burst passes
+   * through normally for forensic fidelity; subsequent events within
+   * `SDP_AGGREGATE_WINDOW_MS` are coalesced. A summary
+   * `SdpData fsm-offer x47 over 1.0s` flushes either when the next event
+   * arrives outside the window or when the periodic sweep catches a
+   * stale burst (e.g. storm ended without another event).
+   */
+  private _sdpDataAggregates = new Map<string, {
+    count: number;
+    firstTimestamp: number;
+    lastTimestamp: number;
+    agent: AgentPubKeyB64;
+    connectionId: string;
+    sdpType: string;
+  }>();
+  private static readonly SDP_AGGREGATE_WINDOW_MS = 1000;
+
+  /**
    * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
    * Connected as: MediaStreamSource → AnalyserNode (no destination —
    * the <video> element handles playback). Called from the peer-stream
@@ -3867,32 +3930,82 @@ export class StreamsStore {
     );
   }
 
+  /** Maximum number of attempts before marking a diagnostic request failed. */
+  private static readonly DIAGNOSTIC_MAX_ATTEMPTS = 3;
+  /** Per-attempt timeout (ms) before retrying or giving up. */
+  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MS = 8_000;
+
   /**
-   * Request diagnostic logs from a specific peer (or all known agents) via Holochain signal.
+   * Request diagnostic logs from a specific peer (or all known agents) via
+   * Holochain signal. Retries up to DIAGNOSTIC_MAX_ATTEMPTS times if no
+   * response arrives within DIAGNOSTIC_ATTEMPT_TIMEOUT_MS per attempt.
+   * Peers that exhaust retries land in `_failedDiagnosticRequests`.
+   *
+   * Calling again for a peer already in pending/failed re-starts the
+   * retry loop from attempt 1 — lets the user manually retry from the UI.
    */
   async requestDiagnosticLogs(pubKeyB64?: AgentPubKeyB64) {
-    const targets = pubKeyB64
-      ? [decodeHashFromBase64(pubKeyB64)]
-      : Object.keys(get(this._knownAgents))
-          .filter(a => a !== this.myPubKeyB64)
-          .map(b64 => decodeHashFromBase64(b64));
-
-    if (targets.length === 0) return;
-
     const targetKeys = pubKeyB64
       ? [pubKeyB64]
       : Object.keys(get(this._knownAgents)).filter(a => a !== this.myPubKeyB64);
-    targetKeys.forEach(k => this._pendingDiagnosticRequests.add(k));
+    if (targetKeys.length === 0) return;
 
-    await this.roomClient.sendMessage(targets, 'DiagnosticRequest', '');
+    // Clear any prior failed state for these peers — manual re-trigger.
+    this._failedDiagnosticRequests.update(curr => {
+      const next = { ...curr };
+      targetKeys.forEach(k => delete next[k]);
+      return next;
+    });
+
+    targetKeys.forEach(k => this._startDiagnosticAttempt(k, 1));
+
     this.logger.logCustomMessage(
       `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
     );
+  }
 
-    // Timeout: clear pending state after 10s if no response
+  /**
+   * Single attempt of a diagnostic request to one peer. Sends the signal,
+   * schedules a timeout that either retries (attempt + 1) or marks failed.
+   * Handler is no-op if a response has already arrived by the time the
+   * timeout fires (the peer is no longer pending).
+   */
+  private _startDiagnosticAttempt(peerB64: AgentPubKeyB64, attempt: number): void {
+    this._pendingDiagnosticRequests.update(curr => ({
+      ...curr,
+      [peerB64]: { attempts: attempt, startedAt: Date.now() },
+    }));
+
+    const peerHash = decodeHashFromBase64(peerB64);
+    this.roomClient.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
+      this.logger.logCustomMessage(
+        `DiagnosticRequest send failed [${peerB64.slice(0, 8)}] attempt ${attempt}: ${e?.message ?? e}`
+      );
+    });
+
     setTimeout(() => {
-      targetKeys.forEach(k => this._pendingDiagnosticRequests.delete(k));
-    }, 10_000);
+      const stillPending = get(this._pendingDiagnosticRequests)[peerB64];
+      // Response arrived (handler cleared pending) or user re-triggered
+      // a fresh attempt that supersedes this one.
+      if (!stillPending || stillPending.attempts !== attempt) return;
+
+      if (attempt < StreamsStore.DIAGNOSTIC_MAX_ATTEMPTS) {
+        this.logger.logCustomMessage(
+          `DiagnosticRequest timeout [${peerB64.slice(0, 8)}] attempt ${attempt}, retrying`
+        );
+        this._startDiagnosticAttempt(peerB64, attempt + 1);
+      } else {
+        this.logger.logCustomMessage(
+          `DiagnosticRequest failed [${peerB64.slice(0, 8)}] after ${attempt} attempts`
+        );
+        this._pendingDiagnosticRequests.update(curr => {
+          const next = { ...curr };
+          delete next[peerB64];
+          return next;
+        });
+        this._failedDiagnosticRequests.update(curr => ({ ...curr, [peerB64]: true }));
+      }
+    }, StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS);
   }
 
   /**
@@ -3971,6 +4084,83 @@ export class StreamsStore {
   }
 
   /**
+   * Build a merged diagnostic log combining local events with every
+   * received remote snapshot. The result is a single timeline ordered
+   * by timestamp, tagged with which agent emitted each entry. Used by
+   * the room-level bulk download path.
+   */
+  exportMergedLogsAll(): object {
+    const localAgentEvents = this.logger.getRecentAgentEvents();
+    const localCustomLogs = this.logger.getRecentCustomLogs();
+    const allRemote = get(this._receivedDiagnosticLogs);
+
+    type MergedEntry = {
+      timestamp: number;
+      source: AgentPubKeyB64; // emitter of the entry
+      sourceLabel: 'local' | 'remote';
+      type: string;
+      detail: string;
+      connectionId?: string;
+    };
+    const merged: MergedEntry[] = [];
+
+    Object.entries(localAgentEvents).forEach(([agent, events]) => {
+      events.forEach(e => {
+        merged.push({
+          timestamp: e.timestamp,
+          source: this.myPubKeyB64,
+          sourceLabel: 'local',
+          type: 'event',
+          detail: `[${agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
+          connectionId: e.connectionId,
+        });
+      });
+    });
+    localCustomLogs.forEach(log => {
+      merged.push({
+        timestamp: log.timestamp,
+        source: this.myPubKeyB64,
+        sourceLabel: 'local',
+        type: 'custom',
+        detail: log.log,
+      });
+    });
+
+    const respondingPeers: AgentPubKeyB64[] = [];
+    Object.entries(allRemote).forEach(([peerB64, snapshot]) => {
+      respondingPeers.push(peerB64);
+      snapshot.agentEvents.forEach(e => {
+        merged.push({
+          timestamp: e.timestamp,
+          source: peerB64,
+          sourceLabel: 'remote',
+          type: 'event',
+          detail: `[${e.agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
+          connectionId: e.connectionId,
+        });
+      });
+      snapshot.customLogs.forEach(log => {
+        merged.push({
+          timestamp: log.timestamp,
+          source: peerB64,
+          sourceLabel: 'remote',
+          type: 'custom',
+          detail: log.log,
+        });
+      });
+    });
+
+    merged.sort((a, b) => a.timestamp - b.timestamp);
+
+    return {
+      generatedAt: Date.now(),
+      localAgent: this.myPubKeyB64,
+      respondingPeers,
+      entries: merged,
+    };
+  }
+
+  /**
    * Bucket RTT and loss into coarse human-scale bands. The goal is
    * log compression: every poll cycle the raw numbers wiggle, but the
    * bucket changes only when quality actually shifts category. RTT bands
@@ -4012,13 +4202,20 @@ export class StreamsStore {
     jitterMs: number | null,
     lossPercent: number | null,
   ) {
+    // WebRTC: the first stats poll after `connected` often returns RTT
+    // before any inbound-rtp packets, leaving loss null for ~1 cycle.
+    // That used to fire a spurious "webrtc:good:unknown" bucket one tick
+    // before the real "webrtc:good:clean". Require a fully-defined sample
+    // on the webrtc carrier — bucketing is cheap, we can wait a poll.
+    // Signals: RTT comes from pong-echo every cycle, loss/jitter only
+    // exist while voice is flowing. Don't gate signals on loss or we'd
+    // never bucket idle/muted links. Just require any signal at all.
+    if (carrier === 'webrtc' && (rttMs === null || lossPercent === null)) return;
+    if (rttMs === null && lossPercent === null) return;
     const bucket = this._qualityBucket(carrier, rttMs, lossPercent);
     const last = this._lastQualityBucket.get(pubKeyB64);
     if (bucket === last) return;
     this._lastQualityBucket.set(pubKeyB64, bucket);
-    // Don't emit before we have any signal at all — a transition from
-    // (no data) to (no data) on carrier flip is not interesting.
-    if (rttMs === null && lossPercent === null) return;
     const detail =
       `${bucket}` +
       (rttMs !== null ? ` rtt=${rttMs}ms` : '') +
@@ -4030,6 +4227,101 @@ export class StreamsStore {
       event: 'QualityBucketChange',
       detail,
     });
+  }
+
+  /**
+   * Log an SdpData event with burst aggregation. See `_sdpDataAggregates`
+   * for the rationale. First event of a burst always passes through with
+   * full detail; subsequent events within SDP_AGGREGATE_WINDOW_MS are
+   * coalesced into a count. When a new event arrives after the window
+   * expires the prior burst (if count > 1) is flushed as a summary
+   * before the new event is emitted. `_flushStaleSdpAggregates` handles
+   * bursts that end with no follow-up event.
+   */
+  private _logSdpDataEvent(
+    agent: AgentPubKeyB64,
+    connectionId: string,
+    sdpType: string,
+  ): void {
+    const key = `${agent}:${connectionId}:${sdpType}`;
+    const now = Date.now();
+    const entry = this._sdpDataAggregates.get(key);
+    const withinWindow = entry && (now - entry.lastTimestamp) < StreamsStore.SDP_AGGREGATE_WINDOW_MS;
+
+    if (withinWindow) {
+      entry!.count += 1;
+      entry!.lastTimestamp = now;
+      return;
+    }
+
+    if (entry && entry.count > 1) {
+      this._emitSdpAggregateSummary(entry);
+    }
+
+    this.logger.logAgentEvent({
+      agent,
+      timestamp: now,
+      event: 'SdpData',
+      connectionId,
+      detail: sdpType,
+    });
+    this._sdpDataAggregates.set(key, {
+      count: 1,
+      firstTimestamp: now,
+      lastTimestamp: now,
+      agent,
+      connectionId,
+      sdpType,
+    });
+  }
+
+  private _emitSdpAggregateSummary(entry: {
+    count: number;
+    firstTimestamp: number;
+    lastTimestamp: number;
+    agent: AgentPubKeyB64;
+    connectionId: string;
+    sdpType: string;
+  }): void {
+    const durationMs = entry.lastTimestamp - entry.firstTimestamp;
+    this.logger.logAgentEvent({
+      agent: entry.agent,
+      timestamp: entry.lastTimestamp,
+      event: 'SdpData',
+      connectionId: entry.connectionId,
+      detail: `${entry.sdpType} x${entry.count} over ${(durationMs / 1000).toFixed(1)}s`,
+    });
+  }
+
+  /**
+   * Flush SdpData aggregates whose last event is older than the window —
+   * i.e. bursts that ended without another event to push them out
+   * naturally. Called on the same 2s ping tick that drives the rest of
+   * the periodic bookkeeping.
+   */
+  private _flushStaleSdpAggregates(): void {
+    const now = Date.now();
+    for (const [key, entry] of this._sdpDataAggregates) {
+      if ((now - entry.lastTimestamp) >= StreamsStore.SDP_AGGREGATE_WINDOW_MS) {
+        if (entry.count > 1) this._emitSdpAggregateSummary(entry);
+        this._sdpDataAggregates.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Flush all SdpData aggregates for a given connectionId. Called from
+   * the close/error paths so the storm summary lands in the timeline
+   * immediately before the FsmClose / SimplePeerClose / *Error event,
+   * not at the next periodic tick (where it would orphan).
+   */
+  private _flushSdpAggregatesForConnection(connectionId: string): void {
+    for (const [key, entry] of this._sdpDataAggregates) {
+      if (entry.connectionId === connectionId) {
+        if (entry.count > 1) this._emitSdpAggregateSummary(entry);
+        this._sdpDataAggregates.delete(key);
+      }
+    }
   }
 
   /**
@@ -5183,13 +5475,13 @@ export class StreamsStore {
       console.warn(`SdpFsm parse error from ${pubkeyB64.slice(0, 8)}:`, e);
       return;
     }
-    this.logger.logAgentEvent({
-      agent: pubkeyB64,
-      timestamp: Date.now(),
-      event: 'SdpData',
-      connectionId: parsed.connection_id,
-      detail: 'fsm',
-    });
+    // Surface the sub-type so the FSM path is as readable in logs as
+    // the simplepeer path (which records 'offer'/'answer'/'candidate').
+    const data = parsed.data as { type?: string } | null;
+    const sdpType = data && typeof data === 'object' && 'type' in data && data.type
+      ? data.type
+      : 'candidate';
+    this._logSdpDataEvent(pubkeyB64, parsed.connection_id, `fsm-${sdpType}`);
     this.mediaTransportFsm.processIncomingSignal({
       from: pubkeyB64,
       connectionId: parsed.connection_id,
@@ -5208,23 +5500,14 @@ export class StreamsStore {
     const { connection_id, data } = JSON.parse(signal.payload) as SdpPayload;
     console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, data);
 
-    // Log the SDP sub-type for diagnostics
+    let sdpType = 'candidate';
     try {
-      const sdpContent = JSON.parse(data);
-      const sdpType = sdpContent.type || 'candidate';
-      this.logger.logCustomMessage(
-        `SDP ${sdpType} [${pubkeyB64.slice(0, 8)}] connId=${connection_id.slice(0, 8)}`
-      );
+      sdpType = JSON.parse(data).type || 'candidate';
     } catch {
-      // ignore parse errors for logging
+      // ignore parse errors
     }
 
-    this.logger.logAgentEvent({
-      agent: pubkeyB64,
-      timestamp: Date.now(),
-      event: 'SdpData',
-      connectionId: connection_id,
-    });
+    this._logSdpDataEvent(pubkeyB64, connection_id, sdpType);
 
     // Update connection status
     this.updateConnectionStatus(pubkeyB64, { type: 'SdpExchange' });
@@ -5450,11 +5733,18 @@ export class StreamsStore {
 
     try {
       const snapshot: DiagnosticSnapshot = JSON.parse(signal.payload);
-      this._receivedDiagnosticLogs.update(current => {
-        current[pubkeyB64] = snapshot;
-        return current;
+      this._receivedDiagnosticLogs.update(current => ({ ...current, [pubkeyB64]: snapshot }));
+      this._pendingDiagnosticRequests.update(curr => {
+        const next = { ...curr };
+        delete next[pubkeyB64];
+        return next;
       });
-      this._pendingDiagnosticRequests.delete(pubkeyB64);
+      this._failedDiagnosticRequests.update(curr => {
+        if (!curr[pubkeyB64]) return curr;
+        const next = { ...curr };
+        delete next[pubkeyB64];
+        return next;
+      });
       this.logger.logCustomMessage(
         `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs`
       );

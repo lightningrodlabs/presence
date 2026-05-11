@@ -62,6 +62,14 @@ export class RTCPeer {
   private _taskResolvers: Array<() => void> = [];
   private _processingTasks = false;
 
+  // Stream IDs already surfaced via the 'stream' event. The native `track`
+  // event fires once per remote track, but `streams` references the same
+  // MediaStream object for tracks that share a stream. Without this guard,
+  // a 2-track stream produces 2 identical 'stream' emissions — which breaks
+  // the invariant that downstream sees one `StreamReceived` event per
+  // stream, the same way simplepeer behaves.
+  private _emittedStreamIds = new Set<string>();
+
   constructor(options: RTCPeerOptions) {
     this._polite = options.polite;
     this._trickleICE = options.trickleICE ?? true;
@@ -236,6 +244,7 @@ export class RTCPeer {
     }
     this._taskResolvers = [];
     this._taskQueue = [];
+    this._emittedStreamIds.clear();
     // Unblock any pending gathering wait so it doesn't leak
     if (this._gatheringCompleteResolve) {
       this._gatheringCompleteResolve();
@@ -452,8 +461,10 @@ export class RTCPeer {
     this.pc.addEventListener('track', (event: any) => {
       if (this._destroyed) return;
       this._emit({ type: 'track', data: { track: event.track, streams: event.streams } });
-      if (event.streams && event.streams.length > 0) {
-        this._emit({ type: 'stream', data: event.streams[0] });
+      const stream = event.streams?.[0] as MediaStream | undefined;
+      if (stream && !this._emittedStreamIds.has(stream.id)) {
+        this._emittedStreamIds.add(stream.id);
+        this._emit({ type: 'stream', data: stream });
       }
     });
   }

@@ -26,7 +26,6 @@ import {
   mdiPaperclip,
   mdiPencilCircleOutline,
   mdiHub,
-  mdiDownload,
   mdiCloudDownloadOutline,
   mdiVideo,
   mdiVideoOff,
@@ -69,7 +68,6 @@ import './logs-graph';
 import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
 import { PING_INTERVAL, StreamsStore } from '../streams-store';
 import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
-import { exportLogs } from '../logging';
 import { getAllModules, getModule, getShareModules } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
@@ -160,6 +158,18 @@ export class RoomView extends LitElement {
   _receivedDiagnosticLogs = new StoreSubscriber(
     this,
     () => this.streamsStore._receivedDiagnosticLogs,
+    () => [this.streamsStore]
+  );
+
+  _pendingDiagnosticRequests = new StoreSubscriber(
+    this,
+    () => this.streamsStore._pendingDiagnosticRequests,
+    () => [this.streamsStore]
+  );
+
+  _failedDiagnosticRequests = new StoreSubscriber(
+    this,
+    () => this.streamsStore._failedDiagnosticRequests,
     () => [this.streamsStore]
   );
 
@@ -1118,20 +1128,31 @@ export class RoomView extends LitElement {
       <!-- Diagnostic log request button -->
       ${(() => {
         const hasReceivedLogs = !!this._receivedDiagnosticLogs?.value?.[pubkeyB64];
-        const isPending = this.streamsStore._pendingDiagnosticRequests.has(pubkeyB64);
+        const pending = this._pendingDiagnosticRequests?.value?.[pubkeyB64];
+        const failed = !!this._failedDiagnosticRequests?.value?.[pubkeyB64];
+        const color = hasReceivedLogs
+          ? '#09b500'
+          : pending
+            ? '#e7a008'
+            : failed
+              ? '#d23030'
+              : '#c3c9eb';
+        const tooltip = hasReceivedLogs
+          ? 'Download merged diagnostic logs'
+          : pending
+            ? `Requesting logs... (attempt ${pending.attempts})`
+            : failed
+              ? 'No response after 3 attempts — click to retry'
+              : 'Request peer diagnostic logs';
         return html`
           <sl-tooltip
             hoist
             class="tooltip-filled"
             placement="top"
-            content="${hasReceivedLogs
-              ? 'Download merged diagnostic logs'
-              : isPending
-                ? 'Requesting logs...'
-                : 'Request peer diagnostic logs'}"
+            content="${tooltip}"
           >
             <sl-icon
-              style="font-size: 18px; color: ${hasReceivedLogs ? '#09b500' : isPending ? '#e7a008' : '#c3c9eb'}; cursor: pointer; margin-top: 2px;"
+              style="font-size: 18px; color: ${color}; cursor: pointer; margin-top: 2px;"
               .src=${wrapPathInSvg(mdiCloudDownloadOutline)}
               @click=${() => {
                 if (hasReceivedLogs) {
@@ -1139,9 +1160,8 @@ export class RoomView extends LitElement {
                     `Presence_diagnostic_${pubkeyB64.slice(0, 8)}_${formattedDate()}.json`,
                     JSON.stringify(this.streamsStore.exportMergedLogs(pubkeyB64), undefined, 2)
                   );
-                } else {
+                } else if (!pending) {
                   this.streamsStore.requestDiagnosticLogs(pubkeyB64);
-                  this.requestUpdate();
                 }
               }}
             ></sl-icon>
@@ -1266,24 +1286,56 @@ export class RoomView extends LitElement {
     return html`
       <div class="toggles-panel">
         ${this._showConnectionDetails
-          ? html`
-              <sl-tooltip content="${msg('Export Logs')}" hoist>
+          ? (() => {
+              const received = this._receivedDiagnosticLogs?.value ?? {};
+              const pending = this._pendingDiagnosticRequests?.value ?? {};
+              const failed = this._failedDiagnosticRequests?.value ?? {};
+              const receivedCount = Object.keys(received).length;
+              const pendingCount = Object.keys(pending).length;
+              const failedCount = Object.keys(failed).length;
+              const isPending = pendingCount > 0;
+              const hasAnyReceived = receivedCount > 0;
+              const failedSuffix = failedCount > 0
+                ? ` — ${failedCount} peer${failedCount === 1 ? '' : 's'} failed: ${Object.keys(failed).map(k => k.slice(0, 8)).join(', ')}`
+                : '';
+              const tooltip = isPending
+                ? `Requesting logs from ${pendingCount} peer${pendingCount === 1 ? '' : 's'}...${failedSuffix}`
+                : hasAnyReceived
+                  ? `Download merged logs from ${receivedCount} peer${receivedCount === 1 ? '' : 's'} + local${failedSuffix}`
+                  : failedCount > 0
+                    ? `No peers responded after 3 attempts${failedSuffix} — click to retry`
+                    : 'Request diagnostic logs from all peers on call';
+              const color = isPending
+                ? '#e7a008'
+                : hasAnyReceived
+                  ? '#09b500'
+                  : failedCount > 0
+                    ? '#d23030'
+                    : '';
+              return html`
+              <sl-tooltip content="${tooltip}" hoist>
                 <div
                   class="toggle-btn"
                   style="position: absolute; left: -130px;"
                   tabindex="0"
                   @click=${(e: any) => {
-                    downloadJson(
-                      `Presence_${__APP_VERSION__}_logs_${formattedDate()}.json`,
-                      JSON.stringify(exportLogs(), undefined, 2)
-                    );
                     e.stopPropagation();
+                    if (isPending) return;
+                    if (hasAnyReceived) {
+                      downloadJson(
+                        `Presence_merged_${__APP_VERSION__}_${formattedDate()}.json`,
+                        JSON.stringify(this.streamsStore.exportMergedLogsAll(), undefined, 2)
+                      );
+                    } else {
+                      this.streamsStore.requestDiagnosticLogs();
+                    }
                   }}
                   @keypress=${() => undefined}
                 >
                   <sl-icon
                     class="toggle-btn-icon"
-                    .src=${wrapPathInSvg(mdiDownload)}
+                    style="color: ${color};"
+                    .src=${wrapPathInSvg(mdiCloudDownloadOutline)}
                   ></sl-icon>
                 </div>
               </sl-tooltip>
@@ -1306,7 +1358,8 @@ export class RoomView extends LitElement {
                   ></sl-icon>
                 </div>
               </sl-tooltip>
-            `
+            `;
+            })()
           : html``}
         <sl-tooltip
           content="${this._microphone
