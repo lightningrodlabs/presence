@@ -338,6 +338,7 @@ export class StreamsStore {
           }),
         );
       },
+      onTransition: (entry) => this._logFsmTransition(entry),
     });
 
     // Subscribe transport events to the application-level handlers.
@@ -604,6 +605,9 @@ export class StreamsStore {
         return;
       }
       this._iceMonitorsAttached.add(key);
+      const ac = new AbortController();
+      this._iceMonitorAbortControllers.set(key, ac);
+      const signal = ac.signal;
       pc.addEventListener('iceconnectionstatechange', () => {
         const state = pc.iceConnectionState;
         this.logger.logCustomMessage(
@@ -638,7 +642,7 @@ export class StreamsStore {
             // getSenders/iceTransport may not be available on all browsers
           }
         }
-      });
+      }, { signal });
       pc.addEventListener('icegatheringstatechange', () => {
         this.logger.logCustomMessage(
           `ICE gathering [${pubKeyB64.slice(0, 8)}]: ${pc.iceGatheringState}`
@@ -658,7 +662,7 @@ export class StreamsStore {
             t.relay = hasRelay;
           }
         }
-      });
+      }, { signal });
       pc.addEventListener('icecandidate', (event: RTCPeerConnectionIceEvent) => {
         if (event.candidate) {
           const c = event.candidate;
@@ -666,20 +670,28 @@ export class StreamsStore {
             `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${c.type} ${c.protocol} ${c.address}:${c.port}`
           );
         }
-      });
+      }, { signal });
     };
     attach();
   }
 
   /**
-   * Release the attach-once bookkeeping for a (peer, connectionId) pair.
-   * Called from the close handler so a future reconnect with a fresh
-   * connectionId re-attaches listeners. The underlying pc is GC'd by
-   * the transport; no explicit removeEventListener is needed.
+   * Release the attach-once bookkeeping for a (peer, connectionId) pair
+   * AND actively detach the listeners by aborting their AbortController.
+   * Called from the close/error paths so a future reconnect with a fresh
+   * connectionId re-attaches a clean set, and orphaned pcs (where the
+   * FSM teardown didn't synchronously destroy the underlying pc) stop
+   * leaking ICE-state events into the log.
    */
   private _stopMediaIceMonitor(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
-    this._iceMonitorsAttached.delete(`${pubKeyB64}:${connectionId}`);
-    delete this._iceTimings[`${pubKeyB64}:${connectionId}`];
+    const key = `${pubKeyB64}:${connectionId}`;
+    this._iceMonitorsAttached.delete(key);
+    delete this._iceTimings[key];
+    const ac = this._iceMonitorAbortControllers.get(key);
+    if (ac) {
+      ac.abort();
+      this._iceMonitorAbortControllers.delete(key);
+    }
   }
 
   /**
@@ -708,12 +720,17 @@ export class StreamsStore {
   }
 
   /**
-   * Counterpart to `_emitIceEstablishment`: emit on close-before-connect
-   * so failure-side latency is also captured. Distinguished from the
-   * success event by name and by carrying the final ICE state so the
-   * log analysis can attribute failures (stuck-in-checking vs failed
-   * vs closed-during-gather). No-op if the establishment event already
-   * fired for this connection.
+   * Counterpart to `_emitIceEstablishment`: emit on close-before-FSM-connected
+   * so failure-side latency is also captured. Splits into two event types
+   * based on whether ICE itself succeeded:
+   *   - `IceNeverConnected`: ICE didn't reach 'connected'/'completed' —
+   *     a real network/NAT diagnostic (stuck checking, failed, closed
+   *     during gather).
+   *   - `ConnectionAborted`: ICE was fine but the FSM was torn down before
+   *     reaching `connected` (carrier flip / disconnectFromPeerVideo /
+   *     remote-leave mid-handshake). Not an ICE problem; bookkeeping.
+   * Both carry the same fields so log analysis is uniform; only the event
+   * name differs. No-op if the establishment event already fired.
    */
   private _emitIceNeverConnected(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
     const key = `${pubKeyB64}:${connectionId}`;
@@ -724,10 +741,12 @@ export class StreamsStore {
     const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
     const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
     const elapsed = now - t.t0;
+    const iceReachedConnected =
+      t.finalIceState === 'connected' || t.finalIceState === 'completed';
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: now,
-      event: 'IceNeverConnected',
+      event: iceReachedConnected ? 'ConnectionAborted' : 'IceNeverConnected',
       connectionId,
       detail: `impl=${t.impl} ice=${ice} gather=${gather} elapsed=${elapsed} relay=${t.relay ?? 'unknown'} finalIceState=${t.finalIceState ?? 'none'}`,
     });
@@ -2483,6 +2502,20 @@ export class StreamsStore {
    * is logged N times for N signaling transitions on the same pc.
    */
   _iceMonitorsAttached = new Set<string>();
+
+  /**
+   * AbortController per (peer, connectionId) carrying the
+   * `iceconnectionstatechange` / `icegatheringstatechange` / `icecandidate`
+   * listeners attached by `_startMediaIceMonitor`. Calling `.abort()` on
+   * stop actively removes the listeners regardless of whether the
+   * underlying RTCPeerConnection is still alive — necessary because the
+   * FSM-side teardown does not always destroy the pc synchronously, so
+   * stale listeners on orphaned pcs would otherwise keep emitting
+   * `ICE [...]: checking` events long after FsmClose (witnessed in the
+   * 3-node toggle-storm capture, ~3 concurrent pcs per peer until
+   * SDP timeout cleaned them up).
+   */
+  _iceMonitorAbortControllers = new Map<string, AbortController>();
 
   /**
    * Per-(peer, connectionId) establishment timings, captured for forensic
@@ -4261,17 +4294,23 @@ export class StreamsStore {
   }
 
   /**
-   * Bucket RTT and loss into coarse human-scale bands. The goal is
-   * log compression: every poll cycle the raw numbers wiggle, but the
+   * Bucket RTT, loss, and jitter into coarse human-scale bands. The goal
+   * is log compression: every poll cycle the raw numbers wiggle, but the
    * bucket changes only when quality actually shifts category. RTT bands
    * are tuned for voice — >200ms is where duplex conversation starts to
    * feel laggy; >400ms is walkie-talkie territory. Loss bands match the
    * points where Opus concealment starts to be audible (1%) and where
-   * most listeners will complain (3%).
+   * most listeners will complain (3%). Jitter bands are tuned around the
+   * voice jitter buffer (80 ms target) — anything past `rough` means the
+   * buffer is being overrun and audio starts to glitch. The signals
+   * carrier can hit `choppy`/`broken` under Holochain signal overload;
+   * surfacing that as a bucket transition (rather than hiding it in the
+   * `detail` text) makes it usable as a failover input.
    */
   private _qualityBucket(
     carrier: 'webrtc' | 'signals',
     rttMs: number | null,
+    jitterMs: number | null,
     lossPercent: number | null,
   ): string {
     const rttBand =
@@ -4285,7 +4324,13 @@ export class StreamsStore {
       : lossPercent < 1 ? 'clean'
       : lossPercent <= 3 ? 'mild'
       : 'lossy';
-    return `${carrier}:${rttBand}:${lossBand}`;
+    const jitBand =
+      jitterMs === null ? 'unknown'
+      : jitterMs < 30 ? 'smooth'
+      : jitterMs <= 100 ? 'rough'
+      : jitterMs <= 500 ? 'choppy'
+      : 'broken';
+    return `${carrier}:${rttBand}:${lossBand}:${jitBand}`;
   }
 
   /**
@@ -4312,7 +4357,7 @@ export class StreamsStore {
     // never bucket idle/muted links. Just require any signal at all.
     if (carrier === 'webrtc' && (rttMs === null || lossPercent === null)) return;
     if (rttMs === null && lossPercent === null) return;
-    const bucket = this._qualityBucket(carrier, rttMs, lossPercent);
+    const bucket = this._qualityBucket(carrier, rttMs, jitterMs, lossPercent);
     const last = this._lastQualityBucket.get(pubKeyB64);
     if (bucket === last) return;
     this._lastQualityBucket.set(pubKeyB64, bucket);
@@ -4390,6 +4435,41 @@ export class StreamsStore {
       event: 'SdpData',
       connectionId: entry.connectionId,
       detail: `${entry.sdpType} x${entry.count} over ${(durationMs / 1000).toFixed(1)}s`,
+    });
+  }
+
+  /**
+   * Log a single FSM transition as a structured event. Driven by the
+   * FsmTransport's onTransition callback (which forwards every
+   * PeerConnectionFSM._onTransition call). The detail string carries
+   * `<from>-><to> trigger="..."` so log analysis can attribute
+   * signaling re-entries to specific causes — notably the
+   * "fresh peer for new remote connection" path that fires on glare-
+   * induced renegotiation cycles. peerSessionId, when present, makes
+   * it possible to count distinct peer-session generations within a
+   * single connectionId.
+   *
+   * Self-transitions (fromState === toState) are still logged: the
+   * FSM uses these to signal sub-state changes within a phase (e.g.
+   * reconnecting → reconnecting on a full reconnect) and they're the
+   * very events we need to see when diagnosing storm-like behaviour.
+   */
+  private _logFsmTransition(entry: import('./transport/fsm/types').FSMTransitionEntry): void {
+    // Drop internal DTLS-watchdog bookkeeping. These are self-transitions
+    // within `connecting`, fire 3-4 times per successful FSM connection,
+    // and duplicate the information already carried by the surrounding
+    // ICE state events. Keep them out of the timeline unless we're
+    // specifically debugging DTLS / data-channel readiness.
+    if (entry.trigger.startsWith('DIAG:')) return;
+    const detail =
+      `${entry.fromState}->${entry.toState} trigger="${entry.trigger}"` +
+      (entry.peerSessionId !== undefined ? ` peerSession=${entry.peerSessionId}` : '');
+    this.logger.logAgentEvent({
+      agent: entry.remoteAgent,
+      timestamp: entry.timestamp,
+      event: 'FsmTransition',
+      connectionId: entry.connectionId,
+      detail,
     });
   }
 

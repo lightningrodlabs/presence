@@ -40,6 +40,7 @@ import { ConnectionManager } from './connection-manager';
 import { DEFAULT_CONFIG } from './types';
 import type {
   ConnectionConfig,
+  FSMTransitionEntry,
   SignalingAdapter,
   SignalMessage,
   Unsubscribe as FsmUnsubscribe,
@@ -56,6 +57,11 @@ export type FsmTransportOptions = PeerTransportOptions & {
   configOverrides?: Partial<ConnectionConfig>;
   /** Test seam: factory for RTCPeerConnection. */
   createPeerConnection?: (config: RTCConfiguration) => RTCPeerConnection;
+  /** Forensic hook fired on every FSM state transition. Carries the
+   *  trigger string the FSM logs internally — wire this up in the
+   *  application layer (e.g. log as `FsmTransition` events) to make
+   *  the cause of each (re)entry into signaling visible in capture. */
+  onTransition?: (entry: FSMTransitionEntry) => void;
 };
 
 export class FsmTransport implements PeerTransport {
@@ -114,6 +120,7 @@ export class FsmTransport implements PeerTransport {
       signaling: adapter,
       config: this._config,
       createPeerConnection: options.createPeerConnection,
+      onTransition: options.onTransition,
     });
 
     this._manager.on('connection-state-changed', (e: any) => {

@@ -140,11 +140,24 @@ export type SimpleEventType =
   // Used to A/B carriers on real links — FSM should show a higher
   // non-relay rate and lower median 'ice' on marginal NATs.
   | 'IceEstablishment'
-  // Counterpart when the connection closes before reaching connected.
+  // Counterpart when the connection closes before reaching connected
+  // AND ICE itself failed to land (finalIceState != 'connected'/'completed').
   // Detail format mirrors IceEstablishment but with partial timings and
   // adds finalIceState=<state> so log-analysis can attribute the failure
   // (e.g. stuck in 'checking' vs flipped to 'failed').
-  | 'IceNeverConnected';
+  | 'IceNeverConnected'
+  // Connection closed before the FSM reached its `connected` state, but
+  // ICE itself was fine (finalIceState='connected'|'completed'). This is
+  // the user-aborted / carrier-flipped-mid-handshake case — not an ICE
+  // diagnostic, just bookkeeping. Distinguished from IceNeverConnected so
+  // forensic analysis doesn't mis-attribute network failures.
+  | 'ConnectionAborted'
+  // FSM-internal state transition — only emitted by the FSM transport.
+  // The detail string carries `<fromState>-><toState> trigger="<reason>"`.
+  // Used to forensically explain why an FSM attempt enters signaling
+  // multiple times (e.g. the "fresh peer for new remote connection"
+  // path that fires on glare-induced renegotiation cycles).
+  | 'FsmTransition';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
