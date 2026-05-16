@@ -470,7 +470,15 @@ export class PeerConnectionFSM {
         // Timeout if SDP exchange takes too long
         this._startTimer('sdp-exchange-timeout', this._config.sdpExchangeTimeoutMs, () => {
           if (this._state === 'signaling') {
-            this._transition('disconnected', { trigger: `SDP exchange timeout (${this._config.sdpExchangeTimeoutMs}ms)` });
+            // Record the RTCPeerConnection signalingState so log analysis
+            // can tell where the SDP exchange stalled (e.g. stuck in
+            // have-local-offer = answer never arrived).
+            const snap = this.transportSnapshot;
+            this._transition('disconnected', {
+              trigger:
+                `SDP exchange timeout (${this._config.sdpExchangeTimeoutMs}ms, ` +
+                `signaling=${snap.signaling} ice=${snap.ice})`,
+            });
           }
         });
         break;
@@ -1141,10 +1149,13 @@ export class PeerConnectionFSM {
       // Act FIRST — transition to disconnected before any async work.
       // The getStats() call below can hang on a stalled peer connection,
       // which would block the retry if we awaited it before transitioning.
+      // Capture DTLS / data-channel state so log analysis can tell a
+      // handshake that never started from one that hung mid-negotiation.
+      const dtlsDetail = `dtls=${snapshot.dtls} dc=${snapshot.dataChannel}`;
       if (this._state === 'connecting') {
-        this._transition('disconnected', { trigger: `DTLS stall after ${stallMs}ms (stall #${this._dtlsStallCount})` });
+        this._transition('disconnected', { trigger: `DTLS stall after ${stallMs}ms (stall #${this._dtlsStallCount}, ${dtlsDetail})` });
       } else if (this._state === 'reconnecting') {
-        this._transition('disconnected', { trigger: `DTLS stall during reconnect after ${stallMs}ms (stall #${this._dtlsStallCount})` });
+        this._transition('disconnected', { trigger: `DTLS stall during reconnect after ${stallMs}ms (stall #${this._dtlsStallCount}, ${dtlsDetail})` });
       }
     }, this._config.dtlsStallTimeoutMs);
   }
