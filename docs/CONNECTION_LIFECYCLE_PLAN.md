@@ -21,7 +21,14 @@ Date: 2026-05-15
   transition (`transport/fsm/connection-manager.ts:362-377`). The earlier
   finding that closed FSMs linger was imprecise. Remaining 1C work is narrower
   than first stated — see the revised note in Phase 1C below.
-- **Phases 1B, 1C, 1D, 2, 4 — not yet implemented.** 1B/1C/1D touch the
+- **Phase 2 — partially DONE & typecheck-verified** (240/240 tests pass).
+  Implemented in the ping cycle / voice module: `SignalCarrierDown/Up`
+  events (item 1), `PresenceAdd/PresenceRemove` events with reason
+  (item 2), and a jitter-deviation clamp in `voice.ts` so a post-stall
+  frame can no longer spike the EWMA to nonsense (item 5). Remaining
+  Phase 2 items: DTLS state at stall (item 3) and SDP-timeout step
+  reached (item 4) — both in the FSM.
+- **Phases 1B, 1C, 1D, 4 — not yet implemented.** 1B/1C/1D touch the
   realtime connection-teardown path and should land as separate,
   runtime-tested increments rather than alongside 1A.
 

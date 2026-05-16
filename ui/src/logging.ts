@@ -157,7 +157,15 @@ export type SimpleEventType =
   // Used to forensically explain why an FSM attempt enters signaling
   // multiple times (e.g. the "fresh peer for new remote connection"
   // path that fires on glare-induced renegotiation cycles).
-  | 'FsmTransition';
+  | 'FsmTransition'
+  // Presence-set membership forensics, emitted once per ping cycle when a
+  // peer enters or leaves `globalPresenceSet()` (which drives pane
+  // rendering). `detail` carries the reason — for adds,
+  // `reason=media-live|ping-fresh|observer-reported`; for removes,
+  // `reason=ping-stale+no-media`. Lets log analysis see exactly when and
+  // why a peer's pane appeared or disappeared.
+  | 'PresenceAdd'
+  | 'PresenceRemove';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;

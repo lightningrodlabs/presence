@@ -392,7 +392,12 @@ class VoiceController {
     // 20ms Opus nominal period. alpha = 0.1 for slow smoothing.
     if (state.lastArrivalMs > 0) {
       const delta = now - state.lastArrivalMs;
-      const deviation = Math.abs(delta - 20);
+      // Cap the per-sample deviation. A frame arriving after a long
+      // silence/stall produces a huge inter-arrival delta that is not
+      // jitter — feeding it raw spiked the EWMA to nonsense values
+      // (e.g. jit=148966ms in merged logs). 200ms is well past any real
+      // jitter for 20ms Opus frames.
+      const deviation = Math.min(Math.abs(delta - 20), 200);
       state.jitterEwma = 0.1 * deviation + 0.9 * state.jitterEwma;
     }
     state.lastArrivalMs = now;

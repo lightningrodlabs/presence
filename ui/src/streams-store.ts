@@ -1919,6 +1919,77 @@ export class StreamsStore {
 
     // Flush any SdpData bursts that ended without a follow-up event.
     this._flushStaleSdpAggregates();
+
+    // Forensics: signal-carrier liveness + presence-set membership.
+    this._emitPresenceForensics();
+  }
+
+  /**
+   * Per-ping-cycle forensics (diagnostic only, no behaviour change):
+   *
+   *  - SignalCarrierDown/Up — inferred from pong freshness. If we know
+   *    peers but none have ponged within 3*PING_INTERVAL, the bidirectional
+   *    Holochain signal path is presumed down. Makes signal-relay outages
+   *    visible in merged logs — without this they are invisible.
+   *  - PresenceAdd/PresenceRemove — diff of `globalPresenceSet()` with the
+   *    reason a peer entered (media-live / ping-fresh / observer-reported),
+   *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
+   */
+  private _emitPresenceForensics(): void {
+    const now = Date.now();
+
+    const known = get(this._knownAgents);
+    const blocked = get(this.blockedAgents);
+    const knownPeers = Object.keys(known).filter(
+      k => k !== this.myPubKeyB64 && !blocked.includes(k),
+    );
+    if (knownPeers.length > 0) {
+      const anyFresh = knownPeers.some(k => {
+        const ls = known[k]?.lastSeen;
+        return ls !== undefined && now - ls < 3 * PING_INTERVAL;
+      });
+      if (!anyFresh && this._signalCarrierDownSince === undefined) {
+        this._signalCarrierDownSince = now;
+        this.logger.logCustomMessage(
+          `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
+        );
+      } else if (anyFresh && this._signalCarrierDownSince !== undefined) {
+        const downMs = now - this._signalCarrierDownSince;
+        this._signalCarrierDownSince = undefined;
+        this.logger.logCustomMessage(
+          `SignalCarrierUp: pong path recovered after ${downMs}ms`,
+        );
+      }
+    }
+
+    const current = this.globalPresenceSet();
+    const prev = this._lastPresenceSet;
+    for (const peer of current) {
+      if (peer === this.myPubKeyB64 || prev.has(peer)) continue;
+      this.logger.logAgentEvent({
+        agent: peer,
+        timestamp: now,
+        event: 'PresenceAdd',
+        detail: `reason=${this._presenceReason(peer)}`,
+      });
+    }
+    for (const peer of prev) {
+      if (peer === this.myPubKeyB64 || current.has(peer)) continue;
+      this.logger.logAgentEvent({
+        agent: peer,
+        timestamp: now,
+        event: 'PresenceRemove',
+        detail: 'reason=ping-stale+no-media',
+      });
+    }
+    this._lastPresenceSet = current;
+  }
+
+  /** Why a peer is currently in `globalPresenceSet()`. Forensics helper. */
+  private _presenceReason(peer: AgentPubKeyB64): string {
+    if (this.isPeerMediaLive(peer)) return 'media-live';
+    if (get(this._activeAgents)[peer]) return 'ping-fresh';
+    return 'observer-reported';
   }
 
   async changeVideoInput(deviceId: string) {
@@ -3557,6 +3628,19 @@ export class StreamsStore {
    * rather than every poll cycle.
    */
   private _lastQualityBucket = new Map<string, string>();
+
+  /**
+   * Wall-clock ms since the signal carrier was inferred down (no pong from
+   * any known peer), or undefined while it is up. Drives the
+   * SignalCarrierDown/Up forensic events emitted from `pingAgents`.
+   */
+  private _signalCarrierDownSince: number | undefined;
+
+  /**
+   * Last computed `globalPresenceSet()`, kept so the ping cycle can diff
+   * membership and emit PresenceAdd/PresenceRemove forensic events.
+   */
+  private _lastPresenceSet = new Set<AgentPubKeyB64>();
 
   /**
    * Per-peer audibility-outage tracking. When our audioLink to this peer
