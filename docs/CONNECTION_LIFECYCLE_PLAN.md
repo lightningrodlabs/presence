@@ -33,10 +33,21 @@ Date: 2026-05-15
   from the signals-carrier RTT EWMA (`clamp(rtt*20, 5000, 15000)`);
   no sample → undefined → FSM falls back to the 15s config default, so a
   no-RTT connection is never worse than before. K/FLOOR provisional.
-- **Phases 1B, 1C, 1D, 4B — not yet implemented.** 1B/1C/1D touch the
-  realtime connection-teardown path and should land as separate,
-  runtime-tested increments rather than alongside 1A. 4B is a
-  verification pass (no code change expected).
+- **Phase 4B — DONE (verification, no code change needed).** Duplicate
+  FSM connections to a peer are structurally impossible:
+  `ConnectionManager._connections` is a `Map` keyed by agent;
+  `ensureConnection` is idempotent (`connection-manager.test.ts` "does
+  not create duplicate FSMs"); simultaneous bilateral initiation does not
+  deadlock (`two-peer-integration.test.ts` test 4); glare is resolved by
+  Perfect Negotiation with deterministic polite/impolite roles
+  (`rtc-peer.test.ts` "Perfect Negotiation — glare handling"). All
+  covered by passing tests. The multiple connection-ids seen for one
+  peer-pair in the 2026-05-13 log are *different layers* — the FSM
+  allocates its own connectionId and ignores the InitRequest/InitAccept
+  handshake id — not duplicate live FSMs.
+- **Phases 1B, 1C, 1D — not yet implemented.** They touch the realtime
+  connection-teardown path and should land as separate, runtime-tested
+  increments rather than alongside 1A.
 
 
 Source: forensic analysis of merged logs `Presence_merged_0.14.7_2026-5-13` and
