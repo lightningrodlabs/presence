@@ -1992,6 +1992,28 @@ export class StreamsStore {
     return 'observer-reported';
   }
 
+  /**
+   * RTT-scaled SDP-exchange timeout (ms) for an FSM initiator connection,
+   * or undefined when no signaling-RTT sample exists yet — the FSM then
+   * falls back to its config default (15s), i.e. unchanged behaviour.
+   *
+   * The SDP exchange rides the same Holochain signal transport as
+   * ping/pong, so the signals-carrier RTT EWMA is the correct latency
+   * proxy. K is kept generous to absorb signal-relay retransmits; the
+   * floor avoids an over-tight timeout on very low-RTT links; the ceiling
+   * equals today's fixed default so the change can never make a
+   * no-improvement case worse. K/FLOOR are provisional — see
+   * docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
+   */
+  private _computeSdpTimeout(peerB64: AgentPubKeyB64): number | undefined {
+    const rtt = this._signalsRttEwma.get(peerB64);
+    if (rtt === undefined || rtt <= 0) return undefined;
+    const K = 20;
+    const FLOOR_MS = 5000;
+    const CEILING_MS = 15000;
+    return Math.min(CEILING_MS, Math.max(FLOOR_MS, Math.round(rtt * K)));
+  }
+
   async changeVideoInput(deviceId: string) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
@@ -5695,6 +5717,7 @@ export class StreamsStore {
           const effectiveConnId = transport.ensureConnection(pubKey64, {
             initiator: true,
             connectionId: connection_id,
+            sdpExchangeTimeoutMs: this._computeSdpTimeout(pubKey64),
           });
 
           this._openConnections.update(currentValue => {

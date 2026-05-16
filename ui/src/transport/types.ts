@@ -139,7 +139,16 @@ export interface PeerTransport {
    */
   ensureConnection(
     peer: AgentPubKeyB64,
-    opts?: { initiator?: boolean; connectionId?: ConnectionId }
+    opts?: {
+      initiator?: boolean;
+      connectionId?: ConnectionId;
+      /**
+       * Optional RTT-scaled SDP-exchange timeout (ms). Honoured by the FSM
+       * transport for initiator connections; ignored by transports that do
+       * not model an SDP-exchange phase.
+       */
+      sdpExchangeTimeoutMs?: number;
+    }
   ): ConnectionId;
 
   /** Tear down the connection to `peer`. Emits a final 'connection-state-change' to 'closed'. */

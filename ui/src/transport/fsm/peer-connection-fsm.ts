@@ -47,6 +47,14 @@ export type PeerConnectionFSMOptions = {
   onTransition?: (entry: FSMTransitionEntry) => void;
   /** Optional: factory for RTCPeerConnection (for testing) */
   createPeerConnection?: (config: RTCConfiguration) => RTCPeerConnection;
+  /**
+   * Optional per-connection SDP-exchange timeout (ms), overriding
+   * `config.sdpExchangeTimeoutMs`. The application sets this RTT-scaled
+   * for initiator connections so a clearly-dead exchange fails faster
+   * than the fixed 15s default; omitted (acceptor / no RTT sample) it
+   * falls back to the config value.
+   */
+  sdpExchangeTimeoutMs?: number;
 };
 
 type Timer = {
@@ -73,6 +81,8 @@ export class PeerConnectionFSM {
 
   private _state: ConnectionPhase = 'idle';
   private _config: ConnectionConfig;
+  /** Per-connection SDP-exchange timeout override; see options. */
+  private _sdpTimeoutOverrideMs: number | undefined;
   private _polite: boolean;
   private _reconnectPolicy: ReconnectPolicy;
   private _onSignalCallback: (data: RTCSessionDescriptionInit | RTCIceCandidateInit) => void;
@@ -143,6 +153,7 @@ export class PeerConnectionFSM {
     this.connectionId = options.connectionId;
     this.role = options.role ?? 'mesh';
     this._config = options.config ?? DEFAULT_CONFIG;
+    this._sdpTimeoutOverrideMs = options.sdpExchangeTimeoutMs;
     this._polite = options.polite;
     this._reconnectPolicy = options.reconnectPolicy ?? new DefaultReconnectPolicy();
     this._onSignalCallback = options.onSignal;
@@ -466,9 +477,12 @@ export class PeerConnectionFSM {
 
   private _startTimersForState(state: ConnectionPhase, oldState: ConnectionPhase): void {
     switch (state) {
-      case 'signaling':
-        // Timeout if SDP exchange takes too long
-        this._startTimer('sdp-exchange-timeout', this._config.sdpExchangeTimeoutMs, () => {
+      case 'signaling': {
+        // Timeout if SDP exchange takes too long. Use the per-connection
+        // RTT-scaled override when present, else the config default.
+        const sdpTimeoutMs =
+          this._sdpTimeoutOverrideMs ?? this._config.sdpExchangeTimeoutMs;
+        this._startTimer('sdp-exchange-timeout', sdpTimeoutMs, () => {
           if (this._state === 'signaling') {
             // Record the RTCPeerConnection signalingState so log analysis
             // can tell where the SDP exchange stalled (e.g. stuck in
@@ -476,12 +490,13 @@ export class PeerConnectionFSM {
             const snap = this.transportSnapshot;
             this._transition('disconnected', {
               trigger:
-                `SDP exchange timeout (${this._config.sdpExchangeTimeoutMs}ms, ` +
+                `SDP exchange timeout (${sdpTimeoutMs}ms, ` +
                 `signaling=${snap.signaling} ice=${snap.ice})`,
             });
           }
         });
         break;
+      }
 
       case 'connecting':
         // Timeout if connection doesn't complete

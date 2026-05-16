@@ -203,7 +203,11 @@ export class FsmTransport implements PeerTransport {
 
   ensureConnection(
     peer: AgentPubKeyB64,
-    _opts?: { initiator?: boolean; connectionId?: ConnectionId }
+    opts?: {
+      initiator?: boolean;
+      connectionId?: ConnectionId;
+      sdpExchangeTimeoutMs?: number;
+    }
   ): ConnectionId {
     if (this._destroyed) {
       throw new Error('FsmTransport: destroyed');
@@ -213,7 +217,9 @@ export class FsmTransport implements PeerTransport {
       iceServers: this._getIceServers(),
       trickleICE: this._getTrickleICE(),
     });
-    this._manager.ensureConnection(peer);
+    this._manager.ensureConnection(peer, {
+      sdpExchangeTimeoutMs: opts?.sdpExchangeTimeoutMs,
+    });
     const fsm = this._manager.getFSM(peer);
     return fsm?.connectionId ?? '';
   }

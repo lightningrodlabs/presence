@@ -54,6 +54,8 @@ export class ConnectionManager {
   private _createPeerConnection: ((config: RTCConfiguration) => RTCPeerConnection) | undefined;
 
   private _connections: Map<string, PeerConnectionFSM> = new Map();
+  /** Per-agent RTT-scaled SDP-exchange timeout override (ms). */
+  private _sdpTimeoutOverrides: Map<string, number> = new Map();
   private _eventHandlers: Map<string, ManagerEventHandler[]> = new Map();
   private _signalingUnsub: Unsubscribe;
   private _destroyed = false;
@@ -102,8 +104,15 @@ export class ConnectionManager {
    * If no FSM exists, creates one and calls connect().
    * If an FSM exists in idle/disconnected state, restarts it.
    */
-  ensureConnection(agent: string): void {
+  ensureConnection(
+    agent: string,
+    opts?: { sdpExchangeTimeoutMs?: number },
+  ): void {
     if (this._destroyed) return;
+
+    if (opts?.sdpExchangeTimeoutMs !== undefined) {
+      this._sdpTimeoutOverrides.set(agent, opts.sdpExchangeTimeoutMs);
+    }
 
     let fsm = this._connections.get(agent);
 
@@ -329,6 +338,7 @@ export class ConnectionManager {
       connectionId,
       polite,
       config: this._config,
+      sdpExchangeTimeoutMs: this._sdpTimeoutOverrides.get(remoteAgent),
       role: this._role,
       reconnectPolicy: this._reconnectPolicy,
       onSignal: (data) => {

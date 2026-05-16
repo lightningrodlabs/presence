@@ -26,9 +26,17 @@ Date: 2026-05-15
   events with reason (2), DTLS/data-channel state in the DTLS-stall
   trigger (3), RTCPeerConnection `signalingState` in the SDP-exchange-
   timeout trigger (4), and a jitter-deviation clamp in `voice.ts` (5).
-- **Phases 1B, 1C, 1D, 4 — not yet implemented.** 1B/1C/1D touch the
+- **Phase 4A — DONE & typecheck-verified** (240/240 tests pass).
+  Per-connection `sdpExchangeTimeoutMs` threaded through
+  `ensureConnection` opts → `ConnectionManager` (per-agent override map) →
+  `PeerConnectionFSM`. `streams-store._computeSdpTimeout()` derives it
+  from the signals-carrier RTT EWMA (`clamp(rtt*20, 5000, 15000)`);
+  no sample → undefined → FSM falls back to the 15s config default, so a
+  no-RTT connection is never worse than before. K/FLOOR provisional.
+- **Phases 1B, 1C, 1D, 4B — not yet implemented.** 1B/1C/1D touch the
   realtime connection-teardown path and should land as separate,
-  runtime-tested increments rather than alongside 1A.
+  runtime-tested increments rather than alongside 1A. 4B is a
+  verification pass (no code change expected).
 
 
 Source: forensic analysis of merged logs `Presence_merged_0.14.7_2026-5-13` and
