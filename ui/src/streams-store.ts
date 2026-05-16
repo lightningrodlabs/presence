@@ -93,6 +93,16 @@ const INIT_RETRY_THRESHOLD = 5000;
 export const PING_INTERVAL = 2000;
 
 /**
+ * A peer with media frames received within this window on the signals
+ * carrier (voice or filmstrip video) — or with a connected WebRTC
+ * connection — is treated as present regardless of ping/pong staleness.
+ * Holochain-signal ping/pong can go stale (>3*PING_INTERVAL) during a
+ * signal-relay hiccup while media keeps flowing fine; without this the
+ * peer's pane would be wrongly removed. See `isPeerMediaLive`.
+ */
+const MEDIA_LIVE_WINDOW_MS = 3000;
+
+/**
  * A store that handles the creation and management of WebRTC streams with
  * holochain peers
  */
@@ -807,6 +817,9 @@ export class StreamsStore {
     }
     console.log('#### CONNECTED with', pubKeyB64);
     this._flushSdpAggregatesForConnection(connectionId);
+    // Record this peer as a genuine call participant for diagnostic-log
+    // targeting. Kept for the whole session even if they later drop.
+    this._conversationParticipants.add(pubKeyB64);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: Date.now(),
@@ -2718,6 +2731,37 @@ export class StreamsStore {
    */
   _failedDiagnosticRequests: Writable<Record<AgentPubKeyB64, true>> = writable({});
 
+  /**
+   * Peers we have actually had a WebRTC media connection with this
+   * session — added the first time a connection to them reaches the
+   * `connected` state. Session-scoped; entries are kept even after the
+   * peer disconnects, because a peer who dropped mid-call is exactly who
+   * we want diagnostic logs from. Drives `requestDiagnosticLogs()`'s
+   * recipient list so a room-level request targets genuine call
+   * participants rather than every known (incl. merely heard-about) agent.
+   */
+  private _conversationParticipants = new Set<AgentPubKeyB64>();
+
+  /**
+   * Clear cached diagnostic results so the request button returns to its
+   * default requestable colour. Called after the merged log is downloaded
+   * (results consumed). With no argument, clears every peer.
+   */
+  clearReceivedDiagnostics(pubKeyB64?: AgentPubKeyB64): void {
+    this._receivedDiagnosticLogs.update(curr => {
+      if (!pubKeyB64) return {};
+      const next = { ...curr };
+      delete next[pubKeyB64];
+      return next;
+    });
+    this._failedDiagnosticRequests.update(curr => {
+      if (!pubKeyB64) return {};
+      const next = { ...curr };
+      delete next[pubKeyB64];
+      return next;
+    });
+  }
+
   // ===========================================================================================
   // MODULE SYSTEM
   // ===========================================================================================
@@ -2942,6 +2986,35 @@ export class StreamsStore {
   }
 
   /**
+   * True iff media is actively flowing to/from this peer on either
+   * carrier: a connected WebRTC connection, or signals-carrier voice or
+   * filmstrip-video frames received within `MEDIA_LIVE_WINDOW_MS`.
+   *
+   * Used by `globalPresenceSet()` so that a peer with live media is never
+   * pruned by ping/pong staleness alone. A Holochain-signal hiccup of more
+   * than 3*PING_INTERVAL must not remove the pane of a peer we can still
+   * see and hear. WebRTC connections that failed/closed or exceeded the
+   * ICE disconnected grace are already removed from `_openConnections`, so
+   * a surviving `connected` entry is genuinely live.
+   */
+  isPeerMediaLive(peerB64: AgentPubKeyB64): boolean {
+    if (get(this._openConnections)[peerB64]?.connected) return true;
+    const now = Date.now();
+    const lastVoice = voiceController.peerLastRecvMs.get(peerB64);
+    if (lastVoice !== undefined && now - lastVoice < MEDIA_LIVE_WINDOW_MS) {
+      return true;
+    }
+    const lastFilmstrip = filmstripController.peerLastRecvMs.get(peerB64);
+    if (
+      lastFilmstrip !== undefined &&
+      now - lastFilmstrip < MEDIA_LIVE_WINDOW_MS
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Set of agents anyone (me or any peer with a fresh broadcast) reports
    * as currently present in the room. Drives the icon list in the
    * connection-details overlay so that:
@@ -2965,6 +3038,19 @@ export class StreamsStore {
     // My own active agents.
     for (const k of Object.keys(get(this._activeAgents))) {
       if (!blocked.has(k)) out.add(k);
+    }
+    // Peers with live media on either carrier. Ping/pong staleness must
+    // not prune a peer we can still see or hear: a Holochain-signal hiccup
+    // would otherwise remove the pane of a peer whose WebRTC (or
+    // signals-carrier) media is flowing fine. See `isPeerMediaLive`.
+    const mediaCandidates = new Set<AgentPubKeyB64>([
+      ...Object.keys(get(this._openConnections)),
+      ...voiceController.peerLastRecvMs.keys(),
+      ...filmstripController.peerLastRecvMs.keys(),
+    ]);
+    for (const k of mediaCandidates) {
+      if (k === this.myPubKeyB64 || blocked.has(k)) continue;
+      if (this.isPeerMediaLive(k)) out.add(k);
     }
     // Anyone a *fresh* observer reports as present. We require the
     // observer's broadcast itself to be recent so that an observer who
@@ -4069,10 +4155,18 @@ export class StreamsStore {
   private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MS = 8_000;
 
   /**
-   * Request diagnostic logs from a specific peer (or all known agents) via
-   * Holochain signal. Retries up to DIAGNOSTIC_MAX_ATTEMPTS times if no
-   * response arrives within DIAGNOSTIC_ATTEMPT_TIMEOUT_MS per attempt.
-   * Peers that exhaust retries land in `_failedDiagnosticRequests`.
+   * Request diagnostic logs from a specific peer (or, with no argument,
+   * every peer in this conversation) via Holochain signal. Retries up to
+   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within
+   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS per attempt. Peers that exhaust retries
+   * land in `_failedDiagnosticRequests`.
+   *
+   * The room-level recipient set is the union of `_conversationParticipants`
+   * (peers we have had a media connection with this session, incl. ones who
+   * have since dropped) and the current `globalPresenceSet()`. This
+   * deliberately excludes merely heard-about (`'told'`) agents who were
+   * never in the call — requesting from them only produced timeouts and
+   * polluted the merged log.
    *
    * Calling again for a peer already in pending/failed re-starts the
    * retry loop from attempt 1 — lets the user manually retry from the UI.
@@ -4080,7 +4174,12 @@ export class StreamsStore {
   async requestDiagnosticLogs(pubKeyB64?: AgentPubKeyB64) {
     const targetKeys = pubKeyB64
       ? [pubKeyB64]
-      : Object.keys(get(this._knownAgents)).filter(a => a !== this.myPubKeyB64);
+      : [
+          ...new Set<AgentPubKeyB64>([
+            ...this._conversationParticipants,
+            ...this.globalPresenceSet(),
+          ]),
+        ].filter(a => a !== this.myPubKeyB64);
     if (targetKeys.length === 0) return;
 
     // Clear any prior failed state for these peers — manual re-trigger.

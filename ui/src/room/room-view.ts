@@ -1160,6 +1160,8 @@ export class RoomView extends LitElement {
                     `Presence_diagnostic_${pubkeyB64.slice(0, 8)}_${formattedDate()}.json`,
                     JSON.stringify(this.streamsStore.exportMergedLogs(pubkeyB64), undefined, 2)
                   );
+                  // Results consumed — reset the button to requestable.
+                  this.streamsStore.clearReceivedDiagnostics(pubkeyB64);
                 } else if (!pending) {
                   this.streamsStore.requestDiagnosticLogs(pubkeyB64);
                 }
@@ -1326,6 +1328,8 @@ export class RoomView extends LitElement {
                         `Presence_merged_${__APP_VERSION__}_${formattedDate()}.json`,
                         JSON.stringify(this.streamsStore.exportMergedLogsAll(), undefined, 2)
                       );
+                      // Results consumed — reset the button to requestable.
+                      this.streamsStore.clearReceivedDiagnostics();
                     } else {
                       this.streamsStore.requestDiagnosticLogs();
                     }
