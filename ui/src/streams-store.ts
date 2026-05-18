@@ -3455,6 +3455,76 @@ export class StreamsStore {
     this.disconnectFromPeerVideo(peerB64);
   }
 
+  /**
+   * Read our own per-peer carrier selection for `peerB64`. Reflects our
+   * explicit override only — not the symmetric-union resolution or the
+   * peer's own choice. Returns:
+   *   - `'signals'`:            peer is in our `disableWebrtcWith` list
+   *   - `'simplepeer'`/`'fsm'`: we have a `peerImpl` override for them
+   *   - `'inherit'`:            no per-peer override — the link follows
+   *                             the global carrier and auto-flip policy
+   */
+  myPeerCarrier(peerB64: AgentPubKeyB64): 'inherit' | 'simplepeer' | 'fsm' | 'signals' {
+    const existing = get(this._myModuleStates)['conversation'];
+    const payload = existing ? parseConversationPayload(existing) : null;
+    if (!payload) return 'inherit';
+    if (payload.disableWebrtcWith.includes(peerB64)) return 'signals';
+    return payload.peerImpl[peerB64] ?? 'inherit';
+  }
+
+  /**
+   * Set the per-peer carrier for `peerB64` in a single conversation-payload
+   * broadcast. Collapses the two underlying per-peer fields
+   * (`disableWebrtcWith`, `peerImpl`) into one user-facing choice,
+   * mirroring `setCarrierMode` for the global control:
+   *   - `'signals'`:            add to `disableWebrtcWith`, clear any
+   *                             impl override
+   *   - `'simplepeer'`/`'fsm'`: set the `peerImpl` override, remove from
+   *                             `disableWebrtcWith`
+   *   - `'inherit'`:            clear both — the link follows the global
+   *                             carrier and the auto-flip policy again
+   * Tears down the existing media connection so the next pong cycle
+   * re-establishes via the new selection.
+   */
+  async setPeerCarrier(
+    peerB64: AgentPubKeyB64,
+    carrier: 'inherit' | 'simplepeer' | 'fsm' | 'signals',
+  ): Promise<void> {
+    const previous = this.myPeerCarrier(peerB64);
+    if (previous === carrier) return;
+
+    const existing = get(this._myModuleStates)['conversation'];
+    const payload: ConversationPayload = existing
+      ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
+      : { ...DEFAULT_CONVERSATION_PAYLOAD };
+
+    const nextPeerImpl: Record<AgentPubKeyB64, 'simplepeer' | 'fsm'> = { ...payload.peerImpl };
+    delete nextPeerImpl[peerB64];
+    if (carrier === 'simplepeer' || carrier === 'fsm') {
+      nextPeerImpl[peerB64] = carrier;
+    }
+    payload.peerImpl = nextPeerImpl;
+
+    payload.disableWebrtcWith = payload.disableWebrtcWith.filter(p => p !== peerB64);
+    if (carrier === 'signals') {
+      payload.disableWebrtcWith = [...payload.disableWebrtcWith, peerB64];
+    }
+
+    this.logger.logAgentEvent({
+      agent: peerB64,
+      timestamp: Date.now(),
+      event: carrier === 'signals' ? 'MyWebrtcDisable' : 'MyWebrtcEnable',
+      detail: `carrier=${previous}->${carrier} (per-peer)`,
+    });
+
+    await this._syncConversationPayload(payload);
+
+    this.disconnectFromPeerVideo(peerB64);
+    if (carrier === 'signals') {
+      this._clearPendingWebrtcStatus(peerB64);
+    }
+  }
+
   // ===========================================================================================
   // PHASE 3 — Automated failure toggle bookkeeping
   // ===========================================================================================

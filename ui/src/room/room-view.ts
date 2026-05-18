@@ -29,6 +29,7 @@ import {
   mdiCloudDownloadOutline,
   mdiVideo,
   mdiVideoOff,
+  mdiSwapHorizontal,
 } from '@mdi/js';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import { localized, msg } from '@lit/localize';
@@ -2200,14 +2201,18 @@ export class RoomView extends LitElement {
   }
 
   /**
-   * Render a per-peer "Disable WebRTC" toggle. Only shown when connection
-   * details are visible. When WebRTC is disabled for a peer, neither side
-   * initiates or accepts WebRTC — audio flows via signals automatically.
+   * Render a per-peer carrier selector. Only shown when connection
+   * details are visible. Lets the user pin this link to a specific
+   * carrier (WebRTC simple-peer / WebRTC FSM / signals) or leave it on
+   * 'inherit' to follow the global carrier and the auto-flip policy.
+   *
+   * When the peer has disabled WebRTC from their side, the link is
+   * forced to signals regardless of our choice — we show a static
+   * indicator instead of the dropdown.
    */
-  private _renderWebrtcToggle(pubkeyB64: AgentPubKeyB64) {
-    // Check who disabled WebRTC for this link. If the peer disabled it
-    // (globally or specifically for us), our toggle can't re-enable it
-    // — we disable the button and show a different message.
+  private _renderCarrierToggle(pubkeyB64: AgentPubKeyB64) {
+    // Did the peer force signals from their side (globally, or for us
+    // specifically via their disableWebrtcWith list)?
     let disabledByPeer = false;
     const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
     if (peerConv) {
@@ -2221,37 +2226,61 @@ export class RoomView extends LitElement {
       } catch {}
     }
 
-    const disabledByMe = !disabledByPeer && this.streamsStore.webrtcDisabled(pubkeyB64);
-    const disabled = disabledByPeer || disabledByMe;
+    if (disabledByPeer) {
+      return html`
+        <sl-tooltip
+          hoist
+          class="tooltip-filled"
+          placement="top"
+          content="Carrier forced to signals by agent"
+        >
+          <sl-icon
+            style="color: #e7a008; height: 24px; width: 24px; opacity: 0.6;"
+            .src=${wrapPathInSvg(mdiSwapHorizontal)}
+          ></sl-icon>
+        </sl-tooltip>
+      `;
+    }
 
-    const tooltip = disabledByPeer
-      ? 'WebRTC disabled by agent'
-      : disabledByMe
-        ? 'WebRTC disabled - click to re-enable'
-        : 'Click to disable WebRTC for this peer';
-
-    const clickable = !disabledByPeer;
-    const color = disabled ? '#c72100' : '#7adc7a';
-    const cursor = clickable ? 'pointer' : 'not-allowed';
-    const opacity = clickable ? '1' : '0.5';
+    const selected = this.streamsStore.myPeerCarrier(pubkeyB64);
+    const options: Array<{
+      value: 'inherit' | 'simplepeer' | 'fsm' | 'signals';
+      label: string;
+    }> = [
+      { value: 'inherit', label: 'Inherit global' },
+      { value: 'simplepeer', label: 'WebRTC (SP)' },
+      { value: 'fsm', label: 'WebRTC (FSM)' },
+      { value: 'signals', label: 'Signals' },
+    ];
+    // Icon colour: amber when pinned to signals, neutral when inheriting
+    // the global carrier, green when pinned to a WebRTC impl.
+    const color =
+      selected === 'signals' ? '#e7a008'
+        : selected === 'inherit' ? '#c3c9eb'
+          : '#7adc7a';
+    const opacity = selected === 'inherit' ? '0.6' : '1';
 
     return html`
-      <sl-tooltip
-        hoist
-        class="tooltip-filled"
-        placement="top"
-        content="${tooltip}"
-      >
+      <sl-dropdown placement="top" distance="4" hoist>
         <sl-icon
-          style="color: ${color}; height: 24px; width: 24px; cursor: ${cursor}; opacity: ${opacity};"
-          .src=${disabled ? wrapPathInSvg(mdiVideoOff) : wrapPathInSvg(mdiVideo)}
-          @click=${() => {
-            if (clickable) {
-              this.streamsStore.toggleDisableWebrtc(pubkeyB64);
-            }
-          }}
+          slot="trigger"
+          title="Select carrier for this peer"
+          style="color: ${color}; height: 24px; width: 24px; cursor: pointer; opacity: ${opacity};"
+          .src=${wrapPathInSvg(mdiSwapHorizontal)}
         ></sl-icon>
-      </sl-tooltip>
+        <sl-menu class="reconnect-menu secondary-font">
+          ${options.map(opt => html`
+            <sl-menu-item
+              class="reconnect-menu-item"
+              @click=${() => {
+                this.streamsStore.setPeerCarrier(pubkeyB64, opt.value);
+              }}
+            >
+              ${opt.label}${selected === opt.value ? ' ✓' : ''}
+            </sl-menu-item>
+          `)}
+        </sl-menu>
+      </sl-dropdown>
     `;
   }
 
@@ -2896,7 +2925,7 @@ export class RoomView extends LitElement {
                   >
                     <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
                       ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
-                      ${this._renderWebrtcToggle(pubkeyB64)}
+                      ${this._renderCarrierToggle(pubkeyB64)}
                     </div>
                     <peer-stats-panel
                       .streamsStore=${this.streamsStore}
