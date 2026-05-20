@@ -1,0 +1,51 @@
+{
+  "name": "@lightningrodlabs/webrtc-peer",
+  "version": "0.1.0",
+  "description": "Managed WebRTC peer connection for the browser: W3C Perfect Negotiation, a connection-lifecycle state machine, and a pluggable reconnection engine.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "keywords": [
+    "webrtc",
+    "perfect-negotiation",
+    "rtcpeerconnection",
+    "p2p",
+    "reconnection",
+    "state-machine"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lightningrodlabs/webrtc-peer"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^1.6.1",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}
