@@ -3970,6 +3970,32 @@ export class RoomView extends LitElement {
         /* left: calc(50% - 150px); */
       }
 
+      /*
+       * Narrow contexts (asset panes, room-in-room embeds): shrink the toolbar
+       * buttons and allow wrapping. The panel keeps its bottom-right anchor,
+       * so when it wraps to a second row it grows upward.
+       */
+      @media (max-width: 600px) {
+        .toggles-panel {
+          height: auto;
+          padding: 4px 8px;
+          border-radius: 28px;
+          flex-wrap: wrap;
+          max-width: calc(100vw - 20px);
+          row-gap: 4px;
+        }
+        .toggle-btn {
+          height: 44px;
+          width: 44px;
+          margin: 0 2px;
+        }
+        .toggle-sub-btn {
+          width: 14px;
+          height: 14px;
+          border-width: 2px;
+        }
+      }
+
       .close-graph-btn {
         all: unset;
         border-radius: 50%;

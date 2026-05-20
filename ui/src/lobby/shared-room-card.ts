@@ -2,10 +2,11 @@ import { LitElement, css, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { AgentPubKey, AppClient, ClonedCell } from '@holochain/client';
 import { localized, msg } from '@lit/localize';
-import { WeaveClient } from '@theweave/api';
+import { NULL_HASH, WeaveClient } from '@theweave/api';
 
 import '@shoelace-style/shoelace/dist/components/input/input';
 import '@shoelace-style/shoelace/dist/components/icon/icon';
+import '../shared/wal-to-pocket-btn';
 
 import { consume } from '@lit/context';
 import { sharedStyles } from '../sharedStyles';
@@ -214,6 +215,13 @@ export class SharedRoomCard extends LitElement {
             ${this._roomInfo ? this._roomInfo.name : '[unknown]'}
           </div>
           <span style="display: flex; flex: 1;"></span>
+          ${this._myCell
+            ? html`<wal-to-pocket-btn
+                class="pocket-btn"
+                .wal=${{ hrl: [this._myCell.cell_id[0], NULL_HASH] }}
+                .weaveClient=${this._weaveClient}
+              ></wal-to-pocket-btn>`
+            : ''}
           <button
             @click=${() => this.handleOpenRoom()}
             class="enter-room-btn secondary-font"
@@ -259,6 +267,13 @@ export class SharedRoomCard extends LitElement {
         color: #071b31;
         font-size: 20px;
         box-shadow: 1px 1px 8px 2px #020b16b8;
+      }
+
+      .pocket-btn {
+        margin-right: 10px;
+        --bg-color: #2a4a8f;
+        --bg-color-hover: #3558a0;
+        color: #fff0f0;
       }
 
       .enter-room-btn {

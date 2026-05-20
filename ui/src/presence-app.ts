@@ -56,6 +56,7 @@ import {
 
 import '@shoelace-style/shoelace/dist/components/input/input';
 import '@shoelace-style/shoelace/dist/components/icon/icon';
+import './shared/wal-to-pocket-btn';
 
 import { clientContext } from './contexts';
 
@@ -78,6 +79,7 @@ enum PageView {
   Loading,
   Home,
   Room,
+  RoomClosed,
 }
 
 export type GroupRoomInfo = {
@@ -114,6 +116,18 @@ export class PresenceApp extends LitElement {
 
   @state()
   _selectedWal: WAL | undefined;
+
+  @state()
+  _roomAlreadyOpen = false;
+
+  private _roomLockRelease: (() => void) | undefined;
+
+  private _currentRoomDnaB64: string | undefined;
+
+  private _roomChannel: BroadcastChannel | undefined;
+
+  @state()
+  _takingOver = false;
 
   @state()
   _displayError: string | undefined;
@@ -285,7 +299,7 @@ export class PresenceApp extends LitElement {
 
       if (encodeHashToBase64(cellTypes.provisioned.cell_id[0]) === dnaHashB64) {
         this._selectedRoleName = 'presence';
-        this._pageView = PageView.Room;
+        await this._enterRoom(dnaHashB64);
         return;
       }
       const clonedCell = cellTypes.cloned.find(
@@ -293,7 +307,7 @@ export class PresenceApp extends LitElement {
       );
       if (!clonedCell) throw Error('No cell found for WAL');
       this._selectedRoleName = clonedCell.clone_id;
-      this._pageView = PageView.Room;
+      await this._enterRoom(dnaHashB64);
       return;
     }
 
@@ -343,6 +357,118 @@ export class PresenceApp extends LitElement {
           );
       }
     });
+  }
+
+  /**
+   * Acquire an exclusive same-origin lock for a room's DNA. If another pane in
+   * this Moss applet origin is already holding it, the lock request is denied
+   * and `_roomAlreadyOpen` is set so the render path shows a notice instead of
+   * a second room-container (which would cause duplicate signaling/streams).
+   */
+  private async _enterRoom(
+    dnaHashB64: string,
+    opts: { waitMs?: number } = {}
+  ) {
+    this._currentRoomDnaB64 = dnaHashB64;
+    this._roomAlreadyOpen = false;
+    const locks = (navigator as any).locks;
+    if (!locks) {
+      this._pageView = PageView.Room;
+      return;
+    }
+    const lockName = `presence-room:${dnaHashB64}`;
+    // If waitMs is set, request the lock and wait up to that many ms for the
+    // current holder to release. Otherwise fail fast via `ifAvailable: true`.
+    const requestOpts: LockOptions = opts.waitMs
+      ? { signal: AbortSignal.timeout(opts.waitMs) }
+      : { ifAvailable: true };
+    const acquired = new Promise<{ release?: () => void }>(resolveOuter => {
+      locks
+        .request(lockName, requestOpts, (lock: Lock | null) => {
+          if (!lock) {
+            resolveOuter({});
+            return undefined;
+          }
+          return new Promise<void>(resolveInner => {
+            resolveOuter({ release: resolveInner });
+          });
+        })
+        .catch((err: any) => {
+          if (err && err.name !== 'AbortError') {
+            console.warn('locks.request failed', err);
+          }
+          resolveOuter({});
+        });
+    });
+    const { release } = await acquired;
+    if (!release) {
+      this._roomAlreadyOpen = true;
+    } else {
+      this._roomLockRelease = release;
+      // Listen for take-over requests from other panes in the same origin.
+      const channel = new BroadcastChannel('presence-room');
+      channel.onmessage = (e: MessageEvent) => {
+        const data = e.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.dnaHashB64 !== dnaHashB64) return;
+        if (data.type === 'kick') {
+          // Another pane is asking us to release this room so it can take over.
+          // Send the ack BEFORE releasing — _releaseRoomLock closes this same
+          // channel, after which postMessage would throw and the taker would
+          // time out.
+          try {
+            channel.postMessage({ type: 'released', dnaHashB64 });
+          } catch (err) {
+            console.warn('released broadcast failed', err);
+          }
+          this._releaseRoomLock();
+          this._pageView = PageView.RoomClosed;
+        }
+      };
+      this._roomChannel = channel;
+    }
+    this._pageView = PageView.Room;
+  }
+
+  /**
+   * Ask the pane currently holding the room lock to release it, then take over
+   * here. Resolves true if we got the lock, false if no one acknowledged in
+   * time.
+   */
+  private async _takeOverRoom(dnaHashB64: string): Promise<boolean> {
+    const channel = new BroadcastChannel('presence-room');
+    const released = new Promise<boolean>(resolve => {
+      const timer = window.setTimeout(() => {
+        resolve(false);
+      }, 2000);
+      channel.onmessage = (e: MessageEvent) => {
+        const data = e.data;
+        if (
+          data &&
+          data.type === 'released' &&
+          data.dnaHashB64 === dnaHashB64
+        ) {
+          window.clearTimeout(timer);
+          resolve(true);
+        }
+      };
+    });
+    channel.postMessage({ type: 'kick', dnaHashB64 });
+    const ok = await released;
+    channel.close();
+    return ok;
+  }
+
+  private _releaseRoomLock() {
+    if (this._roomLockRelease) {
+      this._roomLockRelease();
+      this._roomLockRelease = undefined;
+    }
+    if (this._roomChannel) {
+      this._roomChannel.close();
+      this._roomChannel = undefined;
+    }
+    this._roomAlreadyOpen = false;
   }
 
   notifyError(msg: string) {
@@ -632,7 +758,7 @@ export class PresenceApp extends LitElement {
                 } catch (err) {
                   console.warn('Failed to open room in external window: ', err);
                   this._selectedRoleName = clonedCell.clone_id;
-                  this._pageView = PageView.Room;
+                  await this._enterRoom(encodeHashToBase64(clonedCell.cell_id[0]));
                 }
               }}
               style="margin: 7px 0;"
@@ -668,7 +794,7 @@ export class PresenceApp extends LitElement {
             } catch (err) {
               console.warn('Failed to open room in external window: ', err);
               this._selectedRoleName = e.detail.clone_id;
-              this._pageView = PageView.Room;
+              await this._enterRoom(encodeHashToBase64(e.detail.cell_id[0]));
             }
           }}
           style="margin: 7px 0;"
@@ -902,7 +1028,7 @@ export class PresenceApp extends LitElement {
                 ></sl-icon>
               </div>
               ${this._showSettings ? this.renderSettingsPanel() : ''}
-              <div style="margin-top: 120px; margin-bottom: 20px;">
+              <div class="row" style="margin-top: 120px; margin-bottom: 20px; align-items: center; gap: 14px;">
                 <button
                   class="enter-main-room-btn"
                   @click=${async () => {
@@ -925,6 +1051,13 @@ export class PresenceApp extends LitElement {
                     <span>${msg('Enter Main Room')}</span>
                   </div>
                 </button>
+                ${this._provisionedCell
+                  ? html`<wal-to-pocket-btn
+                      class="main-room-pocket-btn"
+                      .wal=${{ hrl: [this._provisionedCell.cell_id[0], NULL_HASH] }}
+                      .weaveClient=${this._weaveClient}
+                    ></wal-to-pocket-btn>`
+                  : ''}
               </div>
               ${this._profilesStore
                 ? this._activeMainRoomParticipants.length === 0
@@ -1022,19 +1155,122 @@ export class PresenceApp extends LitElement {
         `;
       case PageView.Room:
         if (!this._weaveClient) return html`loading...`;
+        if (this._roomAlreadyOpen) {
+          return html`
+            <div class="room-already-open secondary-font">
+              <div class="room-already-open-card">
+                <div style="font-size: 28px; margin-bottom: 16px;">
+                  ${msg('This room is already open in another window.')}
+                </div>
+                <div style="font-size: 18px; opacity: 0.85; margin-bottom: 24px;">
+                  ${msg(
+                    'A presence room can only be open in one place at a time.'
+                  )}
+                </div>
+                <div class="row" style="gap: 14px; justify-content: center; flex-wrap: wrap;">
+                  <button
+                    class="enter-main-room-btn"
+                    ?disabled=${this._takingOver || !this._currentRoomDnaB64}
+                    @click=${async () => {
+                      if (!this._currentRoomDnaB64) return;
+                      this._takingOver = true;
+                      try {
+                        const ok = await this._takeOverRoom(
+                          this._currentRoomDnaB64
+                        );
+                        if (ok) {
+                          await this._enterRoom(this._currentRoomDnaB64, {
+                            waitMs: 3000,
+                          });
+                        } else {
+                          this.notifyError(
+                            msg(
+                              'The other window did not respond. Close it manually and try again.'
+                            )
+                          );
+                        }
+                      } finally {
+                        this._takingOver = false;
+                      }
+                    }}
+                  >
+                    ${this._takingOver
+                      ? msg('Moving…')
+                      : msg('Use it here instead')}
+                  </button>
+                  ${this.externalWindow
+                    ? html`<button
+                        class="enter-main-room-btn"
+                        @click=${async () => {
+                          this._releaseRoomLock();
+                          try {
+                            await this._weaveClient.requestClose();
+                          } catch (e) {
+                            console.warn('requestClose failed', e);
+                          }
+                          this._pageView = PageView.RoomClosed;
+                        }}
+                      >
+                        ${msg('Close this window')}
+                      </button>`
+                    : html`<button
+                        class="enter-main-room-btn"
+                        @click=${() => {
+                          this._releaseRoomLock();
+                          this._pageView = PageView.Home;
+                        }}
+                      >
+                        ${msg('Back')}
+                      </button>`}
+                </div>
+              </div>
+            </div>
+          `;
+        }
         return html`
           <room-container
             class="room-container"
             .roleName=${this._selectedRoleName}
             .wal=${this._selectedWal}
             @quit-room=${async () => {
+              this._releaseRoomLock();
               if (this.externalWindow) {
                 console.log('Closing window.');
-                await this._weaveClient.requestClose();
+                try {
+                  await this._weaveClient.requestClose();
+                } catch (e) {
+                  console.warn('requestClose failed', e);
+                }
+                this._pageView = PageView.RoomClosed;
+              } else {
+                this._pageView = PageView.Home;
               }
-              this._pageView = PageView.Home;
             }}
           ></room-container>
+        `;
+      case PageView.RoomClosed:
+        return html`
+          <div class="room-already-open secondary-font">
+            <div class="room-already-open-card">
+              <div style="font-size: 28px; margin-bottom: 16px;">
+                ${msg('Room closed.')}
+              </div>
+              <div style="font-size: 18px; opacity: 0.85; margin-bottom: 24px;">
+                ${msg('You can reopen this room here.')}
+              </div>
+              <button
+                class="enter-main-room-btn"
+                ?disabled=${!this._currentRoomDnaB64}
+                @click=${async () => {
+                  if (this._currentRoomDnaB64) {
+                    await this._enterRoom(this._currentRoomDnaB64);
+                  }
+                }}
+              >
+                ${msg('Reopen')}
+              </button>
+            </div>
+          </div>
         `;
       default:
         return PageView.Home;
@@ -1105,6 +1341,12 @@ export class PresenceApp extends LitElement {
         position: relative;
         align-items: center;
         color: #bbc4f2;
+      }
+
+      .main-room-pocket-btn {
+        --bg-color: #102a4d;
+        --bg-color-hover: #1f3870;
+        color: #fff0f0;
       }
 
       .enter-main-room-btn {
@@ -1282,6 +1524,27 @@ export class PresenceApp extends LitElement {
 
       .settings-close-btn:hover {
         color: #c3c9eb;
+      }
+
+      .room-already-open {
+        display: flex;
+        flex: 1;
+        align-items: center;
+        justify-content: center;
+        width: 100vw;
+        min-height: 100vh;
+        color: #e1e5fc;
+        padding: 20px;
+        box-sizing: border-box;
+      }
+
+      .room-already-open-card {
+        background: linear-gradient(#1a3060, #102a4d);
+        border-radius: 25px;
+        padding: 40px 50px;
+        max-width: 560px;
+        text-align: center;
+        box-shadow: 1px 1px 8px 2px #020b16b8;
       }
 
       .room-container {

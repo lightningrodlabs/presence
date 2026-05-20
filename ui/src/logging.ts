@@ -283,6 +283,8 @@ export class PresenceLogger {
 
   _eventCallbacks: Partial<Record<PresenceLogEvent, CallbackWithId[]>> = {};
 
+  private _writeInterval: number | undefined;
+
   constructor() {
     if (window.__PRESENCE_LOGGER_ACTIVE__)
       throw new Error(
@@ -317,7 +319,7 @@ export class PresenceLogger {
     }
 
     // Add an interval to write full state to localStorage every 15 seconds
-    window.setInterval(() => {
+    this._writeInterval = window.setInterval(() => {
       console.log('writing log to localStorage.');
       this.write();
     }, 15_000);
@@ -328,6 +330,19 @@ export class PresenceLogger {
 
     // Remove logs from sessions older than 1 week
     this._garbageCollect();
+  }
+
+  destroy(): void {
+    if (this._writeInterval !== undefined) {
+      window.clearInterval(this._writeInterval);
+      this._writeInterval = undefined;
+    }
+    try {
+      this.write();
+    } catch (e) {
+      console.warn('PresenceLogger final write failed', e);
+    }
+    window.__PRESENCE_LOGGER_ACTIVE__ = false;
   }
 
   emit(

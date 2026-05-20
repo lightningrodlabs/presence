@@ -72,13 +72,27 @@ export class RoomContainer extends LitElement {
       this._private = true;
     }
 
+    this._presenceLogger = new PresenceLogger();
     this.streamsStore = await StreamsStore.connect(
       this.roomStore,
       () => this.weaveClient.userSelectScreen(),
-      new PresenceLogger()
+      this._presenceLogger
     );
 
     this.loading = false;
+  }
+
+  private _presenceLogger: PresenceLogger | undefined;
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    try {
+      this.streamsStore?.disconnect();
+    } catch (e) {
+      console.warn('streamsStore.disconnect failed', e);
+    }
+    this._presenceLogger?.destroy();
+    this._presenceLogger = undefined;
   }
 
   render() {
