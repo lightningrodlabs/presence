@@ -3,7 +3,8 @@
   "private": true,
   "workspaces": [
     "ui",
-    "tests"
+    "tests",
+    "packages/webrtc-peer"
   ],
   "scripts": {
     "start": "AGENTS=1 npm run network",

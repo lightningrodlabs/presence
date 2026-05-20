@@ -36,15 +36,14 @@ import type {
   TransportStats,
   Unsubscribe,
 } from '../types';
-import { ConnectionManager } from './connection-manager';
-import { DEFAULT_CONFIG } from './types';
+import { ConnectionManager, DEFAULT_CONFIG } from '@lightningrodlabs/webrtc-peer';
 import type {
   ConnectionConfig,
   FSMTransitionEntry,
   SignalingAdapter,
   SignalMessage,
   Unsubscribe as FsmUnsubscribe,
-} from './types';
+} from '@lightningrodlabs/webrtc-peer';
 
 export type FsmSignalEnvelope = {
   type: SignalMessage['type'];

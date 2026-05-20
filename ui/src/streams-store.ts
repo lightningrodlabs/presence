@@ -4724,7 +4724,7 @@ export class StreamsStore {
    * reconnecting → reconnecting on a full reconnect) and they're the
    * very events we need to see when diagnosing storm-like behaviour.
    */
-  private _logFsmTransition(entry: import('./transport/fsm/types').FSMTransitionEntry): void {
+  private _logFsmTransition(entry: import('@lightningrodlabs/webrtc-peer').FSMTransitionEntry): void {
     // Drop internal DTLS-watchdog bookkeeping. These are self-transitions
     // within `connecting`, fire 3-4 times per successful FSM connection,
     // and duplicate the information already carried by the surrounding

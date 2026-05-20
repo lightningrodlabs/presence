@@ -9,7 +9,7 @@ import type {
   SignalingAdapter,
   SignalMessage,
   Unsubscribe,
-} from '../types';
+} from '@lightningrodlabs/webrtc-peer';
 
 // ---------------------------------------------------------------------------
 // MockRTCPeerConnection

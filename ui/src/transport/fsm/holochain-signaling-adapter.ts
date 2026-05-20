@@ -8,7 +8,7 @@
 
 import { AgentPubKey, AgentPubKeyB64, decodeHashFromBase64, encodeHashToBase64 } from '@holochain/client';
 import { RoomClient } from '../../room/room-client';
-import type { SignalingAdapter, SignalMessage, Unsubscribe } from './types';
+import type { SignalingAdapter, SignalMessage, Unsubscribe } from '@lightningrodlabs/webrtc-peer';
 
 export class HolochainSignalingAdapter implements SignalingAdapter {
   private _roomClient: RoomClient;
