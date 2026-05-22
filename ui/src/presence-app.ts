@@ -845,6 +845,35 @@ export class PresenceApp extends LitElement {
         class="column"
         style="margin-top: 40px; align-items: center; margin-bottom: 80px;"
       >
+        ${this._provisionedCell
+          ? html`<shared-room-card
+              .isMainRoom=${true}
+              .mainRoomCellId=${this._provisionedCell.cell_id}
+              .mainRoomParticipants=${this._activeMainRoomParticipants.map(
+                info => info.pubkey
+              )}
+              @request-open-room=${async () => {
+                try {
+                  await (this._weaveClient as any).openAsset(
+                    {
+                      hrl: [this._provisionedCell!.cell_id[0], NULL_HASH],
+                    },
+                    'window'
+                  );
+                } catch (err) {
+                  console.warn(
+                    'Failed to open main room in external window: ',
+                    err
+                  );
+                  this._selectedRoleName = 'presence';
+                  await this._enterRoom(
+                    encodeHashToBase64(this._provisionedCell!.cell_id[0])
+                  );
+                }
+              }}
+              style="margin: 7px 0;"
+            ></shared-room-card>`
+          : ''}
         ${this.renderSharedRoomCards(this._groupRooms)}
       </div>
       <span style="display: flex; flex: 1;"></span>
@@ -998,6 +1027,7 @@ export class PresenceApp extends LitElement {
           class="column center-content"
           style="color: #c8ddf9; height: 100vh;"
         >
+          <img src="icon.png" alt="presence logo" class="entry-logo-img" />
           <div class="entry-logo">presence</div>
           <!-- <div>...and see the bigger picture</div> -->
           <div style="position: absolute; bottom: 20px;">loading...</div>
@@ -1018,66 +1048,17 @@ export class PresenceApp extends LitElement {
               style="position: fixed; bottom: 0; left: 5px; color: #c8ddf9; font-size: 16px;"
               >${__APP_VERSION__}</span
             >
-            <div class="column top-panel">
-              <div class="row" style="position: absolute; top: 0; right: 20px; align-items: center; gap: 10px;">
-                presence.
-                <sl-icon
-                  .src=${wrapPathInSvg(mdiCog)}
-                  style="font-size: 22px; cursor: pointer; opacity: 0.8;"
-                  @click=${() => { this._showSettings = true; }}
-                ></sl-icon>
+            <div class="top-bar">
+              <div class="row" style="align-items: center; gap: 12px;">
+                <img src="icon.png" alt="presence logo" class="header-logo" />
+                <span class="header-title">presence</span>
               </div>
+              <sl-icon
+                .src=${wrapPathInSvg(mdiCog)}
+                class="header-cog"
+                @click=${() => { this._showSettings = true; }}
+              ></sl-icon>
               ${this._showSettings ? this.renderSettingsPanel() : ''}
-              <div class="row" style="margin-top: 120px; margin-bottom: 20px; align-items: center; gap: 14px;">
-                <button
-                  class="enter-main-room-btn"
-                  @click=${async () => {
-                    await (this._weaveClient as any).openAsset(
-                      {
-                        hrl: [this._provisionedCell!.cell_id[0], NULL_HASH],
-                      },
-                      'window'
-                    );
-                    // this._selectedRoleName = 'presence';
-                    // this._pageView = PageView.Room;
-                  }}
-                >
-                  <div class="row" style="align-items: center;">
-                    <img
-                      src="door.png"
-                      alt="icon of a door"
-                      style="height: 45px; margin-right: 10px; margin-left: 10px; transform: scaleX(-1);"
-                    />
-                    <span>${msg('Enter Main Room')}</span>
-                  </div>
-                </button>
-                ${this._provisionedCell
-                  ? html`<wal-to-pocket-btn
-                      class="main-room-pocket-btn"
-                      .wal=${{ hrl: [this._provisionedCell.cell_id[0], NULL_HASH] }}
-                      .weaveClient=${this._weaveClient}
-                    ></wal-to-pocket-btn>`
-                  : ''}
-              </div>
-              ${this._profilesStore
-                ? this._activeMainRoomParticipants.length === 0
-                  ? html`<span class="blue-dark secondary-font" style="font-size: 20px;"
-                      >${msg('Be the first one here — others will see you when they arrive.')}</span
-                    >`
-                  : html`<div
-                      class="row blue-dark"
-                      style="align-items: center;"
-                    >
-                      <span style="margin-right: 10px;"
-                        >${msg('Currently in the main room: ')}</span
-                      >
-                      <list-online-agents
-                        .agents=${this._activeMainRoomParticipants.map(
-                          info => info.pubkey
-                        )}
-                      ></list-online-agents>
-                    </div>`
-                : html``}
             </div>
             <div class="column bottom-panel">
               <button
@@ -1310,6 +1291,13 @@ export class PresenceApp extends LitElement {
         box-shadow: 0 0 3px 1px #721c1c;
       }
 
+      .entry-logo-img {
+        height: 140px;
+        width: 140px;
+        border-radius: 50%;
+        margin-bottom: 10px;
+      }
+
       .entry-logo {
         font-size: 100px;
         font-family: 'Pacifico' sans-serif;
@@ -1319,21 +1307,45 @@ export class PresenceApp extends LitElement {
         font-weight: normal;
       }
 
-      .top-panel {
-        /* background: linear-gradient(#b2b9e0, #838bb2); */
-        /* background: linear-gradient(#9da6db, #717bae); */
+      .top-bar {
         background: linear-gradient(#a1aad9, #7780af);
-        /* background: #b2b9e0; */
-        /* background: #bbc4f2; */
-        /* background: #ced5fa; */
-        /* background: #668fc2; */
         display: flex;
         align-items: center;
-        min-height: 315px;
+        justify-content: space-between;
+        height: 56px;
+        padding: 0 16px;
         margin: 0;
         width: 100%;
+        box-sizing: border-box;
         position: relative;
-        box-shadow: 0 0 60px 10px #1e2137;
+        box-shadow: 0 0 30px 6px #1e2137;
+      }
+
+      .header-logo {
+        height: 40px;
+        width: 40px;
+        border-radius: 50%;
+      }
+
+      .header-title {
+        font-family: 'Pacifico', sans-serif;
+        font-size: 30px;
+        color: #0a1c35;
+        line-height: 1;
+        /* Pacifico's tall ascenders bias the glyphs above the line-box
+           center; nudge down to optically center against the logo. */
+        transform: translateY(-3px);
+      }
+
+      .header-cog {
+        font-size: 24px;
+        cursor: pointer;
+        color: #0a1c35;
+        opacity: 0.8;
+      }
+
+      .header-cog:hover {
+        opacity: 1;
       }
 
       .bottom-panel {
@@ -1341,12 +1353,6 @@ export class PresenceApp extends LitElement {
         position: relative;
         align-items: center;
         color: #bbc4f2;
-      }
-
-      .main-room-pocket-btn {
-        --bg-color: #102a4d;
-        --bg-color-hover: #1f3870;
-        color: #fff0f0;
       }
 
       .enter-main-room-btn {

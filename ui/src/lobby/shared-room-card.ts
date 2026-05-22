@@ -1,6 +1,6 @@
 import { LitElement, css, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { AgentPubKey, AppClient, ClonedCell } from '@holochain/client';
+import { AgentPubKey, AppClient, CellId, ClonedCell } from '@holochain/client';
 import { localized, msg } from '@lit/localize';
 import { NULL_HASH, WeaveClient } from '@theweave/api';
 
@@ -32,6 +32,17 @@ export class SharedRoomCard extends LitElement {
 
   @property()
   groupRoomInfo!: GroupRoomInfo;
+
+  // Main-room mode: render the always-present default room (the provisioned
+  // cell) using the same card. groupRoomInfo / clone logic are not used here.
+  @property({ type: Boolean })
+  isMainRoom = false;
+
+  @property()
+  mainRoomCellId: CellId | undefined;
+
+  @property()
+  mainRoomParticipants: AgentPubKey[] = [];
 
   @state()
   _showSecretWords = false;
@@ -130,6 +141,14 @@ export class SharedRoomCard extends LitElement {
   }
 
   async firstUpdated() {
+    if (this.isMainRoom) {
+      this._roomInfo = {
+        name: msg('Main Room'),
+        icon_src: undefined,
+        meta_data: undefined,
+      };
+      return;
+    }
     await this.updateRoomInfo();
   }
 
@@ -147,6 +166,17 @@ export class SharedRoomCard extends LitElement {
   }
 
   async handleOpenRoom() {
+    if (this.isMainRoom) {
+      // Parent handles opening the provisioned cell (openAsset + fallback).
+      this.dispatchEvent(
+        new CustomEvent('request-open-room', {
+          detail: { cell_id: this.mainRoomCellId },
+          composed: true,
+          bubbles: true,
+        })
+      );
+      return;
+    }
     // If the cell is not installed yet, install it first
     if (!this._myCell) {
       console.log('Installing cell.');
@@ -181,6 +211,17 @@ export class SharedRoomCard extends LitElement {
   }
 
   renderActiveParticipants() {
+    if (this.isMainRoom) {
+      if (this.mainRoomParticipants.length === 0) {
+        return html`<span>${msg('room is empty')}</span>`;
+      }
+      return html`
+        <list-online-agents
+          .avatarSize=${34}
+          .agents=${this.mainRoomParticipants}
+        ></list-online-agents>
+      `;
+    }
     if (!this._myCell) {
       return html`<span style="font-size: 18px; opacity: 0.8;"
         >${msg(
@@ -208,14 +249,24 @@ export class SharedRoomCard extends LitElement {
         <div class="row" style="align-items: flex-start; flex: 1; width: 100%;">
           <div
             style="margin-bottom: 15px; font-size: 26px; font-weight: bold;${this
-              ._roomInfo?.name
+              .isMainRoom || this._roomInfo?.name
               ? ''
               : 'opacity: 0.6'}"
           >
-            ${this._roomInfo ? this._roomInfo.name : '[unknown]'}
+            ${this.isMainRoom
+              ? msg('Main Room')
+              : this._roomInfo
+              ? this._roomInfo.name
+              : '[unknown]'}
           </div>
           <span style="display: flex; flex: 1;"></span>
-          ${this._myCell
+          ${this.isMainRoom && this.mainRoomCellId
+            ? html`<wal-to-pocket-btn
+                class="pocket-btn"
+                .wal=${{ hrl: [this.mainRoomCellId[0], NULL_HASH] }}
+                .weaveClient=${this._weaveClient}
+              ></wal-to-pocket-btn>`
+            : this._myCell
             ? html`<wal-to-pocket-btn
                 class="pocket-btn"
                 .wal=${{ hrl: [this._myCell.cell_id[0], NULL_HASH] }}
