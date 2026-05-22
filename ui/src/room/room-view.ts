@@ -11,10 +11,10 @@ import {
 import { AsyncStatus, StoreSubscriber } from '@holochain-open-dev/stores';
 import {
   mdiAccount,
-  mdiAccountOff,
   mdiChartLine,
   mdiChevronUp,
   mdiClose,
+  mdiCog,
   mdiFullscreen,
   mdiFullscreenExit,
   mdiLock,
@@ -300,7 +300,7 @@ export class RoomView extends LitElement {
   _showVideoSources = false;
 
   @state()
-  _showViewShapeOptions = false;
+  _showViewSettings = false;
 
   @state()
   _circleView = true;
@@ -343,8 +343,8 @@ export class RoomView extends LitElement {
     if (this._showVideoSources) {
       this._showVideoSources = false;
     }
-    if (this._showViewShapeOptions) {
-      this._showViewShapeOptions = false;
+    if (this._showViewSettings) {
+      this._showViewSettings = false;
     }
     if (this._showCustomLogDialog) {
       this.closeCustomLogDialog();
@@ -1665,59 +1665,31 @@ export class RoomView extends LitElement {
         ${this._renderModuleToolbarButton('screen-share')}
         ${this._renderModuleToolbarButton('timer')}
 
-        <sl-tooltip
-          content="${this._selfViewHidden
-            ? msg('Show Self View')
-            : msg('Hide Self View')}"
-          hoist
-        >
+        <sl-tooltip content="${msg('View Settings')}" hoist>
           <div
-            class="toggle-btn ${this._selfViewHidden ? 'btn-off' : ''}"
+            class="toggle-btn"
             tabindex="0"
-            @click=${() => {
-              this._selfViewHidden = !this._selfViewHidden;
+            @click=${(e: any) => {
+              e.stopPropagation();
+              this._showViewSettings = !this._showViewSettings;
             }}
             @keypress=${(e: KeyboardEvent) => {
               if (e.key === 'Enter') {
-                this._selfViewHidden = !this._selfViewHidden;
+                e.stopPropagation();
+                this._showViewSettings = !this._showViewSettings;
               }
             }}
           >
             <sl-icon
-              class="toggle-btn-icon ${this._selfViewHidden ? 'btn-icon-off' : ''}"
-              .src=${this._selfViewHidden
-                ? wrapPathInSvg(mdiAccountOff)
-                : wrapPathInSvg(mdiAccount)}
+              class="toggle-btn-icon"
+              .src=${wrapPathInSvg(mdiCog)}
             ></sl-icon>
 
-            <!-- View shape toggle -->
-            <div
-              class="toggle-sub-btn column center-content"
-              tabindex="0"
-              @click=${(e: any) => {
-                e.stopPropagation();
-                this._showViewShapeOptions = !this._showViewShapeOptions;
-              }}
-              @keypress=${(e: KeyboardEvent) => {
-                if (e.key === 'Enter') {
-                  e.stopPropagation();
-                  this._showViewShapeOptions = !this._showViewShapeOptions;
-                }
-              }}
-              @mouseover=${(e: any) => e.stopPropagation()}
-              @focus=${() => {}}
-            >
-              <sl-icon
-                class="sub-btn-icon"
-                .src=${wrapPathInSvg(mdiChevronUp)}
-              ></sl-icon>
-            </div>
-
-            <!-- View shape options -->
-            ${this._showViewShapeOptions
+            <!-- View settings menu -->
+            ${this._showViewSettings
               ? html`
                   <div
-                    class="column audio-input-sources secondary-font"
+                    class="column audio-input-sources view-settings-menu secondary-font"
                     @click=${(e: any) => {
                       e.stopPropagation();
                     }}
@@ -1729,8 +1701,29 @@ export class RoomView extends LitElement {
                     @mouseover=${(e: any) => e.stopPropagation()}
                     @focus=${() => {}}
                   >
-                    <div class="input-source-title">
-                      ${msg('View Shape')}
+                    <div class="input-source-title">${msg('Self View')}</div>
+                    <div
+                      class="audio-source column"
+                      tabindex="0"
+                      @click=${() => {
+                        this._selfViewHidden = !this._selfViewHidden;
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this._selfViewHidden = !this._selfViewHidden;
+                        }
+                      }}
+                    >
+                      <div class="row">
+                        <div style="${this._selfViewHidden ? 'color: transparent' : ''}">
+                          &#10003;&nbsp;
+                        </div>
+                        <div>${msg('Show self')}</div>
+                      </div>
+                    </div>
+
+                    <div class="input-source-title" style="margin-top: 6px;">
+                      ${msg('Tile Shape')}
                     </div>
                     <div
                       class="audio-source column"
@@ -3920,6 +3913,31 @@ export class RoomView extends LitElement {
         width: 170px;
         padding: 6px;
         cursor: default;
+        /* Menu opens upward from the bottom toolbar; cap height to the
+           viewport so it scrolls instead of clipping off the top of the
+           window in short/embedded panes. */
+        max-height: calc(100vh - 90px);
+        overflow-y: auto;
+      }
+
+      /* The gear sits at the far-right of the toolbar, so open its menu
+         leftward (anchored to the button's right edge) and lift it up a bit
+         to keep it clear of the window edge. */
+      .view-settings-menu {
+        left: auto;
+        right: 8px;
+        bottom: 34px;
+        width: 130px;
+      }
+
+      /* Title flush left; items flush left but indented under it. */
+      .view-settings-menu .input-source-title {
+        text-align: left;
+      }
+
+      .view-settings-menu .audio-source {
+        box-sizing: border-box;
+        padding-left: 14px;
       }
 
       .input-source-title {
