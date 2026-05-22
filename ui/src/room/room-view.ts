@@ -24,6 +24,7 @@ import {
   mdiNoteEditOutline,
   mdiCubeOutline,
   mdiPaperclip,
+  mdiPhoneHangup,
   mdiPencilCircleOutline,
   mdiHub,
   mdiCloudDownloadOutline,
@@ -1791,7 +1792,10 @@ export class RoomView extends LitElement {
               }
             }}
           >
-            <div class="stop-icon"></div>
+            <sl-icon
+              class="hangup-icon"
+              .src=${wrapPathInSvg(mdiPhoneHangup)}
+            ></sl-icon>
           </div>
         </sl-tooltip>
       </div>
@@ -3853,11 +3857,10 @@ export class RoomView extends LitElement {
         background: #dc4a4a;
       }
 
-      .stop-icon {
-        height: 23px;
-        width: 23px;
-        border-radius: 3px;
-        background: #eba6a6;
+      .hangup-icon {
+        height: 28px;
+        width: 28px;
+        color: #facece;
       }
 
       .toggle-btn-icon {
