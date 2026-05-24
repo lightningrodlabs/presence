@@ -152,7 +152,11 @@ export class PrivateRoomCard extends LitElement {
     css`
       .personal-room-card {
         align-items: flex-start;
-        min-width: 600px;
+        width: min(600px, 100%);
+        margin-left: auto;
+        margin-right: auto;
+        box-sizing: border-box;
+        overflow-wrap: anywhere;
         /* background: #40638f; */
         /* background: #668fc2; */
         /* background: #102a4d; */
@@ -206,7 +210,10 @@ export class PrivateRoomCard extends LitElement {
         background: #fff0f0;
         padding: 3px 8px;
         border-radius: 5px;
-        min-width: 400px;
+        min-width: 0;
+        width: 100%;
+        box-sizing: border-box;
+        word-break: break-word;
         text-align: center;
       }
 

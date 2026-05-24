@@ -735,7 +735,7 @@ export class PresenceApp extends LitElement {
       </div>
       <div
         class="column"
-        style="margin-top: 40px; align-items: center; margin-bottom: 80px;"
+        style="margin-top: 40px; align-items: stretch; margin-bottom: 80px; width: 100%; box-sizing: border-box; padding: 0 16px;"
       >
         ${repeat(
           this._personalRooms.sort((cell_a, cell_b) =>
@@ -843,7 +843,7 @@ export class PresenceApp extends LitElement {
       </div>
       <div
         class="column"
-        style="margin-top: 40px; align-items: center; margin-bottom: 80px;"
+        style="margin-top: 40px; align-items: stretch; margin-bottom: 80px; width: 100%; box-sizing: border-box; padding: 0 16px;"
       >
         ${this._provisionedCell
           ? html`<shared-room-card
@@ -1040,9 +1040,10 @@ export class PresenceApp extends LitElement {
           >
             ${this._displayError}
           </div>
+          <div class="home-scroll">
           <div
-            class="column"
-            style="align-items: center; display: flex; flex: 1; width: 100vw;"
+            class="column home-content"
+            style="align-items: center; display: flex; flex: 1; width: 100%; min-width: 240px;"
           >
             <span
               style="position: fixed; bottom: 0; left: 5px; color: #c8ddf9; font-size: 16px;"
@@ -1098,7 +1099,7 @@ export class PresenceApp extends LitElement {
                 >
                   <sl-icon
                     .src=${wrapPathInSvg(mdiAccountGroup)}
-                    style="font-size: 30px; margin-right: 5px;"
+                    class="slider-icon"
                   ></sl-icon>
                   <div style="margin-bottom: -6px;">${msg('Shared Rooms')}</div>
                 </div>
@@ -1121,7 +1122,7 @@ export class PresenceApp extends LitElement {
                 >
                   <sl-icon
                     .src=${wrapPathInSvg(mdiLock)}
-                    style="font-size: 30px; margin-right: 5px;"
+                    class="slider-icon"
                   ></sl-icon>
                   <div style="margin-bottom: -6px;">
                     ${msg('Private Rooms')}
@@ -1132,6 +1133,7 @@ export class PresenceApp extends LitElement {
                 ? this.renderGroupRooms()
                 : this.renderPrivateRooms()}
             </div>
+          </div>
           </div>
         `;
       case PageView.Room:
@@ -1262,8 +1264,13 @@ export class PresenceApp extends LitElement {
     sharedStyles,
     css`
       :host {
-        min-height: 100vh;
-        min-width: 100vw;
+        /* Definite height (not min-height) so .home-scroll's flex:1 is
+           bounded and scrolls internally instead of growing the host and
+           making the document scroll. width:100% (never 100vw) so the host
+           tracks the body's content box -- 100vw would include the vertical
+           scrollbar gutter and push a document-level horizontal scrollbar. */
+        height: 100vh;
+        width: 100%;
         display: flex;
         flex-direction: column;
         align-items: center;
@@ -1349,10 +1356,35 @@ export class PresenceApp extends LitElement {
       }
 
       .bottom-panel {
-        width: 100vw;
+        width: 100%;
         position: relative;
         align-items: center;
         color: #bbc4f2;
+        /* Query container so the toggle scales to the available width (cqi),
+           not the viewport (vw). Container units shrink when a vertical
+           scrollbar appears, so the toggle never forces a horizontal one. */
+        container-type: inline-size;
+      }
+
+      /* Landing page scrolls inside this container. The two axes are
+         independent: a horizontal bar appears only when the pane is
+         narrower than .home-content's min-width, a vertical bar only when
+         the rooms are taller than the pane.
+
+         scrollbar-gutter: stable is the key: a classic vertical scrollbar
+         consumes ~15px of width when it appears, which momentarily makes
+         the content "too wide" and triggers a horizontal bar -- which then
+         steals height, keeping the vertical bar, locking both on. Reserving
+         the gutter at all times means the content width never changes when
+         the vertical bar appears, so there is nothing to trigger the
+         horizontal one. min-height: 0 keeps the vertical overflow inside
+         this box rather than growing the host. */
+      .home-scroll {
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+        overflow: auto;
+        scrollbar-gutter: stable;
       }
 
       .enter-main-room-btn {
@@ -1408,12 +1440,18 @@ export class PresenceApp extends LitElement {
         color: #e1e5fc;
         height: 54px;
         border-radius: 25px 3px 3px 25px;
-        padding: 2px 15px;
+        padding: 2px clamp(6px, 2cqi, 15px);
         box-shadow: 0 0 4px 2px black inset;
         cursor: pointer;
         font-family: 'Baloo 2 Variable', sans-serif;
         font-weight: 600;
-        font-size: 26px;
+        font-size: clamp(11px, 4.5cqi, 26px);
+        white-space: nowrap;
+      }
+
+      .slider-icon {
+        font-size: clamp(13px, 5cqi, 30px);
+        margin-right: 5px;
       }
 
       .slider-button:hover:not(.btn-selected) {

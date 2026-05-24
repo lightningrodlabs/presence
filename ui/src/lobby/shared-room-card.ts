@@ -302,7 +302,11 @@ export class SharedRoomCard extends LitElement {
     css`
       .shared-room-card {
         align-items: flex-start;
-        min-width: 600px;
+        width: min(600px, 100%);
+        margin-left: auto;
+        margin-right: auto;
+        box-sizing: border-box;
+        overflow-wrap: anywhere;
         /* background: #40638f; */
         /* background: #668fc2; */
         /* background: #102a4d; */
