@@ -67,7 +67,13 @@ import {
   FilmstripCaptureSize,
 } from './modules/video-filmstrip';
 import './logs-graph';
-import { downloadJson, formattedDate, sortConnectionStatuses } from '../utils';
+import {
+  downloadJson,
+  formattedDate,
+  readLocalStorage,
+  sortConnectionStatuses,
+  writeLocalStorage,
+} from '../utils';
 import { PING_INTERVAL, StreamsStore } from '../streams-store';
 import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
 import { getAllModules, getModule, getShareModules } from './modules/registry';
@@ -309,6 +315,9 @@ export class RoomView extends LitElement {
 
   @state()
   _circleView = true;
+
+  @state()
+  _autoJoinAV = readLocalStorage<boolean>('presence:autoJoinAV', false);
 
   @state()
   _panelMode: 'assets' | 'people' = 'assets';

@@ -1594,6 +1594,11 @@ export class PresenceApp extends LitElement {
       .room-container {
         display: flex;
         flex: 1;
+        /* presence-app centres its children (align-items:center), so stretch
+           this one to the full content-box width (never 100vw — that includes
+           the scrollbar gutter) and let room-view fill it. */
+        width: 100%;
+        min-width: 0;
         margin: 0;
       }
     `,
