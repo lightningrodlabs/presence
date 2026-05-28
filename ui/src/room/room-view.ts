@@ -902,16 +902,16 @@ export class RoomView extends LitElement {
       title: string;
     }> = [
       {
-        value: 'simplepeer',
-        label: 'WebRTC (SP)',
-        color: '#7adc7a',
-        title: 'WebRTC via simple-peer (default)',
-      },
-      {
         value: 'fsm',
         label: 'WebRTC (FSM)',
         color: '#7adc7a',
-        title: 'WebRTC via perfect-negotiation FSM',
+        title: 'WebRTC via perfect-negotiation FSM (default)',
+      },
+      {
+        value: 'simplepeer',
+        label: 'WebRTC (SP)',
+        color: '#7adc7a',
+        title: 'WebRTC via simple-peer (fallback)',
       },
       {
         value: 'signals',

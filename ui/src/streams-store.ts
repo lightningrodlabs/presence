@@ -459,7 +459,12 @@ export class StreamsStore {
         this._handleMediaRemoteStream(event.peer, event.connectionId, event.stream);
         break;
       case 'remote-track':
-        this._handleMediaRemoteTrack(event.peer, event.connectionId, event.track);
+        this._handleMediaRemoteTrack(
+          event.peer,
+          event.connectionId,
+          event.track,
+          event.stream,
+        );
         break;
       case 'data-channel-message':
         this._handleMediaDataChannelMessage(event.peer, event.data);
@@ -488,7 +493,7 @@ export class StreamsStore {
     const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
     const peerPayload = peerConv ? parseConversationPayload(peerConv) : null;
     return this.webrtcImplForGiven(
-      myPayload?.webrtcImpl ?? 'simplepeer',
+      myPayload?.webrtcImpl ?? 'fsm',
       myPayload?.peerImpl?.[peerB64],
       peerPayload?.webrtcImpl ?? 'simplepeer',
       peerPayload?.peerImpl?.[this.myPubKeyB64],
@@ -1071,6 +1076,7 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
     track: MediaStreamTrack,
+    stream: MediaStream,
   ): void {
     console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
     this.logger.logAgentEvent({
@@ -1079,6 +1085,15 @@ export class StreamsStore {
       event: 'SimplePeerTrack',
       connectionId,
     });
+
+    // Ensure the audio analyser is wired up for this peer. The 'remote-stream'
+    // event is deduped per stream.id in the underlying RTCPeer, so a stream
+    // whose first track was video (analyser-setup early-returns on no audio)
+    // never gets a second pass when the audio track arrives later. Hook it
+    // here as well: idempotent if the analyser already exists.
+    if (track.kind === 'audio' && stream && !this._peerAnalysers.has(pubKeyB64)) {
+      this.setupPeerAudioAnalyser(pubKeyB64, stream);
+    }
 
     if (!track.muted) {
       this._setTrackReady(pubKeyB64, connectionId, track);
@@ -3384,11 +3399,11 @@ export class StreamsStore {
   }
 
   /** Read the current global webrtcImpl preference from our conversation
-   *  payload. Defaults to 'simplepeer'. */
+   *  payload. Defaults to 'fsm' (auto-flip falls back to 'simplepeer'). */
   myWebrtcImpl(): 'simplepeer' | 'fsm' {
     const existing = get(this._myModuleStates)['conversation'];
     const payload = existing ? parseConversationPayload(existing) : null;
-    return payload?.webrtcImpl ?? 'simplepeer';
+    return payload?.webrtcImpl ?? 'fsm';
   }
 
   /**
@@ -3825,6 +3840,14 @@ export class StreamsStore {
 
     const ctx = this.micSource.ensureAudioContext();
     if (!ctx) return;
+
+    // Resume if still suspended (Electron/Wayland sometimes leaves the
+    // context suspended past creation; a suspended context means the audio
+    // graph doesn't run and the analyser reads back zeros, even though the
+    // <video> element plays audio fine).
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
 
     try {
       const source = ctx.createMediaStreamSource(stream);

@@ -45,8 +45,11 @@ import type { StreamsStore } from '../../streams-store';
  *  default for a link is `'fsm'` if either side picks it, else
  *  `'simplepeer'`. Per-link overrides via `peerImpl` (below) take
  *  precedence over the global default. This avoids a signaling-channel
- *  mismatch (Sdp vs SdpFsm). Default `'simplepeer'` preserves existing
- *  behavior for peers running older code that omits the field. */
+ *  mismatch (Sdp vs SdpFsm). Default is `'fsm'` — the more capable carrier
+ *  on marginal NATs; auto-flip falls back to `'simplepeer'` on failure.
+ *  The parser still treats a *missing* field as `'simplepeer'` so peers
+ *  running pre-FSM code (which omit the field entirely) are still
+ *  recognised as simplepeer clients. */
 export type WebrtcImpl = 'simplepeer' | 'fsm';
 
 export interface ConversationPayload {
@@ -81,7 +84,7 @@ export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
   micMuted: true,
   webrtcDisabled: false,
   disableWebrtcWith: [],
-  webrtcImpl: 'simplepeer',
+  webrtcImpl: 'fsm',
   peerImpl: {},
 };
 
