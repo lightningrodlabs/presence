@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>iframe embed probe</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #111;
+      }
+      /* Seamless-embedder shape: width pinned, height driven by content. */
+      iframe {
+        display: block;
+        width: 100%;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="f"></iframe>
+    <script type="module">
+      // Reproduce a content-resizing embedder (Weave/launcher style): set the
+      // iframe height to the inner document's scrollHeight. Because the inner
+      // app sizes itself with 100vh / cqh, this creates the feedback loop that
+      // a normal pinned-height host never triggers.
+      const params = new URLSearchParams(location.search);
+      const inner = params.get('inner') ?? 'mode=grid&shape=circle&n=2';
+      const f = document.getElementById('f');
+      f.src = `/harness/layout-harness.html?${inner}`;
+      // Start with a definite height so 100vh has a seed value.
+      f.style.height = window.innerHeight + 'px';
+      setInterval(() => {
+        try {
+          const sh = f.contentDocument.documentElement.scrollHeight;
+          if (sh) f.style.height = sh + 'px';
+        } catch (e) {
+          /* ignore */
+        }
+      }, 100);
+    </script>
+  </body>
+</html>

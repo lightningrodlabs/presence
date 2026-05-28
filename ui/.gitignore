@@ -23,3 +23,9 @@
 storybook-static
 .rollup.cache
 *.tsbuildinfo
+
+## layout harness (generated artifacts; regenerated each run)
+/harness/__results__/
+/harness/__screenshots__/
+/test-results/
+/playwright-report/

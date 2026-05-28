@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>presence layout harness</title>
+    <!-- Mirror the real index.html: body has NO height; the presence-app host
+         sizes itself via its own :host { height:100vh }. Pinning a height here
+         would mask the very chain bug we want to catch. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #2b304a;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module" src="./layout-harness.ts"></script>
+  </body>
+</html>
