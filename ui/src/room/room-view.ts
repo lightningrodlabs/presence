@@ -3228,10 +3228,10 @@ export class RoomView extends LitElement {
         class="stop-share"
         tabindex="0"
         style="${this.streamsStore.screenShareStream ? '' : 'display: none'}"
-        @click=${async () => this.streamsStore.screenShareOff()}
+        @click=${async () => this.streamsStore.stopScreenShare()}
         @keypress=${async (e: KeyboardEvent) => {
           if (e.key === 'Enter') {
-            await this.streamsStore.screenShareOff();
+            await this.streamsStore.stopScreenShare();
           }
         }}
       >

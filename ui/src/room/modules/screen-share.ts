@@ -90,8 +90,7 @@ const screenShareModule: ModuleDefinition = {
     const active = !!myState;
     const handler = async () => {
       if (active) {
-        await streamsStore.screenShareOff();
-        await streamsStore.deactivateModule('screen-share');
+        await streamsStore.stopScreenShare();
       } else {
         // Activate module first so the video element renders before
         // screenShareOn() fires the my-screen-share-on event. Between

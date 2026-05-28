@@ -2432,6 +2432,18 @@ export class StreamsStore {
     }
   }
 
+  /**
+   * Tear down own screen sharing fully: stop the stream and disconnect peers,
+   * then deactivate the module so the share pane closes for everyone. Both
+   * the big "Stop Screen Share" overlay and the toolbar button call this so
+   * they can't drift on which steps they perform -- `screenShareOff` alone
+   * leaves the module active and the pane open.
+   */
+  async stopScreenShare(): Promise<void> {
+    this.screenShareOff();
+    await this.deactivateModule('screen-share');
+  }
+
   disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64) {
     if (get(this._openConnections)[pubKeyB64]) {
       this._activeMediaTransportFor(pubKeyB64).closeConnection(pubKeyB64, 'disconnectFromPeerVideo');
