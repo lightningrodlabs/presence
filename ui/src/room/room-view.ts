@@ -259,7 +259,7 @@ export class RoomView extends LitElement {
   _camera = false;
 
   @state()
-  _selfViewHidden = false;
+  _selfViewHidden = readLocalStorage<boolean>('presence:selfViewHidden', false);
 
   @state()
   _maximizedVideo: string | undefined; // id of the maximized video if any
@@ -314,10 +314,13 @@ export class RoomView extends LitElement {
   _showViewSettings = false;
 
   @state()
-  _circleView = true;
+  _circleView = readLocalStorage<boolean>('presence:circleView', true);
 
   @state()
-  _autoJoinAV = readLocalStorage<boolean>('presence:autoJoinAV', false);
+  _autoJoinAudio = readLocalStorage<boolean>('presence:autoJoinAudio', false);
+
+  @state()
+  _autoJoinVideo = readLocalStorage<boolean>('presence:autoJoinVideo', false);
 
   @state()
   _panelMode: 'assets' | 'people' = 'assets';
@@ -571,6 +574,13 @@ export class RoomView extends LitElement {
     // without deactivating the module.
     this.streamsStore.activateModule('conversation');
     this.streamsStore.activateModule('reactions');
+
+    if (this._autoJoinAudio) {
+      this.streamsStore.audioOn(true).catch(() => {});
+    }
+    if (this._autoJoinVideo) {
+      this.streamsStore.videoOn().catch(() => {});
+    }
   }
 
   async addAttachment() {
@@ -1748,7 +1758,7 @@ export class RoomView extends LitElement {
         ${this._renderModuleToolbarButton('screen-share')}
         ${this._renderModuleToolbarButton('timer')}
 
-        <sl-tooltip content="${msg('View Settings')}" hoist>
+        <sl-tooltip content="${msg('Call Settings')}" hoist>
           <div
             class="toggle-btn"
             tabindex="0"
@@ -1790,10 +1800,12 @@ export class RoomView extends LitElement {
                       tabindex="0"
                       @click=${() => {
                         this._selfViewHidden = !this._selfViewHidden;
+                        writeLocalStorage('presence:selfViewHidden', this._selfViewHidden);
                       }}
                       @keypress=${(e: KeyboardEvent) => {
                         if (e.key === 'Enter') {
                           this._selfViewHidden = !this._selfViewHidden;
+                          writeLocalStorage('presence:selfViewHidden', this._selfViewHidden);
                         }
                       }}
                     >
@@ -1806,18 +1818,66 @@ export class RoomView extends LitElement {
                     </div>
 
                     <div class="input-source-title" style="margin-top: 6px;">
-                      ${msg('Tile Shape')}
+                      ${msg('Auto-join')}
+                    </div>
+                    <div
+                      class="audio-source column"
+                      tabindex="0"
+                      @click=${() => {
+                        this._autoJoinAudio = !this._autoJoinAudio;
+                        writeLocalStorage('presence:autoJoinAudio', this._autoJoinAudio);
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this._autoJoinAudio = !this._autoJoinAudio;
+                          writeLocalStorage('presence:autoJoinAudio', this._autoJoinAudio);
+                        }
+                      }}
+                    >
+                      <div class="row">
+                        <div style="${this._autoJoinAudio ? '' : 'color: transparent'}">
+                          &#10003;&nbsp;
+                        </div>
+                        <div>${msg('Audio')}</div>
+                      </div>
+                    </div>
+                    <div
+                      class="audio-source column"
+                      tabindex="0"
+                      @click=${() => {
+                        this._autoJoinVideo = !this._autoJoinVideo;
+                        writeLocalStorage('presence:autoJoinVideo', this._autoJoinVideo);
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this._autoJoinVideo = !this._autoJoinVideo;
+                          writeLocalStorage('presence:autoJoinVideo', this._autoJoinVideo);
+                        }
+                      }}
+                    >
+                      <div class="row">
+                        <div style="${this._autoJoinVideo ? '' : 'color: transparent'}">
+                          &#10003;&nbsp;
+                        </div>
+                        <div>${msg('Video')}</div>
+                      </div>
+                    </div>
+
+                    <div class="input-source-title" style="margin-top: 6px;">
+                      ${msg('View Shape')}
                     </div>
                     <div
                       class="audio-source column"
                       tabindex="0"
                       @click=${() => {
                         this._circleView = true;
+                        writeLocalStorage('presence:circleView', true);
                         this.closeClosables();
                       }}
                       @keypress=${(e: KeyboardEvent) => {
                         if (e.key === 'Enter') {
                           this._circleView = true;
+                          writeLocalStorage('presence:circleView', true);
                           this.closeClosables();
                         }
                       }}
@@ -1834,11 +1894,13 @@ export class RoomView extends LitElement {
                       tabindex="0"
                       @click=${() => {
                         this._circleView = false;
+                        writeLocalStorage('presence:circleView', false);
                         this.closeClosables();
                       }}
                       @keypress=${(e: KeyboardEvent) => {
                         if (e.key === 'Enter') {
                           this._circleView = false;
+                          writeLocalStorage('presence:circleView', false);
                           this.closeClosables();
                         }
                       }}
