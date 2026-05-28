@@ -74,6 +74,11 @@ import { getAllModules, getModule, getShareModules } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
 import './modules'; // side-effect: registers all modules
+import {
+  bestColumns,
+  GRID_MIN_TILE_WIDTH,
+  GRID_TOOLBAR_RESERVE,
+} from './layout';
 
 declare const __APP_VERSION__: string;
 
@@ -317,6 +322,19 @@ export class RoomView extends LitElement {
   @state()
   _isResizing = false;
 
+  // Area-maximizing grid shape for the simple people grid. JS only picks the
+  // column/row count (which depends on the container's aspect ratio, robust to
+  // absolute-measurement error inside the nested iframe). Actual tile sizing is
+  // done in CSS with container-query units so tiles can never overflow their
+  // box. 0 columns = inactive (split / maximized / single-tile mode).
+  @state()
+  _gridCols = 0;
+
+  @state()
+  _gridRows = 0;
+
+  private _onWindowResize = () => this._updateGrid();
+
   @state()
   _logsGraphEnabled = true;
 
@@ -386,6 +404,8 @@ export class RoomView extends LitElement {
   async firstUpdated() {
     this.addEventListener('click', this.sideClickListener);
     document.addEventListener('keydown', this.keyDownListener);
+    window.addEventListener('resize', this._onWindowResize);
+    this._updateGrid();
     this.streamsStore.onEvent(async event => {
       switch (event.type) {
         case 'error': {
@@ -607,6 +627,59 @@ export class RoomView extends LitElement {
     if (changedProperties.has('_maximizedVideo')) {
       setTimeout(() => this._reapplyVideoStreams(), 50);
     }
+    this._updateGrid();
+  }
+
+  /**
+   * Recompute the area-maximizing grid shape (columns/rows) for the simple
+   * people grid. Split mode (screen share) and maximized mode keep their own
+   * layouts. Setting state only when it changes avoids re-render loops.
+   */
+  private _updateGrid() {
+    if (this._maximizedVideo || this._getActiveShares().length > 0) {
+      this._setGrid(0, 0);
+      return;
+    }
+    const container = this.shadowRoot?.querySelector(
+      '.videos-container'
+    ) as HTMLElement | null;
+    if (!container) return;
+    // Measure only to derive the container's aspect ratio (W/H), which is all
+    // the column choice needs. We do NOT use these as pixel sizes — inside the
+    // nested iframe the absolute values don't reliably match the visible pane,
+    // so CSS sizes the tiles in container-query units against the real box.
+    const doc = document.documentElement;
+    const W = doc.clientWidth;
+    const headerHeight = Math.max(
+      0,
+      container.getBoundingClientRect().top + window.scrollY
+    );
+    const H = Math.max(0, doc.clientHeight - headerHeight - GRID_TOOLBAR_RESERVE);
+
+    // Count tiles actually laid out: peers + phantoms + own (unless hidden,
+    // in which case it is display:none and takes no grid slot).
+    const phantomCount = this.streamsStore.phantomAgents().length;
+    let n = Object.keys(this._activeAgents.value).length + phantomCount;
+    if (!this._selfViewHidden) n += 1;
+
+    // A lone tile keeps the existing fill-the-viewport behavior (.single),
+    // which sets an explicit height; pinning width too would break it.
+    if (n <= 1) {
+      this._setGrid(0, 0);
+      return;
+    }
+
+    // Circle tiles are 1:1, rectangle tiles are 16:9 — this changes which
+    // column count maximizes area, so it must feed the computation.
+    const aspect = this._circleView ? 1 : 16 / 9;
+    const cols = bestColumns(W, H, n, aspect);
+    this._setGrid(cols, Math.ceil(n / cols));
+  }
+
+  // Update grid shape state, only writing when changed to avoid re-render loops.
+  private _setGrid(cols: number, rows: number) {
+    if (cols !== this._gridCols) this._gridCols = cols;
+    if (rows !== this._gridRows) this._gridRows = rows;
   }
 
   private _reapplyVideoStreams() {
@@ -692,6 +765,7 @@ export class RoomView extends LitElement {
 
   disconnectedCallback(): void {
     if (this.pingInterval) window.clearInterval(this.pingInterval);
+    window.removeEventListener('resize', this._onWindowResize);
     if (this._unsubscribe) this._unsubscribe();
     if (this._activeAgentsUnsubscribe) this._activeAgentsUnsubscribe();
     this.removeEventListener('click', this.sideClickListener);
@@ -2579,6 +2653,9 @@ export class RoomView extends LitElement {
     const activeShares = this._getActiveShares();
     const hasShared = activeShares.length > 0;
     const splitMode = hasShared && !this._maximizedVideo;
+    // Simple people grid (no screen share, not maximized): JS picks the grid
+    // shape (--cols/--rows) and CSS sizes tiles in cqw/cqh to maximize area.
+    const autoGrid = !splitMode && !this._maximizedVideo;
     return html`
       <div
         class="custom-log-dialog"
@@ -2686,7 +2763,28 @@ export class RoomView extends LitElement {
           : html``}
         ${this.roomName()}
       </div>
-      <div class="videos-container${splitMode ? ' split-mode' : ''}">
+      <div
+        class="videos-container${splitMode ? ' split-mode' : ''}${autoGrid
+          ? ' auto-grid'
+          : ''}"
+        style="${autoGrid && this._gridCols > 0
+          ? (() => {
+              // n must match _updateGrid's count: peers + phantoms + self (unless hidden).
+              const n =
+                Object.keys(this._activeAgents.value).length +
+                this.streamsStore.phantomAgents().length +
+                (this._selfViewHidden ? 0 : 1);
+              const lastK = ((n - 1) % this._gridCols) + 1;
+              // When the last row has a single item (the common odd-n / cols=2
+              // case), let it span the row so justify-items:center centers it
+              // across the columns above. Otherwise normal one-cell placement.
+              const lastSpans = lastK === 1 && this._gridCols > 1 ? this._gridCols : 1;
+              return `--cols: ${this._gridCols}; --rows: ${this._gridRows}; --tile-aspect: ${
+                this._circleView ? '1' : '1.7778'
+              }; --tile-min: ${GRID_MIN_TILE_WIDTH}px; --last-spans: ${lastSpans};`;
+            })()
+          : ''}"
+      >
         ${this._isResizing ? html`<div class="resize-overlay"></div>` : html``}
         ${hasShared ? html`
         <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
@@ -3166,6 +3264,19 @@ export class RoomView extends LitElement {
   static styles = [
     sharedStyles,
     css`
+      /* Fill .room-container (a flex row) and lay our own children out in a
+         column. The only in-flow child is .videos-container (the room-name and
+         toolbar are absolutely/fixed positioned), so it gets all the height via
+         flex:1 — no viewport units needed, which avoids the 100vw/100vh
+         scrollbar deadlock. */
+      :host {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-width: 0;
+        min-height: 0;
+      }
+
       main {
         flex-grow: 1;
         margin: 0;
@@ -3411,8 +3522,12 @@ export class RoomView extends LitElement {
         align-items: center;
         justify-content: center;
         flex-wrap: wrap;
-        width: 100vw;
-        min-height: 100vh;
+        /* Fill the host (width:100% of the now-stretched chain, height via
+           flex:1) instead of 100vw/100vh, which included the scrollbar gutter
+           and forced both scrollbars. */
+        width: 100%;
+        min-width: 0;
+        min-height: 0;
         margin: 0;
         align-content: center;
         position: relative;
@@ -3485,14 +3600,14 @@ export class RoomView extends LitElement {
       }
 
       .maximized {
-        height: 100vh;
-        width: 100vw;
+        height: 100%;
+        width: 100%;
         margin: 0;
       }
 
       .video-container.screen-share.maximized {
-        width: 100vw;
-        min-width: 100vw;
+        width: 100%;
+        min-width: 0;
       }
 
       .maximize-icon {
@@ -3551,7 +3666,7 @@ export class RoomView extends LitElement {
       @media (max-aspect-ratio: 1/1) {
         .videos-container.split-mode {
           flex-direction: column;
-          height: 100vh;
+          height: 100%;
         }
       }
 
@@ -3716,6 +3831,73 @@ export class RoomView extends LitElement {
       .video-container:not(.square-view):not(.screen-share).unlimited {
         width: min(24%, 24vw, 23vh);
         min-width: min(23vh, max(50px, 24vw));
+      }
+
+      /* The people grid now fills a real, flex-sized box (no viewport units),
+         so make it a size query container: tiles below can size themselves in
+         cqw/cqh against this box, which tracks the visible pane and resizing.
+         padding-bottom reserves the fixed toolbar's strip so the bottom tile
+         clears it (and the cq basis excludes it). safe-center keeps centring
+         while tiles fit, falling back to scrollable top-alignment when they
+         don't. */
+      .videos-container.auto-grid {
+        /* Real CSS grid: exactly --cols per row, rows created as needed. Unlike
+           flex-wrap this can never bump a tile to an extra row when the usable
+           width drops (e.g. a classic scrollbar stealing ~14px) -- columns just
+           narrow, the tile re-sizes in cqw, and no scrollbar feedback loop can
+           form. scrollbar-gutter:stable keeps the width constant either way. */
+        display: grid;
+        grid-template-columns: repeat(var(--cols, 1), 1fr);
+        /* Rows hug their tile (max-content) so short tiles (e.g. 16:9 in a
+           tall window) don't sit alone in a 1fr row with huge gaps above and
+           below. The grid block as a whole is then centered vertically by
+           align-content. The min-tile floor is enforced by the tile's own
+           width-formula max(--tile-min, ...). */
+        grid-auto-rows: max-content;
+        justify-items: center;
+        align-items: center;
+        justify-content: center;
+        align-content: safe center;
+        container-type: size;
+        box-sizing: border-box;
+        padding-bottom: 90px;
+        overflow-y: auto;
+        overflow-x: hidden;
+        scrollbar-gutter: stable;
+      }
+
+      /* Area-maximizing tile size. JS picks --cols/--rows (from the container
+         aspect ratio) and --tile-aspect; CSS makes each tile the largest that
+         fits both a 1/cols-wide and a 1/rows-tall slice of the container, in
+         cqw/cqh so it can never overflow it and shrinks with the pane down to
+         --tile-min (60px), below which the grid scrolls. 14px = per-tile
+         margin+border. Higher specificity than the per-count classes. */
+      .videos-container.auto-grid
+        .video-container:not(.maximized):not(.screen-share) {
+        /* Largest aspect-correct tile that fits its grid cell, sized in
+           cqw/cqh so it tracks the real pane; centered in the cell by the
+           grid's justify/align-items. 14px = per-tile margin+border. */
+        width: max(
+          var(--tile-min, 60px),
+          min(
+            calc(100cqw / var(--cols, 1) - 14px),
+            calc((100cqh / var(--rows, 1) - 14px) * var(--tile-aspect, 1))
+          )
+        );
+        min-width: 0;
+        max-width: 100cqw;
+      }
+
+      /* When the last row has a single item (JS sets --last-spans=cols), have
+         it span the full row so justify-items:center centers it between the
+         columns above instead of leaving it left-anchored in column 1.
+         Descendant combinator (not >) because the tiles live inside a
+         display:contents wrapper (.layout-transparent), so they aren't direct
+         children of .videos-container in the DOM. :last-child still matches
+         the last .video-container in its DOM parent (the wrapper). */
+      .videos-container.auto-grid
+        .video-container:last-child:not(.maximized):not(.screen-share) {
+        grid-column: span var(--last-spans, 1);
       }
 
       /* People panel: use container query units so videos size
@@ -3992,9 +4174,16 @@ export class RoomView extends LitElement {
       }
 
       /*
-       * Narrow contexts (asset panes, room-in-room embeds): shrink the toolbar
-       * buttons and allow wrapping. The panel keeps its bottom-right anchor,
-       * so when it wraps to a second row it grows upward.
+       * Narrow contexts (asset panes, room-in-room embeds, screen-share with a
+       * slim people column): shrink the toolbar buttons progressively so the
+       * row stays on a single line as long as possible. The panel keeps its
+       * bottom-right anchor, so wrapping to a second row grows it upward and
+       * covers the agent-name overlays at the bottom of the tiles — we avoid
+       * that by making the buttons smaller rather than letting them wrap.
+       *
+       * .btn-stop (leave call) must shrink in lock-step with .toggle-btn (it was
+       * previously left out, so it stayed full-size while the others shrank),
+       * and the icons must scale with the buttons or they overflow.
        */
       @media (max-width: 600px) {
         .toggles-panel {
@@ -4005,15 +4194,64 @@ export class RoomView extends LitElement {
           max-width: calc(100vw - 20px);
           row-gap: 4px;
         }
-        .toggle-btn {
+        .toggle-btn,
+        .btn-stop {
           height: 44px;
           width: 44px;
           margin: 0 2px;
+        }
+        .toggle-btn-icon {
+          height: 30px;
+          width: 30px;
+        }
+        .hangup-icon {
+          height: 22px;
+          width: 22px;
         }
         .toggle-sub-btn {
           width: 14px;
           height: 14px;
           border-width: 2px;
+        }
+      }
+
+      @media (max-width: 460px) {
+        .toggles-panel {
+          padding: 3px 6px;
+        }
+        .toggle-btn,
+        .btn-stop {
+          height: 36px;
+          width: 36px;
+          margin: 0 1px;
+        }
+        .toggle-btn-icon {
+          height: 24px;
+          width: 24px;
+        }
+        .hangup-icon {
+          height: 18px;
+          width: 18px;
+        }
+      }
+
+      @media (max-width: 380px) {
+        .toggles-panel {
+          padding: 2px 5px;
+        }
+        .toggle-btn,
+        .btn-stop {
+          height: 30px;
+          width: 30px;
+          margin: 0 1px;
+        }
+        .toggle-btn-icon {
+          height: 20px;
+          width: 20px;
+        }
+        .hangup-icon {
+          height: 15px;
+          width: 15px;
         }
       }
 
