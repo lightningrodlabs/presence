@@ -406,7 +406,7 @@ export class RoomView extends LitElement {
   }
 
   quitRoom() {
-    this.streamsStore.disconnect();
+    this.streamsStore.disconnect('quitRoom-button');
     this.streamsStore.logger.endSession();
     this.dispatchEvent(
       new CustomEvent('quit-room', { bubbles: true, composed: true })
@@ -788,7 +788,7 @@ export class RoomView extends LitElement {
     if (this._unsubscribe) this._unsubscribe();
     if (this._activeAgentsUnsubscribe) this._activeAgentsUnsubscribe();
     this.removeEventListener('click', this.sideClickListener);
-    this.streamsStore.disconnect();
+    this.streamsStore.disconnect('room-view-disconnectedCallback');
   }
 
   idToLayout(id: string, isShared: boolean = false) {

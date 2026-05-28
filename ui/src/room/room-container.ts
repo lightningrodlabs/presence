@@ -87,7 +87,7 @@ export class RoomContainer extends LitElement {
   disconnectedCallback(): void {
     super.disconnectedCallback();
     try {
-      this.streamsStore?.disconnect();
+      this.streamsStore?.disconnect('room-container-disconnectedCallback');
     } catch (e) {
       console.warn('streamsStore.disconnect failed', e);
     }

@@ -120,6 +120,8 @@ export class StreamsStore {
 
   logger: PresenceLogger;
 
+  _pageLifecycleUnsub: (() => void) | null = null;
+
   trickleICE = true;
 
   turnUrl = '';
@@ -1701,6 +1703,28 @@ export class StreamsStore {
       await streamsStore.pingAgents();
     }, PING_INTERVAL);
 
+    // Page-lifecycle forensics: correlate disconnect() calls with whether
+    // the tab is actually being closed/hidden vs. a DOM remount from the
+    // host shell. These listeners only log; they do not call disconnect().
+    const onPageHide = (e: PageTransitionEvent) =>
+      streamsStore.logger.logCustomMessage(
+        `PageLifecycle pagehide persisted=${e.persisted}`
+      );
+    const onBeforeUnload = () =>
+      streamsStore.logger.logCustomMessage('PageLifecycle beforeunload');
+    const onVisibility = () =>
+      streamsStore.logger.logCustomMessage(
+        `PageLifecycle visibilitychange state=${document.visibilityState}`
+      );
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('beforeunload', onBeforeUnload);
+    document.addEventListener('visibilitychange', onVisibility);
+    streamsStore._pageLifecycleUnsub = () => {
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+
     setTimeout(async () => {
       const mediaDevices = await navigator.mediaDevices.enumerateDevices();
       streamsStore.mediaDevices.set(mediaDevices);
@@ -1708,7 +1732,15 @@ export class StreamsStore {
     return streamsStore;
   }
 
-  disconnect() {
+  disconnect(reason: string = 'unknown') {
+    // Forensics: capture WHO called disconnect (button vs. Lit lifecycle
+    // unmount) so we can tell user-initiated leaves from DOM-remount leaves.
+    // Stack is best-effort — useful when reason='unknown' to find a new caller.
+    const stack = new Error().stack?.split('\n').slice(1, 4).join(' | ') ?? '';
+    this.logger.logCustomMessage(
+      `Disconnect reason=${reason} visibility=${document.visibilityState} ${stack}`
+    );
+
     // Notify peers immediately before tearing down
     const agentsToNotify = Object.keys(get(this._knownAgents))
       .filter(a => a !== this.myPubKeyB64)
@@ -1719,6 +1751,10 @@ export class StreamsStore {
 
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     if (this.signalUnsubscribe) this.signalUnsubscribe();
+    if (this._pageLifecycleUnsub) {
+      this._pageLifecycleUnsub();
+      this._pageLifecycleUnsub = null;
+    }
     // Close all connections and stop all streams
     this.mediaTransport.destroy();
     this.mediaTransportFsm.destroy();
