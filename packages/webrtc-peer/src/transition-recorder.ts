@@ -15,7 +15,7 @@
  *   console.log(recorder.toJSON());
  */
 
-import type { FSMTransitionEntry } from './types';
+import type { FSMTransitionEntry } from './types.js';
 
 export type TransitionRecorderOptions = {
   /** Maximum number of entries retained. Oldest are dropped first. Default 1000. */

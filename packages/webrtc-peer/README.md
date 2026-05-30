@@ -64,6 +64,22 @@ your transport to deliver SDP and ICE messages between two known peers.
 - **Zero runtime dependencies.** Browser WebRTC APIs only. Fully typed. Testable —
   inject a mock `RTCPeerConnection` via `createPeerConnection`.
 
+## Footprint & tiers
+
+The package is layered, and you depend only on the tier you import — the rest
+tree-shakes away (`"sideEffects": false`, ESM):
+
+| Import | You get | Approx. source |
+|--------|---------|---------------|
+| `@lightningrodlabs/webrtc-peer/core` | `RTCPeer` — Perfect-Negotiation wrapper only; bring your own state/retry | ~550 lines |
+| `@lightningrodlabs/webrtc-peer` → `PeerConnectionFSM` | one peer + lifecycle FSM + reconnection | ~1.2k lines |
+| `@lightningrodlabs/webrtc-peer` → `ConnectionManager` | full multi-peer mesh + view models | full package |
+
+`RTCPeer` imports nothing but types; `PeerConnectionFSM` builds on it;
+`ConnectionManager` builds on that. So `import { RTCPeer }` does not pull in the
+FSM or manager. The `/core` subpath makes the smallest tier explicit, but the
+root import tree-shakes to the same result.
+
 ## Install
 
 ```sh
@@ -226,6 +242,12 @@ states. `TransitionRecorder` keeps the last N entries; `dump()` / `toJSON()`
 produce a portable record for bug reports. The library never writes to
 `console` — pass a `logger` (`Logger`) if you want recovered errors and
 warnings surfaced.
+
+Verbose library-internal instrumentation (DTLS-watchdog bookkeeping, timer
+cancellation) is **off by default** and emitted as `DIAG:`-prefixed entries only
+when you set `config.diagnostics = true`. Leave it off in production; turn it on
+when diagnosing connection-establishment or DTLS-stall issues. Real connection
+events (ICE state, dropped stale signals, new peer sessions) are always emitted.
 
 ```ts
 const recorder = new TransitionRecorder({ capacity: 500 });

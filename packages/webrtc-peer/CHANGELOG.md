@@ -23,4 +23,11 @@ Initial extraction from the Presence project.
   string, in addition to the structured `TransportSnapshot`.
 - `TransitionRecorder` — ring buffer for the `onTransition` forensic stream.
 - Injectable `Logger`; the library never writes to `console` on its own.
+- Tiered consumption: `@lightningrodlabs/webrtc-peer/core` exposes just the
+  `RTCPeer` wrapper (~550 lines); the FSM and manager tiers tree-shake out when
+  unused (`sideEffects: false`). See README "Footprint & tiers".
+- `config.diagnostics` (default `false`) gates verbose `DIAG:` instrumentation;
+  real connection events are always emitted.
+- `ConnectionRole`'s `sfu-*` values are documented as reserved/unstable markers
+  for planned SFU support (no behavior yet). See ROADMAP.md.
 - No runtime dependencies.

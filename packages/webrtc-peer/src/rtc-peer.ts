@@ -17,8 +17,8 @@ import type {
   RTCPeerEventHandler,
   TransportSnapshot,
   Unsubscribe,
-} from './types';
-import { NOOP_LOGGER } from './types';
+} from './types.js';
+import { NOOP_LOGGER } from './types.js';
 
 export type RTCPeerOptions = {
   /** If true, this peer has lower pubkey and yields on offer collision (polite) */

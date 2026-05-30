@@ -7,9 +7,9 @@
  * See docs/webrtc-state-machine-plan.md
  */
 
-import { PeerConnectionFSM } from './peer-connection-fsm';
-import type { PeerConnectionFSMOptions, PeerCreatedContext } from './peer-connection-fsm';
-import { DefaultReconnectPolicy } from './reconnect-policy';
+import { PeerConnectionFSM } from './peer-connection-fsm.js';
+import type { PeerConnectionFSMOptions, PeerCreatedContext } from './peer-connection-fsm.js';
+import { DefaultReconnectPolicy } from './reconnect-policy.js';
 import type {
   ConnectionConfig,
   ConnectionManagerViewModel,
@@ -26,8 +26,8 @@ import type {
   SignalMessage,
   SignalSender,
   Unsubscribe,
-} from './types';
-import { DEFAULT_CONFIG, createIdleViewModel, NOOP_LOGGER } from './types';
+} from './types.js';
+import { DEFAULT_CONFIG, createIdleViewModel, NOOP_LOGGER } from './types.js';
 
 export type ConnectionManagerOptions = {
   /** Our agent identity (for polite/impolite role assignment) */

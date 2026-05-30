@@ -16,6 +16,7 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   dtlsStallTimeoutMs: 5000,
   iceDisconnectedGraceMs: 15000,
   role: 'mesh',
+  diagnostics: false,
 };
 
 function createPeer(options: {
