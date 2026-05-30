@@ -12,9 +12,9 @@
  * See docs/webrtc-state-machine-plan.md
  */
 
-import { RTCPeer } from './rtc-peer';
-import type { RTCPeerOptions } from './rtc-peer';
-import { DefaultReconnectPolicy } from './reconnect-policy';
+import { RTCPeer } from './rtc-peer.js';
+import type { RTCPeerOptions } from './rtc-peer.js';
+import { DefaultReconnectPolicy } from './reconnect-policy.js';
 import type {
   ConnectionPhase,
   ConnectionConfig,
@@ -28,8 +28,8 @@ import type {
   ReconnectPolicy,
   TransportSnapshot,
   Unsubscribe,
-} from './types';
-import { VALID_TRANSITIONS, createIdleViewModel, DEFAULT_CONFIG, NOOP_LOGGER } from './types';
+} from './types.js';
+import { VALID_TRANSITIONS, createIdleViewModel, DEFAULT_CONFIG, NOOP_LOGGER } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -583,15 +583,7 @@ export class PeerConnectionFSM {
         // Create a new RTCPeerConnection (new peer session)
         this._resetReadinessFlags();
         this._newPeerSession();
-        this._onTransition?.({
-          timestamp: Date.now(),
-          connectionId: this.connectionId,
-          remoteAgent: this.remoteAgent,
-          fromState: newState,
-          toState: newState,
-          trigger: `new peer session ${this._session.local}`,
-          peerSessionId: this._session.local,
-        });
+        this._logTransition(`new peer session ${this._session.local}`);
         // Fall back to the cached local stream when entering signaling
         // without an explicit ctx.localStream — happens on the acceptor
         // side, where handleRemoteSignal triggers the transition with no
@@ -613,15 +605,7 @@ export class PeerConnectionFSM {
           this._destroyPeer();
           this._resetReadinessFlags();
           this._newPeerSession();
-          this._onTransition?.({
-            timestamp: Date.now(),
-            connectionId: this.connectionId,
-            remoteAgent: this.remoteAgent,
-            fromState: newState,
-            toState: newState,
-            trigger: `new peer session ${this._session.local} (full reconnect)`,
-            peerSessionId: this._session.local,
-          });
+          this._logTransition(`new peer session ${this._session.local} (full reconnect)`);
           // Wait for the new peer to connect; if it doesn't, schedule another attempt
           this._startTimer('full-reconnect-timeout', this._config.connectionTimeoutMs, () => {
             if (this._state === 'reconnecting') {
@@ -671,15 +655,9 @@ export class PeerConnectionFSM {
     // Non-offers: reject if from older session
     if (sessionId < this._session.remote) {
       const signalType = ('type' in signal) ? signal.type : 'candidate';
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
-        trigger: `Dropped stale ${signalType}: remote session ${sessionId} < current ${this._session.remote}`,
-        peerSessionId: this._session.local,
-      });
+      this._logTransition(
+        `Dropped stale ${signalType}: remote session ${sessionId} < current ${this._session.remote}`,
+      );
       return 'drop';
     }
 
@@ -896,15 +874,7 @@ export class PeerConnectionFSM {
     peer.on('ice-state-change', (event) => {
       if (this._destroyed) return;
       const iceState = event.data as string;
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
-        trigger: `ICE: ${iceState} (local=${this._localCandidateCount} remote=${this._remoteCandidateCount})`,
-        peerSessionId: this._session.local,
-      });
+      this._logTransition(`ICE: ${iceState} (local=${this._localCandidateCount} remote=${this._remoteCandidateCount})`);
 
       if (iceState === 'connected' || iceState === 'completed') {
         this._iceConnected = true;
@@ -919,15 +889,7 @@ export class PeerConnectionFSM {
           const timerCount = this._timers.filter(t => t.name === 'connection-timeout').length;
           this._clearTimer('connection-timeout');
           const afterCount = this._timers.filter(t => t.name === 'connection-timeout').length;
-          this._onTransition?.({
-            timestamp: Date.now(),
-            connectionId: this.connectionId,
-            remoteAgent: this.remoteAgent,
-            fromState: this._state,
-            toState: this._state,
-            trigger: `DIAG: cancelled connection-timeout (had=${timerCount}, after=${afterCount}), starting DTLS watchdog (dtlsConnected=${this._dtlsConnected}, dcOpen=${this._dataChannelOpen}, timeoutMs=${this._config.dtlsStallTimeoutMs})`,
-            peerSessionId: this._session.local,
-          });
+          this._logDiag(`cancelled connection-timeout (had=${timerCount}, after=${afterCount}), starting DTLS watchdog (dtlsConnected=${this._dtlsConnected}, dcOpen=${this._dataChannelOpen}, timeoutMs=${this._config.dtlsStallTimeoutMs})`);
         }
         this._startDtlsWatchdog();
         this._checkCompositeReadiness();
@@ -1158,57 +1120,25 @@ export class PeerConnectionFSM {
   private _startDtlsWatchdog(): void {
     // Only watch during connecting/reconnecting phases
     if (this._state !== 'connecting' && this._state !== 'reconnecting') {
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
-        trigger: `DIAG: watchdog skipped (state=${this._state}, expected connecting|reconnecting)`,
-        peerSessionId: this._session.local,
-      });
+      this._logDiag(`watchdog skipped (state=${this._state}, expected connecting|reconnecting)`);
       return;
     }
     // Already connected — no need to watch
     if (this._dtlsConnected && this._dataChannelOpen) {
-      this._onTransition?.({
-        timestamp: Date.now(),
-        connectionId: this.connectionId,
-        remoteAgent: this.remoteAgent,
-        fromState: this._state,
-        toState: this._state,
-        trigger: `DIAG: watchdog skipped (already connected: dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`,
-        peerSessionId: this._session.local,
-      });
+      this._logDiag(`watchdog skipped (already connected: dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`);
       return;
     }
     // Cancel any existing watchdog
     this._cancelDtlsWatchdog();
 
-    this._onTransition?.({
-      timestamp: Date.now(),
-      connectionId: this.connectionId,
-      remoteAgent: this.remoteAgent,
-      fromState: this._state,
-      toState: this._state,
-      trigger: `DIAG: watchdog armed (${this._config.dtlsStallTimeoutMs}ms, ice=${this._iceConnected}, dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`,
-      peerSessionId: this._session.local,
-    });
+    this._logDiag(`watchdog armed (${this._config.dtlsStallTimeoutMs}ms, ice=${this._iceConnected}, dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`);
 
     this._dtlsWatchdogId = setTimeout(() => {
       this._dtlsWatchdogId = null;
       if (this._destroyed) return;
       // Only fire if ICE is still connected but DTLS hasn't completed
       if (!this._iceConnected || this._dtlsConnected) {
-        this._onTransition?.({
-          timestamp: Date.now(),
-          connectionId: this.connectionId,
-          remoteAgent: this.remoteAgent,
-          fromState: this._state,
-          toState: this._state,
-          trigger: `DIAG: watchdog fired but conditions not met (ice=${this._iceConnected}, dtls=${this._dtlsConnected}, state=${this._state})`,
-          peerSessionId: this._session.local,
-        });
+        this._logDiag(`watchdog fired but conditions not met (ice=${this._iceConnected}, dtls=${this._dtlsConnected}, state=${this._state})`);
         return;
       }
 
@@ -1438,6 +1368,37 @@ export class PeerConnectionFSM {
         this._logger.error('View model listener error:', e);
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transition logging
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Emit a same-state log entry on the `onTransition` stream
+   * (fromState === toState === current phase). Used for sub-phase events that
+   * aren't real state changes — new peer session, ICE state, dropped signals.
+   */
+  private _logTransition(trigger: string): void {
+    this._onTransition?.({
+      timestamp: Date.now(),
+      connectionId: this.connectionId,
+      remoteAgent: this.remoteAgent,
+      fromState: this._state,
+      toState: this._state,
+      trigger,
+      peerSessionId: this._session.local,
+    });
+  }
+
+  /**
+   * Verbose library-internal instrumentation, gated behind `config.diagnostics`
+   * (default off). For debugging the library itself; most consumers filter
+   * `DIAG:` entries out, so building them by default is wasted work.
+   */
+  private _logDiag(trigger: string): void {
+    if (!this._config.diagnostics) return;
+    this._logTransition(`DIAG: ${trigger}`);
   }
 
   // ---------------------------------------------------------------------------

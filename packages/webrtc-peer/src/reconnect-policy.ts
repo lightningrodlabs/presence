@@ -23,7 +23,7 @@
  * the peer leaves, rather than relying on a count.
  */
 
-import type { ReconnectContext, ReconnectPolicy } from './types';
+import type { ReconnectContext, ReconnectPolicy } from './types.js';
 
 /** Defaults for `DefaultReconnectPolicy`. Exported so callers can reference or
  *  partially override them without re-deriving the magic numbers. */

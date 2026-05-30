@@ -10,20 +10,20 @@
  * for lower-level use.
  */
 
-export { RTCPeer } from './rtc-peer';
-export type { RTCPeerOptions } from './rtc-peer';
+export { RTCPeer } from './rtc-peer.js';
+export type { RTCPeerOptions } from './rtc-peer.js';
 
-export { PeerConnectionFSM } from './peer-connection-fsm';
-export type { PeerConnectionFSMOptions, PeerCreatedContext } from './peer-connection-fsm';
+export { PeerConnectionFSM } from './peer-connection-fsm.js';
+export type { PeerConnectionFSMOptions, PeerCreatedContext } from './peer-connection-fsm.js';
 
-export { ConnectionManager } from './connection-manager';
-export type { ConnectionManagerOptions } from './connection-manager';
+export { ConnectionManager } from './connection-manager.js';
+export type { ConnectionManagerOptions } from './connection-manager.js';
 
-export { DefaultReconnectPolicy, DEFAULT_RECONNECT_OPTIONS } from './reconnect-policy';
-export type { DefaultReconnectPolicyOptions } from './reconnect-policy';
+export { DefaultReconnectPolicy, DEFAULT_RECONNECT_OPTIONS } from './reconnect-policy.js';
+export type { DefaultReconnectPolicyOptions } from './reconnect-policy.js';
 
-export { TransitionRecorder } from './transition-recorder';
-export type { TransitionRecorderOptions } from './transition-recorder';
+export { TransitionRecorder } from './transition-recorder.js';
+export type { TransitionRecorderOptions } from './transition-recorder.js';
 
 export type {
   // Identity
@@ -65,7 +65,7 @@ export type {
   Logger,
   // Misc
   Unsubscribe,
-} from './types';
+} from './types.js';
 
 export {
   VALID_TRANSITIONS,
@@ -73,4 +73,4 @@ export {
   DEFAULT_ICE_SERVERS,
   NOOP_LOGGER,
   createIdleViewModel,
-} from './types';
+} from './types.js';

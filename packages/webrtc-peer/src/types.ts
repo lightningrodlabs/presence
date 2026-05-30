@@ -98,11 +98,22 @@ export type TransportSnapshot = {
 // Connection Roles (SFU scaffolding)
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-connection role.
+ *
+ * Only `'mesh'` is functional today. The `sfu-*` values are **reserved** for
+ * upcoming SFU (selective-forwarding) support and carry **no behavior yet** —
+ * setting them is equivalent to `'mesh'`. They are also **unstable**: the shape
+ * may change before SFU ships (the relay direction is per-connection, so the
+ * eventual model is likely per-connection media direction + a relay capability
+ * rather than this flat enum). Do not depend on the `sfu-*` values. See
+ * ROADMAP.md.
+ */
 export type ConnectionRole =
-  | 'mesh'            // Standard P2P bidirectional (default)
-  | 'sfu-upstream'    // Send-only to SFU volunteer
-  | 'sfu-downstream'  // Receive-only from SFU volunteer
-  | 'sfu-relay';      // We ARE the SFU volunteer
+  | 'mesh'            // Standard P2P bidirectional (default; the only functional value)
+  | 'sfu-upstream'    // RESERVED: send-only to SFU volunteer
+  | 'sfu-downstream'  // RESERVED: receive-only from SFU volunteer
+  | 'sfu-relay';      // RESERVED: we ARE the SFU volunteer
 
 // ---------------------------------------------------------------------------
 // Reactive UX View Model
@@ -286,6 +297,15 @@ export type ConnectionConfig = {
    */
   iceDisconnectedGraceMs: number;
   role: ConnectionRole;
+  /**
+   * Emit verbose, library-internal `DIAG:` instrumentation on the `onTransition`
+   * stream (DTLS-watchdog arming/skipping bookkeeping, timer cancellation, etc.).
+   * These are for debugging the library itself; most consumers filter them out.
+   * Default `false` — leave off in production to avoid building entries no one
+   * reads. Turn on when diagnosing connection-establishment / DTLS-stall issues.
+   * Optional; defaults to `false` (see `DEFAULT_CONFIG`).
+   */
+  diagnostics?: boolean;
 };
 
 export const DEFAULT_CONFIG: ConnectionConfig = {
@@ -296,6 +316,7 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
   dtlsStallTimeoutMs: 5_000,
   iceDisconnectedGraceMs: 15_000,
   role: 'mesh',
+  diagnostics: false,
 };
 
 // ---------------------------------------------------------------------------
