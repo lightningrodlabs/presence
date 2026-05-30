@@ -184,6 +184,44 @@ describe('RTCPeer', () => {
       );
     });
 
+    it('signals end-of-candidates when gathering completes (trickle)', async () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: true });
+
+      // null candidate = gathering complete (per spec)
+      mockPc.simulateIceCandidate(null);
+
+      // An empty-string candidate is the end-of-candidates indication
+      expect(onSignal).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate: '' }),
+      );
+    });
+
+    it('does not signal end-of-candidates in non-trickle mode', async () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: false });
+
+      mockPc.simulateIceCandidate(null);
+
+      // Non-trickle bundles all candidates in the SDP — no separate marker
+      expect(onSignal).not.toHaveBeenCalledWith(
+        expect.objectContaining({ candidate: '' }),
+      );
+    });
+
+    it('applies a received end-of-candidates marker', async () => {
+      const { peer, mockPc } = createPeer({ polite: false });
+
+      // Establish remote description so candidates apply immediately
+      await peer.handleSignal({ type: 'answer', sdp: 'remote-answer' });
+
+      await peer.handleSignal({ candidate: '' });
+
+      expect(mockPc.addIceCandidate).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate: '' }),
+      );
+    });
+
     it('queues remote ICE candidates until remote description is set', async () => {
       // Use an impolite peer so there's no collision/rollback when we send an answer
       const { peer, mockPc } = createPeer({ polite: false });
