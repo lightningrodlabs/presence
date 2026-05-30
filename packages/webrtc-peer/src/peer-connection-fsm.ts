@@ -995,19 +995,23 @@ export class PeerConnectionFSM {
       const reason = event.data as string;
       if (reason === 'failed') {
         // connectionState 'failed' aggregates the ICE and DTLS transports —
-        // per W3C it signals that *some* transport failed, not which one.
-        // Disambiguate by inspecting iceConnectionState: only when ICE is
-        // provably healthy (connected/completed) do we attribute the failure
-        // to DTLS. Any other ICE state means the failure is (at least) an ICE
-        // failure, which is recoverable via ICE restart.
+        // per W3C it signals that *some* transport failed, not which one. Read
+        // the authoritative transport states to attribute it, rather than
+        // guessing: if ICE itself is 'failed' it's an ICE failure (recoverable
+        // via ICE restart) even when DTLS also reports failed; only when ICE is
+        // NOT failed and the DTLS transport is positively 'failed' do we treat
+        // it as a DTLS failure (which needs a full reconnect). iceConnectionState
+        // is always populated; the dtls reading falls back to a value derived
+        // from connectionState when the DTLS transport isn't directly
+        // observable — consistent with this by-elimination logic.
         //
         // When the ICE layer reports 'failed' first, its own handler has
         // already moved us to 'reconnecting', so the call below is a no-op
         // (_handleTransportFailure only acts from connected/connecting).
         if (this._state === 'connected' || this._state === 'connecting') {
-          const iceState = this._peer?.transportSnapshot.ice;
-          const iceHealthy = iceState === 'connected' || iceState === 'completed';
-          this._handleTransportFailure(iceHealthy ? 'dtls-failed' : 'ice-failed');
+          const snap = this._peer?.transportSnapshot;
+          const dtlsFailed = snap?.ice !== 'failed' && snap?.dtls === 'failed';
+          this._handleTransportFailure(dtlsFailed ? 'dtls-failed' : 'ice-failed');
         }
       }
     });
@@ -1238,6 +1242,11 @@ export class PeerConnectionFSM {
   // ---------------------------------------------------------------------------
 
   private _handleTransportFailure(reason: ReconnectContext['retryReason']): void {
+    // Embed the raw transport states in the trigger so consumers that log only
+    // the trigger string (not the structured TransportSnapshot on the entry)
+    // can still see what the browser reported at the moment of failure.
+    const snap = this.transportSnapshot;
+    const states = `ice=${snap.ice} dtls=${snap.dtls}`;
     if (this._state === 'connected') {
       this._reconnectReason = reason;
       this._reconnectStartedAt = Date.now();
@@ -1250,10 +1259,10 @@ export class PeerConnectionFSM {
       // and the bounded retry count is what eventually lands us in 'failed' if
       // recovery never succeeds. So route every transport failure through
       // 'reconnecting' rather than treating DTLS as terminal here.
-      this._transition('reconnecting', { trigger: `transport failure: ${reason}` });
+      this._transition('reconnecting', { trigger: `transport failure: ${reason} (${states})` });
     } else if (this._state === 'connecting') {
       // Connection never completed — go to disconnected
-      this._transition('disconnected', { trigger: `connection failed during setup: ${reason}` });
+      this._transition('disconnected', { trigger: `connection failed during setup: ${reason} (${states})` });
     }
     // If already reconnecting, the reconnect timer handles it
   }
