@@ -160,13 +160,37 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('reconnecting');
     });
 
-    it('connected → failed on DTLS failure (terminal)', async () => {
+    it('connected → reconnecting on connectionState=failed (not terminal)', async () => {
       const ctx = await getConnectedFSM();
 
-      // DTLS failure is signaled via connectionState → failed
+      // connectionState 'failed' is recoverable, not a dead end — the bounded
+      // retry count, not the first failure, is what eventually reaches 'failed'.
       ctx.mockPc.simulateConnectionState('failed');
 
-      expect(ctx.fsm.state).toBe('failed');
+      expect(ctx.fsm.state).toBe('reconnecting');
+    });
+
+    it('connectionState=failed with ICE healthy is attributed to DTLS (full reconnect)', async () => {
+      const ctx = await getConnectedFSM();
+
+      // ICE provably connected, then the aggregate connectionState fails:
+      // the only transport left to blame is DTLS → full-reconnect strategy.
+      ctx.mockPc.simulateIceConnectionState('connected');
+      ctx.mockPc.simulateConnectionState('failed');
+
+      expect(ctx.fsm.state).toBe('reconnecting');
+      expect(ctx.fsm.viewModel.retry?.strategy).toBe('full-reconnect');
+    });
+
+    it('connectionState=failed with ICE not healthy is attributed to ICE (ice restart)', async () => {
+      const ctx = await getConnectedFSM();
+
+      // ICE never reported healthy in this peer session, so a failed aggregate
+      // is treated as an ICE failure → fast-path ICE restart first.
+      ctx.mockPc.simulateConnectionState('failed');
+
+      expect(ctx.fsm.state).toBe('reconnecting');
+      expect(ctx.fsm.viewModel.retry?.strategy).toBe('ice-restart');
     });
 
     it('connected → closed on explicit close', async () => {
@@ -234,10 +258,16 @@ describe('PeerConnectionFSM', () => {
     });
 
     it('failed → idle after cleanup timer', async () => {
-      const ctx = await getConnectedFSM();
+      // Reach 'failed' the only way it now happens: reconnect retries exhausted.
+      const policy = {
+        maxAttempts: 1,
+        nextRetryDelayMs: () => null,
+        strategy: () => 'full-reconnect' as const,
+      };
+      const ctx = await getConnectedFSM({ reconnectPolicy: policy });
 
-      // DTLS failure → failed
-      ctx.mockPc.simulateConnectionState('failed');
+      // Transport failure → reconnecting → policy returns null → failed
+      ctx.mockPc.simulateIceConnectionState('failed');
       expect(ctx.fsm.state).toBe('failed');
 
       // Cleanup timer (5s)
@@ -926,11 +956,12 @@ describe('PeerConnectionFSM', () => {
       if (dc?.simulateOpen) dc.simulateOpen();
       expect(ctx.fsm.state).toBe('connected');
 
-      // Force disconnect: connected → disconnected
+      // Tear the established connection down. ICE is healthy, so a failed
+      // aggregate connectionState is a DTLS failure → reconnecting (full
+      // reconnect), from which a fresh connect() is valid. The successful
+      // connection above already reset the stall counter.
       ctx.mockPc.simulateConnectionState('failed');
-      // dtls-failed from connected → failed → (cleanup) → idle
-      await vi.advanceTimersByTimeAsync(5_001);
-      expect(ctx.fsm.state).toBe('idle');
+      expect(ctx.fsm.state).toBe('reconnecting');
 
       // Third attempt — DTLS stall again: should be stall #1, not #2
       ctx.fsm.connect();

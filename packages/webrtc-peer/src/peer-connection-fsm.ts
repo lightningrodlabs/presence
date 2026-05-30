@@ -994,12 +994,20 @@ export class PeerConnectionFSM {
       if (this._destroyed) return;
       const reason = event.data as string;
       if (reason === 'failed') {
-        // connectionState 'failed' means ICE or DTLS failed.
-        // Use worst-case interpretation: treat as DTLS failure (terminal)
-        // since DTLS has no recovery path per W3C spec.
-        // If it's actually just ICE, the ice-state-change handler handles it.
+        // connectionState 'failed' aggregates the ICE and DTLS transports —
+        // per W3C it signals that *some* transport failed, not which one.
+        // Disambiguate by inspecting iceConnectionState: only when ICE is
+        // provably healthy (connected/completed) do we attribute the failure
+        // to DTLS. Any other ICE state means the failure is (at least) an ICE
+        // failure, which is recoverable via ICE restart.
+        //
+        // When the ICE layer reports 'failed' first, its own handler has
+        // already moved us to 'reconnecting', so the call below is a no-op
+        // (_handleTransportFailure only acts from connected/connecting).
         if (this._state === 'connected' || this._state === 'connecting') {
-          this._handleTransportFailure('dtls-failed');
+          const iceState = this._peer?.transportSnapshot.ice;
+          const iceHealthy = iceState === 'connected' || iceState === 'completed';
+          this._handleTransportFailure(iceHealthy ? 'dtls-failed' : 'ice-failed');
         }
       }
     });
@@ -1231,17 +1239,18 @@ export class PeerConnectionFSM {
 
   private _handleTransportFailure(reason: ReconnectContext['retryReason']): void {
     if (this._state === 'connected') {
-      // Transition to reconnecting
       this._reconnectReason = reason;
       this._reconnectStartedAt = Date.now();
       this._reconnectCount = 0;
 
-      if (reason === 'dtls-failed') {
-        // DTLS failure is terminal per W3C spec — go to failed, not reconnecting
-        this._transition('failed', { trigger: 'DTLS transport failed (terminal)' });
-      } else {
-        this._transition('reconnecting', { trigger: `transport failure: ${reason}` });
-      }
+      // A 'failed' connectionState does not auto-recover, but it is not a dead
+      // end: ICE failures recover via ICE restart and DTLS failures via a full
+      // reconnect (fresh peer + new DTLS handshake). The reconnect policy picks
+      // the strategy per reason — it forces full-reconnect for 'dtls-failed' —
+      // and the bounded retry count is what eventually lands us in 'failed' if
+      // recovery never succeeds. So route every transport failure through
+      // 'reconnecting' rather than treating DTLS as terminal here.
+      this._transition('reconnecting', { trigger: `transport failure: ${reason}` });
     } else if (this._state === 'connecting') {
       // Connection never completed — go to disconnected
       this._transition('disconnected', { trigger: `connection failed during setup: ${reason}` });

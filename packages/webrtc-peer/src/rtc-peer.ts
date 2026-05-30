@@ -422,7 +422,15 @@ export class RTCPeer {
         }
         // Non-trickle: candidates accumulate in pc.localDescription automatically
       } else {
-        // event.candidate === null means gathering is complete (per spec)
+        // event.candidate === null means gathering is complete (per spec).
+        // In trickle mode, signal end-of-candidates to the remote so its ICE
+        // agent stops expecting more candidates and can finalize its checklist
+        // promptly (RFC 8838 §3 / W3C). An empty-string `candidate` is the
+        // end-of-candidates indication. In non-trickle mode the complete SDP
+        // already carries every candidate, so no separate marker is sent.
+        if (this._trickleICE) {
+          this._onSignal({ candidate: '' });
+        }
         if (this._gatheringCompleteResolve) {
           this._gatheringCompleteResolve();
           this._gatheringCompleteResolve = null;
