@@ -19,7 +19,8 @@ export type { PeerConnectionFSMOptions, PeerCreatedContext } from './peer-connec
 export { ConnectionManager } from './connection-manager';
 export type { ConnectionManagerOptions } from './connection-manager';
 
-export { DefaultReconnectPolicy } from './reconnect-policy';
+export { DefaultReconnectPolicy, DEFAULT_RECONNECT_OPTIONS } from './reconnect-policy';
+export type { DefaultReconnectPolicyOptions } from './reconnect-policy';
 
 export { TransitionRecorder } from './transition-recorder';
 export type { TransitionRecorderOptions } from './transition-recorder';

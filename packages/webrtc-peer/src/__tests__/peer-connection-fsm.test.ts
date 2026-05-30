@@ -182,12 +182,12 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.viewModel.retry?.strategy).toBe('full-reconnect');
     });
 
-    it('connectionState=failed with ICE not healthy is attributed to ICE (ice restart)', async () => {
+    it('ICE transport failure is attributed to ICE (ice restart first)', async () => {
       const ctx = await getConnectedFSM();
 
-      // ICE never reported healthy in this peer session, so a failed aggregate
-      // is treated as an ICE failure → fast-path ICE restart first.
-      ctx.mockPc.simulateConnectionState('failed');
+      // iceConnectionState 'failed' is an ICE failure regardless of any
+      // aggregate connectionState — recover via the fast-path ICE restart.
+      ctx.mockPc.simulateIceConnectionState('failed');
 
       expect(ctx.fsm.state).toBe('reconnecting');
       expect(ctx.fsm.viewModel.retry?.strategy).toBe('ice-restart');
@@ -650,6 +650,44 @@ describe('PeerConnectionFSM', () => {
       expect(policy.strategy({
         retryCount: 0, elapsedMs: 0, retryReason: 'dtls-failed', lastStrategy: 'ice-restart',
       })).toBe('full-reconnect');
+    });
+
+    it('honors a custom maxAttempts', () => {
+      const policy = new DefaultReconnectPolicy({ maxAttempts: 2 });
+      const ctx = (retryCount: number) => ({
+        retryCount, elapsedMs: 0, retryReason: 'ice-failed' as const, lastStrategy: 'ice-restart' as const,
+      });
+
+      expect(policy.maxAttempts).toBe(2);
+      expect(policy.nextRetryDelayMs(ctx(1))).not.toBeNull();
+      expect(policy.nextRetryDelayMs(ctx(2))).toBeNull();
+    });
+
+    it('with maxAttempts Infinity never stops retrying', () => {
+      const policy = new DefaultReconnectPolicy({ maxAttempts: Infinity });
+
+      expect(policy.nextRetryDelayMs({
+        retryCount: 1_000_000, elapsedMs: 0, retryReason: 'ice-failed', lastStrategy: 'ice-restart',
+      })).not.toBeNull();
+    });
+
+    it('honors custom backoff parameters', () => {
+      const policy = new DefaultReconnectPolicy({ baseDelayMs: 100, maxDelayMs: 500, jitterMs: 0 });
+
+      // n=0 → 0; n=2 → min(4*100, 500)=400; n=10 → min(100*100,500)=500
+      expect(policy.nextRetryDelayMs({ retryCount: 0, elapsedMs: 0, retryReason: 'ice-failed', lastStrategy: 'ice-restart' })).toBe(0);
+      expect(policy.nextRetryDelayMs({ retryCount: 2, elapsedMs: 0, retryReason: 'ice-failed', lastStrategy: 'ice-restart' })).toBe(400);
+      expect(policy.nextRetryDelayMs({ retryCount: 9, elapsedMs: 0, retryReason: 'ice-failed', lastStrategy: 'ice-restart' })).toBe(500);
+    });
+
+    it('honors a custom iceRestartMaxAttempts before escalating', () => {
+      const policy = new DefaultReconnectPolicy({ iceRestartMaxAttempts: 1 });
+      const ctx = (retryCount: number) => ({
+        retryCount, elapsedMs: 0, retryReason: 'ice-failed' as const, lastStrategy: 'ice-restart' as const,
+      });
+
+      expect(policy.strategy(ctx(0))).toBe('ice-restart');
+      expect(policy.strategy(ctx(1))).toBe('full-reconnect');
     });
   });
 

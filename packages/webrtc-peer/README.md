@@ -145,8 +145,39 @@ You do **not** need:
 
 `DefaultReconnectPolicy` uses quadratic backoff with jitter and a two-tier
 strategy: the first attempts use ICE restart (fast, preserves DTLS), then it
-switches to full reconnect; DTLS failures always go straight to full reconnect.
-Override by passing any `ReconnectPolicy` implementation to `ConnectionManager`.
+switches to full reconnect; DTLS failures go straight to full reconnect (a fresh
+DTLS handshake needs a new transport). Every knob is a documented constructor
+option — nothing is hard-wired:
+
+```ts
+new ConnectionManager({
+  myAgentId,
+  signaling: send,
+  reconnectPolicy: new DefaultReconnectPolicy({
+    maxAttempts: Infinity,     // retry until you close the connection
+    iceRestartMaxAttempts: 3,  // fast-path attempts before full reconnect
+    baseDelayMs: 300,
+    maxDelayMs: 7_000,
+    jitterMs: 1_000,
+  }),
+});
+```
+
+The WebRTC spec mandates no retry count or backoff — this is application policy.
+A fixed `maxAttempts` can give up mid-outage (a VPN flap or Wi-Fi→cellular
+handover can exceed the backoff window). If a higher layer already knows when a
+peer is still wanted (e.g. room membership), prefer `maxAttempts: Infinity` and
+`closeConnection()` when the peer leaves, rather than relying on a count. Or
+replace the policy entirely with any `ReconnectPolicy` implementation.
+
+### How a failed connection is handled
+
+`connectionState === 'failed'` aggregates the ICE and DTLS transports. The FSM
+reads the underlying states to attribute it: an ICE-transport failure recovers
+via ICE restart, a DTLS-transport failure via full reconnect. Neither is
+terminal — `failed` is reached only when the configured retry count is
+exhausted. The raw `ice=…`/`dtls=…` states are embedded in the transition
+`trigger` (and in the structured `TransportSnapshot`) for diagnosis.
 
 ## Configuring the `RTCPeerConnection`
 
@@ -154,9 +185,20 @@ Override by passing any `ReconnectPolicy` implementation to `ConnectionManager`.
 fallback automatically when host/srflx paths fail. Set
 `iceTransportPolicy: 'relay'` to force TURN-only.
 
+Media direction is implicit: attach a stream with only an audio track to send
+audio only, omit a stream entirely to send nothing (the data channel still
+forms). To **receive** a kind you never send (recvonly), or to pin a direction
+up front, pre-create the transceiver in `onPeerCreated`:
+
+```ts
+onPeerCreated: ({ pc }) => {
+  pc.addTransceiver('video', { direction: 'recvonly' }); // receive, never send
+};
+```
+
 For lower-level configuration (simulcast, codec preferences, custom
-transceivers), pass `onPeerCreated` — it fires once per peer session with the
-bare `RTCPeerConnection`, before any local tracks are attached:
+transceivers), `onPeerCreated` fires once per peer session with the bare
+`RTCPeerConnection`, before any local tracks are attached:
 
 ```ts
 const manager = new ConnectionManager({
