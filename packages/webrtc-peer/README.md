@@ -195,6 +195,29 @@ terminal — `failed` is reached only when the configured retry count is
 exhausted. The raw `ice=…`/`dtls=…` states are embedded in the transition
 `trigger` (and in the structured `TransportSnapshot`) for diagnosis.
 
+### Ownership: let the library recover; you decide give-up
+
+Transport recovery (ICE restart, full reconnect, backoff, the disconnected-grace
+window) is the library's job and is self-contained. **Do not run a parallel
+recovery loop** in your application — e.g. watching `pc.iceConnectionState` and
+calling `closeConnection()` + re-initiating on `failed`. A second controller
+racing the FSM's own recovery produces exactly the "media flows briefly, then
+reconnects repeatedly" churn the FSM exists to prevent.
+
+Your application owns only the **give-up decision** — "is this peer still
+wanted?" — which only you can answer (room membership, presence). Express it by
+either:
+
+- letting a **finite `maxAttempts`** bound the attempts (the FSM lands in
+  `failed` → `idle`, and you re-trigger via `ensureConnection` when the peer is
+  next seen), or
+- setting **`maxAttempts: Infinity`** and calling **`closeConnection()`** when
+  your own signal says the peer is gone.
+
+Subscribe to `connection-state-changed` for UI; don't reach into the `pc`.
+Transient phases (`reconnecting`/`disconnected`) are the FSM working — react to
+them for status, not by tearing down.
+
 ## Configuring the `RTCPeerConnection`
 
 `ConnectionConfig.iceServers` carries STUN/TURN servers. ICE handles relay

@@ -453,6 +453,17 @@ export class StreamsStore {
           this._handleMediaConnected(event.peer, event.connectionId, impl);
         } else if (event.phase === 'closed') {
           this._handleMediaClosed(event.peer, event.connectionId, impl);
+        } else if (event.phase === 'failed' && impl === 'fsm') {
+          // The FSM reaches 'failed' only after exhausting its own reconnection
+          // budget — i.e. it has genuinely given up. Treat that like 'closed'
+          // for app state: clear the connection slot and fall back to the
+          // signals carrier, so a subsequent ping/pong re-initiates a fresh
+          // WebRTC attempt once the peer is reachable again. Transient phases
+          // ('reconnecting'/'disconnected') are intentionally ignored — the FSM
+          // owns recovery and the pane is presence-keyed, so they must not
+          // tear down app state. (SimplePeer recovery stays handled by the
+          // stale-ICE cleanup in handlePongUi.)
+          this._handleMediaClosed(event.peer, event.connectionId, impl);
         }
         break;
       case 'remote-stream':
@@ -5516,8 +5527,18 @@ export class StreamsStore {
     // 'failed'/'closed' immediately; 'disconnected' must persist past
     // ICE_DISCONNECTED_GRACE_MS.
     const existingConn = get(this._openConnections)[pubkeyB64];
-    if (existingConn) {
-      const activeTransport = this._activeMediaTransportFor(pubkeyB64);
+    // Stale-ICE teardown applies only to the SimplePeer carrier. The FSM
+    // carrier owns its own transport recovery (ICE restart, full reconnect,
+    // disconnected-grace); tearing its pc down here would race that recovery
+    // and reproduce the "media flows briefly then suddenly reconnects" churn
+    // this very block warns about. When the FSM exhausts its retry budget it
+    // emits 'failed', which clears the slot (see _dispatchMediaEvent), so the
+    // next ping/pong re-initiates a fresh attempt.
+    const staleTransport = existingConn
+      ? this._activeMediaTransportFor(pubkeyB64)
+      : undefined;
+    if (existingConn && staleTransport && staleTransport !== this.mediaTransportFsm) {
+      const activeTransport = staleTransport;
       const pc = activeTransport.getRTCPeerConnection(pubkeyB64);
       const iceState = pc?.iceConnectionState;
       const disconnectedAt = this._iceDisconnectedAt[pubkeyB64];
