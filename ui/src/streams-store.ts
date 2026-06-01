@@ -4802,9 +4802,18 @@ export class StreamsStore {
     // ICE state events. Keep them out of the timeline unless we're
     // specifically debugging DTLS / data-channel readiness.
     if (entry.trigger.startsWith('DIAG:')) return;
+    // Include the underlying transport states so a transition's cause can be
+    // read straight from the log (e.g. confirm ICE vs DTLS on a 'failed'
+    // attribution) without correlating against separate ICE-state events. Only
+    // real transitions carry a snapshot; same-state log entries omit it.
+    const snap = entry.transportSnapshot;
+    const transport = snap
+      ? ` ice=${snap.ice} dtls=${snap.dtls} sig=${snap.signaling} gather=${snap.gathering} dc=${snap.dataChannel ?? 'none'}`
+      : '';
     const detail =
       `${entry.fromState}->${entry.toState} trigger="${entry.trigger}"` +
-      (entry.peerSessionId !== undefined ? ` peerSession=${entry.peerSessionId}` : '');
+      (entry.peerSessionId !== undefined ? ` peerSession=${entry.peerSessionId}` : '') +
+      transport;
     this.logger.logAgentEvent({
       agent: entry.remoteAgent,
       timestamp: entry.timestamp,
