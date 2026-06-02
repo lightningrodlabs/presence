@@ -195,6 +195,31 @@ terminal — `failed` is reached only when the configured retry count is
 exhausted. The raw `ice=…`/`dtls=…` states are embedded in the transition
 `trigger` (and in the structured `TransportSnapshot`) for diagnosis.
 
+### Ownership: who drives recovery
+
+For a **single-transport** app, let the library recover: ICE restart, full
+reconnect, backoff and the disconnected-grace window are self-contained. Don't
+run a second recovery loop racing the FSM (watching `pc.iceConnectionState` and
+re-initiating) — that produces "media flows briefly, then reconnects repeatedly"
+churn. Subscribe to `connection-state-changed` for UI, express give-up via a
+finite `maxAttempts` (FSM lands in `failed` → `idle`; re-trigger via
+`ensureConnection` when the peer returns) or `maxAttempts: Infinity` +
+`closeConnection()` on your own "peer gone" signal, and don't reach into the
+`pc`.
+
+**Multi-transport apps are different.** If a higher layer chooses among several
+carriers (e.g. WebRTC *and* a signals/relay fallback) and flips between them,
+that orchestrator — not the FSM — owns the give-up *and the timing*. It needs
+WebRTC to fail **fast** and yield so it can switch carriers, which is the
+opposite of persistent in-FSM recovery. For that case:
+
+- keep `maxAttempts` **low** (or even disable full-reconnect via a custom
+  `ReconnectPolicy`) so the FSM surfaces failure quickly, and
+- let the orchestrator own teardown (`closeConnection`) and carrier selection.
+
+A persistent FSM fighting a carrier orchestrator churns endlessly and starves
+the fallback path — so match the policy to which layer is in charge.
+
 ## Configuring the `RTCPeerConnection`
 
 `ConnectionConfig.iceServers` carries STUN/TURN servers. ICE handles relay
