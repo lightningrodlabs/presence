@@ -22,6 +22,7 @@
     "README.md",
     "CHANGELOG.md",
     "ROADMAP.md",
+    "RELEASE_NOTES.md",
     "LICENSE"
   ],
   "sideEffects": false,

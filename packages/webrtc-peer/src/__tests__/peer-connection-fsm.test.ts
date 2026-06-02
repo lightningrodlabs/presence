@@ -432,6 +432,34 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('failed');
     });
 
+    it('a connected path that dies and never recovers reaches failed within maxAttempts (bounded, no infinite churn)', async () => {
+      // The headline reconnection scenario: an established connection's transport
+      // dies (e.g. network change with no usable path) and never comes back.
+      // Recovery must be BOUNDED — the FSM exhausts its retry budget and lands in
+      // failed → idle, rather than spinning new peer sessions forever.
+      const ctx = await getConnectedFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 3, iceRestartMaxAttempts: 1 }),
+      });
+
+      // Transport fails and the mock never re-connects (no driven 'connect').
+      ctx.mockPc.simulateConnectionState('failed');
+      expect(ctx.fsm.state).toBe('reconnecting');
+
+      // Drive every retry + attempt-timeout timer to completion.
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      // Terminal: failed, or idle after the failed→idle cleanup timer.
+      expect(['failed', 'idle']).toContain(ctx.fsm.state);
+
+      // Full-reconnect attempts are bounded by the policy's maxAttempts (3),
+      // not unbounded — this is the "no infinite churn" guarantee.
+      const fullReconnects = ctx.transitionLog.filter(t =>
+        t.trigger.includes('(full reconnect)'),
+      ).length;
+      expect(fullReconnects).toBeLessThanOrEqual(3);
+      expect(fullReconnects).toBeGreaterThan(0);
+    });
+
     it('resets reconnect count on successful reconnection', async () => {
       const ctx = await getConnectedFSM();
 
