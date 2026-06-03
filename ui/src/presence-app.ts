@@ -79,8 +79,16 @@ enum PageView {
   Loading,
   Home,
   Room,
-  RoomClosed,
+  // Generic "enter this room" pane. Shown as the initial state when a room is
+  // opened as an embedded asset (instead of auto-entering), and after a room is
+  // closed or taken over by another pane.
+  EnterRoom,
 }
+
+// Mirrors @theweave/api's RenderLocation. Declared locally so this builds
+// against api versions that predate the field; Moss provides it at runtime via
+// window.__WEAVE_RENDER_INFO__, so reading renderInfo.renderLocation still works.
+type RenderLocation = 'main' | 'embedded' | 'side' | 'window';
 
 export type GroupRoomInfo = {
   room: DescendentRoom;
@@ -123,6 +131,9 @@ export class PresenceApp extends LitElement {
   private _roomLockRelease: (() => void) | undefined;
 
   private _currentRoomDnaB64: string | undefined;
+
+  @state()
+  _currentRoomName: string | undefined;
 
   private _roomChannel: BroadcastChannel | undefined;
 
@@ -299,15 +310,30 @@ export class PresenceApp extends LitElement {
 
       if (encodeHashToBase64(cellTypes.provisioned.cell_id[0]) === dnaHashB64) {
         this._selectedRoleName = 'presence';
-        await this._enterRoom(dnaHashB64);
-        return;
+      } else {
+        const clonedCell = cellTypes.cloned.find(
+          cellInfo => encodeHashToBase64(cellInfo.cell_id[0]) === dnaHashB64
+        );
+        if (!clonedCell) throw Error('No cell found for WAL');
+        this._selectedRoleName = clonedCell.clone_id;
       }
-      const clonedCell = cellTypes.cloned.find(
-        cellInfo => encodeHashToBase64(cellInfo.cell_id[0]) === dnaHashB64
-      );
-      if (!clonedCell) throw Error('No cell found for WAL');
-      this._selectedRoleName = clonedCell.clone_id;
-      await this._enterRoom(dnaHashB64);
+      this._currentRoomDnaB64 = dnaHashB64;
+      this._currentRoomName = await this._roomNameForRole(this._selectedRoleName);
+
+      // Only auto-enter when Moss reports this asset is opened in its own
+      // dedicated window. When embedded inline (e.g. a group dashboard tile),
+      // shown in the side panel, or when the host is too old to report a
+      // location, show the enter pane instead — otherwise we silently join the
+      // room on every visit to the group home. (renderLocation arrives at
+      // runtime via window.__WEAVE_RENDER_INFO__; it may be absent on older Moss.)
+      const renderLocation = (
+        this._weaveClient.renderInfo as { renderLocation?: RenderLocation }
+      ).renderLocation;
+      if (renderLocation === 'window') {
+        await this._enterRoom(dnaHashB64);
+      } else {
+        this._pageView = PageView.EnterRoom;
+      }
       return;
     }
 
@@ -365,11 +391,36 @@ export class PresenceApp extends LitElement {
    * and `_roomAlreadyOpen` is set so the render path shows a notice instead of
    * a second room-container (which would cause duplicate signaling/streams).
    */
+  /**
+   * Resolve a human-readable room name from a role name. The provisioned
+   * 'presence' cell is the Main Room; cloned cells carry their name in room
+   * info. Falls back to a generic label if the lookup fails.
+   */
+  private async _roomNameForRole(
+    roleName: RoleName | undefined
+  ): Promise<string> {
+    if (roleName === 'presence') return msg('Main Room');
+    if (roleName) {
+      try {
+        const info = await new RoomClient(this.client, roleName).getRoomInfo();
+        if (info?.name) return info.name;
+      } catch (e) {
+        console.warn('Failed to load room info', e);
+      }
+    }
+    return msg('this room');
+  }
+
   private async _enterRoom(
     dnaHashB64: string,
     opts: { waitMs?: number } = {}
   ) {
     this._currentRoomDnaB64 = dnaHashB64;
+    // Resolve the room name (non-blocking) so the enter pane can show it if the
+    // room is later closed or taken over.
+    this._roomNameForRole(this._selectedRoleName).then(name => {
+      this._currentRoomName = name;
+    });
     this._roomAlreadyOpen = false;
     const locks = (navigator as any).locks;
     if (!locks) {
@@ -422,7 +473,7 @@ export class PresenceApp extends LitElement {
             console.warn('released broadcast failed', err);
           }
           this._releaseRoomLock();
-          this._pageView = PageView.RoomClosed;
+          this._pageView = PageView.EnterRoom;
         }
       };
       this._roomChannel = channel;
@@ -1191,7 +1242,7 @@ export class PresenceApp extends LitElement {
                           } catch (e) {
                             console.warn('requestClose failed', e);
                           }
-                          this._pageView = PageView.RoomClosed;
+                          this._pageView = PageView.EnterRoom;
                         }}
                       >
                         ${msg('Close this window')}
@@ -1224,22 +1275,22 @@ export class PresenceApp extends LitElement {
                 } catch (e) {
                   console.warn('requestClose failed', e);
                 }
-                this._pageView = PageView.RoomClosed;
+                this._pageView = PageView.EnterRoom;
               } else {
                 this._pageView = PageView.Home;
               }
             }}
           ></room-container>
         `;
-      case PageView.RoomClosed:
+      case PageView.EnterRoom:
         return html`
           <div class="room-already-open secondary-font">
             <div class="room-already-open-card">
               <div style="font-size: 28px; margin-bottom: 16px;">
-                ${msg('Room closed.')}
+                ${this._currentRoomName ?? msg('this room')}
               </div>
               <div style="font-size: 18px; opacity: 0.85; margin-bottom: 24px;">
-                ${msg('You can reopen this room here.')}
+                ${msg('Enter this room to join.')}
               </div>
               <button
                 class="enter-main-room-btn"
@@ -1250,7 +1301,7 @@ export class PresenceApp extends LitElement {
                   }
                 }}
               >
-                ${msg('Reopen')}
+                ${msg('Enter')}
               </button>
             </div>
           </div>
