@@ -85,11 +85,6 @@ enum PageView {
   EnterRoom,
 }
 
-// Mirrors @theweave/api's RenderLocation. Declared locally so this builds
-// against api versions that predate the field; Moss provides it at runtime via
-// window.__WEAVE_RENDER_INFO__, so reading renderInfo.renderLocation still works.
-type RenderLocation = 'main' | 'embedded' | 'side' | 'window';
-
 export type GroupRoomInfo = {
   room: DescendentRoom;
   creator: AgentPubKey;
@@ -324,11 +319,12 @@ export class PresenceApp extends LitElement {
       // dedicated window. When embedded inline (e.g. a group dashboard tile),
       // shown in the side panel, or when the host is too old to report a
       // location, show the enter pane instead — otherwise we silently join the
-      // room on every visit to the group home. (renderLocation arrives at
-      // runtime via window.__WEAVE_RENDER_INFO__; it may be absent on older Moss.)
-      const renderLocation = (
-        this._weaveClient.renderInfo as { renderLocation?: RenderLocation }
-      ).renderLocation;
+      // room on every visit to the group home. (renderLocation is undefined on
+      // Moss hosts older than @theweave/api 0.6.8.)
+      const renderLocation =
+        this._weaveClient.renderInfo.type === 'applet-view'
+          ? this._weaveClient.renderInfo.renderLocation
+          : undefined;
       if (renderLocation === 'window') {
         await this._enterRoom(dnaHashB64);
       } else {
