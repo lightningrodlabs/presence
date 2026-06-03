@@ -25,7 +25,7 @@
   "devDependencies": {
     "@holochain-playground/cli": "^0.1.1",
     "@holochain/hc-spin": "^0.600.2-rc.0",
-    "@theweave/cli": "^0.15.19",
+    "@theweave/cli": "^0.15.20",
     "concurrently": "^6.2.1",
     "rimraf": "^3.0.2"
   },
