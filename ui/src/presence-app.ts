@@ -65,6 +65,7 @@ import './room/elements/toggle-switch';
 import './lobby/private-room-card';
 import './lobby/shared-room-card';
 import './lobby/list-online-agents';
+import './lobby/room-online-agents';
 import { sharedStyles } from './sharedStyles';
 import { RoomClient } from './room/room-client';
 import { exportLogs, clearAllLogs } from './logging';
@@ -1287,9 +1288,21 @@ export class PresenceApp extends LitElement {
                 alt="presence logo"
                 class="entry-logo-img"
               />
-              <div style="font-size: 28px; margin-bottom: 24px;">
+              <div style="font-size: 28px; margin-bottom: 16px;">
                 ${this._currentRoomName ?? msg('this room')}
               </div>
+              ${this._selectedRoleName
+                ? html`<div
+                    class="row center-content"
+                    style="font-size: 18px; opacity: 0.85; margin-bottom: 24px; min-height: 34px;"
+                  >
+                    <room-online-agents
+                      .roleName=${this._selectedRoleName}
+                      .avatarSize=${34}
+                      .label=${msg('In the room:')}
+                    ></room-online-agents>
+                  </div>`
+                : ''}
               <button
                 class="enter-main-room-btn"
                 ?disabled=${!this._currentRoomDnaB64}
