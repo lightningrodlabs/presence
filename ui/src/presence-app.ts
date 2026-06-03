@@ -1282,11 +1282,13 @@ export class PresenceApp extends LitElement {
         return html`
           <div class="room-already-open secondary-font">
             <div class="room-already-open-card">
-              <div style="font-size: 28px; margin-bottom: 16px;">
+              <img
+                src="icon.png"
+                alt="presence logo"
+                class="entry-logo-img"
+              />
+              <div style="font-size: 28px; margin-bottom: 24px;">
                 ${this._currentRoomName ?? msg('this room')}
-              </div>
-              <div style="font-size: 18px; opacity: 0.85; margin-bottom: 24px;">
-                ${msg('Enter this room to join.')}
               </div>
               <button
                 class="enter-main-room-btn"
