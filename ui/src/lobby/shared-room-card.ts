@@ -92,14 +92,10 @@ export class SharedRoomCard extends LitElement {
   }
 
   async firstUpdated() {
-    if (this.isMainRoom) {
-      this._roomInfo = {
-        name: msg('Main Room'),
-        icon_src: undefined,
-        meta_data: undefined,
-      };
-      return;
-    }
+    // Main-room display is hardcoded in render(); no _roomInfo needed. Setting
+    // reactive state here synchronously would schedule a redundant update
+    // (Lit's change-in-update warning), so just skip the room-info lookup.
+    if (this.isMainRoom) return;
     await this.updateRoomInfo();
   }
 

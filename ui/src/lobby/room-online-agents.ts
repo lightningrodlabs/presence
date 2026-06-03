@@ -44,6 +44,18 @@ export class RoomOnlineAgents extends LitElement {
 
   private _gcInterval: number | undefined;
 
+  willUpdate(changed: PropertyValues<this>) {
+    // Reset the list when the watched room changes. Done in willUpdate (part of
+    // the current update) and only when non-empty, so it never schedules an
+    // extra update from within updated() (Lit's change-in-update warning).
+    if (
+      (changed.has('roleName') || changed.has('client')) &&
+      this._participants.length
+    ) {
+      this._participants = [];
+    }
+  }
+
   updated(changed: PropertyValues<this>) {
     if (changed.has('roleName') || changed.has('client')) {
       this._subscribe();
@@ -53,7 +65,6 @@ export class RoomOnlineAgents extends LitElement {
   private _subscribe() {
     this._teardown();
     if (!this.roleName || !this.client) return;
-    this._participants = [];
     const roomClient = new RoomClient(this.client, this.roleName);
     // Expire agents that haven't pinged in the last 10 seconds.
     this._gcInterval = window.setInterval(() => {
