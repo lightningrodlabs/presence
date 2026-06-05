@@ -1,6 +1,6 @@
 {
   "name": "@lightningrodlabs/webrtc-peer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Managed WebRTC peer connection for the browser: W3C Perfect Negotiation, a connection-lifecycle state machine, and a pluggable reconnection engine.",
   "license": "MIT",
   "type": "module",
