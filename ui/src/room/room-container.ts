@@ -61,6 +61,13 @@ export class RoomContainer extends LitElement {
     const appInfo = await this.client.appInfo();
     if (!appInfo) throw new Error('AppInfo is null');
 
+    // If we were removed from the DOM during the await above (e.g. the room was
+    // taken over by another pane and the view switched to EnterRoom), abort
+    // before creating the PresenceLogger. Otherwise we'd leak a logger that
+    // disconnectedCallback already ran too early to destroy, leaving
+    // __PRESENCE_LOGGER_ACTIVE__ stuck true and making the next mount throw.
+    if (!this.isConnected) return;
+
     const cellTypes = getCellTypes(appInfo);
     const myCell = cellTypes.cloned.find(
       cell => cell.clone_id === this.roleName
@@ -78,6 +85,19 @@ export class RoomContainer extends LitElement {
       () => this.weaveClient.userSelectScreen(),
       this._presenceLogger
     );
+
+    // Disconnected while connecting streams — disconnectedCallback ran before
+    // these existed, so tear them down here to avoid orphaning the logger.
+    if (!this.isConnected) {
+      try {
+        this.streamsStore?.disconnect('room-container-firstUpdated-disconnected');
+      } catch (e) {
+        console.warn('streamsStore.disconnect failed', e);
+      }
+      this._presenceLogger?.destroy();
+      this._presenceLogger = undefined;
+      return;
+    }
 
     this.loading = false;
   }

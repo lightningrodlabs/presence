@@ -18,6 +18,7 @@ import { GroupRoomInfo } from '../presence-app';
 
 import '../room/room-container';
 import './list-online-agents';
+import './room-online-agents';
 
 @localized()
 @customElement('shared-room-card')
@@ -54,18 +55,6 @@ export class SharedRoomCard extends LitElement {
   _myCell: ClonedCell | undefined;
 
   @state()
-  _activeRoomParticipants: {
-    pubkey: AgentPubKey;
-    lastSeen: number;
-  }[] = [];
-
-  @state()
-  _clearActiveParticipantsInterval: number | undefined;
-
-  @state()
-  _unsubscribe: (() => void) | undefined;
-
-  @state()
   _networkSeed: string | undefined;
 
   async updateRoomInfo() {
@@ -90,45 +79,7 @@ export class SharedRoomCard extends LitElement {
       if (roomInfo) {
         this._roomInfo = roomInfo;
       }
-      // If RoomInfo has changed, unsubscribe from the signals of the previous room
-      if (this._unsubscribe) this._unsubscribe();
-      // Set the list of active room participants to zero and remove the event listener
-      this._activeRoomParticipants = [];
-      if (this._clearActiveParticipantsInterval)
-        window.clearInterval(this._clearActiveParticipantsInterval);
-      this._clearActiveParticipantsInterval = window.setInterval(() => {
-        const now = Date.now();
-        // If an agent hasn't sent a ping for more than 10 seconds, assume that they are no longer in the room
-        this._activeRoomParticipants = this._activeRoomParticipants.filter(
-          info => now - info.lastSeen < 10000
-        );
-      }, 10000);
-
-      // Listen to pings from agents
-      this._unsubscribe = roomClient.onSignal(async signal => {
-        if (signal.type === 'Message' && signal.msg_type === 'PingUi') {
-          console.log('Got pingUI from room ', roomClient.roleName);
-          // This is the case if the other agent is in the main room
-          const newOnlineAgentsList = this._activeRoomParticipants.filter(
-            info => info.pubkey.toString() !== signal.from_agent.toString()
-          );
-          newOnlineAgentsList.push({
-            pubkey: signal.from_agent,
-            lastSeen: Date.now(),
-          });
-          this._activeRoomParticipants = newOnlineAgentsList;
-          console.log(
-            'this._activeRoomParticipants',
-            this._activeRoomParticipants
-          );
-        }
-        if (signal.type === 'Message' && signal.msg_type === 'LeaveUi') {
-          this._activeRoomParticipants =
-            this._activeRoomParticipants.filter(
-              info => info.pubkey.toString() !== signal.from_agent.toString()
-            );
-        }
-      });
+      // Presence tracking is handled by <room-online-agents> (see render).
     } else {
       this._roomInfo = {
         name: this.groupRoomInfo.room.name,
@@ -141,14 +92,10 @@ export class SharedRoomCard extends LitElement {
   }
 
   async firstUpdated() {
-    if (this.isMainRoom) {
-      this._roomInfo = {
-        name: msg('Main Room'),
-        icon_src: undefined,
-        meta_data: undefined,
-      };
-      return;
-    }
+    // Main-room display is hardcoded in render(); no _roomInfo needed. Setting
+    // reactive state here synchronously would schedule a redundant update
+    // (Lit's change-in-update warning), so just skip the room-info lookup.
+    if (this.isMainRoom) return;
     await this.updateRoomInfo();
   }
 
@@ -160,10 +107,6 @@ export class SharedRoomCard extends LitElement {
   //     await this.updateRoomInfo();
   //   }
   // }
-
-  disconnectedCallback(): void {
-    if (this._unsubscribe) this._unsubscribe();
-  }
 
   async handleOpenRoom() {
     if (this.isMainRoom) {
@@ -229,14 +172,11 @@ export class SharedRoomCard extends LitElement {
         )}</span
       >`;
     }
-    if (this._activeRoomParticipants.length === 0) {
-      return html`<span>${msg('room is empty')}</span>`;
-    }
     return html`
-      <list-online-agents
+      <room-online-agents
+        .roleName=${this._myCell.clone_id}
         .avatarSize=${34}
-        .agents=${this._activeRoomParticipants.map(info => info.pubkey)}
-      ></list-online-agents>
+      ></room-online-agents>
     `;
   }
 
