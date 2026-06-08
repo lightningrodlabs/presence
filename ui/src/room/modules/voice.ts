@@ -38,11 +38,24 @@ import type { MicAcquireResult } from '../../mic-source';
 type AnyEncodedAudioChunk = any;
 type AnyAudioData = any;
 
-interface VoiceFramePayload {
+interface VoiceFrame {
   seq: number;
   ts: number; // microseconds (matches WebCodecs timestamp)
   type: 'key' | 'delta';
   data: string; // base64-encoded chunk bytes
+}
+
+interface VoiceFramePayload extends VoiceFrame {
+  /**
+   * Up to `redundancy` immediately-preceding frames, oldest→newest, carried
+   * redundantly so a frame lost in its own packet can be recovered from the
+   * copy piggybacked on a later packet. The signals carrier (Holochain
+   * remote-signal relay) routinely drops 10–50% of packets; RED-style
+   * redundancy turns that into near-zero effective loss for ~2× the (tiny)
+   * audio bytes. Absent on legacy senders — receivers fall back to the
+   * single primary frame, so the wire format stays compatible both ways.
+   */
+  red?: VoiceFrame[];
 }
 
 interface PeerVoiceState {
@@ -82,6 +95,14 @@ class VoiceController {
    */
   private pipelineGeneration = 0;
   private seq = 0;
+  /**
+   * Number of preceding frames to carry redundantly on each packet (RED-style
+   * loss recovery for the lossy signals carrier). 2 recovers any single, and
+   * most double, consecutive packet losses for ~2× audio bytes. 0 disables.
+   */
+  private redundancy = 2;
+  /** Ring of the last `redundancy` encoded frames, oldest→newest. */
+  private redBuffer: VoiceFrame[] = [];
 
   // Receive-side state
   private audioContext: AudioContext | null = null;
@@ -324,12 +345,21 @@ class VoiceController {
     if (targets.size === 0) return;
     const buf = new Uint8Array(chunk.byteLength);
     chunk.copyTo(buf);
-    const payload: VoiceFramePayload = {
+    const frame: VoiceFrame = {
       seq: this.seq++,
       ts: chunk.timestamp,
       type: chunk.type,
       data: bytesToBase64(buf),
     };
+    const payload: VoiceFramePayload =
+      this.redundancy > 0 && this.redBuffer.length > 0
+        ? { ...frame, red: this.redBuffer.slice() }
+        : frame;
+    // Retain this frame to piggyback on subsequent packets.
+    if (this.redundancy > 0) {
+      this.redBuffer.push(frame);
+      while (this.redBuffer.length > this.redundancy) this.redBuffer.shift();
+    }
     const now = Date.now();
     for (const peer of targets) {
       this.peerLastSentMs.set(peer, now);
@@ -353,6 +383,7 @@ class VoiceController {
       this.micHandle = null;
     }
     this.seq = 0;
+    this.redBuffer = [];
   }
 
   // ----- receive side -----------------------------------------------------
@@ -371,25 +402,17 @@ class VoiceController {
       state = created;
     }
     if (payload.seq <= state.lastSeq && state.lastSeq !== 0) {
-      // out-of-order or duplicate; cheap drop
+      // The newest (primary) frame is already played, so every redundant
+      // copy it carries is older still — duplicate/out-of-order; cheap drop.
       return;
     }
 
     this.peerLastRecvMs.set(agentPubKeyB64, Date.now());
 
-    // --- stats update ---
+    // --- jitter: EWMA of absolute deviation of packet inter-arrival from the
+    // 20ms Opus nominal period. alpha = 0.1 for slow smoothing. Measured per
+    // packet (not per recovered frame). ---
     const now = Date.now();
-    // Loss from seq gaps: any skipped seq numbers count as lost.
-    // Opus frames at ~50fps, so gaps > 1 are real losses, not reorder
-    // (out-of-order frames are dropped above and don't reach here).
-    if (state.lastSeq !== 0) {
-      const gap = payload.seq - state.lastSeq - 1;
-      if (gap > 0) state.lostCount += gap;
-    }
-    state.receivedCount += 1;
-
-    // Jitter: EWMA of absolute deviation of inter-arrival time from the
-    // 20ms Opus nominal period. alpha = 0.1 for slow smoothing.
     if (state.lastArrivalMs > 0) {
       const delta = now - state.lastArrivalMs;
       // Cap the per-sample deviation. A frame arriving after a long
@@ -401,6 +424,29 @@ class VoiceController {
       state.jitterEwma = 0.1 * deviation + 0.9 * state.jitterEwma;
     }
     state.lastArrivalMs = now;
+
+    // Assemble redundant (older) frames + the primary, ascending by seq, and
+    // play any we haven't yet. A frame dropped in its own packet is recovered
+    // here from the copy piggybacked on this later packet. Loss is now counted
+    // post-recovery: only seqs carried by NO packet count as lost, which is
+    // exactly the UX-relevant figure.
+    const frames: VoiceFrame[] = [];
+    if (Array.isArray(payload.red)) {
+      for (const f of payload.red) frames.push(f);
+    }
+    frames.push({ seq: payload.seq, ts: payload.ts, type: payload.type, data: payload.data });
+    frames.sort((a, b) => a.seq - b.seq);
+
+    for (const f of frames) {
+      if (state.lastSeq !== 0 && f.seq <= state.lastSeq) continue; // already played
+      if (state.lastSeq !== 0) {
+        const gap = f.seq - state.lastSeq - 1;
+        if (gap > 0) state.lostCount += gap;
+      }
+      state.receivedCount += 1;
+      this.decodeVoiceFrame(state, f);
+      state.lastSeq = f.seq;
+    }
 
     // Publish stats on a ~1s cadence (when the window closes). Computing
     // per-frame would write 50 times/sec for no visual benefit.
@@ -419,16 +465,17 @@ class VoiceController {
       state.receivedCount = 0;
       state.windowStartMs = now;
     }
+  }
 
-    state.lastSeq = payload.seq;
-
-    const data = base64ToBytes(payload.data);
+  /** Construct an EncodedAudioChunk for one frame and feed the peer decoder. */
+  private decodeVoiceFrame(state: PeerVoiceState, frame: VoiceFrame) {
+    const data = base64ToBytes(frame.data);
     const g: any = globalThis as any;
     let encChunk: AnyEncodedAudioChunk;
     try {
       encChunk = new g.EncodedAudioChunk({
-        type: payload.type,
-        timestamp: payload.ts,
+        type: frame.type,
+        timestamp: frame.ts,
         data,
       });
     } catch (e) {

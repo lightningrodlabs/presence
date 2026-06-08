@@ -333,6 +333,12 @@ export class StreamsStore {
       myAgentId: this.myPubKeyB64,
       iceServers: () => this.iceConfig,
       trickleICE: () => this.trickleICE,
+      // The DTLS watchdog's default 5s is too aggressive on lossy / high-RTT
+      // last-mile uplinks (a handshake there can need several seconds of
+      // retransmits); a single stall tore the connection down to the lossy
+      // signals carrier and churned reconnects. Raise to a viable default,
+      // user-overridable via localStorage('dtlsStallTimeoutMs').
+      configOverrides: { dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs() },
       onOutgoingSignal: (signal) => {
         const toAgent = decodeHashFromBase64(signal.to);
         this.roomClient.sendMessage(
@@ -792,6 +798,73 @@ export class StreamsStore {
     attach();
   }
 
+  /** DTLS-stall watchdog timeout (ms) for the FSM transport. Defaults to a
+   *  link-tolerant 12s; override via localStorage('dtlsStallTimeoutMs').
+   *  Floored at 1s to avoid an unusably twitchy watchdog. */
+  private _readDtlsStallTimeoutMs(): number {
+    const DEFAULT_MS = 12_000;
+    try {
+      const raw = window.localStorage.getItem('dtlsStallTimeoutMs');
+      if (!raw) return DEFAULT_MS;
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) && n >= 1_000 ? n : DEFAULT_MS;
+    } catch {
+      return DEFAULT_MS;
+    }
+  }
+
+  /** Per-sender video bitrate cap (bps), or null to leave uncapped. Override
+   *  via localStorage('videoMaxBitrateKbps'); '0' disables the cap. */
+  private _videoMaxBitrate(): number | null {
+    const DEFAULT_KBPS = 2_000;
+    try {
+      const raw = window.localStorage.getItem('videoMaxBitrateKbps');
+      const kbps = raw != null ? parseInt(raw, 10) : DEFAULT_KBPS;
+      if (!Number.isFinite(kbps) || kbps <= 0) return raw === '0' ? null : DEFAULT_KBPS * 1_000;
+      return kbps * 1_000;
+    } catch {
+      return DEFAULT_KBPS * 1_000;
+    }
+  }
+
+  /**
+   * Bias the encoder toward audio on a constrained uplink: mark the audio
+   * sender high network priority and the video sender low, and cap video
+   * bitrate. On a saturated upload the congestion controller then starves
+   * video before audio, so voice survives loss/contention that would
+   * otherwise hit both equally. Best-effort: setParameters can reject if
+   * called before encodings exist or on browsers that don't support a
+   * field; failures are non-fatal and logged at debug only.
+   */
+  private async _applySenderParams(pc: RTCPeerConnection | undefined): Promise<void> {
+    if (!pc) return;
+    for (const sender of pc.getSenders()) {
+      const kind = sender.track?.kind;
+      if (kind !== 'audio' && kind !== 'video') continue;
+      try {
+        const params = sender.getParameters();
+        // setParameters requires the encodings array shape returned by
+        // getParameters(); if the browser hasn't populated it yet, skip.
+        if (!params.encodings || params.encodings.length === 0) continue;
+        const enc = params.encodings[0] as RTCRtpEncodingParameters & {
+          networkPriority?: RTCPriorityType;
+        };
+        if (kind === 'audio') {
+          enc.priority = 'high';
+          enc.networkPriority = 'high';
+        } else {
+          enc.priority = 'low';
+          enc.networkPriority = 'low';
+          const cap = this._videoMaxBitrate();
+          if (cap) enc.maxBitrate = cap;
+        }
+        await sender.setParameters(params);
+      } catch {
+        // Non-fatal: too-early call, unsupported field, or transient state.
+      }
+    }
+  }
+
   private _handleMediaConnected(
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
@@ -863,6 +936,10 @@ export class StreamsStore {
         // Tracks may already be in the offer — silently ignore duplicate-track errors.
       }
     }
+
+    // Prioritise audio over video on the now-live sender (protects voice on
+    // constrained uplinks). Fire-and-forget; senders exist post-addTrack.
+    void this._applySenderParams(transport.getRTCPeerConnection(pubKeyB64));
 
     this.updateConnectionStatus(pubKeyB64, { type: 'Connected' });
     this.eventCallback({

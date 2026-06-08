@@ -330,6 +330,35 @@ describe('FsmTransport — getStats / getRTCPeerConnection escape hatch', () => 
   });
 });
 
+describe('FsmTransport — on-demand data channel / ICE controls', () => {
+  it('recreateDataChannel(peer) recreates the channel in place on the live pc', async () => {
+    const { transport, pcs } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+    expect(pcs[0].createDataChannel).toHaveBeenCalledTimes(1);
+
+    expect(transport.recreateDataChannel(PEER_B)).toBe(true);
+
+    expect(pcs[0].createDataChannel).toHaveBeenCalledTimes(2);
+    expect(pcs[0].close).not.toHaveBeenCalled();
+  });
+
+  it('restartIce(peer) drives an ICE restart on the live pc', async () => {
+    const { transport, pcs } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    expect(transport.restartIce(PEER_B)).toBe(true);
+    expect(pcs[0].restartIce).toHaveBeenCalled();
+  });
+
+  it('both return false for unknown peers', () => {
+    const { transport } = setup();
+    expect(transport.recreateDataChannel('unknown')).toBe(false);
+    expect(transport.restartIce('unknown')).toBe(false);
+  });
+});
+
 describe('FsmTransport — event subscription', () => {
   it('on(type) only fires for matching event type', () => {
     const { transport } = setup();

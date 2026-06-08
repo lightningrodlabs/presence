@@ -227,6 +227,26 @@ export class FsmTransport implements PeerTransport {
     this._manager.closeConnection(peer, reason ?? 'closeConnection called');
   }
 
+  /**
+   * Recreate a peer's data channel in place — no ICE/DTLS teardown, no new peer
+   * session. Use when the data channel is stuck but the media transport is
+   * healthy. Returns true if a live connection received the call. The FSM also
+   * does this automatically via its data-channel watchdog; this is the manual
+   * escape valve. FSM transport only (SimplePeer has no equivalent).
+   */
+  recreateDataChannel(peer: AgentPubKeyB64): boolean {
+    return this._manager.recreateDataChannel(peer);
+  }
+
+  /**
+   * Trigger an ICE restart for a peer without tearing the connection down
+   * (preserves the DTLS session). Returns true if a live connection received
+   * the call.
+   */
+  restartIce(peer: AgentPubKeyB64): boolean {
+    return this._manager.restartIce(peer);
+  }
+
   hasConnection(peer: AgentPubKeyB64): boolean {
     return !!this._manager.getFSM(peer);
   }
