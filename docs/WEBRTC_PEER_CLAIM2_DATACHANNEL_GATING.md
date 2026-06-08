@@ -3,8 +3,37 @@
 > Reviewer: "It forces creating a data channel that is not used, to gate
 > connectivity, but then that channel sits unused while media channels are used."
 
-Status: **investigate / observe** — no code change recommended. This documents
-the two separable parts of the claim and what the running app shows.
+Status: **SUPERSEDED** by the §6.1 tiered-readiness change (see
+[WEBRTC_CONNECTION_PLAN.md](WEBRTC_CONNECTION_PLAN.md)). The original conclusion
+below ("Part B — gating is correct; defer decoupling until a media-only consumer
+exists") has been **reversed**: `connected` is now reached on **ICE + DTLS
+alone**, and the data channel is surfaced as a separate signal rather than a
+gate. The enhancement Part B deferred (`gateOnDataChannel`) effectively landed —
+unconditionally, not behind a config flag. The investigation text is retained
+below for history; **the current contract is the post-supersession summary in
+the next section.**
+
+## Current contract (post §6.1)
+
+- `connected` ⇐ `iceConnected && dtlsConnected`
+  ([peer-connection-fsm.ts `_checkCompositeReadiness`](../packages/webrtc-peer/src/peer-connection-fsm.ts)).
+  Media (RTP) flows on ICE+DTLS, and remote track availability is driven by
+  `track` events — not the data channel — which is the justification for
+  decoupling.
+- The data channel is exposed separately: the `data-channel-open` FSM event and
+  the `ConnectionViewModel.dataChannelReady` flag. A stuck channel is recovered
+  in place in the background by the data-channel watchdog (recreate, bounded,
+  then escalate) and never gates the call.
+- Outbound `RTCPeer.send()` while the channel is closed is **buffered** (bounded
+  FIFO) and flushed on open, so control/state-sync messages are delayed during
+  the DC-pending / recovery window, not dropped.
+
+---
+
+_Original investigation (historical — conclusion superseded above):_
+
+This documents the two separable parts of the claim and what the running app
+showed at the time.
 
 ## Part A — "the channel sits unused": false for Presence
 
@@ -25,7 +54,11 @@ Observed message types on the channel include:
 So the "unused" premise does not hold here. A media-only embedder that never
 calls `send()` would indeed leave it idle — but that is a different consumer.
 
-## Part B — "gates connectivity": true, intentional, and safe
+## Part B — "gates connectivity": true, intentional, and safe — **SUPERSEDED**
+
+> This section described the pre-§6.1 behavior and recommended keeping it. It is
+> no longer accurate — `connected` no longer requires the data channel. See the
+> "Current contract" section at the top. Retained verbatim for history.
 
 `connected` requires the data channel to be open, alongside ICE and DTLS
 ([peer-connection-fsm.ts:1111-1118](../packages/webrtc-peer/src/peer-connection-fsm.ts#L1111-L1118)).
@@ -49,11 +82,13 @@ A targeted confirmation, if desired, is to grep the FSM transition log for the
 watchdog's `DTLS stall` trigger — its absence on successful connects confirms the
 data channel opens within the window and is not the limiting factor.
 
-## Recommendation
+## Recommendation — **SUPERSEDED**
 
-No change for Presence: the channel is used and the gate is correct and
-safety-netted. The only defensible enhancement is for *other* consumers: an
-optional `gateOnDataChannel?: boolean` (default true) in `ConnectionConfig` so a
-pure-media embedder can reach `connected` on ICE+DTLS alone. Defer until such a
-consumer exists; it pairs naturally with the diagnostics/feature switches in
-[WEBRTC_PEER_SIZE_AUDIT.md](WEBRTC_PEER_SIZE_AUDIT.md).
+> Original recommendation was "no change; defer decoupling behind an optional
+> `gateOnDataChannel` flag." That was reversed by §6.1: decoupling landed
+> unconditionally (no flag) because production captures showed a stuck data
+> channel reading as "not connected" was inviting teardown of an otherwise-good
+> ICE+DTLS transport — the dominant churn cost. The data channel is now a
+> separate, recoverable signal, not a gate. See the "Current contract" section
+> at the top of this file and §5.A/§6.1 of
+> [WEBRTC_CONNECTION_PLAN.md](WEBRTC_CONNECTION_PLAN.md).
