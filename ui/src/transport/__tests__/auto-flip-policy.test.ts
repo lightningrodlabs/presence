@@ -1,8 +1,74 @@
 import { describe, it, expect } from 'vitest';
 import {
   decideAutoFlip,
+  decideCarrierSwitch,
   resolveWebrtcImpl,
 } from '../auto-flip-policy';
+import type { CarrierSwitchInputs } from '../auto-flip-policy';
+
+describe('decideCarrierSwitch — webrtc↔signals hysteresis (§6.4)', () => {
+  const base: CarrierSwitchInputs = {
+    current: 'webrtc',
+    transportUp: false,
+    consecutiveBad: 5,
+    msSinceLastSwitch: 60_000,
+    badThreshold: 3,
+    minDwellMs: 10_000,
+  };
+
+  it('holds within the dwell window even with sustained badness (anti-thrash)', () => {
+    expect(decideCarrierSwitch({ ...base, msSinceLastSwitch: 9_999 })).toEqual({
+      action: 'stay',
+      reason: 'dwell',
+    });
+  });
+
+  it('stays on webrtc while the transport (ICE+DTLS) is up, regardless of audio dips', () => {
+    expect(
+      decideCarrierSwitch({ ...base, transportUp: true, consecutiveBad: 999 }),
+    ).toEqual({ action: 'stay', reason: 'transport-up' });
+  });
+
+  it('does not switch off webrtc until badness is sustained past the threshold', () => {
+    expect(
+      decideCarrierSwitch({ ...base, transportUp: false, consecutiveBad: 2 }),
+    ).toEqual({ action: 'stay', reason: 'below-threshold' });
+  });
+
+  it('switches webrtc → signals once badness is sustained and the transport is down', () => {
+    expect(
+      decideCarrierSwitch({ ...base, transportUp: false, consecutiveBad: 3 }),
+    ).toEqual({ action: 'switch', to: 'signals', reason: 'sustained-bad' });
+  });
+
+  it('switches signals → webrtc on sustained badness (recovery attempt)', () => {
+    expect(
+      decideCarrierSwitch({ ...base, current: 'signals', consecutiveBad: 3 }),
+    ).toEqual({ action: 'switch', to: 'webrtc', reason: 'sustained-bad' });
+  });
+
+  it('transport-up bias does not apply when already on signals', () => {
+    // transportUp is about webrtc; on signals it must not pin us there.
+    expect(
+      decideCarrierSwitch({ ...base, current: 'signals', transportUp: true, consecutiveBad: 3 }),
+    ).toEqual({ action: 'switch', to: 'webrtc', reason: 'sustained-bad' });
+  });
+
+  it('dwell takes precedence over the transport-up bias', () => {
+    expect(
+      decideCarrierSwitch({ ...base, transportUp: true, msSinceLastSwitch: 0 }),
+    ).toEqual({ action: 'stay', reason: 'dwell' });
+  });
+
+  it('walks a bucket sequence: noise dips do not switch, a sustained run does', () => {
+    const run = (consecutiveBad: number) =>
+      decideCarrierSwitch({ ...base, transportUp: false, consecutiveBad });
+    expect(run(0).action).toBe('stay');
+    expect(run(1).action).toBe('stay');
+    expect(run(2).action).toBe('stay');
+    expect(run(3).action).toBe('switch'); // threshold reached
+  });
+});
 
 describe('resolveWebrtcImpl — symmetric union with per-peer overrides', () => {
   it('defaults to simplepeer when neither side has a preference', () => {

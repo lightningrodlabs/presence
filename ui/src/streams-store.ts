@@ -6,7 +6,7 @@ import {
 } from '@holochain/client';
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
-import { decideAutoFlip, resolveWebrtcImpl } from './transport/auto-flip-policy';
+import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import {
   derived,
   get,
@@ -338,7 +338,12 @@ export class StreamsStore {
       // retransmits); a single stall tore the connection down to the lossy
       // signals carrier and churned reconnects. Raise to a viable default,
       // user-overridable via localStorage('dtlsStallTimeoutMs').
-      configOverrides: { dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs() },
+      configOverrides: {
+        dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs(),
+        ...(this._readIceTransportPolicy() !== undefined && {
+          iceTransportPolicy: this._readIceTransportPolicy(),
+        }),
+      },
       onOutgoingSignal: (signal) => {
         const toAgent = decodeHashFromBase64(signal.to);
         this.roomClient.sendMessage(
@@ -813,6 +818,21 @@ export class StreamsStore {
     }
   }
 
+  /**
+   * Optional forced ICE transport policy, for validating the TURN/relay path
+   * (§6.3): set localStorage('iceTransportPolicy') = 'relay' to force TURN-only
+   * (host/srflx candidates are not gathered), proving the relay actually forms
+   * without needing a special build. Returns undefined for normal ICE.
+   */
+  private _readIceTransportPolicy(): RTCIceTransportPolicy | undefined {
+    try {
+      const raw = window.localStorage.getItem('iceTransportPolicy');
+      return raw === 'relay' || raw === 'all' ? raw : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Per-sender video bitrate cap (bps), or null to leave uncapped. Override
    *  via localStorage('videoMaxBitrateKbps'); '0' disables the cap. */
   private _videoMaxBitrate(): number | null {
@@ -836,8 +856,12 @@ export class StreamsStore {
    * called before encodings exist or on browsers that don't support a
    * field; failures are non-fatal and logged at debug only.
    */
-  private async _applySenderParams(pc: RTCPeerConnection | undefined): Promise<void> {
+  private async _applySenderParams(
+    pc: RTCPeerConnection | undefined,
+    peerB64?: AgentPubKeyB64,
+  ): Promise<void> {
     if (!pc) return;
+    const report: string[] = [];
     for (const sender of pc.getSenders()) {
       const kind = sender.track?.kind;
       if (kind !== 'audio' && kind !== 'video') continue;
@@ -849,6 +873,7 @@ export class StreamsStore {
         const enc = params.encodings[0] as RTCRtpEncodingParameters & {
           networkPriority?: RTCPriorityType;
         };
+        const want = kind === 'audio' ? 'high' : 'low';
         if (kind === 'audio') {
           enc.priority = 'high';
           enc.networkPriority = 'high';
@@ -859,9 +884,31 @@ export class StreamsStore {
           if (cap) enc.maxBitrate = cap;
         }
         await sender.setParameters(params);
+        // Read back what the browser actually stored. `networkPriority` is not
+        // universally honored; if it silently reverts, video can starve audio
+        // on a constrained uplink — exactly the periodic-dropout symptom we are
+        // chasing. Logging applied-vs-requested makes that visible in capture.
+        const rb = sender.getParameters().encodings?.[0] as
+          | (RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType })
+          | undefined;
+        const gotPrio = rb?.priority ?? 'unset';
+        const gotNet = rb?.networkPriority ?? 'unset';
+        const applied = gotPrio === want && gotNet === want;
+        let s = `${kind}:want=${want} priority=${gotPrio} netPriority=${gotNet}${applied ? '' : ' NOT-APPLIED'}`;
+        if (kind === 'video') s += ` maxBitrate=${rb?.maxBitrate ?? 'unset'}`;
+        report.push(s);
       } catch {
         // Non-fatal: too-early call, unsupported field, or transient state.
+        report.push(`${kind}:setParameters-failed`);
       }
+    }
+    if (peerB64 && report.length > 0) {
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: Date.now(),
+        event: 'SenderParams',
+        detail: report.join(' | '),
+      });
     }
   }
 
@@ -939,7 +986,7 @@ export class StreamsStore {
 
     // Prioritise audio over video on the now-live sender (protects voice on
     // constrained uplinks). Fire-and-forget; senders exist post-addTrack.
-    void this._applySenderParams(transport.getRTCPeerConnection(pubKeyB64));
+    void this._applySenderParams(transport.getRTCPeerConnection(pubKeyB64), pubKeyB64);
 
     this.updateConnectionStatus(pubKeyB64, { type: 'Connected' });
     this.eventCallback({
@@ -1036,14 +1083,20 @@ export class StreamsStore {
       connectionId,
     });
     if (wasWebrtcCarrier) {
+      // Annotate the downgrade with *why* we left webrtc (§6.6) — the reason
+      // the FSM took this peer out of `connected`, captured in
+      // `_logFsmTransition`. Falls back to the impl-specific FSM close if the
+      // root reason wasn't seen (e.g. close arrived without a connected->X log).
+      const reason = this._lastWebrtcExitReason.get(pubKeyB64) ?? 'unknown';
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: Date.now(),
         event: 'CarrierSwitch',
         connectionId,
-        detail: `${impl}->signals`,
+        detail: `${impl}->signals reason="${reason}"`,
       });
     }
+    this._lastWebrtcExitReason.delete(pubKeyB64);
     this._lastQualityBucket.delete(pubKeyB64);
     this._lastDisconnectTime[pubKeyB64] = Date.now();
 
@@ -1909,9 +1962,18 @@ export class StreamsStore {
 
   get iceConfig(): RTCIceServer[] {
     const servers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
-    if (this.turnUrl) {
+    // `turnUrl` may carry more than one URL (comma- or whitespace-separated) so
+    // a single credential covers multiple transports — typically the UDP relay
+    // `turn:host:3478` plus the TLS-over-TCP relay `turns:host:443?transport=tcp`.
+    // The latter survives lossy-UDP paths and firewalls that only permit 443
+    // (§6.3). One m-line per distinct URL is fine; the agent picks the best.
+    const urls = this.turnUrl
+      .split(/[\s,]+/)
+      .map(u => u.trim())
+      .filter(Boolean);
+    if (urls.length > 0) {
       servers.push({
-        urls: this.turnUrl,
+        urls: urls.length === 1 ? urls[0] : urls,
         username: this.turnUsername,
         credential: this.turnCredential,
       });
@@ -3708,6 +3770,35 @@ export class StreamsStore {
    */
   private async _maybeAutoFlipImpl(peerB64: AgentPubKeyB64): Promise<void> {
     const now = Date.now();
+
+    // Carrier-switch hysteresis (§6.4): bias toward staying on a healthy webrtc
+    // transport. Since §6.1 an FSM phase of `connected` means ICE+DTLS are up —
+    // media flows regardless of momentary RTP loss — so an audibility dip there
+    // is most likely last-mile uplink loss, which flipping to the (far worse)
+    // signals carrier does not fix. The 30s outage gate already supplies the
+    // "sustained" requirement; dwell is enforced by decideAutoFlip's cooldown,
+    // so here decideCarrierSwitch contributes the transport-up bias.
+    const fsmTransportUp =
+      this.webrtcImplFor(peerB64) === 'fsm' &&
+      this.mediaTransportFsm.getPhase(peerB64) === 'connected';
+    const hysteresis = decideCarrierSwitch({
+      current: 'webrtc',
+      transportUp: fsmTransportUp,
+      consecutiveBad: 1, // the outage scan already waited out the sustained window
+      msSinceLastSwitch: Number.POSITIVE_INFINITY, // dwell handled by decideAutoFlip
+      badThreshold: 1,
+      minDwellMs: 0,
+    });
+    if (hysteresis.action === 'stay' && hysteresis.reason === 'transport-up') {
+      this.logger.logAgentEvent({
+        agent: peerB64,
+        timestamp: now,
+        event: 'CarrierHold',
+        detail: 'webrtc transport up (ICE+DTLS) — holding through audibility dip',
+      });
+      return;
+    }
+
     const decision = decideAutoFlip({
       currentImpl: this.webrtcImplFor(peerB64),
       onSignals: this.webrtcGloballyDisabled || this.webrtcDisabled(peerB64),
@@ -3855,6 +3946,15 @@ export class StreamsStore {
    * rather than every poll cycle.
    */
   private _lastQualityBucket = new Map<string, string>();
+
+  /**
+   * Most recent reason a peer left the `connected` webrtc phase, captured from
+   * the FSM transition that took it out of `connected` (e.g. "disconnectFromPeerVideo",
+   * "peer left", "transport failure: dtls-failed"). Read by `_handleMediaClosed`
+   * to annotate the `CarrierSwitch fsm->signals` downgrade with *why* webrtc was
+   * abandoned (§6.6), instead of leaving the analyst to correlate timestamps.
+   */
+  private _lastWebrtcExitReason = new Map<AgentPubKeyB64, string>();
 
   /**
    * Wall-clock ms since the signal carrier was inferred down (no pong from
@@ -4879,6 +4979,15 @@ export class StreamsStore {
     // ICE state events. Keep them out of the timeline unless we're
     // specifically debugging DTLS / data-channel readiness.
     if (entry.trigger.startsWith('DIAG:')) return;
+    // Capture the reason a peer leaves a live webrtc call so the downgrade to
+    // signals can name it (§6.6). The FSM logs the transition (onTransition)
+    // before the corresponding state-change event reaches `_handleMediaClosed`,
+    // so this is populated in time. Use the connected->X trigger (root cause:
+    // disconnectFromPeerVideo / peer-left / transport-failure) rather than the
+    // eventual close trigger, which is often a downstream "stale ICE" note.
+    if (entry.fromState === 'connected' && entry.toState !== 'connected') {
+      this._lastWebrtcExitReason.set(entry.remoteAgent, entry.trigger);
+    }
     // Include the underlying transport states so a transition's cause can be
     // read straight from the log (e.g. confirm ICE vs DTLS on a 'failed'
     // attribution) without correlating against separate ICE-state events. Only

@@ -967,7 +967,7 @@ export class PresenceApp extends LitElement {
           <div style="margin-top: 6px;">
             <input
               type="text"
-              placeholder="turn:host:port"
+              placeholder="turn:host:3478, turns:host:443?transport=tcp"
               .value=${this._turnUrl}
               @input=${(e: InputEvent) => {
                 const val = (e.target as HTMLInputElement).value;

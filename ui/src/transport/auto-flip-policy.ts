@@ -21,6 +21,66 @@
  * call.
  */
 
+// ---------------------------------------------------------------------------
+// Carrier-switch hysteresis (§6.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure damping for the webrtc↔signals carrier decision. Borderline links
+ * oscillate, and every switch is an audio seam plus a reconnect; the captured
+ * data shows webrtc at 80ms+3% loss is far better than the signals carrier at
+ * 400–1800ms, so the bias is to be *reluctant* to leave webrtc. The rules, in
+ * order:
+ *
+ *   1. **Dwell** — never switch again within `minDwellMs` of the last switch.
+ *      Pure anti-thrash.
+ *   2. **Transport-up bias** — while on webrtc with ICE+DTLS up (`transportUp`),
+ *      stay regardless of audio dips. Media flows on ICE+DTLS independent of
+ *      momentary RTP loss; abandoning a live transport for the far-worse signals
+ *      carrier is the audible damage, and last-mile uplink loss (the usual cause)
+ *      isn't fixed by switching anyway.
+ *   3. **Sustained-bad** — only switch once `consecutiveBad` reaches
+ *      `badThreshold`. A single bad bucket is noise.
+ *
+ * Stateless: the store wires the counts, the dwell clock, and the thresholds on
+ * each call. Returns whether to switch and, if so, to which carrier.
+ */
+export type CarrierSwitchInputs = {
+  /** Carrier currently carrying this peer's audio. */
+  current: 'webrtc' | 'signals';
+  /** Whether the webrtc transport (ICE+DTLS) is currently up for this peer. */
+  transportUp: boolean;
+  /** Consecutive "bad" quality observations for the current carrier. */
+  consecutiveBad: number;
+  /** ms since the last carrier switch for this peer (dwell). */
+  msSinceLastSwitch: number;
+  /** Consecutive-bad observations required before leaving the current carrier. */
+  badThreshold: number;
+  /** Minimum dwell on the current carrier before another switch is allowed. */
+  minDwellMs: number;
+};
+
+export type CarrierSwitchDecision =
+  | { action: 'stay'; reason: 'dwell' | 'transport-up' | 'below-threshold' }
+  | { action: 'switch'; to: 'webrtc' | 'signals'; reason: 'sustained-bad' };
+
+export function decideCarrierSwitch(input: CarrierSwitchInputs): CarrierSwitchDecision {
+  if (input.msSinceLastSwitch < input.minDwellMs) {
+    return { action: 'stay', reason: 'dwell' };
+  }
+  if (input.current === 'webrtc' && input.transportUp) {
+    return { action: 'stay', reason: 'transport-up' };
+  }
+  if (input.consecutiveBad < input.badThreshold) {
+    return { action: 'stay', reason: 'below-threshold' };
+  }
+  return {
+    action: 'switch',
+    to: input.current === 'webrtc' ? 'signals' : 'webrtc',
+    reason: 'sustained-bad',
+  };
+}
+
 export type AutoFlipDecision =
   | { action: 'noop'; reason: 'on-signals' | 'cooldown' }
   | { action: 'flip'; nextImpl: 'simplepeer' | 'fsm' }

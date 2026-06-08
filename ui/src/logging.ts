@@ -165,7 +165,16 @@ export type SimpleEventType =
   // `reason=ping-stale+no-media`. Lets log analysis see exactly when and
   // why a peer's pane appeared or disappeared.
   | 'PresenceAdd'
-  | 'PresenceRemove';
+  | 'PresenceRemove'
+  // Carrier-switch hysteresis (§6.4) held the link on webrtc through an
+  // audibility dip because the ICE+DTLS transport was still up — i.e. we
+  // declined an auto-flip that would have abandoned a healthy transport.
+  | 'CarrierHold'
+  // Read-back of the per-sender priority / networkPriority / maxBitrate after
+  // `setParameters`, with a NOT-APPLIED marker when the browser didn't honor
+  // the requested value — used to tell audio-starvation from bufferbloat when
+  // voice chops on an otherwise-healthy webrtc path.
+  | 'SenderParams';
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;
