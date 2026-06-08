@@ -130,6 +130,13 @@ class VoiceController {
    */
   peerLastRecvMs = new Map<string, number>();
 
+  /** Diagnostic (investigate/signals-double-audio): cumulative playout-head
+   *  resets per peer, split by branch. `overcap-drop` is the burst-overlap
+   *  avoidance; a non-trivial count there confirms the double-audio mechanism. */
+  private _playoutResetCounts = new Map<string, { behind: number; overcapDrop: number }>();
+  /** Throttle for VoicePlayoutReset logging (one line per peer per ~2s). */
+  private _lastPlayoutLogMs = new Map<string, number>();
+
   bind(store: StreamsStore) {
     this.store = store;
   }
@@ -143,6 +150,8 @@ class VoiceController {
     this.peerAudioLevels.clear();
     this.peerLastSentMs.clear();
     this.peerLastRecvMs.clear();
+    this._playoutResetCounts.clear();
+    this._lastPlayoutLogMs.clear();
     // AudioContext is owned by MicSource now — don't close it here. It
     // stays alive across voice deactivate/reactivate and is disposed by
     // StreamsStore.disconnect → MicSource.dispose.
@@ -580,13 +589,25 @@ class VoiceController {
       const now = ctx.currentTime;
       const jitterSec = JITTER_BUFFER_MS / 1000;
       const driftSec = PLAYBACK_RESET_DRIFT_MS / 1000;
-      // (Re)initialize playback head if first frame, behind real time, or
-      // unreasonably far ahead (peer paused/network burst).
-      if (
-        state.nextPlaybackTime < now ||
-        state.nextPlaybackTime > now + jitterSec + driftSec
-      ) {
+      if (state.nextPlaybackTime < now) {
+        // Fell behind real time (stall / first frame after a gap) — re-anchor
+        // forward. Nothing is scheduled in [now, nextPlaybackTime), so this
+        // cannot overlap already-committed sources.
+        if (state.nextPlaybackTime !== 0) {
+          this._logPlayoutReset(agentPubKeyB64, 'behind', now - state.nextPlaybackTime, state);
+        }
         state.nextPlaybackTime = now + jitterSec;
+      } else if (state.nextPlaybackTime > now + jitterSec + driftSec) {
+        // Buffer too deep: frames decoded faster than real time (the
+        // remote-signal transport delivered a backlog at once). Up to `driftSec`
+        // of audio is ALREADY source.start()-scheduled ahead of `now`; snapping
+        // nextPlaybackTime back to now+jitter and scheduling here would overlap
+        // it — the hypothesized "voice on top of itself" bug (see
+        // docs/SIGNALS_DOUBLE_AUDIO_INVESTIGATION.md). Shed depth by dropping
+        // this frame instead. A dropped 20ms frame mid-burst is inaudible; a
+        // 400ms overlap is not. Latency drains back to ~jitter between bursts.
+        this._logPlayoutReset(agentPubKeyB64, 'overcap-drop', state.nextPlaybackTime - now, state);
+        return; // `data` is closed in the finally block
       }
       source.start(state.nextPlaybackTime);
       state.nextPlaybackTime += numberOfFrames / sampleRate;
@@ -595,6 +616,38 @@ class VoiceController {
     } finally {
       try { data.close(); } catch {}
     }
+  }
+
+  /**
+   * Diagnostic for the hypothesized burst-overlap ("voice on top of itself")
+   * bug. Counts playout-head re-anchors per peer and logs a throttled summary.
+   * The `overcap-drop` branch is the one that previously snapped the head
+   * backward and overlapped already-scheduled audio; sustained counts there
+   * (correlate the timestamps against signal-relay flaps to find the cadence
+   * driver) are what would confirm the burst-delivery mechanism. See
+   * docs/SIGNALS_DOUBLE_AUDIO_INVESTIGATION.md.
+   */
+  private _logPlayoutReset(
+    agentPubKeyB64: string,
+    branch: 'behind' | 'overcap-drop',
+    aheadOrBehindSec: number,
+    _state: PeerVoiceState,
+  ) {
+    const c = this._playoutResetCounts.get(agentPubKeyB64) ?? { behind: 0, overcapDrop: 0 };
+    if (branch === 'behind') c.behind += 1;
+    else c.overcapDrop += 1;
+    this._playoutResetCounts.set(agentPubKeyB64, c);
+
+    const now = Date.now();
+    const last = this._lastPlayoutLogMs.get(agentPubKeyB64) ?? 0;
+    if (now - last < 2000) return; // throttle
+    this._lastPlayoutLogMs.set(agentPubKeyB64, now);
+
+    this.store?.logger.logCustomMessage(
+      `VoicePlayoutReset [${agentPubKeyB64.slice(0, 8)}] branch=${branch} ` +
+      `${branch === 'overcap-drop' ? 'ahead' : 'behind'}=${Math.round(aheadOrBehindSec * 1000)}ms ` +
+      `totals: behind=${c.behind} overcap-drop=${c.overcapDrop}`,
+    );
   }
 }
 
