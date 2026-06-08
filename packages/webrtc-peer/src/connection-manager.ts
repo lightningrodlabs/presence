@@ -417,13 +417,22 @@ export class ConnectionManager {
         this._onTransition?.(entry);
         this._notifyViewModelChange();
 
-        // Emit connection state change event
-        this._emitManagerEvent({
-          type: 'connection-state-changed',
-          remoteAgent,
-          connectionId,
-          data: { fromState: entry.fromState, toState: entry.toState },
-        });
+        // Emit a connection-state-change event ONLY on an actual phase change.
+        // `onTransition` also fires for same-state sub-phase log entries
+        // (`_logTransition`: ICE-state changes, in-place data-channel recreate,
+        // dropped-signal notes) where fromState === toState. Forwarding those as
+        // "state changes" made consumers re-run their on-connect side effects
+        // (re-add tracks → renegotiation, re-tag carrier, re-apply sender params)
+        // every time the FSM logged a sub-event while `connected`. Gate on a real
+        // transition; the view model above still updates on every entry.
+        if (entry.fromState !== entry.toState) {
+          this._emitManagerEvent({
+            type: 'connection-state-changed',
+            remoteAgent,
+            connectionId,
+            data: { fromState: entry.fromState, toState: entry.toState },
+          });
+        }
 
         // Clean up closed/failed connections from the map
         if (entry.toState === 'closed') {
@@ -469,6 +478,18 @@ export class ConnectionManager {
     fsm.on('data-channel-message', (event) => {
       this._emitManagerEvent({
         type: 'data-channel-message',
+        remoteAgent,
+        connectionId,
+        data: event.data,
+      });
+    });
+
+    // Forward the one-shot establishment timeline (§6.6) so the application can
+    // log a single per-connection record (per-stage ms) instead of
+    // reconstructing it from interleaved transition logs.
+    fsm.on('establishment-timeline', (event) => {
+      this._emitManagerEvent({
+        type: 'establishment-timeline',
         remoteAgent,
         connectionId,
         data: event.data,

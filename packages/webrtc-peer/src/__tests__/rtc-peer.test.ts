@@ -14,6 +14,8 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   connectionTimeoutMs: 7000,
   sdpExchangeTimeoutMs: 15000,
   dtlsStallTimeoutMs: 5000,
+  dataChannelStallTimeoutMs: 4000,
+  maxDataChannelRecreateAttempts: 3,
   iceDisconnectedGraceMs: 15000,
   role: 'mesh',
   diagnostics: false,
@@ -23,13 +25,14 @@ function createPeer(options: {
   polite?: boolean;
   onSignal?: (data: any) => void;
   trickleICE?: boolean;
+  config?: Partial<ConnectionConfig>;
 } = {}) {
   const onSignal = options.onSignal ?? vi.fn();
   let mockPc: MockRTCPeerConnection;
 
   const peer = new RTCPeer({
     polite: options.polite ?? true,
-    config: DEFAULT_CONFIG,
+    config: { ...DEFAULT_CONFIG, ...options.config },
     trickleICE: options.trickleICE,
     onSignal,
     createPeerConnection: (config: RTCConfiguration) => {
@@ -95,6 +98,23 @@ describe('RTCPeer', () => {
         username: 'user',
         credential: 'pass',
       });
+    });
+
+    it('passes iceCandidatePoolSize through to the RTCConfiguration when set', () => {
+      const { mockPc } = createPeer({ config: { iceCandidatePoolSize: 2 } });
+      expect(mockPc.configuration.iceCandidatePoolSize).toBe(2);
+    });
+
+    it('omits iceCandidatePoolSize from the RTCConfiguration when unset', () => {
+      // The default test config does not set it; the key must be absent rather
+      // than `undefined` so the browser applies its own default.
+      const { mockPc } = createPeer();
+      expect('iceCandidatePoolSize' in mockPc.configuration).toBe(false);
+    });
+
+    it('passes iceTransportPolicy through for forced-relay test builds', () => {
+      const { mockPc } = createPeer({ config: { iceTransportPolicy: 'relay' } });
+      expect(mockPc.configuration.iceTransportPolicy).toBe('relay');
     });
   });
 
@@ -344,6 +364,57 @@ describe('RTCPeer', () => {
       peer.destroy();
       // Should not throw
       peer.send('hello');
+    });
+
+    it('buffers sends while the channel is not open and flushes them in order on open', () => {
+      const { peer, mockPc } = createPeer();
+      const dc = mockPc.createDataChannel.mock.results[0]!.value as MockRTCDataChannel;
+
+      // Channel starts in 'connecting' — these must be buffered, not dropped.
+      peer.send('a');
+      peer.send('b');
+      expect(dc.send).not.toHaveBeenCalled();
+
+      dc.simulateOpen();
+
+      // Flushed in FIFO order before any post-open sends.
+      expect(dc.send.mock.calls.map(c => c[0])).toEqual(['a', 'b']);
+
+      // After open, sends pass straight through.
+      peer.send('c');
+      expect(dc.send.mock.calls.map(c => c[0])).toEqual(['a', 'b', 'c']);
+    });
+
+    it('flushes buffered sends onto the recreated channel after an in-place recreate', () => {
+      const { peer, mockPc } = createPeer();
+      const original = mockPc.createDataChannel.mock.results[0]!.value as MockRTCDataChannel;
+      original.simulateOpen();
+      peer.send('before');
+      expect(original.send).toHaveBeenCalledWith('before');
+
+      // Recreate in place (DCEP-open-lost recovery). The new channel is closed
+      // until it opens; sends in the gap must land on it, not the dead one.
+      peer.recreateDataChannel();
+      const replacement = mockPc.createDataChannel.mock.results[1]!.value as MockRTCDataChannel;
+      peer.send('during-recovery');
+      expect(replacement.send).not.toHaveBeenCalled();
+
+      replacement.simulateOpen();
+      expect(replacement.send).toHaveBeenCalledWith('during-recovery');
+    });
+
+    it('bounds the send buffer, discarding oldest messages on overflow', () => {
+      const { peer, mockPc } = createPeer();
+      const dc = mockPc.createDataChannel.mock.results[0]!.value as MockRTCDataChannel;
+
+      // Buffer cap is 64. Enqueue 70 while closed; oldest 6 are dropped.
+      for (let i = 0; i < 70; i++) peer.send(`m${i}`);
+      dc.simulateOpen();
+
+      const flushed = dc.send.mock.calls.map(c => c[0]);
+      expect(flushed).toHaveLength(64);
+      expect(flushed[0]).toBe('m6');   // m0..m5 discarded
+      expect(flushed[63]).toBe('m69');
     });
   });
 

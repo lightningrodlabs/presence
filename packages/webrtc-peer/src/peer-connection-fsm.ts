@@ -20,6 +20,7 @@ import type {
   ConnectionConfig,
   ConnectionRole,
   ConnectionViewModel,
+  EstablishmentTimeline,
   FSMEvent,
   FSMEventHandler,
   FSMTransitionEntry,
@@ -144,6 +145,13 @@ export class PeerConnectionFSM {
   private _iceConnected = false;
   private _dtlsConnected = false;
   private _dataChannelOpen = false;
+
+  // Establishment-timeline timestamps (§6.6). Captured per attempt, reset on a
+  // fresh establishment, emitted once when `connected` is first reached.
+  private _establishmentStartedAt: number | null = null;
+  private _dtlsConnectedAt: number | null = null;
+  private _dataChannelOpenAt: number | null = null;
+  private _establishmentIsReconnect = false;
 
   // DTLS watchdog — tracks when ICE connects but DTLS hasn't completed
   private _iceConnectedAt: number | null = null;
@@ -606,6 +614,10 @@ export class PeerConnectionFSM {
   private _onEnterState(newState: ConnectionPhase, oldState: ConnectionPhase, ctx: TransitionContext): void {
     switch (newState) {
       case 'signaling':
+        // Mark the start of this establishment attempt for the timeline (§6.6).
+        // From idle it's the initial join; from any other state it's a retry /
+        // fresh-peer-for-new-remote-session, which we count as a reconnect.
+        this._beginEstablishmentTimer(oldState !== 'idle');
         // Create a new RTCPeerConnection (new peer session)
         this._resetReadinessFlags();
         this._newPeerSession();
@@ -626,6 +638,8 @@ export class PeerConnectionFSM {
         break;
 
       case 'reconnecting':
+        // Time the reconnect as its own establishment attempt (§6.6).
+        this._beginEstablishmentTimer(true);
         // Self-transition (reconnecting → reconnecting): full reconnect with new peer session
         if (oldState === 'reconnecting') {
           this._destroyPeer();
@@ -974,6 +988,7 @@ export class PeerConnectionFSM {
       if (this._destroyed) return;
       this._iceConnected = true;
       this._dtlsConnected = true;
+      if (this._dtlsConnectedAt === null) this._dtlsConnectedAt = Date.now();
       this._cancelDtlsWatchdog();
       this._checkCompositeReadiness();
       // ICE+DTLS are up. If the data channel hasn't opened yet, watch it: a
@@ -1014,6 +1029,7 @@ export class PeerConnectionFSM {
       const dcState = event.data as string;
       this._dataChannelOpen = dcState === 'open';
       if (this._dataChannelOpen) {
+        if (this._dataChannelOpenAt === null) this._dataChannelOpenAt = Date.now();
         this._cancelDataChannelWatchdog();
         this._dataChannelRecreateAttempts = 0;
         this._checkCompositeReadiness();
@@ -1109,25 +1125,71 @@ export class PeerConnectionFSM {
   // ---------------------------------------------------------------------------
 
   /**
-   * Connection is only "connected" when ALL of:
-   * - ICE transport is connected/completed
-   * - DTLS transport is connected
-   * - Data channel is open
+   * Media readiness — the connection is "connected" once ICE + DTLS are up.
+   *
+   * Media (RTP) flows the instant ICE+DTLS are established, independent of the
+   * data channel, and track availability downstream is driven by `track` events,
+   * not by the data channel. So the data channel is NOT a gate on `connected`:
+   * gating the whole call on it let a stuck channel read as "not connected" and
+   * invite a teardown of an otherwise-good transport (§6.1). The channel is
+   * instead surfaced as a separate signal — the `data-channel-open` event and
+   * the `dataChannelReady` view-model flag — and a stuck channel is recovered in
+   * the background by the data-channel watchdog.
    */
   private _checkCompositeReadiness(): void {
-    if (!this._iceConnected || !this._dtlsConnected || !this._dataChannelOpen) {
+    if (!this._iceConnected || !this._dtlsConnected) {
       return;
     }
 
     if (this._state === 'connecting') {
       this._dtlsStallCount = 0;
-      this._transition('connected', { trigger: 'composite readiness achieved (ICE + DTLS + data channel)' });
+      this._transition('connected', { trigger: 'media readiness achieved (ICE + DTLS)' });
+      this._emitEstablishmentTimeline();
       this._detectRelayAfterConnect();
     } else if (this._state === 'reconnecting') {
       this._dtlsStallCount = 0;
-      this._transition('connected', { trigger: 'reconnection succeeded' });
+      this._transition('connected', { trigger: 'reconnection succeeded (ICE + DTLS)' });
+      this._emitEstablishmentTimeline();
       this._detectRelayAfterConnect();
     }
+  }
+
+  /** Begin (or restart) the establishment timer for a fresh connect attempt. */
+  private _beginEstablishmentTimer(isReconnect: boolean): void {
+    this._establishmentStartedAt = Date.now();
+    this._establishmentIsReconnect = isReconnect;
+    this._dtlsConnectedAt = null;
+    this._dataChannelOpenAt = null;
+  }
+
+  /**
+   * Emit the one-shot establishment-timeline record (§6.6) when a connection
+   * first reaches `connected`. Folds the per-stage timing into a single
+   * structured event so consumers don't have to reconstruct it from interleaved
+   * transition logs.
+   */
+  private _emitEstablishmentTimeline(): void {
+    const start = this._establishmentStartedAt;
+    if (start === null) return;
+    const rel = (t: number | null) => (t === null ? null : Math.max(0, t - start));
+    const timeline: EstablishmentTimeline = {
+      startedAt: start,
+      iceMs: rel(this._iceConnectedAt),
+      dtlsMs: rel(this._dtlsConnectedAt),
+      connectedMs: Math.max(0, Date.now() - start),
+      dataChannelMs: rel(this._dataChannelOpenAt),
+      wasReconnect: this._establishmentIsReconnect,
+      peerSessionId: this._session.local,
+    };
+    // One record per attempt — clear the start so a later readiness re-check
+    // (or a flag flip when the DC finally opens) can't re-emit it.
+    this._establishmentStartedAt = null;
+    this._emitEvent({
+      type: 'establishment-timeline',
+      connectionId: this.connectionId,
+      remoteAgent: this.remoteAgent,
+      data: timeline,
+    });
   }
 
   private _resetReadinessFlags(): void {
@@ -1395,6 +1457,7 @@ export class PeerConnectionFSM {
           }
         : null,
       healthy: this._state === 'connected' && this._iceConnected && this._dtlsConnected,
+      dataChannelReady: this._state === 'connected' && this._dataChannelOpen,
     };
     this._currentViewModel = vm;
     return vm;
@@ -1435,11 +1498,16 @@ export class PeerConnectionFSM {
       case 'idle': return 'Not connected';
       case 'signaling': return 'Exchanging connection info...';
       case 'connecting': {
+        // ICE+DTLS up promotes straight to `connected` now (§6.1), so the data
+        // channel is never the thing we're waiting on in `connecting` — only
+        // ICE and DTLS are.
         if (this._iceConnected && !this._dtlsConnected) return 'Securing connection...';
-        if (this._iceConnected && this._dtlsConnected && !this._dataChannelOpen) return 'Opening data channel...';
         return 'Establishing connection...';
       }
       case 'connected':
+        // The call is live on ICE+DTLS regardless of the data channel; never
+        // report "opening data channel" over flowing media. The data-channel
+        // state is surfaced separately via the `dataChannelReady` flag.
         if (this._relayed) return 'Connected (relayed)';
         return 'Connected';
       case 'reconnecting':

@@ -61,7 +61,11 @@ async function connectedTransportNoDataChannel(configOverride: Partial<Connectio
   await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
   expect(ctx.fsm.state).toBe('connecting');
   // connectionState=connected ⇒ ICE + DTLS both up (the 'connect' event).
-  // The data channel is deliberately NOT opened.
+  // The data channel is deliberately NOT opened. Since §6.1 the FSM promotes to
+  // `connected` on ICE+DTLS alone (media flows), with the data channel as a
+  // separate, recoverable signal — so the call is live here even though the
+  // channel is still closed, and the watchdog recovers the channel in the
+  // background.
   ctx.mockPc.simulateConnectionState('connected');
   return ctx;
 }
@@ -81,8 +85,10 @@ describe('data channel recovery (in-place, no ICE/DTLS teardown)', () => {
       maxDataChannelRecreateAttempts: 3,
     });
 
-    // Transport is up, data channel not open → FSM holds in connecting.
-    expect(ctx.fsm.state).toBe('connecting');
+    // Transport (ICE+DTLS) is up → FSM is `connected` and media flows; the data
+    // channel is not yet open, surfaced separately as dataChannelReady=false.
+    expect(ctx.fsm.state).toBe('connected');
+    expect(ctx.fsm.viewModel.dataChannelReady).toBe(false);
     expect(ctx.mockPc.createDataChannel).toHaveBeenCalledTimes(1); // initial channel only
 
     // Let the data-channel watchdog fire once.
@@ -92,11 +98,12 @@ describe('data channel recovery (in-place, no ICE/DTLS teardown)', () => {
     expect(ctx.mockPc.createDataChannel).toHaveBeenCalledTimes(2); // recreated in place
     expect(ctx.mockPc.close).not.toHaveBeenCalled();               // ICE/DTLS preserved
     expect(ctx.pcFactoryCalls).toBe(1);                            // no new RTCPeerConnection
-    expect(ctx.fsm.state).toBe('connecting');                      // not failed/closed/disconnected
+    expect(ctx.fsm.state).toBe('connected');                      // call stays live throughout
 
-    // The replacement channel opening completes composite readiness.
+    // The replacement channel opening flips the readiness flag — no phase change.
     latestDataChannel(ctx).simulateOpen();
     expect(ctx.fsm.state).toBe('connected');
+    expect(ctx.fsm.viewModel.dataChannelReady).toBe(true);
   });
 
   it('escalates to a reconnect only after exhausting the recreate budget', async () => {
@@ -109,19 +116,25 @@ describe('data channel recovery (in-place, no ICE/DTLS teardown)', () => {
 
     vi.advanceTimersByTime(51); // attempt 1 → recreate
     expect(ctx.mockPc.createDataChannel).toHaveBeenCalledTimes(2);
-    expect(ctx.fsm.state).toBe('connecting');
+    expect(ctx.fsm.state).toBe('connected');
 
     vi.advanceTimersByTime(51); // attempt 2 → recreate
     expect(ctx.mockPc.createDataChannel).toHaveBeenCalledTimes(3);
-    expect(ctx.fsm.state).toBe('connecting');
+    expect(ctx.fsm.state).toBe('connected');
+    // Up to here the live call was preserved — no hard close of the transport.
+    expect(ctx.mockPc.close).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(51); // budget exhausted → escalate
-    // No further in-place recreate on the original pc...
-    expect(ctx.mockPc.createDataChannel).toHaveBeenCalledTimes(3);
-    // ...the connection left `connecting` (escalated for a fresh peer session).
-    expect(ctx.fsm.state).toBe('disconnected');
-    // Even on escalation we never hard-closed mid-recovery before that point.
-    expect(ctx.transitionLog.some(t => t.trigger.includes('data-channel-stall'))).toBe(true);
+    // The live call escalates: a data-channel-stall on a `connected` connection
+    // drives a reconnect (full-reconnect forced by policy) rather than holding a
+    // permanently-mute channel. The escalation transition is recorded
+    // synchronously regardless of when the reconnect timer subsequently fires.
+    const escalation = ctx.transitionLog.find(
+      t => t.fromState === 'connected' && t.toState === 'reconnecting' &&
+        t.trigger.includes('data-channel-stall'),
+    );
+    expect(escalation).toBeDefined();
+    expect(ctx.fsm.state).not.toBe('connected'); // left the live call to rebuild
   });
 
   it('does not arm the watchdog once the data channel is already open', async () => {

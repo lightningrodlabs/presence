@@ -49,13 +49,17 @@ your transport to deliver SDP and ICE messages between two known peers.
   ICE-candidate queueing, trickle and non-trickle ICE.
 - **Lifecycle FSM** — one `ConnectionPhase` (`idle → signaling → connecting →
   connected → reconnecting → disconnected → failed → closed`) with guarded
-  transitions. Subscribe to phases, not raw browser states.
+  transitions. Subscribe to phases, not raw browser states. `connected` means
+  **media-ready** (ICE + DTLS up — RTP flows); the data channel is a separate
+  signal (`ConnectionViewModel.dataChannelReady` / the `data-channel-open` event),
+  not a gate, and a stuck channel is recovered in place in the background.
 - **Two-tier reconnection** — fast ICE-restart first, then full reconnect, with
   quadratic backoff + jitter. Bring your own `ReconnectPolicy` to override.
 - **Multi-peer `ConnectionManager`** — one object owns every peer, routes signals,
   propagates local media, exposes an aggregate view model for room UI.
 - **Reactive view models** — phase, progress, retry context, connection quality
-  (relayed? candidate type?), track flow, a composite `healthy` flag.
+  (relayed? candidate type?), track flow, a `dataChannelReady` flag, a composite
+  `healthy` flag.
 - **Structured forensics** — every transition emits an `FSMTransitionEntry` with
   a full `TransportSnapshot` (ICE / DTLS / signaling / gathering / data-channel).
   `TransitionRecorder` captures a ring buffer you can dump on failure.
@@ -224,7 +228,9 @@ the fallback path — so match the policy to which layer is in charge.
 
 `ConnectionConfig.iceServers` carries STUN/TURN servers. ICE handles relay
 fallback automatically when host/srflx paths fail. Set
-`iceTransportPolicy: 'relay'` to force TURN-only.
+`iceTransportPolicy: 'relay'` to force TURN-only. `iceCandidatePoolSize`
+(default 1) pre-gathers candidates so they're ready at offer time, trimming
+establishment latency on slow signaling paths.
 
 Media direction is implicit: attach a stream with only an audio track to send
 audio only, omit a stream entirely to send nothing (the data channel still

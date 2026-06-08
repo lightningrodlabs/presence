@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+Connection-lifecycle work (see the consuming app's `WEBRTC_CONNECTION_PLAN.md`).
+
+- **BREAKING (semantics): `connected` now means media-ready (ICE + DTLS), not
+  ICE + DTLS + data-channel-open.** Media (RTP) flows on ICE+DTLS and remote
+  track availability is driven by `track` events, not the data channel, so the
+  channel no longer gates the phase. A stuck channel is recovered in place by the
+  data-channel watchdog without holding the call in `connecting`. Consumers that
+  treated `connected` as "data channel is open" must switch to the new
+  `dataChannelReady` signal. (Supersedes the DC-gating investigation doc.)
+- **`ConnectionViewModel.dataChannelReady: boolean`** — new field exposing
+  data-channel-open as a separate signal from `phase`. `true` only when
+  `connected` and the channel is open.
+- **Buffered `RTCPeer.send()`.** Messages sent while the data channel is closed
+  (connected-but-DC-pending, or mid in-place recreate) are buffered (bounded
+  FIFO, oldest dropped on overflow) and flushed in order on open — control/
+  state-sync messages are delayed, not silently dropped.
+- **`establishment-timeline` event** (FSM + `ConnectionManager`) — one structured
+  record per connect with per-stage ms (ICE / DTLS / connected / data channel),
+  `wasReconnect`, and `peerSessionId`. New `EstablishmentTimeline` type exported.
+- **`ConnectionConfig.iceCandidatePoolSize`** — passthrough to
+  `RTCConfiguration` to pre-gather candidates (default 1); trims establishment
+  latency on slow signaling paths. Omitted from the RTCConfiguration when unset.
+- Status strings updated so a live call never reports `"Opening data channel..."`.
+- **Fix: `connection-state-changed` now fires only on actual phase changes.**
+  `ConnectionManager` previously emitted it from the `onTransition` log stream, so
+  same-state sub-phase entries (ICE blips, in-place data-channel recreate,
+  dropped-signal notes) surfaced as spurious `connected->connected` "state
+  changes" — making consumers re-run on-connect side effects (re-add tracks →
+  renegotiation, re-tag carrier, re-apply sender params) repeatedly on a live
+  call. Now gated on `fromState !== toState`; the view model still updates on
+  every entry.
+
 ## 0.2.0
 
 Reconnection, packaging, and spec-correctness improvements over the initial

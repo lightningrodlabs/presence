@@ -166,6 +166,17 @@ export type ConnectionViewModel = {
 
   /** Composite health signal: connected and tracks flowing */
   healthy: boolean;
+
+  /**
+   * Whether the data channel is currently open. Decoupled from `phase` since
+   * §6.1: a connection is `connected` (media flowing) the instant ICE+DTLS are
+   * up, which can precede — or briefly outlast, during in-place recovery — the
+   * data channel. Consumers that send control messages over the channel (mute /
+   * input-state sync) can watch this to know when the channel is live; while it
+   * is `false`, sends are buffered by the transport and flushed on open rather
+   * than dropped. `false` outside `connected`.
+   */
+  dataChannelReady: boolean;
 };
 
 export type ConnectionManagerSummary = {
@@ -195,6 +206,7 @@ export function createIdleViewModel(): ConnectionViewModel {
     quality: null,
     tracks: null,
     healthy: false,
+    dataChannelReady: false,
   };
 }
 
@@ -208,7 +220,41 @@ export type FSMEventType =
   | 'remote-track'
   | 'data-channel-message'
   | 'data-channel-open'
+  | 'establishment-timeline'
   | 'error';
+
+/**
+ * One structured establishment-timeline record, emitted once when a connection
+ * first reaches `connected`. Collapses the per-stage timing that otherwise has
+ * to be reconstructed by hand-reading interleaved transition logs (§6.6) into a
+ * single event: how long each sub-transport took to come up, measured from the
+ * start of this establishment attempt (entering `signaling`, or `reconnecting`
+ * for a reconnect).
+ *
+ * All durations are milliseconds from establishment start, or `null` if that
+ * stage hadn't been reached at emit time. Because §6.1 promotes to `connected`
+ * on ICE+DTLS, the data channel typically opens *after* `connected`, so
+ * `dataChannelMs` is usually `null` here — the data channel's own timing arrives
+ * via the separate `data-channel-open` event. The selected candidate type /
+ * relay status are not known synchronously (they require a stats pass ~2s after
+ * connect) and are surfaced via the `quality` view-model fields instead.
+ */
+export type EstablishmentTimeline = {
+  /** Establishment attempt start (ms epoch) — entering signaling/reconnecting. */
+  startedAt: number;
+  /** ms from start to ICE connected/completed. */
+  iceMs: number | null;
+  /** ms from start to DTLS connected (inferred from connectionState). */
+  dtlsMs: number | null;
+  /** ms from start to FSM `connected` (media-ready: ICE+DTLS). */
+  connectedMs: number;
+  /** ms from start to data channel open, or null if not yet open at emit. */
+  dataChannelMs: number | null;
+  /** Whether this attempt was a reconnect (vs. the initial connect). */
+  wasReconnect: boolean;
+  /** Local peer session counter at emit time. */
+  peerSessionId: number;
+};
 
 export type FSMEvent = {
   type: FSMEventType;
@@ -230,7 +276,8 @@ export type ManagerEventType =
   | 'connection-closed'
   | 'remote-stream'
   | 'remote-track'
-  | 'data-channel-message';
+  | 'data-channel-message'
+  | 'establishment-timeline';
 
 export type ManagerEvent = {
   type: ManagerEventType;
@@ -281,6 +328,14 @@ export type ConnectionConfig = {
    * when host/srflx paths fail. Mirrors `RTCConfiguration.iceTransportPolicy`.
    */
   iceTransportPolicy?: RTCIceTransportPolicy;
+  /**
+   * Optional `RTCConfiguration.iceCandidatePoolSize`. Pre-gathers this many ICE
+   * candidates eagerly (before the first offer is created) so they're ready at
+   * offer time, shaving gathering latency off establishment on slow signaling
+   * paths. Only affects gathering eagerness — does not change which candidates
+   * are used. Omit (or 0) for the browser default. See §6.7 of the connection plan.
+   */
+  iceCandidatePoolSize?: number;
   trickleICE: boolean;
   connectionTimeoutMs: number;
   sdpExchangeTimeoutMs: number;
@@ -324,6 +379,10 @@ export type ConnectionConfig = {
 
 export const DEFAULT_CONFIG: ConnectionConfig = {
   iceServers: DEFAULT_ICE_SERVERS,
+  // Pre-gather one candidate set so srflx/relay candidates are ready at offer
+  // time instead of being discovered mid-exchange — trims establishment latency
+  // on slow signaling paths (§6.7). Modest by design; only affects eagerness.
+  iceCandidatePoolSize: 1,
   trickleICE: true,
   connectionTimeoutMs: 7_000,
   sdpExchangeTimeoutMs: 15_000,

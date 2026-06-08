@@ -54,6 +54,7 @@ export type {
   FSMEvent,
   FSMEventType,
   FSMEventHandler,
+  EstablishmentTimeline,
   ManagerEvent,
   ManagerEventType,
   ManagerEventHandler,

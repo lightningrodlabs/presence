@@ -3,7 +3,7 @@ import { PeerConnectionFSM } from '../peer-connection-fsm';
 import type { PeerConnectionFSMOptions } from '../peer-connection-fsm';
 import { DefaultReconnectPolicy } from '../reconnect-policy';
 import { DEFAULT_CONFIG } from '../types';
-import type { ConnectionPhase, FSMTransitionEntry } from '../types';
+import type { ConnectionPhase, EstablishmentTimeline, FSMTransitionEntry } from '../types';
 import { MockRTCPeerConnection, createMockStream, createMockTrack } from './test-helpers';
 
 function createFSM(overrides: Partial<PeerConnectionFSMOptions> = {}) {
@@ -120,22 +120,58 @@ describe('PeerConnectionFSM', () => {
       expect(connectingTransition!.trigger).toContain('signaling stable');
     });
 
-    it('connecting → connected on composite readiness', async () => {
+    it('connecting → connected on media readiness (ICE + DTLS), before the data channel opens', async () => {
       const ctx = createFSM();
       ctx.fsm.connect();
       await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
       expect(ctx.fsm.state).toBe('connecting');
 
-      // ICE + DTLS connected
+      // ICE + DTLS connected — media can flow now (§6.1). The data channel is
+      // deliberately left closed; it is no longer a gate on `connected`.
       ctx.mockPc.simulateConnectionState('connected');
-      // Data channel open
-      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
-      if (dc?.simulateOpen) dc.simulateOpen();
 
       expect(ctx.fsm.state).toBe('connected');
+      expect(ctx.fsm.viewModel.dataChannelReady).toBe(false);
       const connectedTransition = ctx.transitionLog.find(t => t.toState === 'connected');
       expect(connectedTransition).toBeDefined();
-      expect(connectedTransition!.trigger).toContain('composite readiness');
+      expect(connectedTransition!.trigger).toContain('media readiness');
+
+      // When the channel later opens, the readiness flag flips without any
+      // phase change.
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+      expect(ctx.fsm.viewModel.dataChannelReady).toBe(true);
+    });
+
+    it('emits a single establishment-timeline with per-stage ms on reaching connected (§6.6)', async () => {
+      const ctx = createFSM();
+      const timelines: EstablishmentTimeline[] = [];
+      ctx.fsm.on('establishment-timeline', (e) => timelines.push(e.data as EstablishmentTimeline));
+
+      ctx.fsm.connect(); // establishment start (t0)
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      expect(ctx.fsm.state).toBe('connecting');
+
+      vi.advanceTimersByTime(100);
+      ctx.mockPc.simulateIceConnectionState('connected'); // ICE up at +100
+      vi.advanceTimersByTime(50);
+      ctx.mockPc.simulateConnectionState('connected');    // DTLS+connected at +150
+
+      expect(ctx.fsm.state).toBe('connected');
+      expect(timelines).toHaveLength(1);
+      const tl = timelines[0];
+      expect(tl.wasReconnect).toBe(false);
+      expect(tl.iceMs).toBe(100);
+      expect(tl.dtlsMs).toBe(150);
+      expect(tl.connectedMs).toBe(150);
+      // Promotion happens on ICE+DTLS, so the data channel isn't open yet.
+      expect(tl.dataChannelMs).toBeNull();
+
+      // The DC opening later does NOT emit a second timeline.
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(timelines).toHaveLength(1);
     });
 
     it('connected → reconnecting on ICE disconnection (after grace)', async () => {

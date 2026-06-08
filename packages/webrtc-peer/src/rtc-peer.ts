@@ -45,6 +45,15 @@ export class RTCPeer {
   private _handlers: Map<string, RTCPeerEventHandler[]> = new Map();
   private _dataChannel: RTCDataChannel | null = null;
   private _remoteDataChannels: RTCDataChannel[] = [];
+
+  // Outbound messages enqueued while the data channel isn't open (e.g. ICE+DTLS
+  // are up and the call is `connected`, but the channel hasn't opened yet, or is
+  // being recreated in place after a stall). Flushed in order when a channel
+  // opens. Bounded — these are UI control/state-sync messages where the latest
+  // value wins, so dropping the oldest on overflow is safe and preferable to
+  // unbounded growth on a never-opening channel.
+  private _sendBuffer: string[] = [];
+  private static readonly _MAX_SEND_BUFFER = 64;
   private _destroyed = false;
   private _destroying = false;
 
@@ -85,6 +94,9 @@ export class RTCPeer {
       iceServers: options.config.iceServers,
       ...(options.config.iceTransportPolicy !== undefined && {
         iceTransportPolicy: options.config.iceTransportPolicy,
+      }),
+      ...(options.config.iceCandidatePoolSize !== undefined && {
+        iceCandidatePoolSize: options.config.iceCandidatePoolSize,
       }),
     };
 
@@ -215,11 +227,36 @@ export class RTCPeer {
     this.pc.restartIce();
   }
 
-  /** Send data via data channel */
+  /**
+   * Send data via the data channel. If the channel isn't open yet (still
+   * opening, or being recreated in place after a stall), the message is buffered
+   * and flushed in order when a channel opens — control/state-sync messages are
+   * delayed, never silently dropped (§6.1). The buffer is bounded; on overflow
+   * the oldest message is discarded.
+   */
   send(data: string): void {
     if (this._destroyed) return;
     if (this._dataChannel?.readyState === 'open') {
       this._dataChannel.send(data);
+      return;
+    }
+    this._sendBuffer.push(data);
+    if (this._sendBuffer.length > RTCPeer._MAX_SEND_BUFFER) {
+      this._sendBuffer.splice(0, this._sendBuffer.length - RTCPeer._MAX_SEND_BUFFER);
+    }
+  }
+
+  /** Flush any buffered outbound messages over the now-open data channel. */
+  private _flushSendBuffer(): void {
+    if (this._dataChannel?.readyState !== 'open' || this._sendBuffer.length === 0) return;
+    const pending = this._sendBuffer;
+    this._sendBuffer = [];
+    for (const data of pending) {
+      try {
+        this._dataChannel.send(data);
+      } catch (e) {
+        this._logger.warn('Failed to flush buffered data-channel message:', e);
+      }
     }
   }
 
@@ -254,6 +291,7 @@ export class RTCPeer {
     this._taskResolvers = [];
     this._taskQueue = [];
     this._emittedStreamIds.clear();
+    this._sendBuffer = [];
     // Unblock any pending gathering wait so it doesn't leak
     if (this._gatheringCompleteResolve) {
       this._gatheringCompleteResolve();
@@ -509,6 +547,7 @@ export class RTCPeer {
 
     this._dataChannel.addEventListener('open', () => {
       if (this._destroyed) return;
+      this._flushSendBuffer();
       this._emit({ type: 'data-channel-state-change', data: 'open' });
     });
 

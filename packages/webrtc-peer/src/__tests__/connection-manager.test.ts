@@ -631,6 +631,52 @@ describe('ConnectionManager', () => {
         }),
       );
     });
+
+    it('does not re-emit connection-state-changed on same-state sub-phase log entries', async () => {
+      const { manager } = createManager();
+      manager.ensureConnection('agent-zzz');
+      const fsm = manager.getFSM('agent-zzz')!;
+      await fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      const pc = fsm.peer!.pc as unknown as MockRTCPeerConnection;
+      pc.simulateConnectionState('connected'); // real connecting->connected
+      expect(fsm.state).toBe('connected');
+
+      // Now subscribe and trigger a same-state sub-phase log entry: an ICE
+      // blip while connected produces a `connected->connected` _logTransition,
+      // which must NOT surface as a connection-state-change (it would re-run
+      // consumers' on-connect side effects: re-add tracks, re-tag carrier, etc.).
+      const handler = vi.fn();
+      manager.on('connection-state-changed', handler);
+      pc.simulateIceConnectionState('disconnected'); // logTransition only
+      pc.simulateIceConnectionState('connected');     // logTransition only
+
+      expect(fsm.state).toBe('connected'); // still connected (within grace)
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it('forwards the FSM establishment-timeline (§6.6) when a connection reaches connected', async () => {
+      const { manager } = createManager();
+      const handler = vi.fn();
+      manager.on('establishment-timeline', handler);
+
+      manager.ensureConnection('agent-zzz');
+      const fsm = manager.getFSM('agent-zzz')!;
+      await fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      const pc = fsm.peer!.pc as unknown as MockRTCPeerConnection;
+      pc.simulateConnectionState('connected'); // ICE+DTLS → media-ready
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'establishment-timeline',
+          remoteAgent: 'agent-zzz',
+          data: expect.objectContaining({
+            wasReconnect: false,
+            connectedMs: expect.any(Number),
+          }),
+        }),
+      );
+    });
   });
 
   describe('closeConnection', () => {
