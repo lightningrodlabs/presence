@@ -99,8 +99,10 @@ export class DefaultReconnectPolicy implements ReconnectPolicy {
   }
 
   strategy(context: ReconnectContext): 'ice-restart' | 'full-reconnect' {
-    // DTLS failure needs a fresh handshake — always full reconnect
-    if (context.retryReason === 'dtls-failed') {
+    // DTLS failure needs a fresh handshake — always full reconnect. A
+    // data-channel stall that survived in-place recreate implies a sick SCTP
+    // association, so it likewise needs a fresh peer rather than an ICE restart.
+    if (context.retryReason === 'dtls-failed' || context.retryReason === 'data-channel-stall') {
       return 'full-reconnect';
     }
 

@@ -487,6 +487,24 @@ export class RTCPeer {
   }
 
   private _createDataChannel(): void {
+    this._installLocalDataChannel();
+
+    // Also listen for incoming data channels from remote. Registered once on
+    // the pc (not per local channel) so recreateDataChannel doesn't stack
+    // duplicate listeners.
+    this.pc.addEventListener('datachannel', (event: any) => {
+      if (this._destroyed) return;
+      const channel = event.channel;
+      this._remoteDataChannels.push(channel);
+      channel.addEventListener('message', (msgEvent: any) => {
+        if (this._destroyed) return;
+        this._emit({ type: 'data', data: msgEvent.data });
+      });
+    });
+  }
+
+  /** Create the local 'data' channel and wire its lifecycle events. */
+  private _installLocalDataChannel(): void {
     this._dataChannel = this.pc.createDataChannel('data', { ordered: true });
 
     this._dataChannel.addEventListener('open', () => {
@@ -508,17 +526,24 @@ export class RTCPeer {
       if (this._destroyed) return;
       this._emit({ type: 'error', data: event.error || event });
     });
+  }
 
-    // Also listen for incoming data channels from remote
-    this.pc.addEventListener('datachannel', (event: any) => {
-      if (this._destroyed) return;
-      const channel = event.channel;
-      this._remoteDataChannels.push(channel);
-      channel.addEventListener('message', (msgEvent: any) => {
-        if (this._destroyed) return;
-        this._emit({ type: 'data', data: msgEvent.data });
-      });
-    });
+  /**
+   * Replace a stalled data channel in place. Closes the current local channel
+   * and opens a fresh one on the SAME RTCPeerConnection — reusing the existing
+   * ICE/DTLS/SCTP transport. Adding a replacement channel to an already-
+   * negotiated SCTP m-section does not require SDP renegotiation, so this is a
+   * cheap recovery that preserves the (slow, expensive) transport. No-op once
+   * destroyed.
+   */
+  recreateDataChannel(): void {
+    if (this._destroyed) return;
+    try {
+      this._dataChannel?.close();
+    } catch (_e) {
+      // Already closing/closed — fine, we're replacing it.
+    }
+    this._installLocalDataChannel();
   }
 
   private _getDtlsState(): string {

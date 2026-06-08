@@ -667,4 +667,37 @@ describe('ConnectionManager', () => {
       // (no error thrown)
     });
   });
+
+  describe('on-demand data-channel / ICE controls', () => {
+    function pcFor(manager: ConnectionManager, agent: string): MockRTCPeerConnection {
+      return manager.getFSM(agent)!.peer!.pc as unknown as MockRTCPeerConnection;
+    }
+
+    it('recreateDataChannel(agent) recreates the channel in place on the same pc', () => {
+      const { manager } = createManager(); // agentId 'agent-aaa'
+      manager.ensureConnection('agent-zzz');
+      const pc = pcFor(manager, 'agent-zzz');
+      expect(pc.createDataChannel).toHaveBeenCalledTimes(1);
+
+      expect(manager.recreateDataChannel('agent-zzz')).toBe(true);
+
+      expect(pc.createDataChannel).toHaveBeenCalledTimes(2);
+      expect(pc.close).not.toHaveBeenCalled();
+    });
+
+    it('restartIce(agent) drives an ICE restart on the existing peer', () => {
+      const { manager } = createManager();
+      manager.ensureConnection('agent-zzz');
+      const pc = pcFor(manager, 'agent-zzz');
+
+      expect(manager.restartIce('agent-zzz')).toBe(true);
+      expect(pc.restartIce).toHaveBeenCalled();
+    });
+
+    it('both return false for an unknown peer', () => {
+      const { manager } = createManager();
+      expect(manager.recreateDataChannel('nobody')).toBe(false);
+      expect(manager.restartIce('nobody')).toBe(false);
+    });
+  });
 });

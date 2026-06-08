@@ -205,6 +205,23 @@ export class ConnectionManager {
     return this._connections.get(agent);
   }
 
+  /**
+   * Recreate a peer's data channel in place (no ICE/DTLS teardown). Returns
+   * true if a live connection received the call, false if there's no FSM for
+   * the agent. See `PeerConnectionFSM.recreateDataChannel`.
+   */
+  recreateDataChannel(agent: string): boolean {
+    return this._connections.get(agent)?.recreateDataChannel() ?? false;
+  }
+
+  /**
+   * Trigger an ICE restart for a peer without teardown. Returns true if a live
+   * connection received the call, false if there's no FSM for the agent.
+   */
+  restartIce(agent: string): boolean {
+    return this._connections.get(agent)?.restartIce() ?? false;
+  }
+
   /** Get the state of a specific connection */
   getState(agent: string): ConnectionPhase | undefined {
     return this._connections.get(agent)?.state;

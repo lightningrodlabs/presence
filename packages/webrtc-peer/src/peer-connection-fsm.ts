@@ -148,6 +148,8 @@ export class PeerConnectionFSM {
   // DTLS watchdog — tracks when ICE connects but DTLS hasn't completed
   private _iceConnectedAt: number | null = null;
   private _dtlsWatchdogId: ReturnType<typeof setTimeout> | null = null;
+  private _dataChannelWatchdogId: ReturnType<typeof setTimeout> | null = null;
+  private _dataChannelRecreateAttempts = 0;
 
   // Track event listener cleanup
   private _trackCleanups: (() => void)[] = [];
@@ -198,6 +200,30 @@ export class PeerConnectionFSM {
 
   get peer(): RTCPeer | null {
     return this._peer;
+  }
+
+  /**
+   * Recreate the data channel in place on the existing RTCPeerConnection — no
+   * ICE/DTLS teardown, no new peer session, no SDP renegotiation of the
+   * already-negotiated SCTP m-section. The same recovery the data-channel
+   * watchdog performs automatically, exposed for deliberate use. Returns true
+   * if delegated to a live peer, false if there is none (idle/destroyed).
+   */
+  recreateDataChannel(): boolean {
+    if (this._destroyed || !this._peer) return false;
+    this._peer.recreateDataChannel();
+    return true;
+  }
+
+  /**
+   * Trigger an ICE restart on the existing peer connection without tearing it
+   * down (preserves the DTLS session). Returns true if delegated to a live
+   * peer, false if there is none (idle/destroyed).
+   */
+  restartIce(): boolean {
+    if (this._destroyed || !this._peer) return false;
+    this._peer.restartIce();
+    return true;
   }
 
   get viewModel(): ConnectionViewModel {
@@ -950,6 +976,10 @@ export class PeerConnectionFSM {
       this._dtlsConnected = true;
       this._cancelDtlsWatchdog();
       this._checkCompositeReadiness();
+      // ICE+DTLS are up. If the data channel hasn't opened yet, watch it: a
+      // stalled channel is recovered in place rather than blocking the call
+      // (and ultimately costing a full reconnect of the transport).
+      if (!this._dataChannelOpen) this._startDataChannelWatchdog();
     });
 
     peer.on('close', (event) => {
@@ -984,6 +1014,8 @@ export class PeerConnectionFSM {
       const dcState = event.data as string;
       this._dataChannelOpen = dcState === 'open';
       if (this._dataChannelOpen) {
+        this._cancelDataChannelWatchdog();
+        this._dataChannelRecreateAttempts = 0;
         this._checkCompositeReadiness();
         this._emitEvent({
           type: 'data-channel-open',
@@ -1104,6 +1136,8 @@ export class PeerConnectionFSM {
     this._dataChannelOpen = false;
     this._iceConnectedAt = null;
     this._cancelDtlsWatchdog();
+    this._cancelDataChannelWatchdog();
+    this._dataChannelRecreateAttempts = 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -1164,6 +1198,64 @@ export class PeerConnectionFSM {
     if (this._dtlsWatchdogId !== null) {
       clearTimeout(this._dtlsWatchdogId);
       this._dtlsWatchdogId = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Data-channel Watchdog
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start the data-channel watchdog: when ICE+DTLS are connected but the data
+   * channel hasn't opened within dataChannelStallTimeoutMs, recreate the
+   * channel in place on the existing RTCPeerConnection (no ICE/DTLS teardown,
+   * no new peer session). Re-arms after each attempt; once
+   * maxDataChannelRecreateAttempts is exhausted, escalates to a full reconnect.
+   *
+   * This is what keeps a stuck data channel — observed in production when DCEP
+   * open packets are lost on a lossy relay path — from forcing the whole
+   * connection to be torn down and re-established from scratch.
+   */
+  private _startDataChannelWatchdog(): void {
+    if (this._state !== 'connecting' && this._state !== 'connected') return;
+    if (this._dataChannelOpen) return;
+    this._cancelDataChannelWatchdog();
+
+    this._logDiag(
+      `data-channel watchdog armed (${this._config.dataChannelStallTimeoutMs}ms, ` +
+      `attempts=${this._dataChannelRecreateAttempts}/${this._config.maxDataChannelRecreateAttempts})`
+    );
+
+    this._dataChannelWatchdogId = setTimeout(() => {
+      this._dataChannelWatchdogId = null;
+      if (this._destroyed) return;
+      // Only act while the transport is up but the channel still isn't open.
+      if (this._dataChannelOpen || !this._iceConnected || !this._dtlsConnected) return;
+
+      if (this._dataChannelRecreateAttempts < this._config.maxDataChannelRecreateAttempts) {
+        this._dataChannelRecreateAttempts++;
+        this._logTransition(
+          `data-channel stall — recreating channel in place ` +
+          `(attempt ${this._dataChannelRecreateAttempts}/${this._config.maxDataChannelRecreateAttempts}, ` +
+          `preserving ICE+DTLS)`
+        );
+        try {
+          this._peer?.recreateDataChannel();
+        } catch (_e) {
+          // Recreation failed synchronously — fall through to re-arm; the next
+          // expiry will escalate if attempts are exhausted.
+        }
+        this._startDataChannelWatchdog(); // re-arm for the next attempt
+      } else {
+        this._handleTransportFailure('data-channel-stall');
+      }
+    }, this._config.dataChannelStallTimeoutMs);
+  }
+
+  private _cancelDataChannelWatchdog(): void {
+    if (this._dataChannelWatchdogId !== null) {
+      clearTimeout(this._dataChannelWatchdogId);
+      this._dataChannelWatchdogId = null;
     }
   }
 

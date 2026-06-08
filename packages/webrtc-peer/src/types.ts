@@ -286,6 +286,20 @@ export type ConnectionConfig = {
   sdpExchangeTimeoutMs: number;
   dtlsStallTimeoutMs: number;
   /**
+   * How long ICE+DTLS may be connected with the data channel still not open
+   * before the channel is recreated *in place* (a fresh `createDataChannel` on
+   * the same RTCPeerConnection — no new ICE/DTLS, no renegotiation of the
+   * already-negotiated SCTP m-section). Recovers a data channel whose DCEP open
+   * was lost on a lossy path without throwing away the (expensive) transport.
+   */
+  dataChannelStallTimeoutMs: number;
+  /**
+   * Maximum in-place data-channel recreate attempts before escalating to a full
+   * reconnect. Bounds the recovery loop so a genuinely dead SCTP association
+   * doesn't retry forever.
+   */
+  maxDataChannelRecreateAttempts: number;
+  /**
    * How long an established peer may sit in iceConnectionState 'disconnected'
    * before we treat it as a transport failure and enter `reconnecting`. WebRTC
    * keeps probing the active candidate pair while 'disconnected' and may
@@ -314,6 +328,8 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
   connectionTimeoutMs: 7_000,
   sdpExchangeTimeoutMs: 15_000,
   dtlsStallTimeoutMs: 5_000,
+  dataChannelStallTimeoutMs: 4_000,
+  maxDataChannelRecreateAttempts: 3,
   iceDisconnectedGraceMs: 15_000,
   role: 'mesh',
   diagnostics: false,
@@ -326,7 +342,7 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
 export type ReconnectContext = {
   retryCount: number;
   elapsedMs: number;
-  retryReason: 'ice-failed' | 'ice-disconnected' | 'dtls-failed' | 'dtls-stall' | 'timeout' | 'error';
+  retryReason: 'ice-failed' | 'ice-disconnected' | 'dtls-failed' | 'dtls-stall' | 'data-channel-stall' | 'timeout' | 'error';
   lastStrategy: 'ice-restart' | 'full-reconnect';
 };
 
