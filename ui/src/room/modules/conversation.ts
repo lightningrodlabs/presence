@@ -2,7 +2,6 @@ import {
   mdiMicrophone,
   mdiMicrophoneOff,
   mdiTransitConnectionVariant,
-  mdiRefresh,
   mdiPhoneRefresh,
   mdiVideo,
 } from '@mdi/js';
@@ -132,7 +131,6 @@ export function parseConversationPayload(
 
 enum MicIcon { On = 0, Muted = 1 }
 enum RelayIcon { Relayed = 0 }
-enum ResetMedia { Available = 0 }
 enum Reconnect { Available = 0 }
 
 // =========================================================================
@@ -181,18 +179,6 @@ const conversationModule: ModuleDefinition = {
           { icon: mdiTransitConnectionVariant, tooltip: 'Relayed via TURN server', color: '#e7a008' },
         ],
         currentState: conn.relayed ? RelayIcon.Relayed : undefined,
-      });
-
-      // Reset media — visible when video track is degraded
-      const needsReset = conn.videoMuted || (conn.connected && !conn.video);
-      icons.push({
-        states: [
-          { icon: mdiRefresh, tooltip: 'Reset media', color: '#e7a008' },
-        ],
-        currentState: needsReset ? ResetMedia.Available : undefined,
-        onSelect: needsReset
-          ? () => context.streamsStore.refreshTracksForPeer(agentPubKeyB64)
-          : undefined,
       });
 
       // Full WebRTC reconnect — always available when connected
