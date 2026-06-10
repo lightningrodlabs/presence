@@ -226,6 +226,12 @@ export type PeerTransportOptions = {
   iceServers?: RTCIceServer[] | (() => RTCIceServer[]);
   /** Whether to use trickle ICE. Pass a function to read at each ensureConnection. */
   trickleICE?: boolean | (() => boolean);
+  /** Forced ICE transport policy — 'relay' restricts candidates to TURN relays
+   *  (force-TURN), 'all' is normal ICE. Pass a function to read at each
+   *  ensureConnection; undefined leaves the browser default. */
+  iceTransportPolicy?:
+    | RTCIceTransportPolicy
+    | (() => RTCIceTransportPolicy | undefined);
   /** Implementation-specific knobs (e.g. FSM timeouts). Passed through opaquely. */
   config?: Record<string, unknown>;
 };

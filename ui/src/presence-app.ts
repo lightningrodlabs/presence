@@ -187,6 +187,13 @@ export class PresenceApp extends LitElement {
   @state()
   _turnCredential = window.localStorage.getItem('turnCredential') ?? '';
 
+  // Force-TURN: when on, ICE is restricted to TURN relay candidates
+  // (iceTransportPolicy='relay'), forcing all media through the configured
+  // TURN server. Only meaningful when a TURN server is set; the store
+  // auto-disarms 'relay' if no turnUrl is present.
+  @state()
+  _forceTurn = window.localStorage.getItem('iceTransportPolicy') === 'relay';
+
   @state()
   _signalDelayMs = parseInt(window.localStorage.getItem('signalDelayMs') ?? '0', 10) || 0;
 
@@ -928,6 +935,43 @@ export class PresenceApp extends LitElement {
     `;
   }
 
+  renderForceTurnToggle() {
+    // Active only when a TURN server is configured: forcing relay with no TURN
+    // would gather zero ICE candidates and break every connection. When no TURN
+    // is set we dim the row and swallow clicks, and never persist 'relay'.
+    const hasTurn = this._turnUrl.trim().length > 0;
+    const on = this._forceTurn && hasTurn;
+    const setForceTurn = (value: boolean) => {
+      if (!hasTurn) return;
+      this._forceTurn = value;
+      if (value) {
+        window.localStorage.setItem('iceTransportPolicy', 'relay');
+      } else {
+        window.localStorage.removeItem('iceTransportPolicy');
+      }
+    };
+    return html`
+      <div
+        class="row items-center"
+        style="margin-top: 12px; ${hasTurn ? '' : 'opacity: 0.4; pointer-events: none;'}"
+      >
+        <toggle-switch
+          class="toggle-switch ${on ? 'active' : ''}"
+          .toggleState=${on}
+          @toggle-on=${() => setForceTurn(true)}
+          @toggle-off=${() => setForceTurn(false)}
+        ></toggle-switch>
+        <span
+          class="secondary-font"
+          style="color: #c3c9eb; margin-left: 10px; font-size: 18px;"
+          >force TURN (relay-only)${hasTurn
+            ? ''
+            : ' — set a TURN server to enable'}</span
+        >
+      </div>
+    `;
+  }
+
   renderSettingsPanel() {
     return html`
       <div class="settings-panel">
@@ -999,6 +1043,7 @@ export class PresenceApp extends LitElement {
               style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
             />
           </div>
+          ${this.renderForceTurnToggle()}
         </div>
         <div class="row" style="margin-top: 20px; gap: 10px;">
           <button

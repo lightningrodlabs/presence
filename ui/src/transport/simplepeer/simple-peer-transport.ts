@@ -99,6 +99,7 @@ export class SimplePeerTransport implements PeerTransport {
   private _onOutgoingSignal: (signal: OutgoingSignal) => void;
   private _getIceServers: () => RTCIceServer[];
   private _getTrickleICE: () => boolean;
+  private _getIceTransportPolicy: () => RTCIceTransportPolicy | undefined;
   private _createPeer: SimplePeerFactory;
 
   private _connections = new Map<AgentPubKeyB64, PerPeerState>();
@@ -116,6 +117,9 @@ export class SimplePeerTransport implements PeerTransport {
     this._getIceServers = typeof ice === 'function' ? ice : () => ice;
     const trickle = options.trickleICE ?? true;
     this._getTrickleICE = typeof trickle === 'function' ? trickle : () => trickle;
+    const policy = options.iceTransportPolicy;
+    this._getIceTransportPolicy =
+      typeof policy === 'function' ? policy : () => policy;
     this._createPeer =
       options.createPeer ??
       ((opts: SimplePeer.Options) => new SimplePeer(opts) as unknown as SimplePeerLike);
@@ -154,9 +158,13 @@ export class SimplePeerTransport implements PeerTransport {
     const connectionId = desiredId ?? this._newConnectionId();
     const initiator = opts?.initiator ?? false;
 
+    const policy = this._getIceTransportPolicy();
     const peerInstance = this._createPeer({
       initiator,
-      config: { iceServers: this._getIceServers() },
+      config: {
+        iceServers: this._getIceServers(),
+        ...(policy !== undefined && { iceTransportPolicy: policy }),
+      },
       objectMode: true,
       trickle: this._getTrickleICE(),
     });

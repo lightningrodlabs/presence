@@ -122,13 +122,26 @@ export class StreamsStore {
 
   _pageLifecycleUnsub: (() => void) | null = null;
 
-  trickleICE = true;
+  // ICE/TURN settings live in localStorage and are edited from the Settings
+  // panel. Read them live (not snapshotted at construction) so edits take
+  // effect on the next connection without a reload. iceConfig / the transport
+  // trickle getters consult these on every ensureConnection.
+  get trickleICE(): boolean {
+    // Stored as 'true'/'false'; default ON when unset.
+    return window.localStorage.getItem('trickleICE') !== 'false';
+  }
 
-  turnUrl = '';
+  get turnUrl(): string {
+    return window.localStorage.getItem('turnUrl') || '';
+  }
 
-  turnUsername = '';
+  get turnUsername(): string {
+    return window.localStorage.getItem('turnUsername') || '';
+  }
 
-  turnCredential = '';
+  get turnCredential(): string {
+    return window.localStorage.getItem('turnCredential') || '';
+  }
 
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
 
@@ -273,14 +286,9 @@ export class StreamsStore {
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
     );
-    const trickleICE = window.localStorage.getItem('trickleICE');
-    if (trickleICE) {
-      this.trickleICE = JSON.parse(trickleICE);
-    }
+    // trickleICE / turnUrl / turnUsername / turnCredential are read live from
+    // localStorage via getters, so there is nothing to snapshot here.
     this.webrtcGloballyDisabled = window.localStorage.getItem('disableAllWebrtc') === 'true';
-    this.turnUrl = window.localStorage.getItem('turnUrl') || '';
-    this.turnUsername = window.localStorage.getItem('turnUsername') || '';
-    this.turnCredential = window.localStorage.getItem('turnCredential') || '';
     const signalDelay = window.localStorage.getItem('signalDelayMs');
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
@@ -315,6 +323,7 @@ export class StreamsStore {
       myAgentId: this.myPubKeyB64,
       iceServers: () => this.iceConfig,
       trickleICE: () => this.trickleICE,
+      iceTransportPolicy: () => this._readIceTransportPolicy(),
       onOutgoingSignal: (signal: { to: AgentPubKeyB64; connectionId: string; data: unknown }) => {
         const toAgent = decodeHashFromBase64(signal.to);
         sendSdpData(toAgent, signal.connectionId, signal.data);
@@ -333,6 +342,7 @@ export class StreamsStore {
       myAgentId: this.myPubKeyB64,
       iceServers: () => this.iceConfig,
       trickleICE: () => this.trickleICE,
+      iceTransportPolicy: () => this._readIceTransportPolicy(),
       // The DTLS watchdog's default 5s is too aggressive on lossy / high-RTT
       // last-mile uplinks (a handshake there can need several seconds of
       // retransmits); a single stall tore the connection down to the lossy
@@ -340,9 +350,6 @@ export class StreamsStore {
       // user-overridable via localStorage('dtlsStallTimeoutMs').
       configOverrides: {
         dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs(),
-        ...(this._readIceTransportPolicy() !== undefined && {
-          iceTransportPolicy: this._readIceTransportPolicy(),
-        }),
       },
       onOutgoingSignal: (signal) => {
         const toAgent = decodeHashFromBase64(signal.to);
@@ -827,7 +834,15 @@ export class StreamsStore {
   private _readIceTransportPolicy(): RTCIceTransportPolicy | undefined {
     try {
       const raw = window.localStorage.getItem('iceTransportPolicy');
-      return raw === 'relay' || raw === 'all' ? raw : undefined;
+      if (raw === 'relay') {
+        // Force-TURN is only meaningful — and only safe — when a TURN server is
+        // actually configured. With 'relay' and no TURN, ICE gathers zero
+        // candidates and every connection dies; honor it only when a relay
+        // exists so clearing the TURN field auto-disarms the knob. `turnUrl` is
+        // a live localStorage getter, so this reflects in-flight UI edits.
+        return this.turnUrl.trim() ? 'relay' : undefined;
+      }
+      return raw === 'all' ? 'all' : undefined;
     } catch {
       return undefined;
     }
@@ -1952,12 +1967,10 @@ export class StreamsStore {
 
   enableTrickleICE() {
     window.localStorage.setItem('trickleICE', 'true');
-    this.trickleICE = true;
   }
 
   disableTrickleICE() {
     window.localStorage.setItem('trickleICE', 'false');
-    this.trickleICE = false;
   }
 
   get iceConfig(): RTCIceServer[] {
@@ -1982,17 +1995,14 @@ export class StreamsStore {
   }
 
   setTurnUrl(url: string) {
-    this.turnUrl = url;
     window.localStorage.setItem('turnUrl', url);
   }
 
   setTurnUsername(username: string) {
-    this.turnUsername = username;
     window.localStorage.setItem('turnUsername', username);
   }
 
   setTurnCredential(credential: string) {
-    this.turnCredential = credential;
     window.localStorage.setItem('turnCredential', credential);
   }
 

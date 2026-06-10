@@ -68,6 +68,7 @@ export class FsmTransport implements PeerTransport {
   private _onOutgoingSignal: (signal: OutgoingSignal) => void;
   private _getIceServers: () => RTCIceServer[];
   private _getTrickleICE: () => boolean;
+  private _getIceTransportPolicy: () => RTCIceTransportPolicy | undefined;
 
   private _config: ConnectionConfig;
   private _manager: ConnectionManager;
@@ -87,12 +88,16 @@ export class FsmTransport implements PeerTransport {
     this._getIceServers = typeof ice === 'function' ? ice : () => ice;
     const trickle = options.trickleICE ?? true;
     this._getTrickleICE = typeof trickle === 'function' ? trickle : () => trickle;
+    const policy = options.iceTransportPolicy;
+    this._getIceTransportPolicy =
+      typeof policy === 'function' ? policy : () => policy;
 
     this._config = {
       ...DEFAULT_CONFIG,
       ...(options.configOverrides ?? {}),
       iceServers: this._getIceServers(),
       trickleICE: this._getTrickleICE(),
+      iceTransportPolicy: this._getIceTransportPolicy(),
     };
 
     // Inline SignalingAdapter that bridges to the PeerTransport
@@ -211,10 +216,11 @@ export class FsmTransport implements PeerTransport {
     if (this._destroyed) {
       throw new Error('FsmTransport: destroyed');
     }
-    // Apply current iceServers/trickleICE before creating any new peer.
+    // Apply current iceServers/trickleICE/transport-policy before any new peer.
     this._manager.updateConfig({
       iceServers: this._getIceServers(),
       trickleICE: this._getTrickleICE(),
+      iceTransportPolicy: this._getIceTransportPolicy(),
     });
     this._manager.ensureConnection(peer, {
       sdpExchangeTimeoutMs: opts?.sdpExchangeTimeoutMs,
