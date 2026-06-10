@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>presence voice-playout harness</title>
+  </head>
+  <body>
+    <!--
+      Real-WebCodecs tier of the Symptom B harness
+      (docs/SIGNALS_DOUBLE_AUDIO_INVESTIGATION.md). Exposes
+      window.runVoicePlayout({mode}) which encodes a tone to Opus, decodes it
+      back at a controlled arrival rate through the PRODUCTION decidePlayout, and
+      records the scheduled playback intervals — so a Playwright spec can assert
+      whether a real AudioDecoder races ahead on a burst (the untested
+      assumption) and whether the schedule overlaps.
+    -->
+    <pre id="out">loading…</pre>
+    <script type="module" src="./voice-playout-harness.ts"></script>
+  </body>
+</html>

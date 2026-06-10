@@ -4,10 +4,13 @@ Branch: `investigate/signals-double-audio`. Scope: the **signals** voice carrier
 (`ui/src/room/modules/voice.ts`), *not* WebRTC. Separate from the connection-plan
 work.
 
-**Status: HYPOTHESIS, not yet confirmed.** The diagnosis below is reasoned from
-static code reading; it has **not** been reproduced or measured. The candidate
-fix and the diagnostic on this branch exist to confirm-or-kill it. Two load-
-bearing assumptions are explicitly untested (see "What's unverified").
+**Status: mechanism CONFIRMED by harness; field repro still pending.** The
+diagnosis started as static-analysis reasoning. The browser harness (below) now
+**confirms the load-bearing assumption** — a real `AudioDecoder` handed a backlog
+*does* race ahead of the audio clock, the pre-fix scheduler *does* schedule audio
+on top of itself, and the fix does not — under a *synthetic* burst. What remains
+unconfirmed is in the field: that the production remote-signal path actually
+delivers such bursts, and the ~20s cadence (see "What's unverified").
 
 ## Symptom (human report)
 
@@ -87,12 +90,15 @@ fell behind; nothing is scheduled in `[now, nextPlaybackTime)`).
 
 ## What's unverified
 
-1. **Decoder pacing** — that `AudioDecoder` emits output for a backlog *faster
-   than real time*. If it instead paces output ~real-time, `nextPlaybackTime`
-   never races ahead and this mechanism does not occur. Browser-implementation-
-   dependent; not measured. (This is what the browser harness below targets.)
-2. **The causal link** to the audible symptom and the **~20s cadence** — no
-   transport-level mechanism is known for the period; it must be measured.
+1. ~~**Decoder pacing**~~ — **CONFIRMED** by the browser harness: a real Chromium
+   `AudioDecoder` fed a backlog emits output faster than real time, so the head
+   races past the drift cap (`overcap-drop` fires) and the legacy snap-back
+   overlaps. Done under a synthetic burst (all chunks fed at once).
+2. **Field repro** — that the production remote-signal path delivers bursts of
+   the size/shape that trigger this in a real call, and the **~20s cadence** (no
+   transport-level mechanism is known for the period). Still needs a capture.
+3. **The causal link** from the overlap to exactly what the user heard — likely,
+   but not directly measured (the merged log has no playout trace).
 
 ## Candidate fix (applied on this branch)
 
@@ -121,10 +127,13 @@ Two tiers, because the unknowns live at two layers:
 
 2. **Browser harness** (`ui/harness/voice-playout-harness.html` + Playwright
    `voice-playout.spec.ts`): runs a **real** AudioEncoder→AudioDecoder→
-   AudioContext with an instrumented `createBufferSource` recorder, fed at
-   controlled arrival rates (real-time vs burst), and asserts on the recorded
-   intervals. Exercises the **real-WebCodecs** assumptions the unit tier can't —
-   in particular whether a real decoder races ahead on a burst (untested #1).
+   AudioContext through the production `decidePlayout`, fed at controlled arrival
+   rates (real-time vs burst), and asserts on the recorded schedule. Exercises
+   the **real-WebCodecs** assumption the unit tier can't. **Result (3/3 green):**
+   real-time → no drops/no overlap; burst → `overcap-drop` fires and no overlap
+   (fix holds); burst+legacy → overlaps (bug reproduced). Run via
+   `npm run test:layout` (or `npx playwright test voice-playout.spec.ts`). The
+   tests `test.skip` themselves if WebCodecs/AudioContext are unavailable.
 
 ## How to verify in the field
 
