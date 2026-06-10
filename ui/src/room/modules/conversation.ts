@@ -1,7 +1,7 @@
 import {
   mdiMicrophone,
   mdiMicrophoneOff,
-  mdiHub,
+  mdiTransitConnectionVariant,
   mdiRefresh,
   mdiPhoneRefresh,
   mdiVideo,
@@ -178,7 +178,7 @@ const conversationModule: ModuleDefinition = {
       // Relay indicator — visible when connection uses TURN
       icons.push({
         states: [
-          { icon: mdiHub, tooltip: 'Relayed via TURN server', color: '#e7a008' },
+          { icon: mdiTransitConnectionVariant, tooltip: 'Relayed via TURN server', color: '#e7a008' },
         ],
         currentState: conn.relayed ? RelayIcon.Relayed : undefined,
       });

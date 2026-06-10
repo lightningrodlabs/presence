@@ -143,6 +143,22 @@ export class StreamsStore {
     return window.localStorage.getItem('turnCredential') || '';
   }
 
+  // Cloudflare-provisioned TURN. Stored under separate keys from the manual
+  // TURN server so both can be offered as ICE candidates simultaneously (the
+  // ICE agent gathers relay candidates from every configured server). Written
+  // by the Settings panel's auto-provisioning; read live here.
+  get cfTurnUrl(): string {
+    return window.localStorage.getItem('cfTurnUrl') || '';
+  }
+
+  get cfTurnUsername(): string {
+    return window.localStorage.getItem('cfTurnUsername') || '';
+  }
+
+  get cfTurnCredential(): string {
+    return window.localStorage.getItem('cfTurnCredential') || '';
+  }
+
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
 
   /**
@@ -740,12 +756,23 @@ export class StreamsStore {
     const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
     const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
     const connect = now - t.t0;
+    // Record the effective ICE policy and whether a TURN server was actually
+    // configured. Force-TURN ('relay') auto-disarms when turnUrl is empty
+    // (see _readIceTransportPolicy), so logging the resolved values makes a
+    // silent disarm — e.g. force-TURN toggled on but no/unfetched credentials —
+    // visible in diagnostics rather than inferred from candidate types.
+    const policy = this._readIceTransportPolicy() ?? 'all';
+    const turnSources = [
+      this.turnUrl.trim() ? 'manual' : '',
+      this.cfTurnUrl.trim() ? 'cloudflare' : '',
+    ].filter(Boolean);
+    const turn = turnSources.length > 0 ? turnSources.join('+') : 'none';
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: now,
       event: 'IceEstablishment',
       connectionId,
-      detail: `impl=${t.impl} ice=${ice} gather=${gather} connect=${connect} relay=${t.relay ?? 'unknown'}`,
+      detail: `impl=${t.impl} ice=${ice} gather=${gather} connect=${connect} relay=${t.relay ?? 'unknown'} policy=${policy} turn=${turn}`,
     });
   }
 
@@ -838,9 +865,12 @@ export class StreamsStore {
         // Force-TURN is only meaningful — and only safe — when a TURN server is
         // actually configured. With 'relay' and no TURN, ICE gathers zero
         // candidates and every connection dies; honor it only when a relay
-        // exists so clearing the TURN field auto-disarms the knob. `turnUrl` is
-        // a live localStorage getter, so this reflects in-flight UI edits.
-        return this.turnUrl.trim() ? 'relay' : undefined;
+        // exists (manual or Cloudflare) so clearing the TURN fields auto-disarms
+        // the knob. These are live localStorage getters, so this reflects
+        // in-flight UI edits and just-provisioned Cloudflare credentials.
+        return this.turnUrl.trim() || this.cfTurnUrl.trim()
+          ? 'relay'
+          : undefined;
       }
       return raw === 'all' ? 'all' : undefined;
     } catch {
@@ -1026,7 +1056,16 @@ export class StreamsStore {
           if (report.type === 'candidate-pair' && report.state === 'succeeded') {
             const localCandidate = reportsById[report.localCandidateId];
             const remoteCandidate = reportsById[report.remoteCandidateId];
-            if (localCandidate?.candidateType === 'relay') {
+            // A connection is relayed if EITHER endpoint's selected candidate is
+            // a TURN relay. Media traverses the relay bidirectionally, but each
+            // peer only sees its own side as 'relay' — the peer forcing TURN
+            // sees a local relay candidate, while its counterpart sees that
+            // relay only as the remote candidate. Check both so the relay
+            // indicator is symmetric across the pair.
+            if (
+              localCandidate?.candidateType === 'relay' ||
+              remoteCandidate?.candidateType === 'relay'
+            ) {
               isRelayed = true;
             }
             this.logger.logCustomMessage(
@@ -1975,22 +2014,29 @@ export class StreamsStore {
 
   get iceConfig(): RTCIceServer[] {
     const servers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
-    // `turnUrl` may carry more than one URL (comma- or whitespace-separated) so
-    // a single credential covers multiple transports — typically the UDP relay
-    // `turn:host:3478` plus the TLS-over-TCP relay `turns:host:443?transport=tcp`.
-    // The latter survives lossy-UDP paths and firewalls that only permit 443
-    // (§6.3). One m-line per distinct URL is fine; the agent picks the best.
-    const urls = this.turnUrl
-      .split(/[\s,]+/)
-      .map(u => u.trim())
-      .filter(Boolean);
-    if (urls.length > 0) {
-      servers.push({
-        urls: urls.length === 1 ? urls[0] : urls,
-        username: this.turnUsername,
-        credential: this.turnCredential,
-      });
-    }
+    // A TURN field may carry more than one URL (comma- or whitespace-separated)
+    // so a single credential covers multiple transports — typically the UDP
+    // relay `turn:host:3478` plus the TLS-over-TCP relay
+    // `turns:host:443?transport=tcp`. The latter survives lossy-UDP paths and
+    // firewalls that only permit 443 (§6.3). One m-line per distinct URL is
+    // fine; the agent picks the best.
+    const pushTurn = (url: string, username: string, credential: string) => {
+      const urls = url
+        .split(/[\s,]+/)
+        .map(u => u.trim())
+        .filter(Boolean);
+      if (urls.length > 0) {
+        servers.push({
+          urls: urls.length === 1 ? urls[0] : urls,
+          username,
+          credential,
+        });
+      }
+    };
+    // Manual and Cloudflare TURN are independent entries — both are offered as
+    // candidates when present (WebRTC supports multiple TURN servers).
+    pushTurn(this.turnUrl, this.turnUsername, this.turnCredential);
+    pushTurn(this.cfTurnUrl, this.cfTurnUsername, this.cfTurnCredential);
     return servers;
   }
 

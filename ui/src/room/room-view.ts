@@ -26,7 +26,7 @@ import {
   mdiPaperclip,
   mdiPhoneHangup,
   mdiPencilCircleOutline,
-  mdiHub,
+  mdiTransitConnectionVariant,
   mdiCloudDownloadOutline,
   mdiVideo,
   mdiVideoOff,
@@ -1174,7 +1174,7 @@ export class RoomView extends LitElement {
             >
               <sl-icon
                 style="font-size: 20px; color: #e7a008;"
-                .src=${wrapPathInSvg(mdiHub)}
+                .src=${wrapPathInSvg(mdiTransitConnectionVariant)}
               ></sl-icon>
             </sl-tooltip>
           `

@@ -70,6 +70,7 @@ import { sharedStyles } from './sharedStyles';
 import { RoomClient } from './room/room-client';
 import { exportLogs, clearAllLogs } from './logging';
 import { downloadJson, formattedDate } from './utils';
+import { fetchCloudflareTurnCredentials } from './cloudflare-turn';
 import { DescendentRoom, weaveClientContext } from './types';
 import { RoomStore } from './room/room-store';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
@@ -187,6 +188,37 @@ export class PresenceApp extends LitElement {
   @state()
   _turnCredential = window.localStorage.getItem('turnCredential') ?? '';
 
+  // Cloudflare-issued TURN. When a TURN key ID + API token are present, the app
+  // calls Cloudflare's generate-ice-servers endpoint and stores the resulting
+  // relay URL/username/credential under separate cfTurn* localStorage keys
+  // (independent of the manual TURN server above — both are offered as ICE
+  // candidates). Provisioning happens automatically on app load and refreshes
+  // before the TTL lapses. No manual action required.
+  @state()
+  _cfTurnKeyId = window.localStorage.getItem('cfTurnKeyId') ?? '';
+
+  @state()
+  _cfTurnApiToken = window.localStorage.getItem('cfTurnApiToken') ?? '';
+
+  @state()
+  _cfTurnTtl =
+    parseInt(window.localStorage.getItem('cfTurnTtl') ?? '86400', 10) || 86400;
+
+  // Epoch ms at which the current Cloudflare credentials expire (0 = none yet).
+  @state()
+  _cfTurnExpiry =
+    parseInt(window.localStorage.getItem('cfTurnExpiry') ?? '0', 10) || 0;
+
+  @state()
+  _cfTurnStatus:
+    | { kind: 'idle' }
+    | { kind: 'loading' }
+    | { kind: 'ok'; message: string }
+    | { kind: 'error'; message: string } = { kind: 'idle' };
+
+  // setTimeout handle for the pre-expiry refresh.
+  _cfTurnRefreshTimer: number | undefined;
+
   // Force-TURN: when on, ICE is restricted to TURN relay candidates
   // (iceTransportPolicy='relay'), forcing all media through the configured
   // TURN server. Only meaningful when a TURN server is set; the store
@@ -213,10 +245,160 @@ export class PresenceApp extends LitElement {
     if (this._clearActiveParticipantsInterval)
       window.clearInterval(this._clearActiveParticipantsInterval);
     if (this._unsubscribe) this._unsubscribe();
+    if (this._cfTurnRefreshTimer) window.clearTimeout(this._cfTurnRefreshTimer);
+  }
+
+  // Refresh interval bookkeeping: refresh this many ms before the TTL lapses so
+  // there is never a window of expired credentials handed to a new connection.
+  static CF_TURN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+
+  /** Cloudflare auto-provisioning is active when both API credentials exist. */
+  get _cfTurnConfigured(): boolean {
+    return (
+      this._cfTurnKeyId.trim().length > 0 &&
+      this._cfTurnApiToken.trim().length > 0
+    );
+  }
+
+  /**
+   * Whether a currently-valid provisioned credential set exists right now: a
+   * stored relay URL plus an unexpired TTL. Drives the Settings indicator.
+   * Reads localStorage live; re-renders are triggered by _cfTurnExpiry changes.
+   */
+  get _cfTurnValid(): boolean {
+    return (
+      !!window.localStorage.getItem('cfTurnUrl') &&
+      this._cfTurnExpiry > Date.now()
+    );
+  }
+
+  /** Number of provisioned relay URLs currently stored (0 if none). */
+  get _cfTurnRelayCount(): number {
+    const url = window.localStorage.getItem('cfTurnUrl') || '';
+    return url
+      .split(/[\s,]+/)
+      .map(u => u.trim())
+      .filter(Boolean).length;
+  }
+
+  /**
+   * Fetch fresh Cloudflare TURN credentials and store them under the cfTurn*
+   * localStorage keys the store reads live (independent of the manual TURN
+   * server). Records the expiry and schedules the next refresh.
+   */
+  async _refreshCloudflareTurn(): Promise<void> {
+    if (!this._cfTurnConfigured) return;
+    this._cfTurnStatus = { kind: 'loading' };
+    console.log('[cf-turn] provisioning credentials…');
+    try {
+      const creds = await fetchCloudflareTurnCredentials(
+        this._cfTurnKeyId,
+        this._cfTurnApiToken,
+        this._cfTurnTtl
+      );
+      const urlStr = creds.urls.join(', ');
+      window.localStorage.setItem('cfTurnUrl', urlStr);
+      window.localStorage.setItem('cfTurnUsername', creds.username);
+      window.localStorage.setItem('cfTurnCredential', creds.credential);
+
+      const expiry = Date.now() + creds.ttl * 1000;
+      window.localStorage.setItem('cfTurnExpiry', String(expiry));
+      this._cfTurnExpiry = expiry;
+      this._cfTurnStatus = {
+        kind: 'ok',
+        message: `Provisioned ${creds.urls.length} relay URL${
+          creds.urls.length === 1 ? '' : 's'
+        }; valid until ${new Date(expiry).toLocaleString()}`,
+      };
+      console.log(
+        `[cf-turn] provisioned ${
+          creds.urls.length
+        } relay URL(s): ${urlStr}; valid until ${new Date(
+          expiry
+        ).toISOString()}`
+      );
+      this._scheduleCloudflareTurnRefresh();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this._cfTurnStatus = { kind: 'error', message };
+      console.error('[cf-turn] provisioning failed:', message);
+    }
+  }
+
+  /** Clear stored Cloudflare credentials + expiry and cancel the refresh. */
+  _clearCloudflareTurn(): void {
+    if (this._cfTurnRefreshTimer) {
+      window.clearTimeout(this._cfTurnRefreshTimer);
+      this._cfTurnRefreshTimer = undefined;
+    }
+    window.localStorage.removeItem('cfTurnUrl');
+    window.localStorage.removeItem('cfTurnUsername');
+    window.localStorage.removeItem('cfTurnCredential');
+    window.localStorage.removeItem('cfTurnExpiry');
+    this._cfTurnExpiry = 0;
+    this._cfTurnStatus = { kind: 'idle' };
+  }
+
+  /** (Re)arm the single pre-expiry refresh timer. */
+  _scheduleCloudflareTurnRefresh(): void {
+    if (this._cfTurnRefreshTimer) {
+      window.clearTimeout(this._cfTurnRefreshTimer);
+      this._cfTurnRefreshTimer = undefined;
+    }
+    if (!this._cfTurnConfigured || !this._cfTurnExpiry) return;
+    const delay = Math.max(
+      10_000,
+      this._cfTurnExpiry - Date.now() - PresenceApp.CF_TURN_REFRESH_BUFFER_MS
+    );
+    this._cfTurnRefreshTimer = window.setTimeout(
+      () => this._refreshCloudflareTurn(),
+      delay
+    );
+  }
+
+  /**
+   * Ensure Cloudflare TURN credentials are fresh. Called once on app load (so
+   * credentials are ready for every room) and whenever the API credentials are
+   * edited: if they are present and we have no credentials yet (or they are
+   * within the refresh buffer of expiring) it fetches immediately; otherwise it
+   * just (re)arms the single pre-expiry refresh timer. No-op when Cloudflare is
+   * not configured.
+   */
+  _ensureCloudflareTurn(): void {
+    console.log(
+      `[cf-turn] ensure: configured=${this._cfTurnConfigured} keyId=${
+        this._cfTurnKeyId.trim() ? 'set' : 'empty'
+      } token=${this._cfTurnApiToken.trim() ? 'set' : 'empty'} expiry=${
+        this._cfTurnExpiry || 'none'
+      } storedUrl=${window.localStorage.getItem('cfTurnUrl') || 'none'}`
+    );
+    if (!this._cfTurnConfigured) {
+      if (this._cfTurnRefreshTimer) {
+        window.clearTimeout(this._cfTurnRefreshTimer);
+        this._cfTurnRefreshTimer = undefined;
+      }
+      return;
+    }
+    // Freshness is gated on an actual stored relay URL, not just the expiry:
+    // a recorded expiry with no cfTurnUrl (e.g. left over from an older build
+    // that stored credentials elsewhere, or a partial write) must still trigger
+    // a fetch rather than be treated as provisioned.
+    const hasStoredUrl = !!window.localStorage.getItem('cfTurnUrl');
+    if (
+      !hasStoredUrl ||
+      !this._cfTurnExpiry ||
+      this._cfTurnExpiry - Date.now() <= PresenceApp.CF_TURN_REFRESH_BUFFER_MS
+    ) {
+      void this._refreshCloudflareTurn();
+    } else {
+      this._scheduleCloudflareTurnRefresh();
+    }
   }
 
   async firstUpdated() {
     const start = Date.now();
+    // Provision/refresh Cloudflare TURN credentials on load if configured.
+    this._ensureCloudflareTurn();
     if ((import.meta as any).env.DEV) {
       try {
         await initializeHotReload();
@@ -935,12 +1117,133 @@ export class PresenceApp extends LitElement {
     `;
   }
 
+  renderCloudflareTurnSection() {
+    const inputStyle =
+      'width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px; margin-bottom: 6px;';
+    const status = this._cfTurnStatus;
+    // Setting/clearing either API field re-evaluates provisioning: a complete
+    // pair fetches immediately, clearing either field tears down the stored
+    // credentials so they stop being offered as candidates.
+    const onCredChange = () => {
+      if (this._cfTurnConfigured) {
+        this._ensureCloudflareTurn();
+      } else {
+        this._clearCloudflareTurn();
+      }
+    };
+    // Persistent indicator of the current provisioning state (independent of
+    // the transient fetch status above): green = valid credentials stored,
+    // amber = configured but provisioning/expired, grey = not configured.
+    const indicator = this._cfTurnValid
+      ? {
+          color: '#7adc7a',
+          label: `Active — ${this._cfTurnRelayCount} relay${
+            this._cfTurnRelayCount === 1 ? '' : 's'
+          }, valid until ${new Date(this._cfTurnExpiry).toLocaleString()}`,
+        }
+      : this._cfTurnConfigured
+        ? status.kind === 'loading'
+          ? { color: '#e7a008', label: 'Provisioning…' }
+          : {
+              color: '#e7a008',
+              label: this._cfTurnExpiry
+                ? 'Expired — reprovisioning'
+                : 'Not provisioned yet',
+            }
+        : { color: '#888ea8', label: 'Off — enter credentials below' };
+    return html`
+      <div style="margin-top: 16px; width: 100%;">
+        <div class="row items-center" style="gap: 8px;">
+          <span class="secondary-font" style="color: #c3c9eb; font-size: 18px;"
+            >Cloudflare TURN (auto credentials)</span
+          >
+        </div>
+        <div class="row items-center" style="gap: 6px; margin-top: 4px;">
+          <span
+            style="width: 9px; height: 9px; border-radius: 50%; background: ${indicator.color}; flex: 0 0 auto;"
+          ></span>
+          <span
+            class="secondary-font"
+            style="color: ${indicator.color}; font-size: 13px;"
+            >${indicator.label}</span
+          >
+        </div>
+        <div style="margin-top: 6px;">
+          <input
+            type="text"
+            placeholder="TURN key ID"
+            .value=${this._cfTurnKeyId}
+            @input=${(e: InputEvent) => {
+              const val = (e.target as HTMLInputElement).value;
+              this._cfTurnKeyId = val;
+              window.localStorage.setItem('cfTurnKeyId', val);
+              onCredChange();
+            }}
+            style=${inputStyle}
+          />
+          <input
+            type="password"
+            placeholder="API token"
+            .value=${this._cfTurnApiToken}
+            @input=${(e: InputEvent) => {
+              const val = (e.target as HTMLInputElement).value;
+              this._cfTurnApiToken = val;
+              window.localStorage.setItem('cfTurnApiToken', val);
+              onCredChange();
+            }}
+            style=${inputStyle}
+          />
+          <div class="row items-center" style="gap: 8px;">
+            <input
+              type="number"
+              min="600"
+              step="600"
+              placeholder="TTL (seconds)"
+              .value=${String(this._cfTurnTtl)}
+              @input=${(e: InputEvent) => {
+                const val = parseInt((e.target as HTMLInputElement).value, 10);
+                const ttl = isNaN(val) ? 86400 : Math.max(600, val);
+                this._cfTurnTtl = ttl;
+                window.localStorage.setItem('cfTurnTtl', String(ttl));
+              }}
+              style="flex: 1; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
+            />
+          </div>
+          <span
+            class="secondary-font"
+            style="color: #888ea8; font-size: 12px; margin-top: 4px; display: block;"
+            >Enter a key ID and API token; credentials are provisioned
+            automatically on room open and refreshed before they expire.</span
+          >
+          <!-- Provisioning/expiry state is shown by the indicator dot above;
+               only the error detail is surfaced here. -->
+          ${status.kind === 'error'
+            ? html`<span
+                class="secondary-font"
+                style="color: #d23030; font-size: 12px; margin-top: 4px; display: block; word-break: break-word;"
+                >${status.message}</span
+              >`
+            : ''}
+        </div>
+      </div>
+    `;
+  }
+
   renderForceTurnToggle() {
     // Active only when a TURN server is configured: forcing relay with no TURN
     // would gather zero ICE candidates and break every connection. When no TURN
     // is set we dim the row and swallow clicks, and never persist 'relay'.
-    const hasTurn = this._turnUrl.trim().length > 0;
+    // Cloudflare counts as configured once its API credentials are entered —
+    // the store still guards 'relay' on an actual relay URL, so relay stays
+    // disarmed until provisioning lands, then engages on the next connection.
+    const hasManualTurn = this._turnUrl.trim().length > 0;
+    const hasTurn = hasManualTurn || this._cfTurnConfigured;
     const on = this._forceTurn && hasTurn;
+    // Armed but not yet effective: relay is requested but no relay URL is
+    // populated yet (Cloudflare configured but credentials not provisioned).
+    // The store silently disarms 'relay' in this state, so warn rather than
+    // imply media is being forced through a relay.
+    const armedButInactive = on && !hasManualTurn && this._cfTurnExpiry === 0;
     const setForceTurn = (value: boolean) => {
       if (!hasTurn) return;
       this._forceTurn = value;
@@ -950,6 +1253,11 @@ export class PresenceApp extends LitElement {
         window.localStorage.removeItem('iceTransportPolicy');
       }
     };
+    const label = !hasTurn
+      ? ' — set a TURN server to enable'
+      : armedButInactive
+        ? ' — waiting for TURN credentials (not yet active)'
+        : '';
     return html`
       <div
         class="row items-center"
@@ -963,10 +1271,10 @@ export class PresenceApp extends LitElement {
         ></toggle-switch>
         <span
           class="secondary-font"
-          style="color: #c3c9eb; margin-left: 10px; font-size: 18px;"
-          >force TURN (relay-only)${hasTurn
-            ? ''
-            : ' — set a TURN server to enable'}</span
+          style="color: ${armedButInactive
+            ? '#e7a008'
+            : '#c3c9eb'}; margin-left: 10px; font-size: 18px;"
+          >force TURN (relay-only)${label}</span
         >
       </div>
     `;
@@ -1006,7 +1314,7 @@ export class PresenceApp extends LitElement {
           <span
             class="secondary-font"
             style="color: #c3c9eb; font-size: 18px;"
-            >TURN Server</span
+            >Manual TURN Server</span
           >
           <div style="margin-top: 6px;">
             <input
@@ -1043,8 +1351,11 @@ export class PresenceApp extends LitElement {
               style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
             />
           </div>
-          ${this.renderForceTurnToggle()}
         </div>
+        ${this.renderCloudflareTurnSection()}
+        <!-- Force-TURN sits below both provisioning sections; it applies to
+             whichever TURN server(s) are configured. -->
+        ${this.renderForceTurnToggle()}
         <div class="row" style="margin-top: 20px; gap: 10px;">
           <button
             class="btn"
