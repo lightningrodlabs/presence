@@ -1,5 +1,6 @@
 import { mdiBroadcast } from '@mdi/js';
 import { get } from '@holochain-open-dev/stores';
+import { decidePlayout } from './voice-playout';
 import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
@@ -589,28 +590,25 @@ class VoiceController {
       const now = ctx.currentTime;
       const jitterSec = JITTER_BUFFER_MS / 1000;
       const driftSec = PLAYBACK_RESET_DRIFT_MS / 1000;
-      if (state.nextPlaybackTime < now) {
-        // Fell behind real time (stall / first frame after a gap) — re-anchor
-        // forward. Nothing is scheduled in [now, nextPlaybackTime), so this
-        // cannot overlap already-committed sources.
-        if (state.nextPlaybackTime !== 0) {
-          this._logPlayoutReset(agentPubKeyB64, 'behind', now - state.nextPlaybackTime, state);
-        }
-        state.nextPlaybackTime = now + jitterSec;
-      } else if (state.nextPlaybackTime > now + jitterSec + driftSec) {
-        // Buffer too deep: frames decoded faster than real time (the
-        // remote-signal transport delivered a backlog at once). Up to `driftSec`
-        // of audio is ALREADY source.start()-scheduled ahead of `now`; snapping
-        // nextPlaybackTime back to now+jitter and scheduling here would overlap
-        // it — the hypothesized "voice on top of itself" bug (see
-        // docs/SIGNALS_DOUBLE_AUDIO_INVESTIGATION.md). Shed depth by dropping
-        // this frame instead. A dropped 20ms frame mid-burst is inaudible; a
-        // 400ms overlap is not. Latency drains back to ~jitter between bursts.
-        this._logPlayoutReset(agentPubKeyB64, 'overcap-drop', state.nextPlaybackTime - now, state);
-        return; // `data` is closed in the finally block
+      const frameDurationSec = numberOfFrames / sampleRate;
+      // Pure scheduling decision (see voice-playout.ts). The key property: for a
+      // buffer that has drifted too deep (a relay-delivered backlog decoded
+      // faster than real time) it DROPS the frame rather than re-anchoring the
+      // head backward — re-anchoring would overlap audio already committed
+      // ahead, the hypothesized "voice on top of itself" bug. See
+      // docs/SIGNALS_DOUBLE_AUDIO_INVESTIGATION.md.
+      const prevHead = state.nextPlaybackTime;
+      const decision = decidePlayout(
+        prevHead, now, frameDurationSec, jitterSec, driftSec,
+      );
+      state.nextPlaybackTime = decision.nextPlaybackTime;
+      if (decision.reason === 'behind') {
+        this._logPlayoutReset(agentPubKeyB64, 'behind', now - prevHead);
+      } else if (decision.reason === 'overcap-drop') {
+        this._logPlayoutReset(agentPubKeyB64, 'overcap-drop', prevHead - now);
       }
-      source.start(state.nextPlaybackTime);
-      state.nextPlaybackTime += numberOfFrames / sampleRate;
+      if (decision.action === 'drop') return; // `data` is closed in the finally block
+      source.start(decision.at);
     } catch (e) {
       console.error('voice: playback error', e);
     } finally {
@@ -631,7 +629,6 @@ class VoiceController {
     agentPubKeyB64: string,
     branch: 'behind' | 'overcap-drop',
     aheadOrBehindSec: number,
-    _state: PeerVoiceState,
   ) {
     const c = this._playoutResetCounts.get(agentPubKeyB64) ?? { behind: 0, overcapDrop: 0 };
     if (branch === 'behind') c.behind += 1;
