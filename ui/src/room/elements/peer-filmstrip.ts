@@ -6,6 +6,7 @@ import {
 } from '../modules/video-filmstrip';
 import { voiceController } from '../modules/voice';
 import { framePaceMs } from '../modules/av-sync';
+import { filmstripDebug } from '../../filmstrip-debug';
 
 /**
  * Self-updating filmstrip overlay for one peer with a playback jitter
@@ -102,6 +103,7 @@ export class PeerFilmstrip extends LitElement {
   private _setActive(active: boolean): void {
     if (active === this._active) return;
     this._active = active;
+    filmstripDebug.log(this.agentPubKeyB64, 'active', String(active));
     try { this.onActiveChange?.(active); } catch (e) {
       console.error('peer-filmstrip: onActiveChange threw', e);
     }
@@ -205,11 +207,13 @@ export class PeerFilmstrip extends LitElement {
 
   connectedCallback(): void {
     super.connectedCallback();
+    filmstripDebug.log(this.agentPubKeyB64, 'mount');
     this._subscribe();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
+    filmstripDebug.log(this.agentPubKeyB64, 'unmount');
     this._teardown();
   }
 
@@ -243,7 +247,15 @@ export class PeerFilmstrip extends LitElement {
     // peer doesn't linger if `agentPubKeyB64` is reassigned without an
     // immediate replay-subscribe. Also hide the slider.
     const el = this.renderRoot?.querySelector?.('.strip') as HTMLDivElement | null;
-    if (el) el.style.backgroundImage = '';
+    filmstripDebug.log(
+      this.agentPubKeyB64,
+      'teardown',
+      `hadImage=${!!el?.style.backgroundImage}`,
+    );
+    if (el) {
+      el.style.backgroundImage = '';
+      el.style.backgroundColor = '';
+    }
     const slider = this.renderRoot?.querySelector?.('.size-slider') as HTMLInputElement | null;
     if (slider) slider.style.display = 'none';
     this._lastFrameWidth = 0;
@@ -262,7 +274,15 @@ export class PeerFilmstrip extends LitElement {
       this._queue = [];
       this._started = false;
       const el = this.renderRoot.querySelector('.strip') as HTMLDivElement | null;
-      if (el) el.style.backgroundImage = '';
+      filmstripDebug.log(
+        this.agentPubKeyB64,
+        'clear-null',
+        `hadImage=${!!el?.style.backgroundImage}`,
+      );
+      if (el) {
+        el.style.backgroundImage = '';
+        el.style.backgroundColor = '';
+      }
       const slider = this.renderRoot.querySelector('.size-slider') as HTMLInputElement | null;
       if (slider) slider.style.display = 'none';
       filmstripController.setBufferDepth(this.agentPubKeyB64, 0);
@@ -274,15 +294,28 @@ export class PeerFilmstrip extends LitElement {
     // already has the pixel data ready and the swap is atomic. Without
     // this, the swap can paint an empty bg for one frame while the new
     // image decodes (visible as an avatar-flash through the host).
+    const decodeStart = performance.now();
     try {
       const probe = new Image();
       probe.src = frame.url;
       await probe.decode();
-    } catch {
+    } catch (e) {
       // Decode rejected (rare — corrupt JPEG, revoked URL). Fall through.
+      filmstripDebug.log(this.agentPubKeyB64, 'decode-fail', String(e));
+    }
+    const decodeMs = performance.now() - decodeStart;
+    if (decodeMs > 30) {
+      filmstripDebug.log(
+        this.agentPubKeyB64,
+        'decode-slow',
+        `${decodeMs.toFixed(1)}ms`,
+      );
     }
     // The element may have been unmounted while we awaited decode.
-    if (!this._unsubscribe) return;
+    if (!this._unsubscribe) {
+      filmstripDebug.log(this.agentPubKeyB64, 'decode-unmounted');
+      return;
+    }
 
     // Push N entries (one per frame) into the queue. The setTimeout
     // chain consumes them at periodMs intervals.
@@ -315,12 +348,14 @@ export class PeerFilmstrip extends LitElement {
       const target = BUFFER_CLIPS * frame.frameCount;
       if (this._queue.length >= target) {
         this._started = true;
+        filmstripDebug.log(this.agentPubKeyB64, 'buffer-start', `q=${this._queue.length}`);
         this._popAndSchedule();
       }
     } else if (this._animTimer === null) {
       // Resuming after underrun. Don't re-buffer — the user has already
       // seen the freeze; pushing them through more wait is worse than
       // resuming with whatever just arrived.
+      filmstripDebug.log(this.agentPubKeyB64, 'resume', `q=${this._queue.length}`);
       this._popAndSchedule();
     }
   }
@@ -339,7 +374,12 @@ export class PeerFilmstrip extends LitElement {
    */
   private _popAndSchedule(): void {
     const next = this._queue.shift();
-    if (!next) return;
+    if (!next) {
+      // Display freezes on the last shown frame from here until the
+      // next clip arrival's `resume`.
+      filmstripDebug.log(this.agentPubKeyB64, 'underrun');
+      return;
+    }
     this._applyFrame(next);
     this._reportAvSkew(next);
     filmstripController.setBufferDepth(this.agentPubKeyB64, this._queue.length);
@@ -371,14 +411,27 @@ export class PeerFilmstrip extends LitElement {
 
   private _applyFrame(f: QueuedFrame): void {
     const el = this.renderRoot.querySelector('.strip') as HTMLDivElement | null;
-    if (!el) return;
+    if (!el) {
+      filmstripDebug.log(this.agentPubKeyB64, 'apply-no-el');
+      return;
+    }
     // Only update bg-image when the source clip changes — avoids
     // unnecessary style writes when stepping through frames within the
     // same clip. Size is set by _applyScale based on the slider.
     const desiredBg = `url("${f.url}")`;
     if (el.style.backgroundImage !== desiredBg) {
+      filmstripDebug.log(
+        this.agentPubKeyB64,
+        'apply-swap',
+        `url=…${f.url.slice(-8)} q=${this._queue.length}`,
+      );
       el.style.backgroundImage = `url(${f.url})`;
       el.style.backgroundSize = `100% ${f.count * 100}%`;
+      // Forensics color-coding: lime paints wherever the bg-image fails
+      // to (decode race / dead blob URL) while a clip is displayed,
+      // distinguishing that from the container background (magenta)
+      // and from black frame content. No-op when the flag is off.
+      if (filmstripDebug.colorsEnabled) el.style.backgroundColor = 'lime';
       this._lastFrameWidth = f.width;
       this._applyScale();
       // Show the slider — a clip is now being displayed. Need an

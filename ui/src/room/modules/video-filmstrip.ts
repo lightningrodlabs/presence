@@ -4,6 +4,7 @@ import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
 import type { CameraAcquireResult } from '../../camera-source';
+import { filmstripDebug } from '../../filmstrip-debug';
 
 /**
  * Video-filmstrip module — sends low-fps JPEG video frames over Holochain
@@ -553,6 +554,7 @@ class FilmstripController {
     }
     if (payload.seq <= state.lastSeq && state.lastSeq !== 0) {
       // out-of-order or duplicate; cheap drop
+      filmstripDebug.log(agentPubKeyB64, 'rx-dup', `seq=${payload.seq}`);
       return;
     }
 
@@ -560,7 +562,8 @@ class FilmstripController {
     // display immediately rather than waiting for the inactivity TTL.
     if (payload.kind === 'stop') {
       state.lastSeq = payload.seq;
-      this._clearPeerDisplay(agentPubKeyB64);
+      filmstripDebug.log(agentPubKeyB64, 'rx-stop', `seq=${payload.seq}`);
+      this._clearPeerDisplay(agentPubKeyB64, 'stop');
       return;
     }
 
@@ -571,7 +574,10 @@ class FilmstripController {
     // Loss: any seq gap > 0 implies missed clips.
     if (state.lastSeq !== 0) {
       const gap = payload.seq - state.lastSeq - 1;
-      if (gap > 0) state.clipsLost += gap;
+      if (gap > 0) {
+        state.clipsLost += gap;
+        filmstripDebug.log(agentPubKeyB64, 'rx-gap', `lost=${gap} seq=${payload.seq}`);
+      }
     }
     state.clipsReceived += 1;
 
@@ -604,6 +610,11 @@ class FilmstripController {
     state.bytesReceived += bytes.byteLength;
     const blob = new Blob([bytes], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
+    filmstripDebug.log(
+      agentPubKeyB64,
+      'rx-clip',
+      `seq=${payload.seq} url=…${url.slice(-8)} bytes=${bytes.byteLength}`,
+    );
 
     // Publish stats on a ~1 s cadence (one window per ~fps clip
     // arrivals with per-frame clips).
@@ -646,6 +657,7 @@ class FilmstripController {
     if (state.latest) {
       const oldUrl = state.latest.url;
       setTimeout(() => {
+        filmstripDebug.log(agentPubKeyB64, 'revoke', `url=…${oldUrl.slice(-8)}`);
         try { URL.revokeObjectURL(oldUrl); } catch {}
       }, URL_REVOKE_DELAY_MS);
     }
@@ -670,7 +682,7 @@ class FilmstripController {
       window.clearTimeout(state.inactivityTimer);
     }
     state.inactivityTimer = window.setTimeout(() => {
-      this._clearPeerDisplay(agentPubKeyB64);
+      this._clearPeerDisplay(agentPubKeyB64, 'ttl');
     }, RECEIVE_INACTIVITY_TTL_MS);
 
     const subs = this.subscribers.get(agentPubKeyB64);
@@ -695,9 +707,10 @@ class FilmstripController {
    * first new window doesn't include a phantom 1-second gap left over
    * from the stop.
    */
-  private _clearPeerDisplay(agentPubKeyB64: string): void {
+  private _clearPeerDisplay(agentPubKeyB64: string, reason: 'stop' | 'ttl'): void {
     const state = this.peers.get(agentPubKeyB64);
     if (!state) return;
+    filmstripDebug.log(agentPubKeyB64, 'clear', reason);
     if (state.inactivityTimer !== null) {
       window.clearTimeout(state.inactivityTimer);
       state.inactivityTimer = null;
@@ -705,6 +718,7 @@ class FilmstripController {
     if (state.latest) {
       const oldUrl = state.latest.url;
       setTimeout(() => {
+        filmstripDebug.log(agentPubKeyB64, 'revoke', `url=…${oldUrl.slice(-8)}`);
         try { URL.revokeObjectURL(oldUrl); } catch {}
       }, URL_REVOKE_DELAY_MS);
       state.latest = null;

@@ -58,6 +58,7 @@ import './elements/agent-connection-status-icon';
 import './elements/audio-level-meter';
 import './elements/peer-stats-panel';
 import './elements/peer-filmstrip';
+import { filmstripDebug } from '../filmstrip-debug';
 import './elements/toggle-switch';
 import {
   filmstripController,
@@ -279,6 +280,10 @@ export class RoomView extends LitElement {
     if (active) next.add(peerB64);
     else next.delete(peerB64);
     if (next.size !== this._filmstripActivePeers.size) {
+      // Flash forensics: the avatar's display toggles on the Lit render
+      // that follows this state write, not at this instant — logging
+      // here bounds the start of that gap.
+      filmstripDebug.log(peerB64, 'avatar-toggle-queued', `hidden=${active}`);
       this._filmstripActivePeers = next;
     }
   }
@@ -3033,7 +3038,7 @@ export class RoomView extends LitElement {
                 : false;
             return html`
             <div
-              class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
+              class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}${filmstripDebug.colorsEnabled ? ' fs-debug-bg' : ''}"
               @dblclick=${() => this.toggleMaximized(pubkeyB64)}
             >
               <!--
@@ -3623,6 +3628,15 @@ export class RoomView extends LitElement {
 
       .video-container:not(.square-view):not(.screen-share) {
         overflow: visible;
+      }
+
+      /* Filmstrip flash forensics (localStorage.filmstripDebug = '1'):
+         recolor the container background so a flash classifies its own
+         cause — magenta = container showing through a non-painting
+         strip, lime = strip painting without its bg-image, black =
+         the JPEG content itself. See filmstrip-debug.ts. */
+      .video-container.fs-debug-bg {
+        background: magenta;
       }
 
       .module-replace-content {
