@@ -23,7 +23,7 @@
  *     { type: 'stop' }
  *
  *   worker → main:
- *     { type: 'clip', bytes, w, h, n, p, capturedAt }   transfer: [bytes]
+ *     { type: 'clip', bytes, w, h, n, p, t0, capturedAt }   transfer: [bytes]
  *     { type: 'stats', clipsPerSec, kbps, cycleMs, reads, avgGapMs, maxGapMs }
  *     { type: 'error', message }
  *
@@ -33,7 +33,11 @@
  */
 
 const DEFAULT_CAPTURE_SIDE = 192;
-const CLIP_TARGET_MS = 1000;
+// Must match CLIP_TARGET_MS in video-filmstrip.ts. Halved from 1000ms:
+// clip batching is the largest structural source of video-behind-audio
+// skew (a frame waits up to one clip length before it is even sent), so
+// shorter clips directly cut latency for ~1 extra signal/sec.
+const CLIP_TARGET_MS = 500;
 const JPEG_QUALITY = 0.6;
 
 interface StartMessage {
@@ -132,6 +136,11 @@ async function pumpCapture(gen: number): Promise<void> {
   let lastSampleMs = 0;
   let clipPeriodMs = 0;
   let clipFrameCount = 0;
+  // Sender wall-clock ms when the clip's FIRST frame was sampled. Sent
+  // as `t0` so the receiver can stamp every frame i with t0 + i*p on
+  // the shared sender timebase (audio frames carry the same clock as
+  // `wts`) — the basis for receiver-side A/V skew measurement.
+  let clipT0 = 0;
 
   // Rolling-window stats.
   let clipsThisWindow = 0;
@@ -193,6 +202,7 @@ async function pumpCapture(gen: number): Promise<void> {
         const sx = (vw - side) / 2;
         const sy = (vh - side) / 2;
         sctx.drawImage(vf, sx, sy, side, side, 0, framesInClip * H, W, H);
+        if (framesInClip === 0) clipT0 = Date.now();
         framesInClip += 1;
         lastSampleMs = now;
 
@@ -200,6 +210,7 @@ async function pumpCapture(gen: number): Promise<void> {
           const finishedStrip = stripCanvas;
           const finishedN = clipFrameCount;
           const finishedP = clipPeriodMs;
+          const finishedT0 = clipT0;
           const capturedAt = Date.now();
 
           const blob = await finishedStrip.convertToBlob({
@@ -224,6 +235,7 @@ async function pumpCapture(gen: number): Promise<void> {
                 h: H,
                 n: finishedN,
                 p: finishedP,
+                t0: finishedT0,
                 capturedAt,
               },
               [buf]

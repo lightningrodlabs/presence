@@ -41,6 +41,8 @@ export class PeerStatsPanel extends LitElement {
   private _lastVidTransit: number | null = null;
   private _lastVidBuf: number | null = null;
   private _lastVidLoss: number | null = null;
+  /** A/V skew (ms, sender timebase): positive = video lags audio. */
+  private _lastVidSkew: number | null = null;
 
   static styles = css`
     :host {
@@ -115,6 +117,7 @@ export class PeerStatsPanel extends LitElement {
           <span><span class="label">tr</span> <span class="value">${fmt(this._lastVidTransit, 'ms')}</span></span>
           <span><span class="label">buf</span> <span class="value">${fmt(this._lastVidBuf, '')}</span></span>
           <span><span class="label">loss</span> <span class="value">${fmt(this._lastVidLoss, '%')}</span></span>
+          <span title="A/V skew: positive = video lags audio"><span class="label">skew</span> <span class="value">${fmt(this._lastVidSkew, 'ms')}</span></span>
         </div>
       ` : html``}
     `;
@@ -191,6 +194,7 @@ export class PeerStatsPanel extends LitElement {
     const vidTransit = vid?.transitMs ?? null;
     const vidBuf = vid?.bufferDepth ?? null;
     const vidLoss = vid?.lossPercent ?? null;
+    const vidSkew = vid?.avSkewMs ?? null;
 
     if (
       carrier !== this._lastCarrier ||
@@ -203,7 +207,8 @@ export class PeerStatsPanel extends LitElement {
       vidJitter !== this._lastVidJitter ||
       vidTransit !== this._lastVidTransit ||
       vidBuf !== this._lastVidBuf ||
-      vidLoss !== this._lastVidLoss
+      vidLoss !== this._lastVidLoss ||
+      vidSkew !== this._lastVidSkew
     ) {
       this._lastCarrier = carrier;
       this._lastImpl = impl;
@@ -216,6 +221,7 @@ export class PeerStatsPanel extends LitElement {
       this._lastVidTransit = vidTransit;
       this._lastVidBuf = vidBuf;
       this._lastVidLoss = vidLoss;
+      this._lastVidSkew = vidSkew;
       this.requestUpdate();
     }
   };

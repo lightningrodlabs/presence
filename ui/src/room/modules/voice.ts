@@ -1,6 +1,7 @@
 import { mdiBroadcast } from '@mdi/js';
 import { get } from '@holochain-open-dev/stores';
 import { decidePlayout } from './voice-playout';
+import { estimatePlayoutSenderTimeMs, type PlayoutAnchor } from './av-sync';
 import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
@@ -13,7 +14,7 @@ import type { MicAcquireResult } from '../../mic-source';
  * sendModuleData / handleModuleData / onData wiring carries everything.
  *
  * Capture: MicSource (shared mic track) → MediaStreamTrackProcessor → AudioEncoder (Opus)
- * Wire   : { seq, ts, type, data(base64) } in JSON, sent via sendModuleData
+ * Wire   : { seq, ts, wts, type, data(base64) } in JSON, sent via sendModuleData
  * Play   : AudioDecoder → AudioBufferSourceNode scheduled into a small jitter buffer
  *
  * Phase 4 moved the mic acquisition out of this module: voice now acquires
@@ -44,6 +45,15 @@ interface VoiceFrame {
   ts: number; // microseconds (matches WebCodecs timestamp)
   type: 'key' | 'delta';
   data: string; // base64-encoded chunk bytes
+  /**
+   * Sender wall-clock ms (`Date.now()`) at encoder output — the shared
+   * cross-carrier timebase. Filmstrip clips stamp the same sender clock
+   * (`t0`), so a receiver can measure audio/video skew by comparing the
+   * two without any clock sync between machines. Carries a small
+   * constant bias (frame duration + encode time, ~25ms) which cancels
+   * out of skew deltas. Absent on legacy senders.
+   */
+  wts?: number;
 }
 
 interface VoiceFramePayload extends VoiceFrame {
@@ -75,6 +85,19 @@ interface PeerVoiceState {
   receivedCount: number;
   /** Wall-clock ms of the window start */
   windowStartMs: number;
+  /**
+   * WebCodecs timestamp (µs) → sender wall-clock ms (`wts`), bridging
+   * the encoded frame (which carries wts) to the decoded AudioData
+   * (which only carries the µs timestamp) across the async decoder.
+   * Entries are deleted at playout; pruned by size as a leak guard for
+   * frames the decoder swallows.
+   */
+  wtsByTs: Map<number, number>;
+  /**
+   * Sender-time ↔ audio-clock mapping of the most recently scheduled
+   * frame. Null until a frame carrying `wts` has been scheduled.
+   */
+  playoutAnchor: PlayoutAnchor | null;
 }
 
 const JITTER_BUFFER_MS = 80;
@@ -360,6 +383,7 @@ class VoiceController {
       ts: chunk.timestamp,
       type: chunk.type,
       data: bytesToBase64(buf),
+      wts: Date.now(),
     };
     const payload: VoiceFramePayload =
       this.redundancy > 0 && this.redBuffer.length > 0
@@ -397,6 +421,26 @@ class VoiceController {
   }
 
   // ----- receive side -----------------------------------------------------
+
+  /**
+   * Sender wall-clock time (ms) of the audio currently audible from this
+   * peer, projected from the most recent playout anchor along the audio
+   * clock. Null when no anchored audio is flowing (peer never sent `wts`,
+   * voice idle/muted, or the anchor is stale). The filmstrip display uses
+   * this to measure audio/video skew on the shared sender timebase.
+   */
+  getPlayoutSenderTimeMs(agentPubKeyB64: string): number | null {
+    const state = this.peers.get(agentPubKeyB64);
+    const anchor = state?.playoutAnchor;
+    if (!state || !anchor) return null;
+    // Stale anchor — audio stopped flowing; projecting forward from it
+    // would drift open-loop. 3s is well past any scheduling horizon
+    // (jitter buffer + drift cap is ~0.5s).
+    if (Date.now() - anchor.setAtMs > 3000) return null;
+    const ctx = this.audioContext;
+    if (!ctx) return null;
+    return estimatePlayoutSenderTimeMs(anchor, ctx.currentTime);
+  }
 
   receiveFrame(agentPubKeyB64: string, chunk: string) {
     let payload: VoiceFramePayload;
@@ -444,7 +488,7 @@ class VoiceController {
     if (Array.isArray(payload.red)) {
       for (const f of payload.red) frames.push(f);
     }
-    frames.push({ seq: payload.seq, ts: payload.ts, type: payload.type, data: payload.data });
+    frames.push({ seq: payload.seq, ts: payload.ts, type: payload.type, data: payload.data, wts: payload.wts });
     frames.sort((a, b) => a.seq - b.seq);
 
     for (const f of frames) {
@@ -479,6 +523,17 @@ class VoiceController {
 
   /** Construct an EncodedAudioChunk for one frame and feed the peer decoder. */
   private decodeVoiceFrame(state: PeerVoiceState, frame: VoiceFrame) {
+    // Remember the sender wall-clock stamp so playAudioData (which only
+    // sees the decoded AudioData's µs timestamp) can anchor sender time
+    // to the audio clock. Prune oldest entries if the decoder swallows
+    // frames without emitting output (insertion order = oldest first).
+    if (typeof frame.wts === 'number') {
+      state.wtsByTs.set(frame.ts, frame.wts);
+      if (state.wtsByTs.size > 64) {
+        const oldest = state.wtsByTs.keys().next().value;
+        if (oldest !== undefined) state.wtsByTs.delete(oldest);
+      }
+    }
     const data = base64ToBytes(frame.data);
     const g: any = globalThis as any;
     let encChunk: AnyEncodedAudioChunk;
@@ -529,6 +584,8 @@ class VoiceController {
       lostCount: 0,
       receivedCount: 0,
       windowStartMs: Date.now(),
+      wtsByTs: new Map(),
+      playoutAnchor: null,
     };
     try {
       state.decoder = new g.AudioDecoder({
@@ -607,7 +664,19 @@ class VoiceController {
       } else if (decision.reason === 'overcap-drop') {
         this._logPlayoutReset(agentPubKeyB64, 'overcap-drop', prevHead - now);
       }
+      // Resolve the sender wall-clock stamp for this frame (set in
+      // decodeVoiceFrame keyed by the µs timestamp, which the decoder
+      // preserves onto the AudioData). Consumed whether we play or drop.
+      const wts = state.wtsByTs.get(data.timestamp);
+      if (wts !== undefined) state.wtsByTs.delete(data.timestamp);
       if (decision.action === 'drop') return; // `data` is closed in the finally block
+      if (wts !== undefined) {
+        state.playoutAnchor = {
+          senderWtsMs: wts,
+          atCtxSec: decision.at,
+          setAtMs: Date.now(),
+        };
+      }
       source.start(decision.at);
     } catch (e) {
       console.error('voice: playback error', e);

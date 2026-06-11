@@ -4,6 +4,8 @@ import {
   filmstripController,
   FilmstripFrame,
 } from '../modules/video-filmstrip';
+import { voiceController } from '../modules/voice';
+import { framePaceMs } from '../modules/av-sync';
 
 /**
  * Self-updating filmstrip overlay for one peer with a playback jitter
@@ -31,14 +33,16 @@ import {
  */
 
 /**
- * Initial buffer depth, in clips. Setting playback to start once we
- * have BUFFER_CLIPS clips' worth of frames means the queue stays around
- * (BUFFER_CLIPS - 1) clips deep in steady state, giving us up to
- * (BUFFER_CLIPS - 1) clip-cadence-worth of clip-arrival jitter
- * tolerance before underrun. With a 1 s clip cadence, BUFFER_CLIPS = 2
- * absorbs ~1 s of jitter at the cost of ~1 s of added startup latency.
+ * Initial buffer depth, in clips. Playback starts once BUFFER_CLIPS
+ * clips' worth of frames have arrived; every buffered clip is added
+ * latency for the whole session, which directly widens audio/video
+ * skew (audio runs at ~80ms of jitter buffer). BUFFER_CLIPS = 1 starts
+ * on the first clip — a late next clip freezes on the last frame and
+ * resumes on arrival (no re-buffering), which costs less than carrying
+ * a permanent extra clip of latency. With a 0.5 s clip cadence this
+ * cuts startup latency from ~2 s (old 2 × 1 s clips) to ~0.5 s.
  */
-const BUFFER_CLIPS = 2;
+const BUFFER_CLIPS = 1;
 
 /**
  * Hard cap on queue depth, in clips. Drops oldest frames if exceeded.
@@ -54,6 +58,13 @@ interface QueuedFrame {
   periodMs: number;
   /** Per-frame edge length (px), used to scale the display max-size. */
   width: number;
+  /**
+   * Sender wall-clock ms when this frame was captured (clip t0 +
+   * index × period). Same sender clock as voice `wts`, so comparing it
+   * against the voice playout sender-time yields A/V skew with no
+   * cross-machine clock sync.
+   */
+  captureTimeMs: number;
 }
 
 @customElement('peer-filmstrip')
@@ -282,6 +293,7 @@ export class PeerFilmstrip extends LitElement {
         count: frame.frameCount,
         periodMs: frame.periodMs,
         width: frame.width,
+        captureTimeMs: frame.captureT0Ms + i * frame.periodMs,
       });
     }
 
@@ -318,16 +330,43 @@ export class PeerFilmstrip extends LitElement {
    * tick. If the queue is empty, leave the timer null so a new clip's
    * `_onFrame` can resume playback. The displayed frame stays on
    * screen during the underrun (frozen on last shown frame).
+   *
+   * The tick period is paced by queue depth (framePaceMs): when a
+   * relay burst leaves more than ~1.5 clips queued, play 25% fast
+   * until the backlog drains, instead of letting the excess sit as
+   * permanent added latency (and A/V skew) until the hard cap drops
+   * frames.
    */
   private _popAndSchedule(): void {
     const next = this._queue.shift();
     if (!next) return;
     this._applyFrame(next);
+    this._reportAvSkew(next);
     filmstripController.setBufferDepth(this.agentPubKeyB64, this._queue.length);
+    const pace = framePaceMs(this._queue.length, next.count, next.periodMs);
     this._animTimer = window.setTimeout(() => {
       this._animTimer = null;
       this._popAndSchedule();
-    }, next.periodMs);
+    }, pace);
+  }
+
+  /**
+   * Measure audio/video skew at the moment a frame is displayed: the
+   * sender-time of the audio currently audible minus this frame's
+   * sender capture time. Both timestamps are on the sender's clock, so
+   * no cross-machine sync is involved. Published into the controller's
+   * stats map (shown by the stats panel and the 1 Hz rx console line).
+   * Null (no anchored audio — peer muted, voice idle, legacy sender)
+   * clears the stat rather than letting a stale value linger.
+   */
+  private _reportAvSkew(f: QueuedFrame): void {
+    const audioSenderTimeMs = voiceController.getPlayoutSenderTimeMs(
+      this.agentPubKeyB64,
+    );
+    filmstripController.setAvSkew(
+      this.agentPubKeyB64,
+      audioSenderTimeMs === null ? null : audioSenderTimeMs - f.captureTimeMs,
+    );
   }
 
   private _applyFrame(f: QueuedFrame): void {

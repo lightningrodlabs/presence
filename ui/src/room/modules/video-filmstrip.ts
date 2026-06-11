@@ -19,7 +19,7 @@ import type { CameraAcquireResult } from '../../camera-source';
  * Capture: cameraSource.acquire() -> off-DOM <video> playing the camera
  *          track -> HTMLCanvasElement drawImage at sample rate ->
  *          filmstrip canvas -> toBlob('image/jpeg').
- * Wire   : { seq, ts, w, h, n, p, data(base64) } in JSON via sendModuleData.
+ * Wire   : { seq, ts, w, h, n, p, t0, data(base64) } in JSON via sendModuleData.
  * Play   : URL.createObjectURL on receive; subscribers (per-peer overlay
  *          element) swap their <img> src and step a CSS background-position
  *          animator at the original sample period.
@@ -35,12 +35,20 @@ const DEFAULT_CAPTURE_PERIOD_MS = 167; // 6 fps
 
 /**
  * Target clip cadence — one filmstrip is sent roughly every CLIP_TARGET_MS,
- * regardless of fps. The number of frames per clip equals fps (so 1 fps =
- * 1-frame snapshot per second; 8 fps = 8 frames in a 1 s loop). Keeping
- * clip cadence ~constant is what makes low fps feel near-real-time
- * instead of "8 s of buffered footage every 8 s".
+ * regardless of fps (frames per clip = round(CLIP_TARGET_MS / period),
+ * min 1, so very low fps degrades to one-frame clips at the frame
+ * period). Keeping clip cadence ~constant is what makes low fps feel
+ * near-real-time instead of "8 s of buffered footage every 8 s".
+ *
+ * Halved from 1000ms to 500ms for A/V skew: clip batching is the
+ * largest structural source of video-behind-audio latency — a captured
+ * frame waits up to one full clip length before it is even sent, and
+ * the receiver's initial buffer is denominated in clips. The cost is
+ * ~1 extra signal/sec (audio already sends 50/sec) and slightly worse
+ * JPEG header amortization. Must match CLIP_TARGET_MS in
+ * filmstrip-worker.ts.
  */
-const CLIP_TARGET_MS = 1000;
+const CLIP_TARGET_MS = 500;
 
 /**
  * Sender frame rates the UI exposes via setFps(). 8 fps was tested but
@@ -91,6 +99,14 @@ interface FilmstripClipPayload {
   h: number;  // single-frame height
   n: number;  // frame count
   p: number;  // playback period ms
+  /**
+   * Sender wall-clock ms when the clip's FIRST frame was captured, so
+   * frame i's capture time is t0 + i*p on the same sender clock that
+   * voice frames stamp as `wts` — the shared timebase for receiver-side
+   * A/V skew measurement. Absent on legacy senders (receivers fall back
+   * to deriving it from `ts`).
+   */
+  t0?: number;
   data: string; // base64-encoded JPEG filmstrip
 }
 interface FilmstripStopPayload {
@@ -118,6 +134,12 @@ export interface FilmstripFrame {
   height: number;
   frameCount: number;
   periodMs: number;
+  /**
+   * Sender wall-clock ms of the clip's first frame capture (frame i was
+   * captured at captureT0Ms + i*periodMs). Derived from ts on legacy
+   * clips without t0.
+   */
+  captureT0Ms: number;
   /** Wall-clock ms when this frame was received locally. */
   receivedAt: number;
 }
@@ -166,6 +188,14 @@ export interface VideoSignalsStats {
    * bottleneck.
    */
   transitMs: number | null;
+  /**
+   * Audio/video skew in ms on the SENDER's timebase, measured at frame
+   * display time by peer-filmstrip: (sender-time of the audio currently
+   * audible) − (sender capture time of the video frame being shown).
+   * Positive = video lags audio. Null when no anchored audio is flowing
+   * (peer muted, voice idle, or legacy sender without timestamps).
+   */
+  avSkewMs: number | null;
 }
 
 class FilmstripController {
@@ -238,12 +268,27 @@ class FilmstripController {
    * stats panel can surface it without polling the element.
    */
   setBufferDepth(agentPubKeyB64: string, depth: number): void {
-    const existing: VideoSignalsStats = this.signalsVideoStats.get(agentPubKeyB64) ?? {
-      jitterMs: null, lossPercent: null, kbps: null, fpsActual: null,
-      bufferDepth: null, transitMs: null,
-    };
+    const existing = this._statsFor(agentPubKeyB64);
     existing.bufferDepth = depth;
     this.signalsVideoStats.set(agentPubKeyB64, existing);
+  }
+
+  /**
+   * Update the A/V-skew field of a peer's stats. Called by the
+   * peer-filmstrip element each time it displays a frame while anchored
+   * audio is flowing (see VideoSignalsStats.avSkewMs).
+   */
+  setAvSkew(agentPubKeyB64: string, skewMs: number | null): void {
+    const existing = this._statsFor(agentPubKeyB64);
+    existing.avSkewMs = skewMs === null ? null : Math.round(skewMs);
+    this.signalsVideoStats.set(agentPubKeyB64, existing);
+  }
+
+  private _statsFor(agentPubKeyB64: string): VideoSignalsStats {
+    return this.signalsVideoStats.get(agentPubKeyB64) ?? {
+      jitterMs: null, lossPercent: null, kbps: null, fpsActual: null,
+      bufferDepth: null, transitMs: null, avSkewMs: null,
+    };
   }
 
   bind(store: StreamsStore) {
@@ -386,6 +431,7 @@ class FilmstripController {
   private _handleClipFromWorker(msg: {
     bytes: ArrayBuffer;
     w: number; h: number; n: number; p: number;
+    t0: number;
     capturedAt: number;
   }): void {
     if (!this.store) return;
@@ -397,6 +443,7 @@ class FilmstripController {
       seq: this.seq++,
       ts: msg.capturedAt,
       w: msg.w, h: msg.h, n: msg.n, p: msg.p,
+      t0: msg.t0,
       data: bytesToBase64(buf),
     };
     const sentAt = Date.now();
@@ -542,13 +589,16 @@ class FilmstripController {
     }
     state.clipsReceived += 1;
 
-    // Jitter: EWMA of |inter-arrival - CLIP_TARGET_MS| where CLIP_TARGET_MS
-    // is the sender's nominal cadence. alpha = 0.2 — slightly faster
-    // smoothing than voice's 0.1 because video clips are 50× slower so
-    // we have far fewer samples per second to integrate.
+    // Jitter: EWMA of |inter-arrival - nominal cadence|, where the
+    // nominal cadence is this clip's actual span (n × p — at very low
+    // fps a clip is longer than CLIP_TARGET_MS because frame count is
+    // floored at 1). alpha = 0.2 — slightly faster smoothing than
+    // voice's 0.1 because video clips are far slower so we have fewer
+    // samples per second to integrate.
     if (state.lastArrivalMs > 0) {
       const interval = now - state.lastArrivalMs;
-      const deviation = Math.abs(interval - CLIP_TARGET_MS);
+      const nominalMs = payload.n * payload.p;
+      const deviation = Math.abs(interval - nominalMs);
       state.jitterEwma = 0.2 * deviation + 0.8 * state.jitterEwma;
     }
     state.lastArrivalMs = now;
@@ -585,6 +635,8 @@ class FilmstripController {
         bufferDepth:
           this.signalsVideoStats.get(agentPubKeyB64)?.bufferDepth ?? null,
         transitMs: Math.round(state.transitEwma * 10) / 10,
+        avSkewMs:
+          this.signalsVideoStats.get(agentPubKeyB64)?.avSkewMs ?? null,
       };
       this.signalsVideoStats.set(agentPubKeyB64, stats);
       // Also log so a user testing in DevTools can see the numbers
@@ -594,7 +646,8 @@ class FilmstripController {
         `jitter=${stats.jitterMs}ms transit=${stats.transitMs}ms ` +
         `loss=${stats.lossPercent}% ` +
         `bw=${stats.kbps}kbps fps=${stats.fpsActual} ` +
-        `buf=${stats.bufferDepth ?? '-'}`
+        `buf=${stats.bufferDepth ?? '-'} ` +
+        `avSkew=${stats.avSkewMs ?? '-'}ms`
       );
       state.bytesReceived = 0;
       state.clipsReceived = 0;
@@ -617,6 +670,9 @@ class FilmstripController {
       height: payload.h,
       frameCount: payload.n,
       periodMs: payload.p,
+      // Legacy clips lack t0; their ts is stamped at clip end, so the
+      // first frame was captured ~ (n-1) periods earlier.
+      captureT0Ms: payload.t0 ?? payload.ts - (payload.n - 1) * payload.p,
       receivedAt: Date.now(),
     };
     state.latest = frame;
