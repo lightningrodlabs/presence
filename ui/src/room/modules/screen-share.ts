@@ -92,17 +92,11 @@ const screenShareModule: ModuleDefinition = {
       if (active) {
         await streamsStore.stopScreenShare();
       } else {
-        // Activate module first so the video element renders before
-        // screenShareOn() fires the my-screen-share-on event. Between
-        // activation and the picker resolving, peers see the module as
-        // active with no stream — handled by the renderShare peer branch's
-        // "establishing connection..." placeholder.
-        await streamsStore.activateModule('screen-share');
+        // screenShareOn() opens the source picker and activates the
+        // screen-share module itself, only once a source was actually
+        // picked — so the share pane never opens (locally or on peers)
+        // for a share that gets canceled.
         await streamsStore.screenShareOn();
-        // If acquisition was canceled, no stream — roll back the activation
-        if (!streamsStore.screenShareStream) {
-          await streamsStore.deactivateModule('screen-share');
-        }
       }
     };
     return html`

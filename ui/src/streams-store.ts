@@ -2640,19 +2640,23 @@ export class StreamsStore {
           });
         }
       }
-      // If there's an error here it's potentially possible that 'my-screen-share-on' further
-      // down never gets emitted.
-      if (this.screenShareStream) {
-        this.screenShareOutTransport.setLocalStream(this.screenShareStream);
-        for (const track of this.screenShareStream.getTracks()) {
-          try {
-            this.screenShareOutTransport.addTrack(track, this.screenShareStream);
-          } catch (_e) {
-            // duplicate-track adds are silently ignored
-          }
+      // Canceled picker or acquisition failure: nothing was shared, so
+      // don't activate the module or announce anything.
+      if (!this.screenShareStream) return;
+      this.screenShareOutTransport.setLocalStream(this.screenShareStream);
+      for (const track of this.screenShareStream.getTracks()) {
+        try {
+          this.screenShareOutTransport.addTrack(track, this.screenShareStream);
+        } catch (_e) {
+          // duplicate-track adds are silently ignored
         }
       }
     }
+    // Activate the module only after a source has been picked, so the share
+    // pane opens on remote peers (and locally) only once sharing actually
+    // starts. The activation must precede 'my-screen-share-on' so the local
+    // video element is rendered when room-view sets its srcObject.
+    await this.activateModule('screen-share');
     this.eventCallback({
       type: 'my-screen-share-on',
     });
