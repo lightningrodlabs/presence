@@ -6,19 +6,21 @@ import type { StreamsStore } from '../../streams-store';
 import type { CameraAcquireResult } from '../../camera-source';
 
 /**
- * Video-filmstrip module — sends short looping video clips over Holochain
+ * Video-filmstrip module — sends low-fps JPEG video frames over Holochain
  * remote signals as a low-bandwidth fallback when WebRTC video isn't
  * available (mirrors voice-over-signals for video).
  *
  * Wire format: a JPEG "filmstrip" — N frames stacked vertically into one
- * JPEG ArrayBuffer (the seatcamp pattern). Each clip is ~2 s at 4 fps,
- * 120x90 per frame, q=0.6. The encoder bake-off in
- * spikes/low-bandwidth-video/ measured this at ~19 KB / 12 ms /
- * 100 kbps — the smallest and fastest of GIF / filmstrip / WebCodecs.
+ * JPEG ArrayBuffer (the seatcamp pattern). The sender now sends each
+ * frame immediately as its own 1-frame clip (n=1): clip batching was
+ * the largest structural source of video-behind-audio skew (a frame
+ * waited up to a clip length before send), and per-frame signals cost
+ * ≤7/sec next to voice's 50/sec. The receive path still handles any N
+ * for compatibility with older batching senders.
  *
- * Capture: cameraSource.acquire() -> off-DOM <video> playing the camera
- *          track -> HTMLCanvasElement drawImage at sample rate ->
- *          filmstrip canvas -> toBlob('image/jpeg').
+ * Capture: cameraSource.acquire() -> MediaStreamTrackProcessor readable
+ *          transferred to a worker -> OffscreenCanvas drawImage at the
+ *          sample period -> convertToBlob('image/jpeg') per frame.
  * Wire   : { seq, ts, w, h, n, p, t0, data(base64) } in JSON via sendModuleData.
  * Play   : URL.createObjectURL on receive; subscribers (per-peer overlay
  *          element) swap their <img> src and step a CSS background-position
@@ -32,23 +34,6 @@ import type { CameraAcquireResult } from '../../camera-source';
  */
 
 const DEFAULT_CAPTURE_PERIOD_MS = 167; // 6 fps
-
-/**
- * Target clip cadence — one filmstrip is sent roughly every CLIP_TARGET_MS,
- * regardless of fps (frames per clip = round(CLIP_TARGET_MS / period),
- * min 1, so very low fps degrades to one-frame clips at the frame
- * period). Keeping clip cadence ~constant is what makes low fps feel
- * near-real-time instead of "8 s of buffered footage every 8 s".
- *
- * Halved from 1000ms to 500ms for A/V skew: clip batching is the
- * largest structural source of video-behind-audio latency — a captured
- * frame waits up to one full clip length before it is even sent, and
- * the receiver's initial buffer is denominated in clips. The cost is
- * ~1 extra signal/sec (audio already sends 50/sec) and slightly worse
- * JPEG header amortization. Must match CLIP_TARGET_MS in
- * filmstrip-worker.ts.
- */
-const CLIP_TARGET_MS = 500;
 
 /**
  * Sender frame rates the UI exposes via setFps(). 8 fps was tested but
@@ -76,11 +61,12 @@ const RECEIVE_TTL_MS = 3000;
 
 /**
  * Delay before revoking a swapped-out blob URL. Must be safely larger
- * than the clip cadence (CLIP_TARGET_MS) and any reasonable JS event-
- * loop hiccup, otherwise the OLD URL can be revoked before the receiver
- * has applied the NEW bg-image, leaving the strip pointed at a now-
- * dead URL — visible as an avatar flash through the (transparent) host.
- * 10 s buys ~10 clip cycles of headroom.
+ * than the clip cadence and any reasonable JS event-loop hiccup,
+ * otherwise the OLD URL can be revoked before the receiver has applied
+ * the NEW bg-image, leaving the strip pointed at a now-dead URL —
+ * visible as an avatar flash through the (transparent) host. With
+ * per-frame clips (~7/s of a few KB each) 10 s keeps ≤ ~70 small blobs
+ * alive — a few hundred KB, negligible.
  */
 const URL_REVOKE_DELAY_MS = 10000;
 
@@ -119,8 +105,8 @@ type FilmstripPayload = FilmstripClipPayload | FilmstripStopPayload;
 /**
  * How long the receiver displays a peer's last clip with no new clips
  * arriving before falling back to "no video" (clears the bg-image so
- * the avatar shows through). 5 s is far longer than the 1 s clip
- * cadence + any reasonable jitter, so this only fires when the sender
+ * the avatar shows through). 5 s is far longer than any clip cadence
+ * (≤1 s even at 1 fps) + reasonable jitter, so this only fires when the sender
  * has actually stopped (without managing to send a stop signal — e.g.
  * the sender's tab crashed). Normal stops use the explicit stop
  * payload and clear immediately.
@@ -149,7 +135,7 @@ interface PeerFilmstripState {
   lastSeq: number;
   /** Wall-clock ms of the previous arrival (for inter-arrival jitter). */
   lastArrivalMs: number;
-  /** EWMA of |inter-arrival - CLIP_TARGET_MS|, in ms. */
+  /** EWMA of |inter-arrival - nominal clip span (n × p)|, in ms. */
   jitterEwma: number;
   /** EWMA of (Date.now() - payload.ts), in ms — conductor transit time. */
   transitEwma: number;
@@ -170,7 +156,7 @@ interface PeerFilmstripState {
  * rolling window. Read by the stats panel.
  */
 export interface VideoSignalsStats {
-  /** EWMA of clip inter-arrival deviation from CLIP_TARGET_MS, ms. */
+  /** EWMA of clip inter-arrival deviation from the nominal span (n × p), ms. */
   jitterMs: number | null;
   /** Loss percent over the rolling window (0–100). */
   lossPercent: number | null;
@@ -619,8 +605,8 @@ class FilmstripController {
     const blob = new Blob([bytes], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
 
-    // Publish stats on a ~1 s cadence. With clip cadence ~1 s, this
-    // window captures roughly one clip arrival per emission.
+    // Publish stats on a ~1 s cadence (one window per ~fps clip
+    // arrivals with per-frame clips).
     if (now - state.windowStartMs >= 1000 && this.store) {
       const elapsedMs = now - state.windowStartMs;
       const total = state.clipsReceived + state.clipsLost;

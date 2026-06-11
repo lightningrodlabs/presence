@@ -33,11 +33,6 @@
  */
 
 const DEFAULT_CAPTURE_SIDE = 192;
-// Must match CLIP_TARGET_MS in video-filmstrip.ts. Halved from 1000ms:
-// clip batching is the largest structural source of video-behind-audio
-// skew (a frame waits up to one clip length before it is even sent), so
-// shorter clips directly cut latency for ~1 extra signal/sec.
-const CLIP_TARGET_MS = 500;
 const JPEG_QUALITY = 0.6;
 
 interface StartMessage {
@@ -121,31 +116,30 @@ function stopCapture(): void {
 }
 
 async function pumpCapture(gen: number): Promise<void> {
-  // W/H read fresh per clip so setCaptureSide() takes effect on the
-  // next clip boundary. Bound below.
+  // Each sampled frame is encoded and posted immediately as a 1-frame
+  // clip (n=1) — no batching. Clip assembly was the largest structural
+  // source of video-behind-audio skew: a frame waited up to a full clip
+  // length before it was even sent, and the receiver's startup buffer
+  // was denominated in clips. Per-frame send costs ~fps signals/sec
+  // (≤7/s, trivial next to voice's 50/s) and loses JPEG-strip header
+  // amortization (~a few hundred bytes/frame). The wire format is
+  // unchanged — receivers already handle any n, so legacy receivers
+  // play n=1 clips as-is.
+
+  // Types use `any` because the project's TS lib (es2017 + dom)
+  // doesn't fully cover OffscreenCanvas / convertToBlob; runtime is fine.
   let W = captureSide;
   let H = captureSide;
-
-  // Per-clip state. Types use `any` because the project's TS lib
-  // (es2017 + dom) doesn't fully cover OffscreenCanvas /
-  // OffscreenCanvasRenderingContext2D / convertToBlob; runtime is fine.
-  let stripCanvas: any = null;
-  let sctx: any = null;
-  let framesInClip = 0;
-  let cycleStart = 0;
+  let canvas: any = null;
+  let cctx: any = null;
   let lastSampleMs = 0;
-  let clipPeriodMs = 0;
-  let clipFrameCount = 0;
-  // Sender wall-clock ms when the clip's FIRST frame was sampled. Sent
-  // as `t0` so the receiver can stamp every frame i with t0 + i*p on
-  // the shared sender timebase (audio frames carry the same clock as
-  // `wts`) — the basis for receiver-side A/V skew measurement.
-  let clipT0 = 0;
 
-  // Rolling-window stats.
-  let clipsThisWindow = 0;
+  // Rolling-window stats. "frames" here = sent 1-frame clips; the
+  // message field names keep the historical clip terminology so the
+  // main thread's logger doesn't need to change.
+  let framesThisWindow = 0;
   let bytesThisWindow = 0;
-  let cycleSumMs = 0;
+  let encodeSumMs = 0;
   let readsThisWindow = 0;
   let lastReadMs = performance.now();
   let readGapSumMs = 0;
@@ -176,96 +170,78 @@ async function pumpCapture(gen: number): Promise<void> {
 
     try {
       const P = capturePeriodMs;
-      const N = Math.max(1, Math.round(CLIP_TARGET_MS / P));
+      const dueForSample = lastSampleMs === 0 || now - lastSampleMs >= P;
+      if (dueForSample) {
+        // Re-read the side each sample so setCaptureSide() applies on
+        // the next frame.
+        if (!canvas || W !== captureSide) {
+          W = captureSide;
+          H = captureSide;
+          canvas = new (self as any).OffscreenCanvas(W, H);
+          cctx = canvas.getContext('2d');
+        }
+        if (!cctx) continue;
 
-      if (!stripCanvas || framesInClip === 0) {
-        // Re-read W/H from the live captureSide each clip so a
-        // setCaptureSide() applies on the next clip boundary.
-        W = captureSide;
-        H = captureSide;
-        stripCanvas = new (self as any).OffscreenCanvas(W, H * N);
-        sctx = stripCanvas.getContext('2d');
-        framesInClip = 0;
-        cycleStart = now;
-        lastSampleMs = 0;
-        clipPeriodMs = P;
-        clipFrameCount = N;
-        if (!sctx) continue;
-      }
-
-      const dueForSample =
-        framesInClip === 0 || (now - lastSampleMs >= clipPeriodMs);
-      if (dueForSample && sctx) {
         const vw = vf.displayWidth || vf.codedWidth || W;
         const vh = vf.displayHeight || vf.codedHeight || H;
         const side = Math.min(vw, vh);
         const sx = (vw - side) / 2;
         const sy = (vh - side) / 2;
-        sctx.drawImage(vf, sx, sy, side, side, 0, framesInClip * H, W, H);
-        if (framesInClip === 0) clipT0 = Date.now();
-        framesInClip += 1;
+        cctx.drawImage(vf, sx, sy, side, side, 0, 0, W, H);
         lastSampleMs = now;
+        // Sender wall-clock ms at frame capture — the shared timebase
+        // with voice's `wts`, basis for receiver-side A/V skew.
+        const t0 = Date.now();
 
-        if (framesInClip >= clipFrameCount) {
-          const finishedStrip = stripCanvas;
-          const finishedN = clipFrameCount;
-          const finishedP = clipPeriodMs;
-          const finishedT0 = clipT0;
-          const capturedAt = Date.now();
+        const blob = await canvas.convertToBlob({
+          type: 'image/jpeg',
+          quality: JPEG_QUALITY,
+        });
+        const encodeEnd = performance.now();
 
-          const blob = await finishedStrip.convertToBlob({
-            type: 'image/jpeg',
-            quality: JPEG_QUALITY,
+        if (gen !== pipelineGeneration) break;
+
+        if (blob) {
+          const buf = await blob.arrayBuffer();
+          // Transfer the ArrayBuffer to the main thread (zero-copy).
+          (self as any).postMessage(
+            {
+              type: 'clip',
+              bytes: buf,
+              w: W,
+              h: H,
+              n: 1,
+              p: P,
+              t0,
+              capturedAt: Date.now(),
+            },
+            [buf]
+          );
+          framesThisWindow += 1;
+          bytesThisWindow += buf.byteLength;
+        }
+        encodeSumMs += encodeEnd - now;
+
+        // Stats once per second.
+        const checkNow = performance.now();
+        if (checkNow - windowStart >= 1000 && framesThisWindow > 0) {
+          const elapsed = checkNow - windowStart;
+          (self as any).postMessage({
+            type: 'stats',
+            clipsPerSec: (framesThisWindow * 1000) / elapsed,
+            kbps: (bytesThisWindow * 8) / elapsed,
+            cycleMs: encodeSumMs / framesThisWindow,
+            reads: (readsThisWindow * 1000) / elapsed,
+            avgGapMs: readsThisWindow > 0 ? readGapSumMs / readsThisWindow : 0,
+            maxGapMs: readGapMaxMs,
           });
-          const cycleEnd = performance.now();
-          stripCanvas = null;
-          sctx = null;
-          framesInClip = 0;
-
-          if (gen !== pipelineGeneration) break;
-
-          if (blob) {
-            const buf = await blob.arrayBuffer();
-            // Transfer the ArrayBuffer to the main thread (zero-copy).
-            (self as any).postMessage(
-              {
-                type: 'clip',
-                bytes: buf,
-                w: W,
-                h: H,
-                n: finishedN,
-                p: finishedP,
-                t0: finishedT0,
-                capturedAt,
-              },
-              [buf]
-            );
-            clipsThisWindow += 1;
-            bytesThisWindow += buf.byteLength;
-          }
-          cycleSumMs += cycleEnd - cycleStart;
-
-          // Stats once per second.
-          const checkNow = performance.now();
-          if (checkNow - windowStart >= 1000 && clipsThisWindow > 0) {
-            const elapsed = checkNow - windowStart;
-            (self as any).postMessage({
-              type: 'stats',
-              clipsPerSec: (clipsThisWindow * 1000) / elapsed,
-              kbps: (bytesThisWindow * 8) / elapsed,
-              cycleMs: cycleSumMs / clipsThisWindow,
-              reads: (readsThisWindow * 1000) / elapsed,
-              avgGapMs: readsThisWindow > 0 ? readGapSumMs / readsThisWindow : 0,
-              maxGapMs: readGapMaxMs,
-            });
-            clipsThisWindow = 0;
-            bytesThisWindow = 0;
-            cycleSumMs = 0;
-            readsThisWindow = 0;
-            readGapSumMs = 0;
-            readGapMaxMs = 0;
-            windowStart = checkNow;
-          }
+          framesThisWindow = 0;
+          bytesThisWindow = 0;
+          encodeSumMs = 0;
+          readsThisWindow = 0;
+          readGapSumMs = 0;
+          readGapMaxMs = 0;
+          windowStart = checkNow;
         }
       }
     } finally {

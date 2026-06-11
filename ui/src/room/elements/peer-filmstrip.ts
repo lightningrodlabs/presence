@@ -39,8 +39,8 @@ import { framePaceMs } from '../modules/av-sync';
  * skew (audio runs at ~80ms of jitter buffer). BUFFER_CLIPS = 1 starts
  * on the first clip — a late next clip freezes on the last frame and
  * resumes on arrival (no re-buffering), which costs less than carrying
- * a permanent extra clip of latency. With a 0.5 s clip cadence this
- * cuts startup latency from ~2 s (old 2 × 1 s clips) to ~0.5 s.
+ * a permanent extra clip of latency. With per-frame clips (n=1) this
+ * means display starts on the first received frame.
  */
 const BUFFER_CLIPS = 1;
 
