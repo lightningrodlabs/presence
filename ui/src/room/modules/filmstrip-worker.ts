@@ -32,7 +32,7 @@
  * on the main thread).
  */
 
-const DEFAULT_CAPTURE_SIDE = 96;
+const DEFAULT_CAPTURE_SIDE = 192;
 const CLIP_TARGET_MS = 1000;
 const JPEG_QUALITY = 0.6;
 
@@ -61,7 +61,7 @@ type WorkerInputMessage =
 
 let captureReader: ReadableStreamDefaultReader<any> | null = null;
 let pipelineGeneration = 0;
-let capturePeriodMs = 250;
+let capturePeriodMs = 167;
 let captureSide = DEFAULT_CAPTURE_SIDE;
 
 self.onmessage = (e: MessageEvent<WorkerInputMessage>) => {

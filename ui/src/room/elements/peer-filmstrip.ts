@@ -80,8 +80,9 @@ export class PeerFilmstrip extends LitElement {
    *   - 100 = strip fills the pane (frame size).
    *   - linear interpolation between in pixels.
    * Per-element local state — adjusted by the slider in the host.
+   * Defaults to 100 (fill the pane).
    */
-  private _scalePercent = 25;
+  private _scalePercent = 100;
   /** Width (px) of the latest received frame; used by _applyScale. */
   private _lastFrameWidth = 0;
   /** Track active state to fire onActiveChange only on transitions. */
@@ -153,11 +154,11 @@ export class PeerFilmstrip extends LitElement {
     }
     .size-slider {
       position: absolute;
-      /* Default top — overridden per pane shape via :host-context()
-         below. Square-view rects don't clip at the top so we can put
-         it near the edge; circle-view does clip on the upper arc so
-         it has to sit lower where the chord is wider. */
-      top: 4px;
+      /* Sit just above the pane's bottom icon chrome (tile-meta).
+         Square view: tile-meta is a single 36px row at bottom: 10px,
+         so its top edge is ~46px from the bottom. Overridden for
+         circle view via :host-context() below. */
+      bottom: 50px;
       left: 50%;
       transform: translateX(-50%);
       width: 60%;
@@ -175,11 +176,12 @@ export class PeerFilmstrip extends LitElement {
          Visibility toggled imperatively in _applyFrame / null callback. */
       display: none;
     }
-    /* Circle view: chord at the very top of the circle is too narrow
-       for the slider's 60% width. At ~13% from the top the chord is
-       wide enough (~140px on a 200px pane) for a 60% slider. */
+    /* Circle view: tile-meta is a stacked column at bottom: 10px —
+       icons row (30px) + 4px margin + avatar row (36px) puts its top
+       edge ~80px from the bottom; a little extra clearance keeps the
+       slider from overlapping the icons. */
     :host-context(.video-container:not(.square-view):not(.screen-share)) .size-slider {
-      top: 13%;
+      bottom: 92px;
     }
     :host(:hover) .size-slider {
       opacity: 0.85;
