@@ -280,6 +280,12 @@ when you set `config.diagnostics = true`. Leave it off in production; turn it on
 when diagnosing connection-establishment or DTLS-stall issues. Real connection
 events (ICE state, dropped stale signals, new peer sessions) are always emitted.
 
+The `establishment-timeline` event (on the FSM and `ConnectionManager`) emits one
+structured `EstablishmentTimeline` record per connect, with per-stage durations
+(ICE / DTLS / connected / data channel), a `wasReconnect` flag, and the
+`peerSessionId` — a compact way to track establishment latency without parsing
+the transition firehose.
+
 ```ts
 const recorder = new TransitionRecorder({ capacity: 500 });
 const manager = new ConnectionManager({

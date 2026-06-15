@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 Connection-lifecycle work (see the consuming app's `WEBRTC_CONNECTION_PLAN.md`).
 

@@ -76,8 +76,8 @@ function latestDataChannel(ctx: ReturnType<typeof createFSM>): MockRTCDataChanne
 }
 
 describe('data channel recovery (in-place, no ICE/DTLS teardown)', () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
 
   it('recreates the data channel in place when it stalls, without tearing down the connection', async () => {
     const ctx = await connectedTransportNoDataChannel({
@@ -153,8 +153,8 @@ describe('data channel recovery (in-place, no ICE/DTLS teardown)', () => {
 });
 
 describe('on-demand affordances (PeerConnectionFSM)', () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
 
   it('recreateDataChannel() recreates in place on a live peer and reports success', () => {
     const ctx = createFSM();

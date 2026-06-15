@@ -24,7 +24,7 @@
     "@holochain-open-dev/stores": "^0.601.0",
     "@holochain-open-dev/utils": "^0.601.0",
     "@holochain/client": "^0.20.4-rc.0",
-    "@lightningrodlabs/webrtc-peer": "^0.2.0",
+    "@lightningrodlabs/webrtc-peer": "^0.3.0",
     "@lit/context": "^1.1.0",
     "@lit/localize": "0.12.1",
     "@lit/task": "^1.0.0",
