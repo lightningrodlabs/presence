@@ -188,6 +188,15 @@ export class FsmTransport implements PeerTransport {
       });
     });
 
+    this._manager.on('establishment-timeline', (e: any) => {
+      this._emit({
+        type: 'establishment-timeline',
+        peer: e.remoteAgent,
+        connectionId: e.connectionId,
+        timeline: e.data,
+      });
+    });
+
     this._manager.on('connection-closed', (e: any) => {
       const prev = this._lastPhase.get(e.remoteAgent) ?? 'connected';
       this._lastPhase.delete(e.remoteAgent);
