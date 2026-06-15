@@ -152,6 +152,17 @@ export type SimpleEventType =
   // diagnostic, just bookkeeping. Distinguished from IceNeverConnected so
   // forensic analysis doesn't mis-attribute network failures.
   | 'ConnectionAborted'
+  // FSM-authoritative establishment timeline (library §6.6 one-shot event),
+  // emitted once when the FSM first reaches `connected`. Unlike IceEstablishment
+  // — which reaches into the pc and only sees ICE/gather — this carries the
+  // FSM's own per-stage milestones measured from establishment start:
+  //   ice=<ms> dtls=<ms> connected=<ms> dc=<ms> reconnect=<bool> session=<n>
+  // 'connected' is media-ready (ICE+DTLS); 'dc' is data-channel-open (or -1 if
+  // the channel hadn't opened yet at emit). 'reconnect' distinguishes a
+  // reconnect attempt from the initial connect. FSM transport only — surfaces
+  // which stage stalls when a call flashes connected-then-not. See the flash
+  // investigation. Complements, not replaces, IceEstablishment.
+  | 'FsmEstablishmentTimeline'
   // FSM-internal state transition — only emitted by the FSM transport.
   // The detail string carries `<fromState>-><toState> trigger="<reason>"`.
   // Used to forensically explain why an FSM attempt enters signaling

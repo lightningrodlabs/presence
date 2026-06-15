@@ -504,10 +504,39 @@ export class StreamsStore {
       case 'data-channel-message':
         this._handleMediaDataChannelMessage(event.peer, event.data);
         break;
+      case 'establishment-timeline':
+        this._handleEstablishmentTimeline(event.peer, event.connectionId, event.timeline);
+        break;
       case 'error':
         this._handleMediaError(event.peer, event.connectionId, event.error, impl);
         break;
     }
+  }
+
+  /**
+   * Log the FSM-authoritative establishment timeline (library §6.6 one-shot
+   * event) as a single `FsmEstablishmentTimeline` forensic record. Distinct
+   * from the manual `IceEstablishment` path (`_emitIceEstablishment`), which
+   * reaches into the pc and only sees ICE/gather: this carries the FSM's own
+   * per-stage milestones (ICE / DTLS / connected / data-channel) plus whether
+   * the attempt was a reconnect — the breakdown the flash investigation needs
+   * to see which stage stalls. FSM transport only; SimplePeer never emits it.
+   */
+  private _handleEstablishmentTimeline(
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    timeline: import('@lightningrodlabs/webrtc-peer').EstablishmentTimeline,
+  ): void {
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: Date.now(),
+      event: 'FsmEstablishmentTimeline',
+      connectionId,
+      detail:
+        `ice=${timeline.iceMs ?? -1} dtls=${timeline.dtlsMs ?? -1} ` +
+        `connected=${timeline.connectedMs} dc=${timeline.dataChannelMs ?? -1} ` +
+        `reconnect=${timeline.wasReconnect} session=${timeline.peerSessionId}`,
+    });
   }
 
   /**

@@ -27,6 +27,7 @@
  */
 
 import type { AgentPubKeyB64 } from '@holochain/client';
+import type { EstablishmentTimeline } from '@lightningrodlabs/webrtc-peer';
 
 /** Stable identity for a single connection attempt to a peer. */
 export type ConnectionId = string;
@@ -106,6 +107,14 @@ export type TransportEvent =
       peer: AgentPubKeyB64;
       connectionId: ConnectionId;
       data: unknown;
+    }
+  | {
+      // One-shot per-connection establishment timeline (per-stage ms) from the
+      // FSM. FSM transport only; SimplePeer never emits this.
+      type: 'establishment-timeline';
+      peer: AgentPubKeyB64;
+      connectionId: ConnectionId;
+      timeline: EstablishmentTimeline;
     }
   | {
       type: 'error';
