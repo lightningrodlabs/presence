@@ -647,6 +647,33 @@ export class RoomView extends LitElement {
       setTimeout(() => this._reapplyVideoStreams(), 50);
     }
     this._updateGrid();
+    this._ensurePeerVideoStreams();
+  }
+
+  /**
+   * Bind every live peer tile's <video> to its MediaStream. The
+   * `peer-stream` event sets srcObject once, when the stream first arrives,
+   * but a tile can unmount/remount (presence-roster flap on signaling
+   * staleness, maximize, layout/module change) and come back with a fresh
+   * <video> that never received that one-shot event — a permanently black
+   * tile even though the stream is still live. Re-bind here after every
+   * render, but only when the element's srcObject doesn't already match, so
+   * we never null-and-reassign (which would interrupt active playback).
+   */
+  private _ensurePeerVideoStreams() {
+    for (const [pubkeyB64, conn] of Object.entries(this._openConnections.value)) {
+      if (!conn?.connected) continue;
+      const stream = this.streamsStore._videoStreams[pubkeyB64];
+      if (!stream) continue;
+      const el = this.shadowRoot?.getElementById(
+        `video-${pubkeyB64}`
+      ) as HTMLVideoElement | null;
+      if (el && el.srcObject !== stream) {
+        el.autoplay = true;
+        el.srcObject = stream;
+        el.play().catch(() => {});
+      }
+    }
   }
 
   /**
@@ -654,6 +681,31 @@ export class RoomView extends LitElement {
    * people grid. Split mode (screen share) and maximized mode keep their own
    * layouts. Setting state only when it changes avoids re-render loops.
    */
+  /**
+   * Peers that should have a visible tile: everyone fresh on the presence
+   * ping (`_activeAgents`) PLUS anyone whose WebRTC media is still live
+   * (`_openConnections[k].connected`) even though their signaling pongs have
+   * gone stale. Signaling-pong staleness alone must never remove a tile whose
+   * media is flowing — a transient Holochain-signal hiccup (or a third peer
+   * congesting the shared signals carrier) would otherwise drop a peer we can
+   * still see and hear. streams-store applies the same guard to the presence
+   * overlay (`isPeerMediaLive` / `globalPresenceSet`); this keeps the main
+   * video grid consistent with it. De-duplicated, active-first ordering.
+   */
+  private _visiblePeers(): AgentPubKeyB64[] {
+    const active = this._activeAgents.value;
+    const conns = this._openConnections.value;
+    const out: AgentPubKeyB64[] = Object.keys(active);
+    const seen = new Set<string>(out);
+    for (const [pubkeyB64, conn] of Object.entries(conns)) {
+      if (conn?.connected && !seen.has(pubkeyB64)) {
+        seen.add(pubkeyB64);
+        out.push(pubkeyB64);
+      }
+    }
+    return out;
+  }
+
   private _updateGrid() {
     if (this._maximizedVideo || this._getActiveShares().length > 0) {
       this._setGrid(0, 0);
@@ -678,7 +730,7 @@ export class RoomView extends LitElement {
     // Count tiles actually laid out: peers + phantoms + own (unless hidden,
     // in which case it is display:none and takes no grid slot).
     const phantomCount = this.streamsStore.phantomAgents().length;
-    let n = Object.keys(this._activeAgents.value).length + phantomCount;
+    let n = this._visiblePeers().length + phantomCount;
     if (!this._selfViewHidden) n += 1;
 
     // A lone tile keeps the existing fill-the-viewport behavior (.single),
@@ -2996,11 +3048,12 @@ export class RoomView extends LitElement {
           `;
         })()}
 
-        <!-- Panes for present agents (driven by holochain presence, not WebRTC) -->
+        <!-- Panes for visible peers: presence-fresh OR media-live (a stale
+             signaling pong must not drop a tile whose media still flows). -->
         ${repeat(
-          Object.entries(this._activeAgents.value),
-          ([pubkeyB64]) => pubkeyB64,
-          ([pubkeyB64]) => {
+          this._visiblePeers(),
+          (pubkeyB64) => pubkeyB64,
+          (pubkeyB64) => {
             const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
             const moduleContext: ModuleRenderContext = {
               isMe: false,
@@ -3081,6 +3134,28 @@ export class RoomView extends LitElement {
                     >
                       connecting media...
                     </div>
+                  `
+                : html``}
+
+              <!--
+                Signaling-held indicator. When media is live but this peer's
+                presence pongs have gone stale (the tile is only surviving
+                because of the media-live guard in _visiblePeers), surface a
+                quiet amber marker so the user understands the link is
+                degraded-but-recovering and does NOT manually tear it down.
+              -->
+              ${conn?.connected && !this._activeAgents.value[pubkeyB64]
+                ? html`
+                    <sl-tooltip
+                      hoist
+                      class="tooltip-filled"
+                      placement="top"
+                      content="Signaling unstable — holding this connection on live media. It should recover on its own."
+                    >
+                      <div
+                        style="position: absolute; top: 10px; right: 10px; width: 10px; height: 10px; border-radius: 50%; background: #e7a008; box-shadow: 0 0 6px #e7a008; opacity: 0.85;"
+                      ></div>
+                    </sl-tooltip>
                   `
                 : html``}
 

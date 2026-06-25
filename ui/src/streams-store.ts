@@ -3453,7 +3453,8 @@ export class StreamsStore {
       for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
         if (peerKey === this.myPubKeyB64) continue;
         if (blocked.has(peerKey)) continue;
-        if (active[peerKey]) continue; // we already see them directly
+        if (active[peerKey]) continue; // we already see them directly (ping-fresh)
+        if (this.isPeerMediaLive(peerKey)) continue; // ...or via live media despite stale pong
         if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
           out.add(peerKey);
         }
