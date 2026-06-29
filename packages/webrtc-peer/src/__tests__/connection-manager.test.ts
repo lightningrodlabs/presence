@@ -366,6 +366,145 @@ describe('ConnectionManager', () => {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // Epoch ordering — the cross-FSM reconnect-identity fix.
+  // peerSessionId resets to 0 on every new FSM, so it cannot order signals
+  // across a teardown+recreate. The orchestrator-allocated `epoch` survives FSM
+  // recreation and is the authoritative "which attempt is current" order.
+  // See docs/WEBRTC_RECONNECT_IDENTITY.md.
+  // ---------------------------------------------------------------------------
+  describe('epoch ordering (cross-FSM reconnect identity)', () => {
+    it('stamps the epoch on every outgoing signal when given one', async () => {
+      const channel = new FakeSignalingChannel();
+      const { manager } = createManager({ agentId: 'agent-aaa', signalingChannel: channel });
+
+      manager.ensureConnection('agent-bbb', { epoch: 7 });
+      await vi.advanceTimersByTimeAsync(0); // flush negotiationneeded microtask
+
+      const outgoing = channel.messageLog.filter(e => e.from === 'agent-aaa');
+      expect(outgoing.length).toBeGreaterThan(0);
+      for (const entry of outgoing) {
+        expect(entry.message.epoch).toBe(7);
+      }
+    });
+
+    it('drops a signal from a superseded (lower) epoch', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      a.manager.ensureConnection('agent-bbb', { epoch: 2 });
+
+      const logBefore = a.transitionLog.length;
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'candidate',
+        connectionId: 'b-dead',
+        epoch: 1, // from the previous, torn-down attempt
+        data: { candidate: 'stale-candidate', sdpMLineIndex: 0 },
+      });
+
+      const dropEntry = a.transitionLog.slice(logBefore).find(
+        e => e.trigger.includes('Dropped stale') && e.trigger.includes('epoch 1 < current 2')
+      );
+      expect(dropEntry).toBeDefined();
+    });
+
+    it('a stale lower-epoch offer cannot latch the remote session, so the live answer is NOT dropped (the fix)', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // We initiate the current attempt at epoch 2.
+      a.manager.ensureConnection('agent-bbb', { epoch: 2 });
+      const fsm = a.manager.getFSM('agent-bbb')!;
+      expect(fsm.epoch).toBe(2);
+
+      // A late offer from the DEAD attempt (epoch 1) arrives after the fresh FSM
+      // exists. Pre-fix this would be accepted (offers always passed) and latch
+      // remoteConnectionId='b-dead', after which the live answer is rejected.
+      const log1 = a.transitionLog.length;
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-dead',
+        epoch: 1,
+        data: { type: 'offer', sdp: 'stale-offer' },
+      });
+      // Dropped on epoch order — the dead session never latches.
+      expect(
+        a.transitionLog.slice(log1).some(e => e.trigger.includes('epoch 1 < current 2'))
+      ).toBe(true);
+      expect(fsm.remoteConnectionId).toBeNull();
+
+      // The LIVE answer for the current attempt (epoch 2), with an independently
+      // random connectionId, must be accepted — equal epoch skips the
+      // connectionId-equality filter that used to cause the deadlock.
+      const log2 = a.transitionLog.length;
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'b-live',
+        epoch: 2,
+        data: { type: 'answer', sdp: 'live-answer' },
+      });
+      const dropped = a.transitionLog.slice(log2).filter(e => e.trigger.includes('Dropped stale'));
+      expect(dropped).toHaveLength(0);
+      expect(a.manager.getFSM('agent-bbb')!.remoteConnectionId).toBe('b-live');
+    });
+
+    it('a higher-epoch offer supersedes the FSM and adopts the new generation', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const oldFsm = a.manager.getFSM('agent-bbb')!;
+      expect(oldFsm.epoch).toBe(1);
+
+      // Peer re-initiated at a newer generation.
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-gen2',
+        epoch: 2,
+        data: { type: 'offer', sdp: 'offer-gen2' },
+      });
+
+      const newFsm = a.manager.getFSM('agent-bbb')!;
+      expect(newFsm).not.toBe(oldFsm);
+      expect(newFsm.epoch).toBe(2);
+      expect(newFsm.remoteConnectionId).toBe('b-gen2');
+    });
+
+    it('CONTRAST: without epochs, a latched stale session drops the live answer (the pre-fix deadlock)', () => {
+      const { manager, channel, transitionLog } = createManager({ agentId: 'agent-aaa' });
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // Legacy path — no epoch anywhere.
+      manager.ensureConnection('agent-bbb');
+      const fsm = manager.getFSM('agent-bbb')!;
+
+      // A late offer from a dead session latches remoteConnectionId (offers
+      // always pass in the legacy path).
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId: 'b-dead',
+        data: { type: 'offer', sdp: 'stale-offer' },
+      });
+      expect(fsm.remoteConnectionId).toBe('b-dead');
+
+      // The live answer (independently-random connectionId) now matches neither
+      // our connectionId nor the latched 'b-dead' — so it is dropped. This is
+      // the deadlock the epoch ordering removes.
+      const logBefore = transitionLog.length;
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'b-live',
+        data: { type: 'answer', sdp: 'live-answer' },
+      });
+      expect(
+        transitionLog.slice(logBefore).some(e => e.trigger.includes('Dropped stale answer'))
+      ).toBe(true);
+      // remoteConnectionId stays latched to the dead session — the live answer
+      // did not get through.
+      expect(manager.getFSM('agent-bbb')!.remoteConnectionId).toBe('b-dead');
+    });
+  });
+
   describe('peerSessionId filtering (intra-FSM stale signals)', () => {
     it('stamps peerSessionId on outgoing signals', async () => {
       const channel = new FakeSignalingChannel();

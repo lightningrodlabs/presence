@@ -298,6 +298,19 @@ export type SignalMessage = {
   /** Monotonic counter incremented each time a new RTCPeerConnection is created.
    *  Used to discard stale signals from previous peer sessions within the same FSM. */
   peerSessionId?: number;
+  /**
+   * Connection generation ("epoch") for this peer pair. Unlike `peerSessionId`
+   * (which is per-FSM-instance and resets to 0 when the FSM is recreated), the
+   * epoch is allocated by the orchestrator that outlives any single FSM, so it
+   * is **monotonic across teardown + recreate**. When present on both the
+   * incoming signal and the receiving FSM, it is the authoritative "which
+   * attempt is current" order: a strictly-higher epoch supersedes the FSM, a
+   * strictly-lower epoch is dropped, equal epochs fall back to
+   * connectionId/peerSessionId handling. Optional and backward-compatible: when
+   * absent, routing uses the legacy connectionId/peerSessionId logic unchanged.
+   * See docs/WEBRTC_RECONNECT_IDENTITY.md.
+   */
+  epoch?: number;
   data?: any;
 };
 

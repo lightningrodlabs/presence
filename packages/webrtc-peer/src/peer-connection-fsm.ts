@@ -39,6 +39,13 @@ import { VALID_TRANSITIONS, createIdleViewModel, DEFAULT_CONFIG, NOOP_LOGGER } f
 export type PeerConnectionFSMOptions = {
   remoteAgent: string;
   connectionId: string;
+  /**
+   * Connection generation for this peer pair, allocated by the orchestrator
+   * (survives FSM recreation). When set, it is the authoritative cross-FSM
+   * "which attempt is current" order; see `SignalMessage.epoch` and
+   * docs/WEBRTC_RECONNECT_IDENTITY.md. Optional/backward-compatible.
+   */
+  epoch?: number;
   polite: boolean;
   config?: ConnectionConfig;
   role?: ConnectionRole;
@@ -173,6 +180,14 @@ export class PeerConnectionFSM {
   // Used by ConnectionManager to filter stale signals from previous sessions.
   private _remoteConnectionId: string | null = null;
 
+  // Connection generation ("epoch") for this peer pair (orchestrator-allocated,
+  // monotonic across FSM recreation). `_epoch` is our attempt's generation;
+  // `_remoteEpoch` is the highest generation seen from the peer. Used for the
+  // authoritative cross-FSM "newest attempt wins" ordering. null => not in use
+  // (legacy connectionId/peerSessionId path). See docs/WEBRTC_RECONNECT_IDENTITY.md.
+  private _epoch: number | null = null;
+  private _remoteEpoch: number | null = null;
+
   // Peer session identity — managed by the FSM's transition logic.
   // local: incremented each time a new RTCPeerConnection is created (entry action for signaling, full reconnect).
   // remote: updated when accepting an offer/answer with a higher session ID.
@@ -185,6 +200,7 @@ export class PeerConnectionFSM {
   constructor(options: PeerConnectionFSMOptions) {
     this.remoteAgent = options.remoteAgent;
     this.connectionId = options.connectionId;
+    this._epoch = options.epoch ?? null;
     this.role = options.role ?? 'mesh';
     this._config = options.config ?? DEFAULT_CONFIG;
     this._sdpTimeoutOverrideMs = options.sdpExchangeTimeoutMs;
@@ -243,6 +259,16 @@ export class PeerConnectionFSM {
     return this._remoteConnectionId;
   }
 
+  /** This connection's generation ("epoch"), or null if epochs are not in use. */
+  get epoch(): number | null {
+    return this._epoch;
+  }
+
+  /** Highest remote epoch seen from the peer, or null if none seen / not in use. */
+  get remoteEpoch(): number | null {
+    return this._remoteEpoch;
+  }
+
   /** Current peer session counter — increments on each new RTCPeerConnection. */
   get peerSessionId(): number {
     return this._session.local;
@@ -293,8 +319,15 @@ export class PeerConnectionFSM {
    * @param remoteConnectionId — the connectionId from the signal's sender,
    *   used to track which remote session this signal belongs to.
    */
-  async handleRemoteSignal(signal: RTCSessionDescriptionInit | RTCIceCandidateInit, remoteConnectionId?: string, remotePeerSessionId?: number): Promise<void> {
+  async handleRemoteSignal(signal: RTCSessionDescriptionInit | RTCIceCandidateInit, remoteConnectionId?: string, remotePeerSessionId?: number, remoteEpoch?: number): Promise<void> {
     if (this._destroyed) return;
+
+    // Record the highest remote epoch seen (diagnostic / getter). Cross-epoch
+    // ordering is enforced upstream in ConnectionManager._routeSignalToFSM;
+    // by the time a signal reaches here it is same-epoch (or epochs are unused).
+    if (remoteEpoch != null) {
+      this._remoteEpoch = this._remoteEpoch == null ? remoteEpoch : Math.max(this._remoteEpoch, remoteEpoch);
+    }
 
     // Validate signal session — part of the FSM's contract
     const validation = this._validateSignalSession(signal, remotePeerSessionId);

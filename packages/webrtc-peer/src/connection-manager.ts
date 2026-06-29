@@ -145,7 +145,7 @@ export class ConnectionManager {
    */
   ensureConnection(
     agent: string,
-    opts?: { sdpExchangeTimeoutMs?: number },
+    opts?: { sdpExchangeTimeoutMs?: number; epoch?: number },
   ): void {
     if (this._destroyed) return;
 
@@ -153,10 +153,20 @@ export class ConnectionManager {
       this._sdpTimeoutOverrides.set(agent, opts.sdpExchangeTimeoutMs);
     }
 
+    const epoch = opts?.epoch;
     let fsm = this._connections.get(agent);
 
+    // Orchestrator advanced the connection generation: the existing FSM belongs
+    // to a superseded attempt. Replace it so the new attempt (and its outgoing
+    // signals) carry the current epoch. Equal/absent epoch leaves it in place.
+    if (fsm && epoch != null && fsm.epoch != null && epoch > fsm.epoch) {
+      fsm.destroy();
+      this._connections.delete(agent);
+      fsm = undefined;
+    }
+
     if (!fsm) {
-      fsm = this._createFSM(agent);
+      fsm = this._createFSM(agent, epoch);
       this._connections.set(agent, fsm);
       fsm.connect(this._localStream ?? undefined);
       this._emitManagerEvent({
@@ -172,7 +182,7 @@ export class ConnectionManager {
     if (state === 'closed') {
       // Closed FSM is terminal — destroy and replace with a fresh one
       fsm.destroy();
-      fsm = this._createFSM(agent);
+      fsm = this._createFSM(agent, epoch);
       this._connections.set(agent, fsm);
       fsm.connect(this._localStream ?? undefined);
       this._emitManagerEvent({
@@ -316,23 +326,76 @@ export class ConnectionManager {
 
     // Route SDP/ICE signals to FSM
     if (message.type === 'offer' || message.type === 'answer' || message.type === 'candidate') {
-      this._routeSignalToFSM(from, message.connectionId, message.type, message.data, message.peerSessionId);
+      this._routeSignalToFSM(from, message.connectionId, message.type, message.data, message.peerSessionId, message.epoch);
     }
   }
 
-  private async _routeSignalToFSM(from: string, remoteConnectionId: string, signalType: string, signal: any, remotePeerSessionId?: number): Promise<void> {
+  private async _routeSignalToFSM(from: string, remoteConnectionId: string, signalType: string, signal: any, remotePeerSessionId?: number, remoteEpoch?: number): Promise<void> {
     let fsm = this._connections.get(from);
 
-    // Replace FSMs that can't handle a new remote session's SDP.
-    // When the remote peer closed their window and re-opened, their new
-    // RTCPeerConnection generates offers with different m-line ordering.
-    // Our existing RTCPeerConnection will reject these with:
-    //   "The order of m-lines in subsequent offer doesn't match"
-    // Detect this via remoteConnectionId mismatch and replace the FSM.
-    // Renegotiation offers from the SAME remote session (e.g., adding a track)
-    // still go through Perfect Negotiation on the existing peer.
+    // ---- Epoch ordering (authoritative when in use) -------------------------
+    // The orchestrator allocates a monotonic per-peer connection generation
+    // ("epoch") that survives FSM teardown+recreate — the property the per-FSM
+    // `peerSessionId` lacks (it resets to 0 on every new FSM). When both the
+    // incoming signal and the current FSM carry an epoch, it is the single
+    // source of truth for "which attempt is current":
+    //   • lower epoch  → a signal from a dead, superseded attempt → drop
+    //   • higher epoch → the peer re-initiated → supersede our FSM
+    //   • equal epoch  → the current attempt → handle normally, and DELIBERATELY
+    //     skip the connectionId-equality filter below (each side's connectionId
+    //     is independently random, so a live answer/candidate would otherwise be
+    //     dropped — the exact deadlock that motivated this; see
+    //     docs/WEBRTC_RECONNECT_IDENTITY.md).
+    const epochInUse = fsm != null && remoteEpoch != null && fsm.epoch != null;
+    if (epochInUse) {
+      const localEpoch = fsm!.epoch!;
+      if (remoteEpoch! < localEpoch) {
+        this._onTransition?.({
+          timestamp: Date.now(),
+          connectionId: fsm!.connectionId,
+          remoteAgent: from,
+          fromState: fsm!.state,
+          toState: fsm!.state,
+          trigger: `Dropped stale ${signalType}: epoch ${remoteEpoch} < current ${localEpoch}`,
+          peerSessionId: fsm!.peerSessionId,
+        });
+        return;
+      }
+      if (remoteEpoch! > localEpoch) {
+        if (signalType === 'offer') {
+          // Peer re-initiated at a newer generation — replace our FSM and
+          // adopt the new epoch (recreated below from `remoteEpoch`).
+          fsm!.destroy();
+          this._connections.delete(from);
+          fsm = undefined;
+        } else {
+          // Newer generation but not an offer: our orchestrator hasn't created
+          // the matching FSM yet. Drop and wait for it to catch up (a fresh
+          // offer at this epoch, or ensureConnection, will establish it).
+          this._onTransition?.({
+            timestamp: Date.now(),
+            connectionId: fsm!.connectionId,
+            remoteAgent: from,
+            fromState: fsm!.state,
+            toState: fsm!.state,
+            trigger: `Deferred ${signalType}: epoch ${remoteEpoch} > current ${localEpoch} (awaiting local epoch)`,
+            peerSessionId: fsm!.peerSessionId,
+          });
+          return;
+        }
+      }
+    }
+
+    // Replace FSMs that can't handle a new remote session's SDP (legacy path,
+    // and the closed-FSM case). When the remote peer closed their window and
+    // re-opened, their new RTCPeerConnection generates offers with different
+    // m-line ordering; our existing RTCPeerConnection rejects these with
+    // "The order of m-lines in subsequent offer doesn't match". Detect via
+    // remoteConnectionId mismatch and replace the FSM. Renegotiation offers from
+    // the SAME remote session (adding a track) still go through Perfect
+    // Negotiation on the existing peer.
     if (fsm) {
-      const isNewRemoteSession = signalType === 'offer' && remoteConnectionId &&
+      const isNewRemoteSession = !epochInUse && signalType === 'offer' && remoteConnectionId &&
         fsm.remoteConnectionId !== null && remoteConnectionId !== fsm.remoteConnectionId;
       if (fsm.state === 'closed' || isNewRemoteSession) {
         fsm.destroy();
@@ -342,8 +405,9 @@ export class ConnectionManager {
     }
 
     if (!fsm) {
-      // Remote agent is initiating — create FSM
-      fsm = this._createFSM(from);
+      // Remote agent is initiating — create FSM, seeding its epoch from the
+      // signal so both sides of one attempt share a generation.
+      fsm = this._createFSM(from, remoteEpoch);
       this._connections.set(from, fsm);
       this._emitManagerEvent({
         type: 'connection-created',
@@ -352,12 +416,13 @@ export class ConnectionManager {
       });
     }
 
-    // Connection-scoped signal filtering:
+    // Connection-scoped signal filtering (LEGACY path — epochs not in use):
     // Offers always pass — they establish or reset the remote session identity.
     // Answers and candidates must match either our connectionId (response to
     // our offer) or the remoteConnectionId (from the session we accepted).
-    // Stale signals from previous sessions are dropped.
-    if (signalType !== 'offer' && fsm.remoteConnectionId !== null) {
+    // Stale signals from previous sessions are dropped. With epochs in use this
+    // is superseded by the epoch ordering above and intentionally skipped.
+    if (!epochInUse && signalType !== 'offer' && fsm.remoteConnectionId !== null) {
       const matchesLocal = remoteConnectionId === fsm.connectionId;
       const matchesRemote = remoteConnectionId === fsm.remoteConnectionId;
       if (!matchesLocal && !matchesRemote) {
@@ -375,7 +440,7 @@ export class ConnectionManager {
       }
     }
 
-    await fsm.handleRemoteSignal(signal, remoteConnectionId, remotePeerSessionId);
+    await fsm.handleRemoteSignal(signal, remoteConnectionId, remotePeerSessionId, remoteEpoch);
     this._notifyViewModelChange();
   }
 
@@ -383,7 +448,7 @@ export class ConnectionManager {
   // Private: FSM factory
   // ---------------------------------------------------------------------------
 
-  private _createFSM(remoteAgent: string): PeerConnectionFSM {
+  private _createFSM(remoteAgent: string, epoch?: number): PeerConnectionFSM {
     // Polite peer = lower agent ID (alphabetically)
     const polite = this._myAgentId < remoteAgent;
 
@@ -392,6 +457,7 @@ export class ConnectionManager {
     const fsm = new PeerConnectionFSM({
       remoteAgent,
       connectionId,
+      epoch,
       polite,
       config: this._config,
       sdpExchangeTimeoutMs: this._sdpTimeoutOverrides.get(remoteAgent),
@@ -410,6 +476,9 @@ export class ConnectionManager {
           type,
           connectionId,
           peerSessionId: fsm.peerSessionId,
+          // Stamp the connection generation so the peer can order this signal
+          // against teardown+recreate. Omitted when epochs are not in use.
+          ...(fsm.epoch != null ? { epoch: fsm.epoch } : {}),
           data,
         });
       },
