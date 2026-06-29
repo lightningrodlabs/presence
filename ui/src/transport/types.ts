@@ -63,6 +63,10 @@ export type OutgoingSignal = {
   data: unknown;
   /** Monotonic per-session counter for stale-signal filtering. FSM-only. */
   peerSessionId?: number;
+  /** Orchestrator-allocated connection generation; ordered across teardown+
+   *  recreate (unlike `peerSessionId`). FSM-only. See OutgoingSignal consumers
+   *  and docs/WEBRTC_RECONNECT_IDENTITY.md. */
+  epoch?: number;
 };
 
 /** Incoming signal — application received from remote, hands to transport. */
@@ -71,6 +75,8 @@ export type IncomingSignal = {
   connectionId: ConnectionId;
   data: unknown;
   peerSessionId?: number;
+  /** Orchestrator-allocated connection generation (see OutgoingSignal.epoch). */
+  epoch?: number;
 };
 
 /** Events emitted by the transport. All carry peer + connectionId for supersede-guards. */
@@ -148,6 +154,14 @@ export interface PeerTransport {
        * not model an SDP-exchange phase.
        */
       sdpExchangeTimeoutMs?: number;
+      /**
+       * Monotonic per-peer connection generation ("epoch"), allocated by the
+       * orchestrator so it survives FSM teardown+recreate. The FSM transport
+       * stamps it on outgoing signals and uses it for cross-attempt
+       * "newest-wins" ordering; transports that do not model it ignore it.
+       * See docs/WEBRTC_RECONNECT_IDENTITY.md.
+       */
+      epoch?: number;
     }
   ): ConnectionId;
 

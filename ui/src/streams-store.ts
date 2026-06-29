@@ -375,6 +375,7 @@ export class StreamsStore {
           JSON.stringify({
             connection_id: signal.connectionId,
             peer_session_id: signal.peerSessionId,
+            epoch: signal.epoch,
             data: signal.data,
           }),
         );
@@ -2843,6 +2844,26 @@ export class StreamsStore {
    * used to log the retry gap when a new InitRequest is created.
    */
   _lastDisconnectTime: Record<AgentPubKeyB64, number> = {};
+
+  /**
+   * Monotonic per-peer connection generation ("epoch"). Allocated by the
+   * initiator on each new connection attempt and passed into the FSM transport,
+   * which stamps it on outgoing signals and uses it for cross-attempt
+   * "newest-wins" ordering. Because it lives on the store (which outlives any
+   * FSM), it does NOT reset when an FSM is torn down and recreated — unlike the
+   * FSM's own `peerSessionId`, which resets to 0 per instance and so cannot
+   * order signals across a reconnect. Never reset for the session (a rejoining
+   * peer gets a strictly higher epoch, so in-flight stale signals stay older).
+   * See docs/WEBRTC_RECONNECT_IDENTITY.md.
+   */
+  private _connectionEpoch: Record<AgentPubKeyB64, number> = {};
+
+  /** Allocate the next connection epoch for `peer` (monotonic, per session). */
+  private _nextConnectionEpoch(peer: AgentPubKeyB64): number {
+    const next = (this._connectionEpoch[peer] ?? 0) + 1;
+    this._connectionEpoch[peer] = next;
+    return next;
+  }
 
   /**
    * Tracks the timestamp at which a video peer's iceConnectionState most
@@ -6105,11 +6126,19 @@ export class StreamsStore {
           // its own connectionId (the InitAccept connectionId is ignored
           // by FsmTransport); use the returned id as the source of truth
           // for openConnections tracking.
+          //
+          // Allocate a fresh, monotonic connection epoch for this attempt. The
+          // initiator is the single allocator; the acceptor adopts the epoch
+          // from the offer the FSM transport stamps it on. This is the ordered,
+          // shared identity that survives teardown+recreate and lets a stale
+          // signal from a prior attempt be dropped deterministically instead of
+          // deadlocking reconnect. See docs/WEBRTC_RECONNECT_IDENTITY.md.
           const transport = this._mediaTransportFor(pubKey64);
           const effectiveConnId = transport.ensureConnection(pubKey64, {
             initiator: true,
             connectionId: connection_id,
             sdpExchangeTimeoutMs: this._computeSdpTimeout(pubKey64),
+            epoch: this._nextConnectionEpoch(pubKey64),
           });
 
           this._openConnections.update(currentValue => {
@@ -6246,7 +6275,7 @@ export class StreamsStore {
    */
   handleSdpFsm(signal: Extract<RoomSignal, { type: 'Message' }>): void {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    let parsed: { connection_id: string; peer_session_id?: number; data: unknown };
+    let parsed: { connection_id: string; peer_session_id?: number; epoch?: number; data: unknown };
     try {
       parsed = JSON.parse(signal.payload);
     } catch (e) {
@@ -6265,6 +6294,7 @@ export class StreamsStore {
       from: pubkeyB64,
       connectionId: parsed.connection_id,
       peerSessionId: parsed.peer_session_id,
+      epoch: parsed.epoch,
       data: parsed.data,
     });
     // Log with the LOCAL FSM's connectionId so SdpData entries correlate

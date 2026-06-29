@@ -108,6 +108,7 @@ export class FsmTransport implements PeerTransport {
           to,
           connectionId: message.connectionId,
           peerSessionId: message.peerSessionId,
+          epoch: message.epoch,
           data: { type: message.type, payload: message.data } as FsmSignalEnvelope,
         });
       },
@@ -211,6 +212,7 @@ export class FsmTransport implements PeerTransport {
       initiator?: boolean;
       connectionId?: ConnectionId;
       sdpExchangeTimeoutMs?: number;
+      epoch?: number;
     }
   ): ConnectionId {
     if (this._destroyed) {
@@ -222,8 +224,13 @@ export class FsmTransport implements PeerTransport {
       trickleICE: this._getTrickleICE(),
       iceTransportPolicy: this._getIceTransportPolicy(),
     });
+    // `epoch` is the orchestrator-allocated connection generation: it survives
+    // FSM teardown+recreate (which resets the FSM's own peerSessionId to 0) and
+    // gives both peers an ordered, shared "which attempt is current" key. See
+    // docs/WEBRTC_RECONNECT_IDENTITY.md.
     this._manager.ensureConnection(peer, {
       sdpExchangeTimeoutMs: opts?.sdpExchangeTimeoutMs,
+      epoch: opts?.epoch,
     });
     const fsm = this._manager.getFSM(peer);
     return fsm?.connectionId ?? '';
@@ -341,6 +348,7 @@ export class FsmTransport implements PeerTransport {
       type: envelope.type,
       connectionId: signal.connectionId,
       peerSessionId: signal.peerSessionId,
+      epoch: signal.epoch,
       data: envelope.payload,
     };
     for (const handler of this._signalHandlers) {

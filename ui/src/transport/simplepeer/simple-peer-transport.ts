@@ -131,7 +131,10 @@ export class SimplePeerTransport implements PeerTransport {
 
   ensureConnection(
     peer: AgentPubKeyB64,
-    opts?: { initiator?: boolean; connectionId?: ConnectionId }
+    // `epoch` (orchestrator connection generation) and `sdpExchangeTimeoutMs`
+    // are accepted for interface parity with the FSM transport but not modelled
+    // here — simple-peer does not expose cross-attempt signal ordering.
+    opts?: { initiator?: boolean; connectionId?: ConnectionId; sdpExchangeTimeoutMs?: number; epoch?: number }
   ): ConnectionId {
     if (this._destroyed) {
       throw new Error('SimplePeerTransport: destroyed');
