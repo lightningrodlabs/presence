@@ -4240,7 +4240,14 @@ export class StreamsStore {
   handleModuleState(signal: Extract<RoomSignal, { type: 'Message' }>): void {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     try {
-      const envelope: ModuleStateEnvelope = JSON.parse(signal.payload);
+      // The surrounding try/catch stays: it protects the store updates and the
+      // two dispatch calls below, not just the parse.
+      const parsed = parseSignalPayload<ModuleStateEnvelope>(signal.payload);
+      if (!parsed.ok) {
+        console.warn(`Dropped ModuleState from ${pubkeyB64.slice(0, 8)}: ${parsed.error}`);
+        return;
+      }
+      const envelope = parsed.value;
       const prev = get(this._peerModuleStates)[pubkeyB64]?.[envelope.moduleId] || null;
       this._peerModuleStates.update(all => {
         const updated = { ...all };
@@ -4265,11 +4272,24 @@ export class StreamsStore {
   handleModuleData(signal: Extract<RoomSignal, { type: 'Message' }>): void {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     try {
-      const { moduleId, chunk } = JSON.parse(signal.payload);
+      // The surrounding try/catch stays: `mod.onData` is arbitrary module code
+      // (voice decode, filmstrip decode) and can throw for reasons unrelated to
+      // the payload being well-formed.
+      // `chunk` stays `any`: it is module-defined payload handed straight to
+      // `onData`, whose signature differs per module. Narrowing it here would
+      // only move the cast.
+      const parsed = parseSignalPayload<{ moduleId: string; chunk: any }>(
+        signal.payload
+      );
+      if (!parsed.ok) {
+        console.warn(`Dropped ModuleData from ${pubkeyB64.slice(0, 8)}: ${parsed.error}`);
+        return;
+      }
+      const { moduleId, chunk } = parsed.value;
       const mod = getModule(moduleId);
       mod?.onData?.(pubkeyB64, chunk);
     } catch (e) {
-      console.warn('Failed to parse ModuleData payload:', e);
+      console.warn('ModuleData handler failed:', e);
     }
   }
 
@@ -5399,11 +5419,11 @@ export class StreamsStore {
     this._signalQueue.push(signal);
     if (this._processingSignal) return;
 
-    // `_processingSignal` is a latch, not a flag: `:5392` above turns every
-    // incoming signal into push-and-return while it is true. If it is ever left
-    // true the room goes permanently silent — pings, pongs, presence, SDP and
-    // module data all arrive on this path — with no error surfaced and no
-    // recovery short of a reload. Two guards keep that from happening:
+    // `_processingSignal` is a latch, not a flag: the early return at the top of
+    // this method turns every incoming signal into push-and-return while it is
+    // true. If it is ever left true the room goes permanently silent — pings,
+    // pongs, presence, SDP and module data all arrive on this path — with no
+    // error surfaced and no recovery short of a reload. Two guards prevent that:
     //
     //   `finally` — the latch is released even if the loop throws.
     //   per-signal `catch` — one bad signal drops itself, not the rest of the
@@ -5424,13 +5444,20 @@ export class StreamsStore {
         try {
           await this._processSignal(nextSignal);
         } catch (e) {
+          const label =
+            nextSignal.type === 'Message'
+              ? `Message/${nextSignal.msg_type}`
+              : nextSignal.type;
           this.logger.logCustomMessage(
-            `Dropped signal (${
-              nextSignal.type === 'Message'
-                ? `Message/${nextSignal.msg_type}`
-                : nextSignal.type
-            }): ${e instanceof Error ? e.message : String(e)}`
+            `Dropped signal (${label}): ${
+              e instanceof Error ? e.message : String(e)
+            }`
           );
+          // The log line above is what ships in a merged forensic log, and it
+          // is deliberately one line. But this catch also absorbs genuine
+          // handler bugs, and a message without a stack makes those very hard
+          // to locate. Keep the full error in devtools.
+          console.error(`Dropped signal (${label}):`, e);
         }
       }
     } finally {
@@ -5683,9 +5710,16 @@ export class StreamsStore {
     // Update their connection statuses and the list of known agents
     let metaDataExt: PongMetaData<PongMetaDataV1> | undefined;
     try {
-      const metaData: PongMetaData<PongMetaDataV1> = JSON.parse(
+      const parsedMeta = parseSignalPayload<PongMetaData<PongMetaDataV1>>(
         signal.payload
       );
+      if (!parsedMeta.ok) {
+        console.warn(
+          `Dropped PongUi meta from ${pubkeyB64.slice(0, 8)}: ${parsedMeta.error}`
+        );
+        return;
+      }
+      const metaData = parsedMeta.value;
       this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
       metaDataExt = metaData;
 
@@ -5815,7 +5849,13 @@ export class StreamsStore {
         }
       }
     } catch (e) {
-      console.warn('Failed to parse pong meta data.');
+      // Not a parse failure — the payload is validated and returned on above.
+      // This block spans the RTT stats, presence merge and module-state
+      // reconciliation, so the throw came from one of those.
+      console.warn(
+        `Pong handling failed for ${pubkeyB64.slice(0, 8)} (post-parse):`,
+        e
+      );
     }
 
     /**
@@ -6353,13 +6393,19 @@ export class StreamsStore {
    */
   handleSdpFsm(signal: Extract<RoomSignal, { type: 'Message' }>): void {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    let parsed: { connection_id: string; peer_session_id?: number; epoch?: number; data: unknown };
-    try {
-      parsed = JSON.parse(signal.payload);
-    } catch (e) {
-      console.warn(`SdpFsm parse error from ${pubkeyB64.slice(0, 8)}:`, e);
+    const parsedFsm = parseSignalPayload<{
+      connection_id: string;
+      peer_session_id?: number;
+      epoch?: number;
+      data: unknown;
+    }>(signal.payload);
+    if (!parsedFsm.ok) {
+      console.warn(
+        `Dropped SdpFsm from ${pubkeyB64.slice(0, 8)}: ${parsedFsm.error}`
+      );
       return;
     }
+    const parsed = parsedFsm.value;
     // Surface the sub-type so the FSM path is as readable in logs as
     // the simplepeer path (which records 'offer'/'answer'/'candidate').
     const data = parsed.data as { type?: string } | null;
@@ -6400,10 +6446,9 @@ export class StreamsStore {
     const { connection_id, data } = parsedPayload.value;
     console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, data);
 
-    // `data` is a second, nested JSON string carrying the SDP itself. It is
-    // parsed twice below — once for the log label, once for the value handed to
-    // the transport — so it gets its own guard rather than riding on the
-    // envelope's.
+    // `data` is a second, nested JSON string carrying the SDP itself, so it
+    // needs its own guard rather than riding on the envelope's — the envelope
+    // can be perfectly well-formed while its payload is not.
     const parsedSdpResult = parseSignalPayload<any>(data);
     if (!parsedSdpResult.ok) {
       this.logger.logCustomMessage(
@@ -6639,7 +6684,14 @@ export class StreamsStore {
     console.log(`#### GOT DiagnosticResponse from ${pubkeyB64.slice(0, 8)}`);
 
     try {
-      const snapshot: DiagnosticSnapshot = JSON.parse(signal.payload);
+      const parsedSnapshot = parseSignalPayload<DiagnosticSnapshot>(signal.payload);
+      if (!parsedSnapshot.ok) {
+        console.warn(
+          `Dropped DiagnosticResponse from ${pubkeyB64.slice(0, 8)}: ${parsedSnapshot.error}`
+        );
+        return;
+      }
+      const snapshot = parsedSnapshot.value;
       this._receivedDiagnosticLogs.update(current => ({ ...current, [pubkeyB64]: snapshot }));
       this._pendingDiagnosticRequests.update(curr => {
         const next = { ...curr };

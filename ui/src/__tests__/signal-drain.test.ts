@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { StreamsStore } from '../streams-store';
 
 /**
@@ -25,6 +25,24 @@ type Drain = {
   handleSignal: (s: unknown) => Promise<void>;
 };
 
+/**
+ * Build a `StreamsStore` that has never run its constructor, with only the
+ * members `handleSignal` touches.
+ *
+ * This is load-bearing and fragile in one specific way: it is valid only while
+ * the drain reads exactly these five members. If someone later has it read a
+ * field the real constructor initialises, that field is `undefined` here and
+ * the failure shows up as a confusing mid-test error rather than as "you added
+ * a dependency". If that happens, either stub the new member here or — better —
+ * take it as the signal that the drain should be extracted into a function that
+ * takes what it needs, the way `auto-flip-policy.ts` does.
+ *
+ *   _signalQueue      the queue being drained
+ *   _processingSignal the latch under test
+ *   signalDelayMs     the artificial-delay knob (0 disables the await)
+ *   logger            the sink for dropped-signal messages
+ *   _processSignal    the per-signal handler, stubbed to throw or record
+ */
 function makeDrain(processSignal: (s: unknown) => Promise<void>) {
   const logged: string[] = [];
   const store = Object.create(StreamsStore.prototype) as Drain;
@@ -40,6 +58,16 @@ const sig = (id: string) =>
   ({ type: 'Message', msg_type: 'PingUi', payload: id }) as unknown;
 
 describe('handleSignal drain', () => {
+  // The drain deliberately mirrors dropped signals to console.error so real
+  // handler bugs keep their stack. Silence it here so an expected drop doesn't
+  // look like a test failure in the output.
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('processes queued signals in order on the happy path', async () => {
     const seen: string[] = [];
     const { store } = makeDrain(async s => {
