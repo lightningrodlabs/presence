@@ -172,7 +172,13 @@ The FSM is the effective default: `myWebrtcImpl()` returns `'fsm'` (`:3653`), th
 
 Two defects found alongside:
 - `conversation.ts:73-76` says that when both sides set disagreeing per-peer overrides, `simplepeer` wins. The code returns `fsm` (`auto-flip-policy.ts:149-152`, confirmed by its own tests). The comment is wrong.
-- The backward-compatibility path is inert: a missing payload field maps to `'simplepeer'` (`conversation.ts:96`) so pre-FSM peers are "recognised as simplepeer clients", but the union rule resolves the link to `'fsm'` regardless — so we send `SdpFsm` to a peer listening for `SdpData` and the connection silently never forms.
+- **The backward-compatibility path is inert, and this is a live connectivity failure against every previously released version.** A missing payload field maps to `'simplepeer'` (`conversation.ts:96`) so pre-FSM peers are "recognised as simplepeer clients", but the union rule resolves the link to `'fsm'` regardless (`auto-flip-policy.ts:155`), so we send `SdpFsm` to a peer that has no handler for it.
+
+  The exposure is measurable. `SdpFsm` entered the wire on 2026-05-01 (`2d20e93`); **every release through v0.14.7 contains zero occurrences of it**, and only v0.14.8 has the handler. All of 0.14.0–0.14.7 are still listed in Moss's 0.14.x curation entry, plus 0.13.2 in the 0.13.x branch, and Moss users do not upgrade in lockstep.
+
+  The failure is **directional and deterministic per pair**, which is why it would read as flaky rather than broken. The peer with the higher pubkey initiates (`:5849`). If the v0.14.8 peer initiates, `_mediaTransportFor` picks the FSM, it sends `SdpFsm`, and the old client drops it — no connection, ever, for that pair. If the *old* peer initiates, it sends `SdpData`, and our acceptor path deliberately defers peer creation to `handleSdpData` (`:6043-6045`), which uses the SimplePeer transport — so that direction works. Roughly half of cross-version pairs fail, always the same half.
+
+  It compounds with §3.1(a): each failed FSM attempt still installs an `_openConnections` entry at `signaling`, which suppresses the signals carrier for that peer, so the affected pair gets no video *and* audio that cuts out on every retry cycle. Static trace, not observed at runtime — but it predicts exactly the "I can never connect to that one person" symptom.
 
 ### 3.9 `streams-store.ts` — the shape of the fragility
 
@@ -235,6 +241,22 @@ The May fix built a single source of truth; the render path never consulted it, 
 
 **And the shipped line ends mid-investigation.** The tip of `main-0.6`, `8eb07e5`, adds `FsmEstablishmentTimeline` instrumentation whose own comment points at "the flash investigation". Branch `fix/flash` is unmerged, its instrumentation doesn't compile (it imports an uncommitted file), and no fix commit follows anywhere. The last thing that happened on the line that ships to users was adding forensics for a question that was never answered.
 
+### 3.12 Found after this assessment was first written
+
+Four items surfaced during Phase 0 or while checking the plan for coverage gaps. The first is the most consequential and is a live carrier-correctness bug.
+
+**The per-peer stream repair fixes the wrong transport.** `reconcileVideoStreamState` (`streams-store.ts:4501`, called from `handlePongUi:5892`) is the recovery path for "this peer reports it cannot see our stream". Case 1 — peer sees no stream at all — re-adds every track with `this.mediaTransport.addTrack(track, this.mainStream)` at `:4528`. That is the bare **SimplePeer** transport, and `SimplePeerTransport.addTrack` iterates *its own* connection map (`simple-peer-transport.ts:235-245`). For a peer on the FSM — the default carrier — that map does not contain them, so the repair is a **silent no-op**. It still sets `_lastReconcileTime[pubkey]` and increments `_reconcileAttemptCount[pubkey]`, so the cooldown and the attempt budget are consumed as though the repair happened.
+
+The codebase already knows better in two places. `_allMediaTransports()` (`:610-614`) exists precisely for this, and its docstring says "calling both covers every peer regardless of which impl is selected." And Case 2 of the same recovery family, `_tryReplaceTrackRecovery` (`:4597`), deliberately drives the `RTCRtpSender` directly with the comment "Single-peer recovery … so we don't perturb other peers via the transport-wide replaceTrack fan-out." Two cases of one repair, written to two different standards, one carrier-correct and one not. Note the fix is a decision, not a one-liner: `_allMediaTransports()` restores correctness but keeps the broadcast fan-out, whereas matching Case 2's per-peer approach means going through the pc — the same abstraction gap that forced Case 2 around the interface in the first place.
+
+**The FSM treats ICE `closed` as benign.** `peer-connection-fsm.ts:1011-1013` lumps `'closed'` in with `'new'` and `'checking'` — "maintain the invariant by clearing any pending grace timer" — so an ICE transition to `closed` produces no state transition and the phase stays `connected`. If `pc.iceConnectionState` reaches `closed` without first passing through `failed`, the FSM is permanently wrong about itself, with the same downstream consequences as §3.1(c). Reachability is verified in code only; I have not observed it at runtime.
+
+**A dangling documentation reference.** `peer-connection-fsm.ts:12` says "See docs/webrtc-state-machine-plan.md". That file does not exist in any branch. It is the header comment of the 1,613-line core of the system, so it is the first thing a reader of that file is pointed at.
+
+**The Rust side has never been audited and has no tests at all.** Every audit so far covered TypeScript. `dnas/presence/zomes/` is roughly 1,500 lines, including 588 lines of *real* integrity validation (23 `ValidateCallbackResult::Valid` and 16 `::Invalid` returns — logic, not stubs) governing room info, attachments, and descendent rooms. `tests/` contains a tryorama harness — `package.json`, `tsconfig.json`, `vitest.config.ts` — and exactly one 3-line file, `tests/src/unzoom/unzoom/common.ts`, under a directory named for the app's predecessor. There are no zome tests, and root `npm test` still points at that empty harness. Validation logic is the one part of a Holochain app where a mistake is not merely a bug but a permanent, network-visible one.
+
+**Two things I checked that are *not* defects**, recorded so they don't get "fixed": `handleSdpData` hardcoding `this.mediaTransport` (`:6369`, `:6399`, `:6405`, `:6421`) is correct by construction, because `SdpData` and `SdpFsm` are distinct signal types dispatched to distinct handlers at `:5422-5426`, so that handler only ever sees SimplePeer traffic. And `disconnect()` (`:1988-1991`) destroys all four transports, not just SimplePeer.
+
 ---
 
 ## 4. What is solid
@@ -286,8 +308,10 @@ Adopt one invariant and enforce it with tests:
 3. Change `_signalsTargets` to key on *media flowing*, not entry existence.
 4. **Only then** apply the `handlePongUi` FSM guard from `279d533` — it is unsafe before step 1.
 5. Extract `decideStaleConnectionCleanup({hasExistingConn, iceState, disconnectedAt, now, graceMs}) → {action, reason}` from `:5816-5839`; the `iceState: undefined` row is the zombie case.
+6. **Fix cross-version interop (§3.8).** Half of all pairs with any peer on v0.14.7 or earlier cannot connect at all, and the same failure suppresses their signals audio on every retry. Either make the initiator honour the peer's advertised capability instead of the union rule, or keep the union rule and add an `SdpFsm`-unsupported fallback to `SdpData`. This is the only item in the plan that is currently breaking calls for real users, so it arguably outranks the rest of Phase 1.
+7. **Fix the per-peer stream repair (§3.12).** `reconcileVideoStreamState:4528` re-adds tracks to the SimplePeer transport for peers that are on the FSM, so the repair no-ops while still consuming the cooldown and attempt budget. Decide between `_allMediaTransports()` (correct, keeps the broadcast fan-out) and per-peer sender work matching `_tryReplaceTrackRecovery:4597` (correct and scoped, but goes around the interface again).
 
-Validate with the live multi-agent VPN-flap test; there is no unit coverage for streams-store and these paths cross it.
+Validate with the live multi-agent VPN-flap test; there is no unit coverage for streams-store and these paths cross it. Item 6 additionally needs a cross-version test: a v0.14.8 build against a v0.14.7 build, in both pubkey orderings.
 
 ### Phase 2 — One presence clock
 
@@ -329,13 +353,49 @@ Estimated 200–400 lines, concentrated in `streams-store.ts` §3243-3400 and §
 
 **Explicitly not recommended:** making signals conform to `PeerTransport`. That interface is track-and-connection shaped (`setLocalStream`, `addTrack`, `remote-stream` events); signals is frame-shaped and plays into an `AudioBufferSourceNode` directly. Conforming would mean fabricating `getPhase()` and `getConnectionId()` answers and adopting a Chromium-only API. Roughly 5× the work of Phase 4 for a smaller reduction in conditionals.
 
+### Phase 5 — Retire the forensics
+
+Not urgent, but it is 12.5% of `streams-store.ts` and it accumulates because nothing ever removes it.
+
+1. `logging.ts` declares 54 event types. Four are never emitted (one comment says so) yet still carry colour arms in `logs-graph.ts`; 19 are emitted with no render arm and are visible only by exporting JSON. Reconcile the three lists.
+2. The 900,000 ms default log window is one debugging session's constant, now permanent for the peer-to-peer log-shipping path.
+3. `ConnectionConfig.diagnostics` is double-dead: it defaults false, the app never sets it, and `streams-store.ts:5092` discards `DIAG:` output even if it were set. Either wire it or delete the six `_logDiag` sites.
+4. `TransitionRecorder` is exported from the package index and never constructed outside its own test.
+5. Decide the flash investigation: `fix/flash` is unmerged, its instrumentation does not compile because `ui/src/filmstrip-debug.ts` was never committed, and `8eb07e5` — the tip of the shipped line — is the forensics commit for a question nobody answered. Either finish it or remove the instrumentation, but do not leave the trunk ending mid-investigation.
+
+### Unscheduled — defects with no owning phase
+
+Found and verified, but no phase above claims them. Listed so they stop being rediscovered.
+
+| Defect | Where | Suggested owner |
+|---|---|---|
+| Auto-flip is built but inert — `_maybeAutoFlipImpl` returns early for any connected FSM peer | `streams-store.ts:3903` | **Decision, Phase 3.** If SimplePeer is deleted, the fsm→simplepeer escape is meaningless and the whole auto-flip machinery (19 lines, `decideAutoFlip`, 24 tests) goes with it. Re-arming it only makes sense if SimplePeer stays. |
+| `conversation.ts:73-76` documents `simplepeer` winning the override tiebreaker; the code returns `fsm` | `conversation.ts:73-76` | Phase 0 corrected the *documents*; this is a **code comment** and was missed. One-line fix. |
+| `_screenShareStreams` declared, read by `room-view.ts:782`, written nowhere — permanently `{}` | `streams-store.ts:3002` | Phase 3 (screen-share port). Determine whether the share design ever depended on it resolving, then wire or delete. |
+| `peer-connection-fsm.ts:12` points at `docs/webrtc-state-machine-plan.md`, which exists in no branch | `peer-connection-fsm.ts:12` | Phase 0 docs triage, missed because it is a code comment. |
+| `:6247` calls `Object.keys()` on a Svelte `Writable` without `get()` — the screen-share guard is dead and always true | `streams-store.ts:6247` | Phase 2b, as an isolated one-line PR once the teardown tests exist. |
+| `recreateDataChannel` and `restartIce` have zero callers outside their own tests | `fsm-transport.ts:259`, `:268` | Phase 4, with the rest of the interface cleanup. |
+| The synchronous-`_emit` invariant is what makes three divergent teardown cleanups correct; it spans a package boundary, is documented nowhere, and no test asserts it | `simple-peer-transport.ts:534-540` ↔ `streams-store.ts:1151` | Phase 2b. At minimum a test that fails if any transport defers its emit. |
+| The `try/catch` at `rtc-peer.ts:381-396` — the fix for the duplicate-answer `InvalidStateError`, the #1 documented production failure — has zero tests, because the mock cannot throw | `rtc-peer.ts:381-396` | Phase 0 addendum. Give `MockRTCPeerConnection` a mode that rejects `setRemoteDescription` in `stable`, then assert both the swallow and the rethrow. |
+| `ui/harness/*.spec.ts` runs in no gate, including `voice-playout.spec.ts` — the highest-fidelity test in the repo, with a negative control that reproduces the bug it fixed | `ui/harness/` | Phase 0 addendum. Even a nightly Playwright job beats never. |
+| `epoch` shipped in `c143cda`/`c81bcd7` *after* `22bfe50` released 0.3.0; `package.json` still reads 0.3.0 and neither `CHANGELOG.md` nor `README.md` mentions it | `packages/webrtc-peer` | Phase 0 addendum. The workspace version no longer identifies its source, and `ui`'s `^0.3.0` resolves to a modified local package. |
+| FSM treats ICE `closed` as benign, so the phase can stay `connected` on a dead pc | `peer-connection-fsm.ts:1011-1013` | Phase 1, alongside the `failed`/`idle` routing — same class of defect. |
+
+### Not audited at all
+
+Named so the absence is deliberate rather than accidental.
+
+- **The Rust side.** ~1,500 lines across `dnas/presence/zomes/`, including 588 lines of real integrity validation, with **zero tests** and no audit coverage. `tests/` is an empty tryorama harness whose only file lives under a directory named for the app's predecessor. Validation defects in a Holochain app are network-visible and effectively permanent, which makes this the highest-consequence unexamined area in the repo. It deserves its own phase, and the cheapest first step is a tryorama test that exercises each `Invalid` branch.
+- **Dependency health.** No audit ran. `simple-peer@9.11.1` is the notable one, and Phase 3 removes it.
+- **Resource hygiene beyond `_pendingInits`.** Blob-URL revocation, timer and listener cleanup on destroy, and the unbounded growth patterns nobody swept for systematically.
+
 ---
 
 ## 6. Working agreements for AI-assisted change
 
 The debt above was produced by a specific mechanism, and these are aimed at that mechanism rather than at AI in general.
 
-**Where these belong: `CLAUDE.md`.** It is currently three lines — communication style, commit hygiene, and `nix develop -c`. It says nothing about the architecture, the invariants, or which of the parallel models is authoritative. That is the whole story of how this happened: every session began with no information about what already existed, so each one added its model beside the last. The agreements below only bite if they are in the file every session reads, alongside a short statement of the four liveness predicates (§5 Phase 1–2) and the ownership rule that the library — not the store — drives transport recovery.
+**Where these belong: `CLAUDE.md`.** Until 2026-07-27 it was three lines — communication style, commit hygiene, and `nix develop -c` — and said nothing about the architecture, the invariants, or which of the parallel models was authoritative. That is the whole story of how this happened: every session began with no information about what already existed, so each one added its model beside the last. It now carries the agreements below, the branch fact, and a "true today" section held deliberately separate from a "target state" section, so that planned invariants are never read as current ones. Keep that separation; collapsing it would reproduce the exact defect this document describes.
 
 1. **Replace or declare.** Every change either names the existing mechanism it replaces, or states explicitly that it adds a parallel one and why. "Runs in parallel with X; X remains the source of truth" is the exact sentence that produced this assessment — it should require a justification, not pass unremarked.
 2. **No new threshold without a named predicate.** Six liveness clocks arrived one constant at a time, each locally reasonable. A new timeout must say which of the four predicates (present / reachable / media-flowing / carrier-active) it serves, and reuse that predicate's clock.
