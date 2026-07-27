@@ -53,7 +53,7 @@ Reconnection, packaging, and spec-correctness improvements over the initial
   (`{candidate: ''}`) on gathering completion (RFC 8838) so the remote can
   finalize its checklist promptly.
 - **Tiered consumption.** `@lightningrodlabs/webrtc-peer/core` exposes just the
-  `RTCPeer` wrapper (~550 lines); the FSM and manager tiers tree-shake out when
+  `RTCPeer` wrapper (~620 lines); the FSM and manager tiers tree-shake out when
   unused (`sideEffects: false`). See README "Footprint & tiers".
 - **Diagnostics gate.** `config.diagnostics` (default `false`) gates verbose
   `DIAG:` instrumentation; real connection events are always emitted. Failure

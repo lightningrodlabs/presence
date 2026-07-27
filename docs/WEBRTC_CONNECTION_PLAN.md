@@ -1,16 +1,19 @@
 # WebRTC connection lifecycle: situations, measured data, code gaps, and plan
 
-Status: **for review**. Scope: the WebRTC media transport for Presence — the
+Scope: the WebRTC media transport for Presence — the
 `@lightningrodlabs/webrtc-peer` FSM package, its `FsmTransport` adapter, and the
 `StreamsStore` carrier orchestration. Audio/video correctness on lossy and
 NAT‑constrained paths.
 
 This document maps (1) the full range of situations a WebRTC connection passes
-through, against (2) what our diagnostic captures actually measured, against (3)
-what the current code does, and proposes (4) what to change, why, and how —
-separating what has already landed from what is proposed.
+through, against (2) what our diagnostic captures measured in May–June 2026,
+against (3) how the code behaves today, and (4) what remains to be built.
 
-Anchors are file\:line into the repo at the time of writing.
+§1 is a reference model and does not go stale. §2 is a dated measurement and is
+labelled as such. §3 describes the code as it is; §5 describes behavior that is
+in force. §6 is the only forward‑looking section.
+
+Anchors are file\:line, re‑verified against `main-0.6` on 2026‑07‑27.
 
 ---
 
@@ -29,14 +32,16 @@ Anchors are file\:line into the repo at the time of writing.
   3. **Last‑mile uplink loss at one peer** (Puerto Rico / Liberty), asymmetric
      and physical — not fixable in code, only maskable (FEC, priority, rate).
      **(Platform FEC + priority in place — §5.C.)**
-- Already landed (committed this cycle): in‑place data‑channel recovery + on‑demand
+- In force today (§5): in‑place data‑channel recovery + on‑demand
   `restartIce`/`recreateDataChannel`; signals‑carrier RED redundancy; audio
-  priority + video cap; 12s DTLS‑stall default.
-- Proposed next, in this doc: **readiness tiering** (incl. building the DC
-  control‑message fallback that does **not** exist today — §6.1), **TURN** +
-  cheap ICE knobs, **carrier‑switch hysteresis**, and **app‑side join‑time
-  batching** to cut renegotiations — **not** package‑core reneg coalescing, which
-  was implemented and reverted this cycle as unsafe (§6.5).
+  priority + video cap; 12s DTLS‑stall default; **tiered readiness** (media
+  promotes on ICE+DTLS, the data channel is not a gate); **Cloudflare TURN
+  auto‑provisioning**; `iceCandidatePoolSize: 1`; the **establishment‑timeline**
+  record; a pure carrier‑switch decision function.
+- Still to build (§6): **app‑side join‑time batching** to cut renegotiations, and
+  the **data‑channel control‑message fallback** so mute/input indicators don't
+  desync while the channel is down. Package‑core reneg coalescing is a known dead
+  end — implemented and reverted as unsafe (§6.5).
 
 ---
 
@@ -141,7 +146,11 @@ application's own fallback path quality**.
 
 ---
 
-## 2. Measured data (our captures, mapped to §1)
+## 2. Measured data — captures from 2026‑05/06, mapped to §1
+
+These are the observations the §5 behavior was built to answer. They predate the
+TURN work, so every capture shows `relay=false`; re‑measure before drawing new
+conclusions from them.
 
 Two peers throughout: **local/NY** `uhCAkCNT` (FairPoint/Consolidated,
 216.227.63.114) and **remote/PR** `uhCAkctV` (Liberty Communications of Puerto
@@ -192,24 +201,42 @@ Rico, 24.138.197.51, Hatillo PR). Loss is receiver‑measured from
   [streams-store.ts:836,965](../ui/src/streams-store.ts)) and chooses impl
   (`simplepeer` vs `fsm`) via the auto‑flip policy
   ([streams-store.ts:496](../ui/src/streams-store.ts)).
-- **ICE config (§1.2).** `DEFAULT_ICE_SERVERS` is **STUN‑only** (Twilio,
-  Cloudflare, Google) ([types.ts:15](../packages/webrtc-peer/src/types.ts)).
-  TURN is a manual `localStorage('turnCredential')` field
-  ([presence-app.ts:970](../ui/src/presence-app.ts)) — empty in all captures
-  (`relay=false`).
-- **Composite readiness (§1.3–1.5).** `connected` requires **ICE + DTLS + data
-  channel open** ([peer-connection-fsm.ts:1117](../packages/webrtc-peer/src/peer-connection-fsm.ts)).
-  DTLS‑connected is **inferred** from `pc.connectionState === 'connected'` (the
-  `connect` event), not a DTLS‑specific signal (§1.3).
+- **ICE config (§1.2).** The static `DEFAULT_ICE_SERVERS` list is **STUN‑only**
+  (Twilio, Cloudflare, Google). Note there are **two independent copies** of this
+  array — [ui/src/transport/types.ts](../ui/src/transport/types.ts) and
+  [packages/webrtc-peer/src/types.ts](../packages/webrtc-peer/src/types.ts) — and
+  the package's `DEFAULT_CONFIG` falls back to its own. They are currently
+  byte‑identical, so a change to one alone would drift silently.
+  **TURN is provisioned automatically from Cloudflare**
+  ([cloudflare-turn.ts](../ui/src/cloudflare-turn.ts)); the manual
+  `localStorage('turnCredential')` field remains as an override
+  ([streams-store.ts:142](../ui/src/streams-store.ts)). The 2026‑05/06 captures
+  in §2 predate this and all show `relay=false`.
+- **Composite readiness (§1.3–1.5).** `connected` requires **ICE + DTLS only** —
+  the data channel is *not* a gate
+  ([peer-connection-fsm.ts:1172‑1174](../packages/webrtc-peer/src/peer-connection-fsm.ts)).
+  Media can flow the instant those two are up, which is the state the transition
+  trigger names: `'media readiness achieved (ICE + DTLS)'`. A data channel that
+  has not opened yet is handed to the watchdog
+  ([:1030](../packages/webrtc-peer/src/peer-connection-fsm.ts)) rather than
+  blocking the call. DTLS‑connected is **inferred** from
+  `pc.connectionState === 'connected'` (the `connect` event), not a DTLS‑specific
+  signal (§1.3).
 - **Trickle ICE.** On by default (`trickleICE: true`,
-  [types.ts:327](../packages/webrtc-peer/src/types.ts)); candidates are sent
+  [types.ts](../packages/webrtc-peer/src/types.ts)); candidates are sent
   incrementally and end‑of‑candidates is signaled — confirmed in captures.
-  `iceCandidatePoolSize` is **unset** (see §6.7).
+  `iceCandidatePoolSize` defaults to **1**
+  ([types.ts:398](../packages/webrtc-peer/src/types.ts)), so one candidate set is
+  pre‑gathered before the offer is built.
 - **Timers.** `connection-timeout` 7s (connecting); FSM `sdp-exchange-timeout`
   15s (signaling); **DTLS watchdog** (`dtlsStallTimeoutMs`, now 12s default,
   localStorage‑overridable); **data‑channel watchdog** (`dataChannelStallTimeoutMs`
   4s, recreate‑in‑place, bounded); `iceDisconnectedGraceMs` 15s; **app‑level 15s
-  SDP timeout** in StreamsStore ([streams-store.ts:5985](../ui/src/streams-store.ts)).
+  SDP timeout** in StreamsStore
+  ([streams-store.ts:6214‑6230](../ui/src/streams-store.ts)). That timer only
+  destroys a connection that is still in `SdpExchange` **and** whose entry reads
+  `!conn.connected`, so a transport that has reached ICE+DTLS is spared — the
+  composite‑readiness rule above is what makes that guard effective.
 - **Recovery (§1.7).** `reconnect-policy.ts`: first N attempts ICE‑restart, then
   full‑reconnect; `dtls-failed`/`data-channel-stall` force full‑reconnect.
   `RTCPeer.restartIce()` and `RTCPeer.recreateDataChannel()` exist; on‑demand
@@ -228,18 +255,18 @@ Rico, 24.138.197.51, Hatillo PR). Loss is receiver‑measured from
 | # | Situation (§1) | Current behavior | Gap / risk | Priority |
 |---|---|---|---|---|
 | G1 | DC stalls, ICE+DTLS up (§1.4) | **Now**: recreate in place, bounded, then escalate | Was: full teardown. **Landed.** | done |
-| G2 | DC slow but media flowing (§1.5) | `connected` still gated on DC | App/UX treat a usable call as "not connected"; 15s app timer can still fire | **High** |
-| G3 | Establishment on a degraded signaling path (§1.1) | 15s app SDP timeout **destroys** even when ICE+DTLS are up | Discards a forming/good transport; forces 26s rebuild | **High** |
-| G4 | Startup renegotiation flurry (§1.6) | Many real offers at join (browser already coalesces same‑tick events); serialize over slow relay | Blows establishment budget; fix app‑side (fewer mutations) + cheap ICE knobs — **not** package‑core coalescing (reverted once) | Medium |
-| G5 | Symmetric/CGNAT, srflx fails (§1.2) | STUN‑only; TURN manual & unused | No relay fallback ⇒ no connection (or stuck on signals) | **High (ops)** |
-| G6 | Bad carrier flapping (§1.1 vs §1.5) | Switch on quality buckets | Risk of thrash between webrtc/signals on borderline links | Medium |
+| G2 | DC slow but media flowing (§1.5) | **Now**: `connected` on ICE+DTLS; DC handled by its watchdog | Residual: mute/input indicators desync while the DC is down (§6.1) | partly done |
+| G3 | Establishment on a degraded signaling path (§1.1) | **Now**: the 15s app SDP timeout skips any entry reading `conn.connected` | Was: destroyed live transports. **Landed** via G2. | done |
+| G4 | Startup renegotiation flurry (§1.6) | Many real offers at join (browser already coalesces same‑tick events); serialize over slow relay | Blows establishment budget; fix app‑side (fewer mutations) — **not** package‑core coalescing (reverted once) | Medium |
+| G5 | Symmetric/CGNAT, srflx fails (§1.2) | **Now**: Cloudflare TURN auto‑provisioned, manual override retained | Confirm TURN/TLS‑TCP 443 and prove the relay path forms (§6.3) | mostly done |
+| G6 | Bad carrier flapping (§1.1 vs §1.5) | Pure `decideCarrierSwitch`; caller biases toward staying on webrtc while ICE+DTLS are up | Dwell is enforced in `decideAutoFlip`'s cooldown, not here — two places, one rule | mostly done |
 | G7 | Last‑mile uplink loss (§1.9) | FEC (platform) + priority + cap | Irreducible; current mitigations are the right ones | Maintain |
 | G8 | DTLS stall too eager (§1.3) | **Now** 12s, configurable | Was 5s. **Landed.** | done |
-| G9 | Observability | Rich FSM transition snapshots; per‑carrier quality | Hard to attribute "why off webrtc"; no single establishment timeline metric | Medium |
+| G9 | Observability | Per‑connection establishment timeline emitted on first `connected` | Residual: no explicit "left webrtc because X" on carrier downgrade (§6.6) | mostly done |
 
 ---
 
-## 5. What already landed (this cycle) — for completeness
+## 5. Behavior in force today
 
 - **A. In‑place data‑channel recovery (G1, G8).** `RTCPeer.recreateDataChannel()`
   + FSM data‑channel watchdog (recreate, bounded, escalate); DTLS‑stall default
@@ -253,113 +280,93 @@ Rico, 24.138.197.51, Hatillo PR). Loss is receiver‑measured from
   Wire‑compatible both directions.
 - **C. Media tuning (G7).** Audio high / video low `networkPriority` + video
   bitrate cap on connect.
+- **D. Tiered readiness (G2, G3).** `connected` means ICE+DTLS; the data channel
+  is a separate concern handled by its watchdog
+  ([peer-connection-fsm.ts:1172‑1174](../packages/webrtc-peer/src/peer-connection-fsm.ts)).
+  This also disarms G3: the app's 15s SDP timer skips any entry reading
+  `conn.connected`. **The one thing this trades away is still outstanding** — the
+  UI mute/input‑state messages ride the data channel with no fallback, so peer
+  mute indicators can desync while the channel is down. See §6.1.
+- **E. TURN (G5).** Credentials are provisioned from Cloudflare at runtime
+  ([cloudflare-turn.ts](../ui/src/cloudflare-turn.ts), tested in
+  [cloudflare-turn.test.ts](../ui/src/__tests__/cloudflare-turn.test.ts)); the
+  manual `localStorage` fields remain as an override. Symmetric/CGNAT peers now
+  have a relay path rather than being stuck on signals.
+- **F. Establishment timeline (G9).** The FSM emits one structured per‑stage
+  record when a connection first reaches `connected`
+  (`_emitEstablishmentTimeline`,
+  [peer-connection-fsm.ts:1180](../packages/webrtc-peer/src/peer-connection-fsm.ts)),
+  so "why were we off webrtc" is answerable without hand‑reading interleaved
+  transition logs.
+- **G. `iceCandidatePoolSize: 1`** ([types.ts:398](../packages/webrtc-peer/src/types.ts)) —
+  one candidate set is pre‑gathered before the offer is built.
+- **H. Carrier‑switch damping (G6), partially.** `decideCarrierSwitch`
+  ([auto-flip-policy.ts](../ui/src/transport/auto-flip-policy.ts)) is a pure,
+  table‑tested decision function with dwell, sustained‑bad and transport‑up rules.
+  **At its only call site only the transport‑up rule can fire**: `minDwellMs: 0`
+  and `consecutiveBad: 1` are passed deliberately, because the outage scan has
+  already waited out the sustained window and dwell is enforced by
+  `decideAutoFlip`'s cooldown instead
+  ([streams-store.ts:3890‑3903](../ui/src/streams-store.ts)). The net effect is a
+  bias toward staying on webrtc while ICE+DTLS are up. If you change either
+  caller, check that dwell is still enforced *somewhere* — it is currently the
+  cooldown, not this function.
 
 These addressed the largest share of churn (the DC‑gated teardown) and the worst
-signals‑carrier loss. The proposals below address the **remaining** gaps.
+signals‑carrier loss. §6 is what remains.
 
 ---
 
-## 6. Proposed changes (what / why / how) — for review
+## 6. What remains to be built
 
-Ordered by value‑to‑risk. Each is independently shippable and test‑first.
+Subsection numbers are stable anchors — other documents cite `§6.1`. Items whose
+work is done point at the §5 entry describing the resulting behavior instead of
+repeating the proposal.
 
-### 6.1 Tiered readiness — decouple media from the data channel (G2) — **recommended first**
-- **What.** Promote the FSM to `connected` on **ICE + DTLS** (media can flow);
-  expose data‑channel‑open as a separate signal/flag, not a gate. The DC
-  watchdog (already present) keeps recovering the channel in the background.
-- **Why.** Media is usable the instant ICE+DTLS are up — and **media/track
-  availability is driven by WebRTC `track` events** (`_setTrackReady`,
-  [streams-store.ts:1176‑1217](../ui/src/streams-store.ts)), **not** by the data
-  channel. That is the real, solid justification for decoupling. Gating the whole
-  call on the DC is what let a stuck channel read as "not connected" and invite
-  teardown. This also **subsumes G3's worst case**: once `conn.connected` is true
-  on media‑readiness, the app's 15s SDP timer's `!conn.connected` guard spares it.
-- **What the DC actually carries (corrected).** UI mute/input‑state sync —
-  `video-on/off`, `audio-on/off`, `change-{audio,video}-input`,
-  `request-track-refresh` ([streams-store.ts:1226‑1299, 2152‑2479](../ui/src/streams-store.ts)),
-  sent **only** over `transport.send()` (the DC). **There is no presence‑signal
-  fallback for these today** — `roomClient.sendMessage` only carries
-  `Sdp`/`SdpFsm`/`LeaveUi`/`DiagnosticRequest`. So with the DC down, **media flows
-  but peer mute/input indicators can desync** until the watchdog reopens the
-  channel.
-- **How (scope includes new work).**
-  1. In `_checkCompositeReadiness`, transition to `connected` on
-     `iceConnected && dtlsConnected`; emit a separate `data-channel-ready` when the
-     channel opens; keep `recreateDataChannel`/watchdog as the path to that.
-  2. **Build the missing fallback (or accept transient desync):** either route the
-     UI mute/input‑state messages over a presence‑signal path when the DC isn't
-     open, or explicitly accept that mute indicators may lag until DC recovery and
-     reconcile on `data-channel-ready`. This does not exist yet and is part of 6.1,
-     not an assumption.
-  3. Audit `transport.send()` call sites so DC‑dependent sends queue until
-     `data-channel-ready` rather than silently drop.
-  4. **Fix the status strings.** `_computeStatusText`
-     ([peer-connection-fsm.ts:1438‑1440](../packages/webrtc-peer/src/peer-connection-fsm.ts))
-     still encodes the DC‑gated model — `'Opening data channel...'` for the
-     ICE+DTLS‑up/DC‑pending state. Once that state is `connected` with media
-     flowing, that string reads wrong; update it (e.g. `Connected`, with an
-     optional subtle "restoring data channel" sub‑state) so the UI doesn't show
-     "opening data channel" over a live call.
-- **Risk.** Changes the meaning of `connected` (package contract); other consumers
-  must tolerate media‑ready‑without‑DC. Until the fallback (2) lands, expect
-  transient mute‑state desync windows during DC recovery — acceptable, but call it
-  out in the PR.
-- **Tests (first).** FSM reaches `connected` on ICE+DTLS with DC closed; a
-  `data-channel-ready` event fires only on DC open; `recreateDataChannel`
-  interplay unchanged. Two‑peer integration: media‑ready both sides without DC,
-  then DC opens.
+### 6.1 Data‑channel control‑message fallback (G2)
 
-### 6.2 Establishment‑timeout hardening (G3) — **contingent, do not pre‑build**
-> Only implement if a fresh capture **after 6.1** still shows a connection with
-> ICE+DTLS up being torn down. 6.1 removes the trigger (the timer's
-> `!conn.connected` guard passes once media‑readiness promotes), so this is most
-> likely dead code. Listed for completeness and as a fallback.
+The tiered‑readiness half of this item is **in force** — see §5.D. What was
+traded away to get it is still owed.
 
-- **What.** The app‑level 15s SDP timeout
-  ([streams-store.ts:5985](../ui/src/streams-store.ts)) must **not** destroy a
-  connection whose ICE+DTLS are connected; only abort genuinely stuck signaling
-  (still in `signaling`/no transport progress).
-- **Why.** Capture B destroyed a connection at `ice=connected dtls=connected`.
-  Even with 6.1, defense‑in‑depth: never discard a live transport on a signaling
-  timer.
-- **How.** Before `closeConnection`, consult the transport snapshot
-  (`getRTCPeerConnection(peer)` → `iceConnectionState`/DTLS, or the FSM phase);
-  if media transport is up, convert the timeout into "promote/keep + let DC
-  watchdog run" rather than destroy.
-- **Risk.** `StreamsStore` has **no unit‑test harness** today → limited TDD
-  surface; would rely on integration/manual validation or a new (non‑trivial)
-  harness. Lower priority if 6.1 lands, since 6.1 removes the trigger.
+- **The gap.** UI mute/input‑state sync — `video-on/off`, `audio-on/off`,
+  `change-{audio,video}-input`, `request-track-refresh`
+  ([streams-store.ts:1226‑1299, 2152‑2479](../ui/src/streams-store.ts)) — is sent
+  **only** over `transport.send()`, i.e. the data channel. `roomClient.sendMessage`
+  carries only `Sdp`/`SdpFsm`/`LeaveUi`/`DiagnosticRequest`, so there is no
+  fallback path. With media flowing but the channel down, **peer mute and input
+  indicators desync** until the watchdog reopens it.
+- **What to build.** Either route those messages over a presence‑signal path when
+  the channel isn't open, or reconcile explicitly on `data-channel-ready` and
+  accept a bounded lag. Also audit `transport.send()` call sites so DC‑dependent
+  sends queue rather than silently drop.
+- **Check while you are there.** `_computeStatusText`
+  ([peer-connection-fsm.ts](../packages/webrtc-peer/src/peer-connection-fsm.ts))
+  encodes the older DC‑gated model — it can report `'Opening data channel...'` for
+  a state that is now `connected` with media flowing. The string should say
+  `Connected`, with the channel state as a sub‑state at most.
 
-### 6.3 ICE candidate & TURN policy (G5) — **ops + small code**
-- **What.** Ship a working **TURN** server as a default ICE server, regionally
-  near PR (e.g. Miami/SJU), with short‑lived credentials. Provide **both** UDP
-  (`turn:…:3478`) and **TURN/TLS over TCP 443** (`turns:…:443?transport=tcp`) —
-  the latter survives lossy‑UDP paths and restrictive firewalls that only permit
-  443. Keep the manual override.
-- **Why.** Every capture is `relay=false`. Cone‑NAT peers hole‑punch today, but
-  symmetric/CGNAT peers have **no** media path and get stuck on signals. TURN is
-  also the only way to route around a lossy‑UDP path (TURN/TLS‑TCP) and gives a
-  real fallback far better than the gossip relay. TURN does **not** fix PR's
-  uplink loss (out of scope for TURN).
-- **How.** Credential provisioning service or static time‑boxed creds; inject via
-  the existing `iceServers` getter ([fsm-transport.ts:86‑94](../ui/src/transport/fsm/fsm-transport.ts)).
-  Add a diagnostic that logs selected‑pair `candidateType` (already partly
-  present: `ICE pair … relay=` in `_handleMediaConnected`).
-- **Risk.** Infra/cost/ops, not code stability. Validate relay path with a forced
-  `iceTransportPolicy: 'relay'` test build.
+### 6.2 Establishment‑timeout hardening (G3) — no work outstanding
 
-### 6.4 Carrier‑switch hysteresis (G6)
-- **What.** Add damping to the webrtc↔signals (and impl auto‑flip) decision:
-  require sustained quality (N consecutive buckets / a dwell time) before
-  switching; bias toward **staying on webrtc** while ICE/DTLS are up even if
-  quality dips; treat signals as control/degraded‑audio, not a co‑equal media
-  carrier.
-- **Why.** Borderline links can oscillate; each switch is an audio seam plus a
-  reconnect. The data shows webrtc at 80ms+3% is far better than signals at
-  600ms; we should be reluctant to leave webrtc.
-- **How.** Hysteresis state in the carrier‑selection path; unit‑test the
-  decision function (pure) with bucket sequences.
-- **Risk.** Low if the decision is isolated into a pure, tested function.
+6.1's readiness change removed the trigger, and the guard is in the code: the
+app's 15s SDP timer destroys a connection only when the entry reads
+`!conn.connected` (§3, Timers). A transport that has reached ICE+DTLS is spared.
+Reopen this only if a capture shows a live transport being torn down anyway.
+
+### 6.3 TURN (G5) — landed; the rest is ops
+
+Auto‑provisioning is in force (§5.E). Two things are worth confirming against the
+Cloudflare configuration rather than assuming: that a **TURN/TLS over TCP 443**
+(`turns:…:443?transport=tcp`) candidate is offered — it is what survives lossy‑UDP
+paths and 443‑only firewalls — and that the relay path actually forms, which is
+best proven with a forced `iceTransportPolicy: 'relay'` build. TURN does **not**
+address the PR uplink loss in §2; that is physical.
+
+### 6.4 Carrier‑switch hysteresis (G6) — landed as a decision function
+
+See §5.H. The pure function has dwell, sustained‑bad and transport‑up rules; the
+single caller currently exercises only transport‑up, with dwell delegated to
+`decideAutoFlip`'s cooldown. The remaining judgement call is whether dwell belongs
+in one place rather than two.
 
 ### 6.5 Reduce join‑time renegotiations (G4) — **app‑side batching is the primary path**
 - **What.** Cut the number of *distinct* renegotiations at join. The browser
@@ -399,105 +406,100 @@ Ordered by value‑to‑risk. Each is independently shippable and test‑first.
   negotiation timing is load‑bearing; gate strictly behind the integration tests
   above.
 
-### 6.6 Observability (G9)
-- **What.** A single per‑connection "establishment timeline" event (signaling
-  start → ICE connected → DTLS connected → DC open → connected, with per‑stage
-  ms and the selected candidate types) and an explicit "left webrtc because X"
-  reason on every `CarrierSwitch fsm→signals`.
-- **Why.** Today attribution requires hand‑reading interleaved transitions across
-  two logs. A timeline makes regressions/wins measurable and is the acceptance
-  signal for 6.1–6.5.
-- **How.** Aggregate existing `FsmTransition`/`IceEstablishment`/`CarrierSwitch`
-  into one structured record; emit on connect and on every carrier downgrade.
-- **Risk.** Low (additive logging).
+### 6.6 Observability (G9) — landed
 
-### 6.7 Cheap ICE establishment knobs (G4, supporting) — **near‑zero risk**
-- **What.** Two standard knobs that directly serve "shrink the establishment
-  window," independent of the riskier 6.5:
-  1. **`iceCandidatePoolSize`** (currently unset): pre‑gather candidates so they're
-     ready at offer time, shaving gathering latency off establishment.
-  2. **Confirm trickle ICE** stays on (it is, §3) and end‑of‑candidates is handled —
-     i.e. we never accidentally block on full gathering, which would inflate
-     latency on a slow signaling path. The captures show trickle behavior; this is
-     a guard/regression‑test, not a change.
-- **How.** Set `iceCandidatePoolSize` in the `RTCConfiguration` built in
-  [rtc-peer.ts:84‑89](../packages/webrtc-peer/src/rtc-peer.ts); add a test asserting
-  trickle (incremental candidate signals) and end‑of‑candidates.
-- **Risk.** Minimal; `iceCandidatePoolSize` only affects gathering eagerness.
+The per‑connection establishment‑timeline record is emitted on first `connected`
+(§5.F). The piece not yet built is the matching explicit "left webrtc because X"
+reason on every `CarrierSwitch fsm→signals`.
+
+### 6.7 Cheap ICE establishment knobs (G4, supporting) — landed
+
+`iceCandidatePoolSize` ships as 1 (§5.G) and trickle ICE is on with
+end‑of‑candidates signaled (§3). Both are covered by
+[rtc-peer.test.ts:103‑112](../packages/webrtc-peer/src/__tests__/rtc-peer.test.ts).
 
 ---
 
 ## 7. Sequencing & acceptance
 
-1. **6.6 Observability** first — so every later change is measurable.
-2. **6.1 Tiered readiness** (incl. the DC‑control‑message fallback, which does not
-   exist yet) — highest value, removes G2 and the trigger for G3.
-3. **6.3 TURN** + **6.7 cheap ICE knobs** — parallel ops/low‑risk track; unblocks
-   NAT‑stuck peers (G5) and trims establishment latency.
-4. **6.4 Carrier hysteresis** — reduce flapping once readiness is correct.
-5. **6.5 app‑side join‑time batching** — reduce real renegotiations at join.
-6. **6.2 Establishment hardening** — only if a fresh capture still shows a live
-   transport torn down after 6.1.
-7. **Package‑core reneg coalescing** — only if 6.5 app‑side proves insufficient,
+Remaining work, in order:
+
+1. **6.1 DC control‑message fallback** — the outstanding half of tiered readiness,
+   and the only item with a user‑visible symptom today (mute indicators desync).
+2. **6.5 app‑side join‑time batching** — reduce real renegotiations at join.
+3. **6.3 TURN/TLS‑TCP confirmation** — prove the relay path forms on a forced
+   `iceTransportPolicy: 'relay'` build.
+4. **6.6 carrier‑downgrade reason** — the "left webrtc because X" half of the
+   observability item.
+5. **Package‑core reneg coalescing** — only if 6.5 app‑side proves insufficient,
    and only behind the integration‑test gate (§6.5).
 
-**Acceptance (from real captures, via 6.6):** time‑to‑first‑clean‑webrtc at join
-< a few seconds on a healthy relay; **zero** teardowns of connections with
-ICE+DTLS up; no carrier oscillation on a stable link; relay path proven to form
-on a forced‑`relay` build. Steady‑state ~2–3% PR uplink loss is expected to
-remain (physical) and should be inaudible under FEC.
+**Acceptance, measured from the establishment timeline (§5.F):**
+time‑to‑first‑clean‑webrtc at join < a few seconds on a healthy relay; **zero**
+teardowns of connections with ICE+DTLS up; no carrier oscillation on a stable
+link; relay path proven to form on a forced‑`relay` build. Steady‑state ~2–3% PR
+uplink loss is expected to remain (physical) and should be inaudible under FEC.
 
 ---
 
-## 8. Open questions for review
+## 8. Open questions
 
-1. **`connected` contract + DC fallback (6.1):** OK to redefine package‑level
-   `connected` as media‑ready (ICE+DTLS), or gate behind a `requireDataChannel`
-   config flag for other consumers? **And** for the UI mute/input‑state messages
-   that today ride the DC with no fallback — build a presence‑signal fallback, or
-   accept transient mute‑indicator desync during DC recovery (reconciled on
-   `data-channel-ready`)? This is net‑new work, not an existing safety net.
-2. **TURN (6.3):** provisioning model — static time‑boxed creds vs a credential
-   service? Region(s)? Budget for relayed minutes?
-3. **Signals carrier role:** keep it as a degraded *media* fallback, or demote to
-   control‑only once TURN exists (so media is always webrtc‑or‑relayed)?
-4. **Reneg‑coalescing locus (6.5):** package negotiation core vs app‑side
-   batching of join‑time media operations — which blast radius is acceptable?
-5. **Multi‑channel:** any near‑term need for additional data channels (would make
+1. **DC fallback shape (6.1):** route the UI mute/input‑state messages over a
+   presence‑signal path when the channel is down, or reconcile on
+   `data-channel-ready` and accept a bounded desync window?
+2. **Signals carrier role:** keep it as a degraded *media* fallback, or demote it
+   to control‑only now that TURN exists (so media is always webrtc‑or‑relayed)?
+   This is the same question `MAINTAINABILITY_ASSESSMENT.md` §5 Phase 4 asks.
+3. **Reneg‑coalescing locus (6.5):** app‑side batching of join‑time media
+   operations is the chosen path; the package negotiation core stays untouched
+   unless batching proves insufficient.
+4. **Multi‑channel:** any near‑term need for additional data channels (would make
    readiness/recovery multi‑channel‑aware), or keep single‑channel?
+5. **Dwell location (6.4):** dwell lives in `decideAutoFlip`'s cooldown while
+   `decideCarrierSwitch` also has a dwell rule its caller disables. One of the two
+   should own it.
 
 ---
 
 ## 9. Implementation notes for a fresh context
 
-Operational facts a new agent needs (learned this cycle):
+Operational facts a new agent needs:
 
-- **Toolchain:** prefix every command with `nix develop -c` (e.g.
-  `nix develop -c npx vitest run`). UI typecheck: `nix develop -c npx tsc --noEmit -p ui/tsconfig.json`.
+- **The gate:** `nix develop -c npm run verify` from the repo root runs the
+  package tests, builds `packages/webrtc-peer`, runs the ui tests, then
+  typechecks both workspaces. **315 tests, all green, under 2 seconds.** Keep it
+  green — it is what CI runs on push and PR
+  ([.github/workflows/test.yaml](../.github/workflows/test.yaml)).
+- **Toolchain:** prefix commands with `nix develop -c`. Individual pieces are
+  `npm run test:unit` and `npm run typecheck`.
 - **Package ↔ UI wiring:** `packages/webrtc-peer` is symlinked into
-  `ui/node_modules/@lightningrodlabs/webrtc-peer`; the UI imports the built
-  `dist/` (no vite alias to `src`). After editing package `src`, rebuild:
-  `nix develop -c npm run build -w packages/webrtc-peer` (now also run
-  automatically by `npm run package` via `build:packages`). `dist/` is gitignored.
+  `node_modules/@lightningrodlabs/webrtc-peer`; the UI imports the built `dist/`
+  (no vite alias to `src`). **This ordering is load‑bearing** — after editing
+  package `src` you must rebuild (`npm run build:packages`) or the ui tests and
+  the ui typecheck resolve stale types. `verify` does this for you. `dist/` is
+  gitignored.
 - **Test harnesses (real, reusable — don't write tautological mocks):**
   `MockRTCPeerConnection` + `MockRTCDataChannel.simulateOpen()` and
-  `FakeSignalingChannel` in `packages/webrtc-peer/src/__tests__/test-helpers.ts`;
-  `createFSM`/`getConnectedFSM` patterns in `peer-connection-fsm.test.ts`;
-  the data‑channel recovery tests in `data-channel-recovery.test.ts` are the
-  template for FSM‑level work. Package tests use **global fake timers**
-  (`beforeEach(vi.useFakeTimers)`).
+  `FakeSignalingChannel` in `packages/webrtc-peer/src/__tests__/test-helpers.ts`.
+  That is the **single** copy — the ui FSM tests import it across the workspace
+  boundary. `createFSM`/`getConnectedFSM` patterns live in
+  `peer-connection-fsm.test.ts`; the data‑channel recovery tests in
+  `data-channel-recovery.test.ts` are the template for FSM‑level work. Package
+  tests use **global fake timers** (`beforeEach(vi.useFakeTimers)`).
 - **Landmines:**
   - The **two‑peer integration suite is timing‑sensitive** — the reverted
     coalescing OOM'd it. Any change to negotiation/timer behavior must run the
     full package suite, not just unit tests.
-  - **`StreamsStore` has no unit‑test harness.** App‑side changes (6.1 fallback,
-    6.4 hysteresis, 6.5 batching) need either a new harness or integration/manual
-    validation; isolate logic into pure functions where possible (e.g. the
-    hysteresis decision) so it *can* be unit‑tested.
+  - **`MockRTCPeerConnection` cannot throw.** `setRemoteDescription` accepts
+    anything in any state, so no package test reproduces the duplicate‑answer
+    `InvalidStateError` that is the top documented production failure. A green
+    suite is not evidence against a field log.
+  - **`StreamsStore` cannot be instantiated under vitest** — `environment: 'node'`
+    and the constructor reads `window.sessionStorage`. Don't try to wrap it in
+    characterization tests; extract the decision as a pure function instead, the
+    way `auto-flip-policy.ts` does.
   - DTLS‑connected is inferred from `connectionState` (§1.3); there is no DTLS
     event to hook.
-- **Baseline:** package suite is **191 green** at the start of this work; keep it
-  green. Landed work is commits `bae088b` (webrtc‑peer) and `bc3063f` (ui).
 - **Method:** failing‑test‑first, then implement, then green — and for anything
   touching negotiation/timers, write the **two‑peer integration** test before the
   unit test.

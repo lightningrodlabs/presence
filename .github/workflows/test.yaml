@@ -1,0 +1,47 @@
+name: test
+
+# main-0.6 only. `main` is a dead lineage with no `packages/` workspace and no
+# verify/test:unit scripts, so this job would go red on every push to it — a
+# permanently failing gate teaches people to ignore gates. Add `main` back only
+# if it is ever revived with the scripts this workflow calls.
+on:
+  push:
+    branches: [main-0.6]
+  pull_request:
+    branches: [main-0.6]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `npm run verify` is pure Node — vitest and tsc, no holochain toolchain.
+      # It deliberately does not go through `nix develop`: the devshell supplies
+      # the Rust/holochain deps that `build:zomes` and `hc` need, none of which
+      # this job touches, and pulling it in would make the one gate that must
+      # always run the slowest and most fragile part of CI.
+      #
+      # Pinned exactly, not '20': flake.nix provides nodejs_20 (v20.20.0), and a
+      # floating '20' here would let CI and the devshell drift onto different
+      # minors. The lockfile makes dependency *resolution* identical, but the
+      # closure contains node-gyp modules (bufferutil, utf-8-validate) that build
+      # against the running node's ABI — so the node version is a real input, not
+      # a cosmetic one. Keep this in step with flake.nix.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+          cache: npm
+
+      # Two Electron binaries (29.4.6, 32.3.3) are in the closure via @theweave/cli
+      # and are downloaded by postinstall. This job never launches Electron, so
+      # skip them: ~200MB of network per run, and a flake source for a gate whose
+      # whole value is being fast and trustworthy.
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+      # Runs the package tests, builds packages/webrtc-peer (load-bearing: the
+      # ui tests and ui typecheck resolve @lightningrodlabs/webrtc-peer through
+      # its dist/), runs the ui tests, then typechecks both workspaces.
+      - run: npm run verify

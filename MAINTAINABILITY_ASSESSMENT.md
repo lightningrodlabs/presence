@@ -276,16 +276,39 @@ This matters as much as the debt, because it defines what not to disturb — and
 
 Sequenced so that each phase ends in a state that is *more* verifiable than it started, and so that no phase depends on the judgment of the phase after it. Phases 0 and 1 are worth doing even if nothing else ever happens.
 
-### Phase 0 — Restore the ability to verify (no behavior change)
+### Phase 0 — Restore the ability to verify (no behavior change) — **LANDED 2026-07-27**
 
-1. Add a root `test:unit` that runs the package tests, **then** `build:packages`, then the ui tests — the ordering is load-bearing: without the build, `fsm-transport.test.ts` fails to resolve `@lightningrodlabs/webrtc-peer`.
-2. Rename `.github/workflows/test.yaml.notinuse` and make it run that script on push and PR.
-3. Add `"typecheck": "tsc --noEmit"` to `ui/` and include it. Measure the error count before promising it will be green — `strict` has never run against these 25,000 lines.
-4. Delete the duplicated `ui/src/transport/fsm/__tests__/test-helpers.ts`; import the package's copy.
+Items 1–4 and 6 are done; item 5 is done except for the parts that require pushing to `origin` (see below).
+
+1. **Done.** Root `test:unit` runs the package tests, **then** `build:packages`, then the ui tests — the ordering is load-bearing: without the build, `fsm-transport.test.ts` fails to resolve `@lightningrodlabs/webrtc-peer`. `npm run verify` is the single gate: `test:unit` followed by `typecheck`.
+2. **Done.** `.github/workflows/test.yaml` runs `npm run verify` on push and PR to `main-0.6` and `main`. It uses `actions/setup-node@v4` rather than `nix develop`: `verify` is pure Node, and routing it through the holochain devshell would make the one gate that must always run the slowest part of CI.
+3. **Done, and it is green.** `ui/` has `"typecheck": "tsc --noEmit"`. **The measured error count at `strict: true` is zero** — but only once `packages/webrtc-peer` is built first. Against a stale `dist/` it reports 3 errors, all `epoch` missing from `SignalMessage`.
+4. **Done.** The duplicate is deleted; `ui/src/transport/fsm/__tests__/fsm-transport.test.ts` imports the package's copy across the workspace boundary. 315 tests still pass.
 5. **Settle which branch is trunk, and tag what actually shipped.** `main` is a dead end: since the split at `c589a6b` it has two commits, and `main-0.6` substantively contains both — `cc0ce47` is patch-equivalent to `67a01dd`, and `969d6a6` (118 lines, streams-store only) is the lesser half of `8b23a48` (391 lines, which added the same ICE grace in *both* layers on the same day). Nothing unique would be lost by retiring `main`. But `main` is where `HEAD` and `origin/HEAD` point and where the `v0.14.8` tag sits, so anyone who clones this repo — or any future AI session that reads files without checking the branch — is reading the wrong lineage, one ui version behind, with no `packages/`, no `test` script, and no FSM work. That is a trap worth removing before anything else in this plan. Then tag the commit that shipped, and fix the `FIXME` in the `hash` script.
-6. **Docs triage, one hour of work with a large payoff.** Add a status header to every file in `docs/` and every top-level plan. Mark `WEBRTC_CONNECTION_PLAN.md`, `CONNECTION_LIFECYCLE_PLAN.md`, `TRANSPORT_REFACTOR_PLAN.md`, `WEBRTC_PEER_SIZE_AUDIT.md`, and `LOW_BANDWIDTH_VIDEO_PLAN.md` as superseded or correct their §2–§3 "current state" sections; the five sound documents (`WEBRTC_PEER_CLAIM2…`, `SIGNALS_DOUBLE_AUDIO_INVESTIGATION`, `WEBRTC_CARRIER_ANALYSIS`, `ROADMAP`, and `packages/webrtc-peer/README.md`) can be marked active as they stand. This is the cheapest way to stop future sessions from reasoning off descriptions that stopped being true months ago.
 
-**Exit criterion:** one command runs 315 tests plus a typecheck, in CI, and you know its exit code without asking anyone.
+   **Partly done, and one premise above is wrong.** The `hash` script FIXME is fixed — it now reads the version from `ui/package.json`.
+
+   **`v0.14.8` has been repointed from `cc0ce47` to `7b86951` and force-pushed to `origin`.** The target is verified rather than inferred: the published release asset and `workdir/presence.webhapp` are byte-identical at sha256 `7fb64e01dee9…`, and `7b86951` (2026-06-15 15:00) was the only tip in the window before the 19:42 build — the next commit on any related branch is `cd05dde`, ten days later.
+
+   Two consequences of that move, both live:
+
+   - **It does not propagate.** `git fetch` will not update an existing local tag without `--force`. Anyone who fetched `v0.14.8` before 2026-07-27 still resolves it to `cc0ce47`. Collaborators need `git fetch --tags --force`; until they run it there are two answers in circulation.
+   - **The tag is not an ancestor of `main-0.6`** — `7b86951` is reachable only from `fix/flash`, and its tree differs from `8eb07e5` because the trunk re-applied the same forensics commit on top of `cd05dde`, `c143cda` and `c81bcd7`. So `git describe` and "is this fix in the release?" do not work against the trunk. **This is not a regression**: `cc0ce47` was on `main` and was not an ancestor of `main-0.6` either. No tag has ever been on the trunk, which is the same finding as §3.7 stated differently.
+
+   The alternative — leave `v0.14.8` at `cc0ce47` and record the truth in a never-published `shipped/v0.14.8` — rewrites no published history, but leaves the release tag pointing at code that was never built. That trade was decided in favour of correctness of the tag. Revisiting it means a second force-push, so it is not free either.
+
+   Still outstanding, and still requiring a decision: moving `origin/HEAD` off `main` and retiring `main`.
+
+6. **Docs triage.** **Done, by a different method than proposed here.** Status headers were rejected as pure bookkeeping: a header that records what a document *no longer* is costs tokens on every future read and changes nothing. Instead each document was corrected to state what is true, deleted where it was dead, or — where the history carries a warning — kept and reframed as one. What changed:
+
+   - `docs/WEBRTC_CONNECTION_PLAN.md` — §3's three false claims corrected against code (`connected` is ICE+DTLS, not ICE+DTLS+DC; `iceCandidatePoolSize` ships as 1; TURN is Cloudflare-auto-provisioned). §5 now describes behavior in force; §6 keeps its anchor numbering but carries only what remains to be built. §9's baseline updated to the 315-test gate.
+   - `docs/CONNECTION_LIFECYCLE_PLAN.md` — rewritten. Dead `transport/fsm/` paths fixed, the self-contradicting Phase 1C retraction removed, and the Phase 4B "duplicate connections are structurally impossible … all covered by passing tests" conclusion kept **as a warning**, since `c143cda` later proved it wrong. That is the specimen worth preserving.
+   - `TRANSPORT_REFACTOR_PLAN.md` — Phase 3 is now marked as built-but-inert, because `_maybeAutoFlipImpl` returns early for any connected FSM peer. The disagreement tiebreaker is documented as `fsm` wins, matching `auto-flip-policy.ts:149-152`.
+   - `docs/WEBRTC_PEER_SIZE_AUDIT.md` — every number in the footprint table was wrong; re-measured (3,695 source lines, not 3,144). The derived README/CHANGELOG "~550 lines" figures corrected to ~620.
+   - `LOW_BANDWIDTH_VIDEO_PLAN.md`, `MODULAR_AGENT_PANE.md`, `STREAM_NEXT_STEPS.md` — restated as what shipped, with their genuinely-open items separated out.
+   - `docs/WEBRTC_RECONNECT_IDENTITY.md` — records that the three `maxAttempts` prescriptions conflict and that Presence passes **no** `reconnectPolicy`, so it follows none of them.
+
+**Exit criterion — met.** `nix develop -c npm run verify` runs 315 tests plus a typecheck of both workspaces and exits 0, from a clean `dist/`; CI runs the same command on push and PR.
 
 ### Phase 0.5 — The three-line fix, immediately
 

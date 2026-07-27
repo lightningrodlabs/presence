@@ -8,24 +8,30 @@ and proposes switches so the library can scale down per use-case.
 
 ## Measured footprint (source only, excludes tests)
 
+Counted 2026-07-27 with `wc -l packages/webrtc-peer/src/*.ts`. Re-run that
+command rather than trusting this table if the numbers matter to a decision —
+the previous version of this table was ~550 lines under the real figure and
+every derived number in the document inherited the error.
+
 | File | Lines | Primary concern |
 |------|------:|-----------------|
-| `peer-connection-fsm.ts` | 1,441 | FSM lifecycle + reconnect orchestration + diagnostics + view-model |
-| `rtc-peer.ts` | 550 | **Core** Perfect-Negotiation wrapper (≈ the reviewer's 450-line equivalent) |
-| `connection-manager.ts` | 540 | Multi-peer (mesh) orchestration + signal routing + aggregate view-model |
-| `types.ts` | 390 | Types, defaults, transition table (mostly type-erased at runtime) |
+| `peer-connection-fsm.ts` | 1,613 | FSM lifecycle + reconnect orchestration + diagnostics + view-model |
+| `connection-manager.ts` | 647 | Multi-peer (mesh) orchestration + signal routing + aggregate view-model |
+| `rtc-peer.ts` | 622 | **Core** Perfect-Negotiation wrapper (≈ the reviewer's 450-line equivalent) |
+| `types.ts` | 499 | Types, defaults, transition table (mostly type-erased at runtime) |
+| `reconnect-policy.ts` | 117 | Resilience (pluggable backoff) |
 | `transition-recorder.ts` | 89 | Pure observability (opt-in ring buffer) |
-| `index.ts` | 75 | Exports |
-| `reconnect-policy.ts` | 59 | Resilience (pluggable backoff) |
-| **Total** | **3,144** | |
+| `index.ts` | 77 | Exports |
+| `core.ts` | 31 | Core-tier entrypoint (see Recommendations) |
+| **Total** | **3,695** | |
 
-Tests add a further 3,441 lines across `src/__tests__/` (not counted above).
+Tests add a further 4,124 lines across `src/__tests__/` (not counted above).
 
-## The 7× gap, explained
+## The 8× gap, explained
 
-The reviewer's ~450 lines map almost exactly onto `rtc-peer.ts` (550). The other
-~2,600 lines are **three optional layers the minimal implementation does not
-have**, each cleanly separable:
+The reviewer's ~450 lines map onto `rtc-peer.ts` (622). The other ~3,070 lines
+are **three optional layers the minimal implementation does not have**, each
+cleanly separable:
 
 1. **FSM lifecycle + resilience** (`peer-connection-fsm.ts`, `reconnect-policy.ts`)
 2. **Multi-peer mesh orchestration** (`connection-manager.ts`)
@@ -35,7 +41,12 @@ None of the three is load-bearing for a *single* working connection; all three
 exist because Presence is an N-way mesh with a live connection-health UI and a
 forensic trail requirement (see the Presence-pane / connection-lifecycle work).
 
-### Concern attribution within `peer-connection-fsm.ts` (1,441 lines, approximate)
+### Concern attribution within `peer-connection-fsm.ts` (approximate)
+
+The per-concern line counts below were taken when the file was 1,441 lines; it is
+**1,613** today. The proportions are still indicative, the absolute numbers are
+not — the ~170 lines of growth are mostly the tiered-readiness and
+establishment-timeline work.
 
 | Concern | ~Lines | Category | Needed for Presence? |
 |---------|------:|----------|----------------------|
@@ -72,43 +83,48 @@ is user-toggleable (`trickleICE` localStorage switch in the app), so it stays.
 
 ## Switch matrix — scaling down per use-case
 
-Each switch is independent and subtractive from the 3,144-line baseline.
+Each switch is independent and subtractive from the 3,695-line baseline.
 
 | Switch | What it removes | ~Lines saved | Default |
 |--------|-----------------|-------------:|---------|
-| **A. Diagnostics off** | `DIAG:` transition emissions + per-event ICE logging in FSM; don't import `TransitionRecorder` | ~210 | On for Presence (forensic trail) |
+| **A. Diagnostics off** | `DIAG:` transition emissions + per-event ICE logging in FSM; don't import `TransitionRecorder` | ~210 | Flag exists; **off** — see Recommendations |
 | **B. No view-model** | FSM + manager view-model computation/notify; `ConnectionViewModel` plumbing | ~230 | On for Presence (health UI) |
-| **C. 1:1 (no manager)** | Use `PeerConnectionFSM`/`RTCPeer` directly; drop `ConnectionManager` | ~540 | On for Presence (mesh) |
-| **D. Core only (no FSM)** | Use `RTCPeer` + a ~60-line reconnect loop; drop FSM + policy + manager + recorder | ~2,500 | — |
+| **C. 1:1 (no manager)** | Use `PeerConnectionFSM`/`RTCPeer` directly; drop `ConnectionManager` | ~647 | On for Presence (mesh) |
+| **D. Core only (no FSM)** | Import `@lightningrodlabs/webrtc-peer/core`; drop FSM + policy + manager + recorder | ~2,900 | — |
 | **E. Drop SFU roles** | Collapse `ConnectionRole` to `'mesh'` | ~10 | — |
 
 ### Realistic floors
 
-- **Current (mesh + observability):** ~3,144
-- **Mesh, diagnostics stripped (A):** ~2,930
-- **Mesh, headless — no diag, no view-model (A+B):** ~2,700
-- **1:1 with full FSM + reconnect + diag (C):** ~2,600
-- **1:1, lean (A+B+C):** ~2,300
-- **Core tier (D) — `RTCPeer` + minimal reconnect:** **~600–650**
+- **Current (mesh + observability):** ~3,695
+- **Mesh, diagnostics stripped (A):** ~3,485
+- **Mesh, headless — no diag, no view-model (A+B):** ~3,255
+- **1:1 with full FSM + reconnect + diag (C):** ~3,050
+- **1:1, lean (A+B+C):** ~2,610
+- **Core tier (D) — `RTCPeer` + its types + a minimal reconnect loop:** **~700–800**
 
-The core tier (~600) lands within range of the reviewer's ~450, confirming the
-gap is **entirely the three optional layers**, not bloat in the connection core.
-A consumer who wants the reviewer's experience can already use `RTCPeer`
-directly today; the FSM/manager/observability are opt-in by import.
+The core tier lands within range of the reviewer's ~450 once you discount the
+types module it shares, confirming the gap is **the three optional layers**, not
+bloat in the connection core. That tier is now a real entrypoint, not a claim:
+`@lightningrodlabs/webrtc-peer/core` exports `RTCPeer` and nothing else.
 
 ## Recommendations (ordered)
 
-1. **Make the tiers explicit and documented**, not just implicit in the export
-   surface. Three documented entrypoints — `RTCPeer` (core), `PeerConnectionFSM`
-   (single peer + resilience), `ConnectionManager` (mesh) — with a line-cost note
-   each, so an evaluator sees they aren't forced to take 3.1k to get a working
-   connection.
-2. **Gate diagnostics behind a flag** (switch A). The `DIAG:` emissions are the
-   highest-volume, lowest-value-per-line code for any consumer that isn't
-   debugging this library specifically. A `diagnostics?: boolean` on
-   `ConnectionConfig` (default off in the library, on in the Presence app) makes
-   ~210 lines disappear from the hot path without losing them.
-3. **Drop SFU role scaffolding** until an SFU actually exists (switch E).
+1. **Make the tiers explicit and documented** — **done.** `src/core.ts` is a real
+   entrypoint (`@lightningrodlabs/webrtc-peer/core`) exporting `RTCPeer` and the
+   types its API uses, and `README.md` documents the three tiers with a line cost
+   each. An evaluator can see they aren't forced to take 3.7k lines to get a
+   working connection.
+2. **Gate diagnostics behind a flag** (switch A) — **half done, and the half that
+   landed does nothing.** `ConnectionConfig.diagnostics` exists and defaults to
+   `false` (`types.ts:390`, `:407`). The Presence app never sets it, and
+   `streams-store.ts:5092` discards `DIAG:` output even if it were set. So the
+   flag is dead in both directions: the forensic trail this document assumed was
+   "on for Presence" is not being collected through this path. Either wire it up
+   or delete the flag and the emissions — do not leave it as a switch that
+   appears to work.
+3. **Drop SFU role scaffolding** until an SFU actually exists (switch E). Note
+   `TRANSPORT_REFACTOR_PLAN.md` Phase 6 still plans to use these roles, so this is
+   a genuine either/or, not a cleanup.
 4. **Fold the claim-4 fix in first** — it may shrink the failure-handling code
    rather than add to it.
 5. **Defer view-model extraction** (switch B). Presence depends on it; only worth

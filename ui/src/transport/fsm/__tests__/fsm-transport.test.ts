@@ -6,7 +6,7 @@ import {
   createMockTrack,
   createMockStream,
   waitFor,
-} from './test-helpers';
+} from '../../../../../packages/webrtc-peer/src/__tests__/test-helpers';
 
 const PEER_A = 'aaaa';
 const PEER_B = 'bbbb';

@@ -4,6 +4,7 @@
   "scripts": {
     "start": "vite --port $UI_PORT --clearScreen false",
     "build": "vite build",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "harness": "vite --port 5599 --strictPort --clearScreen false",

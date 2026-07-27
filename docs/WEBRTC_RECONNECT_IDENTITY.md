@@ -320,5 +320,23 @@ Per the README ownership contract: the **carrier orchestrator owns give‑up and
 timing; the FSM fails fast and yields.** Practically — one grace clock, low FSM
 `maxAttempts`, orchestrator drives re‑`InitRequest` with a fresh **epoch**, and
 no second recovery loop reaching into `pc.iceConnectionState`. Epoch is what lets
-the orchestrator's "this is a new attempt" intent be **legible to the FSM layer**,
-which today it is not.
+the orchestrator's "this is a new attempt" intent be legible to the FSM layer.
+
+The epoch itself landed in `c143cda` + `c81bcd7`. **The rest of this rule has
+not**, and the gap is worth stating plainly because three documents give three
+different prescriptions and the code follows none of them:
+
+- `reconnect-policy.ts` recommends `maxAttempts: Infinity` "for presence‑style
+  apps", with the higher layer closing the connection when the peer leaves.
+- `README.md` and §8 above recommend keeping `maxAttempts` **low** for
+  multi‑transport orchestrators, so WebRTC yields quickly to the fallback carrier.
+- **Presence passes no `reconnectPolicy` at all** — there is no `ReconnectPolicy`
+  anywhere in `ui/src`, so the FSM silently uses `DefaultReconnectPolicy`.
+
+Presence is both kinds of app, which is why the two library‑side notes disagree.
+For Presence the multi‑transport rule is the operative one: a persistent FSM
+fighting the carrier orchestrator starves the signals fallback. But the choice
+has to actually be *passed* to be real. Until it is, the second recovery loop in
+`streams-store.ts:5816` and the two independent 15s grace clocks are still
+running alongside the FSM's own — the exact anti‑pattern `README.md:224-225`
+names. See `MAINTAINABILITY_ASSESSMENT.md` §2 and §3.4.

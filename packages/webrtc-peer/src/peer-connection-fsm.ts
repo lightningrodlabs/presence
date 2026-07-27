@@ -9,7 +9,9 @@
  * - Layer 1 (ConnectionPhase): Application-level state, drives UI
  * - Layer 2 (TransportSnapshot): Mirrors browser WebRTC states, for debugging
  *
- * See docs/webrtc-state-machine-plan.md
+ * Which layer owns reconnection and give-up — this FSM or the caller — is the
+ * distinction most likely to be got wrong when embedding it. See "Reconnection"
+ * and "Ownership: who drives recovery" in README.md.
  */
 
 import { RTCPeer } from './rtc-peer.js';

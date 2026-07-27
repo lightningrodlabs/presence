@@ -1,8 +1,10 @@
 # Plan: Generalized Module System for Agent Panes
 
-## Status: In Progress
+The module system is built and shipping. Panes are decoupled from WebRTC (driven by `_activeAgents`), video is a proper activated module, the sharing panel is generalized, and the share-type modules — WAL, screen-share, and countdown timer — all exist under `ui/src/room/modules/`.
 
-Core module system is implemented. Panes decoupled from WebRTC (driven by `_activeAgents`). Video is a proper activated module. Share-type modules implemented: WAL, screen-share, and countdown timer. Sharing panel is generalized.
+The "Share-type Module Abstraction" section below is the design that produced them, kept for its rationale; its four implementation phases all landed. The genuinely open items are the two at the end of this document, plus one defect worth knowing about before you touch the share path:
+
+> **`_screenShareStreams` is permanently empty.** It is declared at `ui/src/streams-store.ts:3002` and read at `ui/src/room/room-view.ts:782`, but **nothing ever writes to it**. The design below has screen share's `renderShare` resolving its stream from that record at render time — that resolution cannot work. Whatever currently puts a screen share on screen is doing it by another route; find that route before extending this one.
 
 ## What's Built
 
@@ -35,7 +37,7 @@ Core module system is implemented. Panes decoupled from WebRTC (driven by `_acti
 - **Full reconnect** (universal chrome, next to avatar): `disconnectFromPeerVideo()` -- destroys WebRTC peer, auto-recovers via next ping/pong cycle. Always visible when connected.
 - **Reset media** (video module icon strip): `refreshTracksForPeer()` -- refreshes tracks without tearing down WebRTC. Visible when video is degraded.
 
-## Remaining Work
+## The share-type module design (built)
 
 ### Plan: Share-type Module Abstraction
 
@@ -151,9 +153,13 @@ New room-view machinery:
 - **Phase 4**: full screen share flow — start, peers see, audio toggle, late-joiner, stop, peers stop
 - **Phase 5**: room-view.ts shrinks meaningfully; no regressions in any of the three share types
 
-### Completed: Pane Existence Decoupled from WebRTC
+## Still open
 
-Panes now render from `_activeAgents` (derived from `_knownAgents`, filtered by pong recency within `3 * PING_INTERVAL`). Key changes:
+The two items below are the outstanding work in this document. Note that the pane-survival question the first section settled has been revisited twice since — `isPeerMediaLive()` (`80940ca`) and `_visiblePeers()` (`cd05dde`) both re-fixed the same symptom in other layers, and the three do not agree. See `MAINTAINABILITY_ASSESSMENT.md` §3.11 before adding a fourth.
+
+### How pane existence was decoupled from WebRTC
+
+Panes render from `_activeAgents` (derived from `_knownAgents`, filtered by pong recency within `3 * PING_INTERVAL`). Key changes:
 - Pane identity is `pubkeyB64` (not `connectionId`) -- Lit reuses DOM nodes across WebRTC reconnects
 - Video is a proper activated module with `renderReplace` handling all connection states (no conn, connecting, connected)
 - WebRTC initiation gated on video module being active in `_myModuleStates`

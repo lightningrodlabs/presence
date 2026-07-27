@@ -71,11 +71,14 @@ export interface ConversationPayload {
   /** Per-peer impl override. Each entry pins the impl for that one link
    *  regardless of global `webrtcImpl`. Symmetric union: if both sides
    *  set an override for the same link and the values disagree,
-   *  `'simplepeer'` wins (the more conservative default — broader
-   *  browser compatibility, less reconnect machinery). Used both by the
-   *  developer per-peer toggle and by the Phase 3 automated failure
-   *  toggle, which flips a peer's override when an `AudibilityOutage`
-   *  fires on the current impl. */
+   *  **`'fsm'` wins** (`auto-flip-policy.ts:149-152`, asserted by its own
+   *  tests). Note the consequence: a peer cannot unilaterally pin a link
+   *  back to simplepeer, so the automated toggle below cannot use an
+   *  override to escape a failing FSM link on its own.
+   *
+   *  Used both by the developer per-peer toggle and by the Phase 3
+   *  automated failure toggle, which flips a peer's override when an
+   *  `AudibilityOutage` fires on the current impl. */
   peerImpl: Record<AgentPubKeyB64, WebrtcImpl>;
 }
 

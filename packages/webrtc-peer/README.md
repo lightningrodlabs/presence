@@ -75,9 +75,9 @@ tree-shakes away (`"sideEffects": false`, ESM):
 
 | Import | You get | Approx. source |
 |--------|---------|---------------|
-| `@lightningrodlabs/webrtc-peer/core` | `RTCPeer` — Perfect-Negotiation wrapper only; bring your own state/retry | ~550 lines |
-| `@lightningrodlabs/webrtc-peer` → `PeerConnectionFSM` | one peer + lifecycle FSM + reconnection | ~1.2k lines |
-| `@lightningrodlabs/webrtc-peer` → `ConnectionManager` | full multi-peer mesh + view models | full package |
+| `@lightningrodlabs/webrtc-peer/core` | `RTCPeer` — Perfect-Negotiation wrapper only; bring your own state/retry | ~620 lines |
+| `@lightningrodlabs/webrtc-peer` → `PeerConnectionFSM` | one peer + lifecycle FSM + reconnection | ~2.3k lines |
+| `@lightningrodlabs/webrtc-peer` → `ConnectionManager` | full multi-peer mesh + view models | ~3.7k lines |
 
 `RTCPeer` imports nothing but types; `PeerConnectionFSM` builds on it;
 `ConnectionManager` builds on that. So `import { RTCPeer }` does not pull in the

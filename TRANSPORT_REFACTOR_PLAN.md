@@ -1,7 +1,13 @@
 # Transport Refactor — Phased Plan
 
-Worktree: `../presence-transport-refactor`
-Branch: `transport-refactor` (based on `origin/main` at `c589a6b`, which includes the voice-over-signals merge + 0.14.7 bump)
+Phases 0–3 shipped and are on `main-0.6`; their entries below record what was
+built and are annotated where the code has since moved on. **Phases 4–7 (the
+subscription axis, relay forwarding, SFU, QUIC) are the live part of this
+document** — they are unbuilt and still describe the intended direction.
+
+Originally worked in the `../presence-transport-refactor` worktree on branch
+`transport-refactor`, cut from `origin/main` at `c589a6b`. That lineage is dead —
+`main-0.6` is the line that ships. See `CLAUDE.md`.
 
 ## Goals
 
@@ -30,7 +36,8 @@ From `feat/webrtc-state-machine`:
 - `connectionId` + monotonic `peerSessionId` for stale-signal filtering.
 - Pluggable `ReconnectPolicy` (ICE-restart for first 3 attempts, then full reconnect, quadratic backoff with jitter).
 - `dtlsStallTimeoutMs` watchdog acting on stall (not just logging).
-- Composite-readiness gating (ICE+DTLS+data-channel).
+- Composite-readiness gating. (Then ICE+DTLS+data-channel; **now ICE+DTLS only** —
+  the data channel is no longer a gate. See `docs/WEBRTC_CONNECTION_PLAN.md` §5.D.)
 - Per-connection `role: 'mesh' | 'sfu-upstream' | 'sfu-downstream' | 'sfu-relay'` scaffolding.
 - Two `ConnectionManager` instances coexisting (media on `Sdp`, screen-share on `ScreenSdp`) — pattern for adding more.
 
@@ -52,7 +59,7 @@ Each phase ships something usable on its own. Earlier phases deliberately don't 
 - [x] voice-over-signals merged to `main` (commit `3b219e7`); branch rebased onto `origin/main` (`c589a6b`).
 - [x] `npm install` complete (872 packages, 56s).
 - [x] Build baseline captured: zomes compile, happ packs, vitest infra runs.
-- [x] Test baseline finding: **no test files on `main`** — `tests/src/` contains only `unzoom/unzoom/common.ts`. Vitest reports "No test files found, exiting with code 1" (this is masked by the `| tail` pipe in `npm test`). Phase-1 verification cannot rely on a regression suite; will be manual smoke tests + optional new unit tests for the `PeerTransport` interface.
+- [x] Test baseline finding: **no test files in the `tests/` workspace** — it holds only `unzoom/unzoom/common.ts`, so vitest reports "No test files found, exiting with code 1" and root `npm test` runs zero tests. **Still true.** The unit suite that does exist lives in `ui/` and `packages/webrtc-peer/` and is run by `npm run verify` (315 tests + typecheck, in CI). The tryorama integration fixtures this phase envisaged under `tests/src/transport/` were never written.
 - [x] Reconciliation strategy with `feat/webrtc-state-machine`: cherry-pick the new files (`ui/src/connection/*` plus its 4 test files in `__tests__/` and `ui/vitest.config.ts`) rather than merge — the streams-store changes there will conflict heavily with main. The FSM lands as new files in Phase 2 and gets adapted to the Phase-1 interface.
 
 ---
@@ -96,10 +103,10 @@ State: `tsc --noEmit` clean. `npm test` passes 27/27 (existing transport unit te
 ## Phase 2 — FSM as second transport, manual per-peer selection (DONE)
 
 Landed:
-- [x] **FSM source cherry-picked** from `feat/webrtc-state-machine` into `ui/src/transport/fsm/*` — `connection-manager.ts`, `peer-connection-fsm.ts`, `rtc-peer.ts`, `reconnect-policy.ts`, `holochain-signaling-adapter.ts`, `types.ts`, `index.ts`, plus the four `__tests__/` files. 149 FSM tests run alongside the 27 SimplePeer transport tests = 176 total green.
+- [x] **FSM source cherry-picked** from `feat/webrtc-state-machine` into `ui/src/transport/fsm/*` — `connection-manager.ts`, `peer-connection-fsm.ts`, `rtc-peer.ts`, `reconnect-policy.ts`, `holochain-signaling-adapter.ts`, `types.ts`, `index.ts`, plus the four `__tests__/` files. 149 FSM tests run alongside the 27 SimplePeer transport tests = 176 total green. (**The library has since moved** to `packages/webrtc-peer/src/` and is consumed as `@lightningrodlabs/webrtc-peer`; only the `FsmTransport` adapter remains under `ui/src/transport/fsm/`.)
 - [x] **`FsmTransport` wrapper** at `ui/src/transport/fsm/fsm-transport.ts` adapts `ConnectionManager` to the `PeerTransport` interface. Owns an inline `SignalingAdapter` that bridges to the application's `onOutgoingSignal` callback / `processIncomingSignal` entrypoint. Exposes the same `getRTCPeerConnection(peer)` escape hatch as `SimplePeerTransport` so streams-store ICE diagnostics, stats poll, and per-peer track recovery work uniformly.
 - [x] **Signaling channel separation**: SimplePeer continues over Holochain `Sdp` messages; FSM uses a new `SdpFsm` message type. `streams-store.handleSdpFsm` parses the FSM-shaped envelope (`{ connection_id, peer_session_id, data: { type, payload } }`) and forwards via `mediaTransportFsm.processIncomingSignal`. No zome change needed — `msg_type` is opaque to the backend.
-- [x] **Conversation payload extended** with `webrtcImpl: 'simplepeer' | 'fsm'` (default `'simplepeer'`) and `fsmWith: AgentPubKeyB64[]` for per-peer overrides. `parseConversationPayload` accepts older payloads that omit the fields.
+- [x] **Conversation payload extended** with `webrtcImpl: 'simplepeer' | 'fsm'` and `fsmWith: AgentPubKeyB64[]` for per-peer overrides. `parseConversationPayload` accepts older payloads that omit the fields. (The default was `'simplepeer'` here; **it is `'fsm'` today** — `conversation.ts:86`.)
 - [x] **Symmetric-union routing**: `streamsStore.webrtcImplFor(peerB64)` returns `'fsm'` if either side chose FSM (globally via `webrtcImpl` or per-peer via `fsmWith`). `_mediaTransportFor(peer)` selects the new-connection transport; `_activeMediaTransportFor(peer)` returns whichever transport currently hosts the live connection (used for sends, closes, and ICE peeks during a flip in flight).
 - [x] **`onModulePayloadChange` transport-swap**: when the effective `prefersFsm` flips, the existing media connection is torn down via `disconnectFromPeerVideo`. The next pong cycle re-establishes through the newly-selected transport.
 - [x] **UI toggle**: global "Use FSM transport (dev)" switch added to the connection-details settings panel next to "Disable all WebRTC". `streamsStore.setWebrtcImpl()` flips the conversation payload and tears down all media connections in one shot. (Per-peer `toggleFsmFor` helper is in place; per-peer UI surface is left for a later session — global toggle covers Phase 2's "manually selectable" exit criterion via the symmetric-union union with peer state.)
@@ -111,24 +118,44 @@ State: `tsc --noEmit` clean. `npm test` 176/176 green. `npm run build` clean. Ma
 
 ---
 
-## Phase 3 — Automated failure toggle (DONE)
+## Phase 3 — Automated failure toggle (built, but largely inert today)
+
+> **Read this before relying on auto-flip.** Everything below was built and its
+> tests pass. But `_maybeAutoFlipImpl` now returns early for any peer whose FSM
+> transport is up: the carrier-hysteresis check immediately above it
+> (`streams-store.ts:3890-3903`) returns `stay`/`transport-up`, and FSM is the
+> default carrier. So for the common case — a connected FSM peer — **the
+> automated flip described here does not fire.** The escape hatch is still
+> reachable manually via `setPeerImpl`. Nothing in the tests catches this,
+> because the policy functions are tested in isolation from the caller that
+> disarms them.
 
 Landed:
 - [x] **`peerImpl` map** replaces `fsmWith` in the conversation payload — `Record<AgentPubKeyB64, 'simplepeer' | 'fsm'>` so per-peer overrides can pin either direction. Backwards-compat parsing promotes legacy `fsmWith` entries to `peerImpl[peer] = 'fsm'` automatically.
-- [x] **Resolution rules** (`resolveWebrtcImpl` in `ui/src/transport/auto-flip-policy.ts`): both-side overrides agree → that value; both override and disagree → `'simplepeer'` wins (broader compat, less reconnect machinery, lets the auto-toggle pin a failing link unilaterally); one side overrides → that value; neither overrides → symmetric union of globals (FSM if either picks FSM).
+- [x] **Resolution rules** (`resolveWebrtcImpl` in `ui/src/transport/auto-flip-policy.ts`): both-side overrides agree → that value; **both override and disagree → `'fsm'` wins** (`auto-flip-policy.ts:149-152`, asserted by its own tests); one side overrides → that value; neither overrides → symmetric union of globals (FSM if either picks FSM).
+
+  The disagreement rule was originally specified as simplepeer-wins, for broader
+  compat and to let the auto-toggle pin a failing link unilaterally. **The code
+  does the opposite**, which means a peer cannot unilaterally pin a link back to
+  simplepeer. Note that `conversation.ts:73-76` still documents the old
+  simplepeer-wins rule and is wrong.
 - [x] **Auto-toggle hook**: `_checkAudibilityOutages` calls `_maybeAutoFlipImpl(peer)` at the same point it emits `AudibilityOutageStart`. The decision is gated by the pure `decideAutoFlip` policy in `auto-flip-policy.ts`:
    - already on signals → noop;
    - inside the per-peer cooldown window (60s) → noop;
    - flip count ≥ max attempts (3) → fallback (pin to signals via `disableWebrtcWith`);
    - otherwise → flip the impl (FSM ↔ simple-peer).
-- [x] **Anti-ping-pong**: `_lastAutoFlipMs` and `_autoFlipCount` per-peer maps on the store. Both sides observing the same outage at the same moment land on the same impl thanks to the simplepeer-wins tiebreaker; subsequent flips wait out the cooldown.
+- [x] **Anti-ping-pong**: `_lastAutoFlipMs` and `_autoFlipCount` per-peer maps on the store. Both sides observing the same outage at the same moment land on the same impl thanks to the deterministic tiebreaker (now fsm-wins, see above); subsequent flips wait out the cooldown.
 - [x] **Logs-graph**: new `WebrtcImplFlip` `SimpleEventType`. Manual flips log `prev->next; reason=manual`; auto-flips log `reason=auto-outage`; exhaustion logs `exhausted after N flips; pinning to signals`. `setPeerImpl(peer, impl, reason)` is the single entry point.
 - [x] **`onModulePayloadChange` reacts to remote flips**: reads my peerImpl for the peer alongside the prev/next conversation payload and recomputes effective impl on both sides via `webrtcImplForGiven`. Tears down the connection only when the effective impl actually changed, so a peer flipping their unrelated `peerImpl[other_agent]` field doesn't trigger spurious teardowns.
-- [x] **Tests**: 16 new pure-policy tests for `decideAutoFlip` and `resolveWebrtcImpl` (cooldown, max-flip, exhaustion, signals fallback, tiebreaker, override precedence). Total suite: **222/222** green.
+- [x] **Tests**: 16 new pure-policy tests for `decideAutoFlip` and `resolveWebrtcImpl` (cooldown, max-flip, exhaustion, signals fallback, tiebreaker, override precedence).
 
-State: `tsc --noEmit` clean. `npm run build` clean. The integration smoke test (induce a connection failure on one impl and watch the other take over within ~30–60s) is the remaining verification before Phase 4.
+State: the suite is **315 green** today across both workspaces; run it with
+`nix develop -c npm run verify`.
 
-**Exit**: induce a connection failure (e.g. block one transport's signaling), watch the other take over within a bounded window.
+**Exit criterion, still unmet**: induce a connection failure (e.g. block one
+transport's signaling) and watch the other take over within a bounded window.
+This was never run, and given the disarming described above it would currently
+fail for an FSM peer.
 
 ---
 
@@ -198,7 +225,7 @@ Tasks:
 
 ## Cross-cutting
 
-- **Tests**: each phase adds integration tests at the new boundary. Phase 1 verifies behavior parity. Phase 2 adds 2-peer FSM-vs-SimplePeer matrix. Phase 5/6 add 3-peer relay scenarios. Use the existing `tests/` infra and add fixtures under `tests/src/transport/`. Run with `nix develop -c`.
+- **Tests**: each phase adds integration tests at the new boundary. Phase 5/6 add 3-peer relay scenarios. Fixtures were meant to go under `tests/src/transport/` on the tryorama infra; **none were ever written**, and the `tests/` workspace still contains no test files. A phase that claims an integration exit criterion needs to actually add one — the unit suite (`npm run verify`) cannot prove relay behavior.
 - **Observability**: every phase verifies its events surface in logs-graph.
 - **Config knobs**: per-phase settings exposed in the developer settings panel (`webrtcImpl` override, relay capacity, carrier preference order).
 - **Decisions deferred until needed**: relay-selection policy starts dumb, gets smarter only when the dumb version visibly fails; identity-on-relay deferred to Phase 6 since signals/QUIC preserve identity natively.

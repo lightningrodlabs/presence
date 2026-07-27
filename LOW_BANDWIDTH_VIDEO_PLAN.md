@@ -1,9 +1,18 @@
 # Low-bandwidth video over Holochain signals
 
-Adds a video-as-tiny-clips fallback path that ships short looping animations
-over Holochain remote signals when WebRTC video is unavailable. Pairs with
-the existing voice-over-signals path so a degraded room still has both
-audio and (low-fps) video.
+Ships video as tiny JPEG filmstrips over Holochain remote signals when WebRTC
+video is unavailable, pairing with the voice-over-signals path so a degraded
+room has both audio and low-fps video.
+
+**This is built and shipping.** The design reasoning below — why filmstrips over
+GIF or WebCodecs, the bandwidth budget, the architectural mirror of `voice.ts` —
+is why the code looks the way it does, and is the part still worth reading.
+Steps 1–4 landed as `ui/src/room/modules/video-filmstrip.ts`,
+`filmstrip-worker.ts`, `ui/src/camera-source.ts` (the clean option, not the v1
+shortcut), `_reconcileSignalsVideo` in `streams-store.ts`, and
+`ui/src/room/elements/peer-filmstrip.ts`. Clip batching was later dropped in
+favour of per-frame sends, and a shared sender timebase plus A/V skew
+measurement was added alongside (`av-sync.ts`).
 
 ## References
 
@@ -125,8 +134,12 @@ Spike done; encoder picked. Module name updated to `video-filmstrip`
    payload has arrived within the last ~3 s. CSS
    `background-image` + `background-position-y` stepping animator
    (seatcamp pattern). After TTL, fall back to the static avatar.
-5. **Tests** — encode/decode roundtrip; size-cap enforcement; reconciler
-   activation under the `cameraOn × signalsTargets` matrix.
+5. **Tests** — **not done.** There are no tests for `video-filmstrip.ts`,
+   `filmstrip-worker.ts`, `camera-source.ts`, or `_reconcileSignalsVideo`. The
+   three originally scoped — encode/decode roundtrip, size-cap enforcement, and
+   reconciler activation over the `cameraOn × signalsTargets` matrix — are all
+   still owed. The `__tests__` directory next to the module covers only
+   `av-sync` and `voice-playout`.
 
 ## Risks and open questions
 
