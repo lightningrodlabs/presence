@@ -27,6 +27,20 @@ Documents in `docs/` are **not** reliable unless they carry a status header. 17 
 
 The plan in `MAINTAINABILITY_ASSESSMENT.md` §5 converges liveness onto four predicates with one authority each: **present**, **reachable**, **media-flowing**, **carrier-active**. Until a phase lands, do not write comments or docs asserting these as if they hold.
 
+## Where knowledge goes
+
+**Types > tests > this file > prose.** Push every invariant as far up that list as it will go. Anything that lands in prose is temporary and will rot silently — 17 assertions in this repo's documents were verified false while reading as current fact. The insights were right; the storage medium was wrong.
+
+## The unit of change
+
+Decisions go in pure functions: snapshot in, tagged union out, carrying a `reason`. Table-driven tests, no mocks. `ui/src/transport/auto-flip-policy.ts` is the template — copy its shape.
+
+- **Exhaustive `switch` over a union type**, so an unhandled case is a compile error rather than a silent drop. `_dispatchMediaEvent` dropping five of eight `ConnectionPhase` members is the bug this prevents.
+- **One authority per concept, one exported name.** A second implementation must delete the first. Adding a parallel path is the cheap wrong move and is how this codebase acquired 21 liveness sources.
+- **Every important mock needs a negative control** — a test that fails if the mock cannot reproduce the bug the mock exists to catch. `MockRTCPeerConnection` cannot throw, which is why the `InvalidStateError` fix in `rtc-peer.ts` has no coverage and would survive being inverted.
+- **Chase decision coverage, not line coverage.** The library sits at 90% and the orchestrator at 0%; every production bug has been in the orchestrator.
+- **An abstraction not used as a type annotation gets deleted, not kept.** `PeerTransport` looks like a constraint and imposes nothing.
+
 ## Working agreements
 
 1. **Replace or declare.** Every change either names the mechanism it replaces, or states explicitly that it adds a parallel one and why. "Runs in parallel with X; X remains the source of truth" is how this codebase acquired four parallel models — it requires a justification, not a passing mention.
