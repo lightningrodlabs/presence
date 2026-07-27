@@ -9,6 +9,7 @@ import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import { routeTransportPhase } from './transport/media-event-policy';
 import { computeSignalsTargets } from './transport/carrier-coverage';
+import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import {
   derived,
   get,
@@ -5600,19 +5601,24 @@ export class StreamsStore {
       // screen share connection immediately rather than waiting for
       // the next Pong cycle.
       if (this.screenShareStream) {
-        // Clean up stale outgoing connection if WebRTC state is dead.
-        // 'disconnected' is treated as recoverable for ICE_DISCONNECTED_GRACE_MS
-        // (see ICE_DISCONNECTED_GRACE_MS rationale).
+        // Clean up stale outgoing connection if WebRTC state is dead. Same
+        // predicate as the video path — see `stale-connection-policy.ts`.
+        // Screen share is SimplePeer-only, which owns no recovery of its
+        // own, so this supervisor stays in force for it.
         const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
         if (outgoing) {
           const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
           const iceState = pc?.iceConnectionState;
-          const disconnectedAt = this._screenShareIceDisconnectedAt[pubkeyB64];
-          const disconnectedExceededGrace =
-            iceState === 'disconnected' &&
-            !!disconnectedAt &&
-            Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
-          if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
+          const decision = decideStaleConnectionCleanup({
+            hasExistingConn: true,
+            slotClaimsConnected: !!outgoing.connected,
+            carrierOwnsRecovery: false,
+            iceState,
+            disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
+            now: Date.now(),
+            graceMs: ICE_DISCONNECTED_GRACE_MS,
+          });
+          if (decision.action === 'teardown') {
             this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
             this._screenShareConnectionsOutgoing.update(v => {
               delete v[pubkeyB64];
@@ -5912,29 +5918,29 @@ export class StreamsStore {
 
     // Clean up stale video connection if the underlying WebRTC is dead.
     // This allows the normal initiation flow to proceed for a re-joining peer.
-    //
-    // 'disconnected' is treated as recoverable for a grace period: WebRTC
-    // keeps probing the active candidate pair and may transition back to
-    // 'connected' if the path heals. Tearing down on the first 'disconnected'
-    // both aborts that recovery locally and (because the new InitRequest we
-    // would send next supersedes the peer's connection too) interrupts the
-    // peer's recovery as well, producing the symptom of "media flows
-    // briefly then suddenly reconnects" repeatedly. We only tear down on
-    // 'failed'/'closed' immediately; 'disconnected' must persist past
-    // ICE_DISCONNECTED_GRACE_MS.
+    // The predicate lives in `transport/stale-connection-policy.ts` — it is
+    // the same rule the two screen-share sites below apply, and it is where
+    // the grace-window and one-recovery-controller rationale is written down.
     const existingConn = get(this._openConnections)[pubkeyB64];
-    if (existingConn) {
+    {
       const activeTransport = this._activeMediaTransportFor(pubkeyB64);
-      const pc = activeTransport.getRTCPeerConnection(pubkeyB64);
+      const pc = existingConn
+        ? activeTransport.getRTCPeerConnection(pubkeyB64)
+        : undefined;
       const iceState = pc?.iceConnectionState;
-      const disconnectedAt = this._iceDisconnectedAt[pubkeyB64];
-      const disconnectedExceededGrace =
-        iceState === 'disconnected' &&
-        !!disconnectedAt &&
-        Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
-      if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
-        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
-        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState}`);
+      const decision = decideStaleConnectionCleanup({
+        hasExistingConn: !!existingConn,
+        slotClaimsConnected: !!existingConn?.connected,
+        // The FSM owns its own recovery. Tearing its pc down here races it.
+        carrierOwnsRecovery: activeTransport === this.mediaTransportFsm,
+        iceState,
+        disconnectedAt: this._iceDisconnectedAt[pubkeyB64],
+        now: Date.now(),
+        graceMs: ICE_DISCONNECTED_GRACE_MS,
+      });
+      if (existingConn && decision.action === 'teardown') {
+        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
+        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState} ${decision.reason}`);
         this.logger.logAgentEvent({
           agent: pubkeyB64,
           timestamp: Date.now(),
@@ -6038,15 +6044,18 @@ export class StreamsStore {
     if (outgoingScreenShare) {
       const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
       const iceState = pc?.iceConnectionState;
-      // 'disconnected' is treated as recoverable for ICE_DISCONNECTED_GRACE_MS
-      // (see ICE_DISCONNECTED_GRACE_MS rationale).
-      const disconnectedAt = this._screenShareIceDisconnectedAt[pubkeyB64];
-      const disconnectedExceededGrace =
-        iceState === 'disconnected' &&
-        !!disconnectedAt &&
-        Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
-      if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
-        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
+      // Same predicate as the video path — see `stale-connection-policy.ts`.
+      const decision = decideStaleConnectionCleanup({
+        hasExistingConn: true,
+        slotClaimsConnected: !!outgoingScreenShare.connected,
+        carrierOwnsRecovery: false,
+        iceState,
+        disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
+        now,
+        graceMs: ICE_DISCONNECTED_GRACE_MS,
+      });
+      if (decision.action === 'teardown') {
+        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
         this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
         this._screenShareConnectionsOutgoing.update(currentValue => {
           delete currentValue[pubkeyB64];
