@@ -7,6 +7,7 @@ import {
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
+import { routeTransportPhase } from './transport/media-event-policy';
 import {
   derived,
   get,
@@ -463,34 +464,55 @@ export class StreamsStore {
 
   private _dispatchMediaEvent(event: TransportEvent, impl: 'simplepeer' | 'fsm'): void {
     switch (event.type) {
-      case 'connection-state-change':
-        if (event.phase === 'signaling') {
-          this._startMediaIceMonitor(event.peer, event.connectionId, impl);
-          // FSM acceptor path: an incoming offer creates an FSM state without
-          // streams-store knowing in advance. Install the openConnections
-          // entry now so subsequent connect/stream events have a slot to
-          // mutate. SimplePeer-acceptor and initiator paths install the
-          // entry directly in handleSdpData / handleInitAccept; we don't
-          // overwrite an existing entry.
-          if (impl === 'fsm' && !get(this._openConnections)[event.peer]) {
-            this._openConnections.update(currentValue => {
-              currentValue[event.peer] = {
-                connectionId: event.connectionId,
-                video: false,
-                audio: false,
-                connected: false,
-                direction: 'duplex',
-              };
-              return currentValue;
-            });
-            this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
-          }
-        } else if (event.phase === 'connected') {
-          this._handleMediaConnected(event.peer, event.connectionId, impl);
-        } else if (event.phase === 'closed') {
-          this._handleMediaClosed(event.peer, event.connectionId, impl);
+      case 'connection-state-change': {
+        // Routing lives in `routeTransportPhase` (transport/media-event-policy.ts),
+        // whose switch is exhaustive over ConnectionPhase. This used to be an
+        // if/else-if over three of eight phases with no else; the five it
+        // dropped included `failed`, which is how a peer ended up with a
+        // `connected: true` slot over a destroyed pc — a rendered pane on a
+        // dead link plus permanent exclusion from `_signalsTargets`.
+        const route = routeTransportPhase({
+          phase: event.phase,
+          impl,
+          hasOpenConnection: !!get(this._openConnections)[event.peer],
+        });
+        switch (route.handler) {
+          case 'start-ice-monitor':
+            this._startMediaIceMonitor(event.peer, event.connectionId, impl);
+            if (route.installSlot) {
+              // FSM acceptor path: an incoming offer creates an FSM state
+              // without streams-store knowing in advance. Install the
+              // openConnections entry now so subsequent connect/stream
+              // events have a slot to mutate.
+              this._openConnections.update(currentValue => {
+                currentValue[event.peer] = {
+                  connectionId: event.connectionId,
+                  video: false,
+                  audio: false,
+                  connected: false,
+                  direction: 'duplex',
+                };
+                return currentValue;
+              });
+              this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
+            }
+            break;
+          case 'media-connected':
+            this._handleMediaConnected(event.peer, event.connectionId, impl);
+            break;
+          case 'media-closed':
+            this._handleMediaClosed(
+              event.peer,
+              event.connectionId,
+              impl,
+              `${event.phase}/${route.reason}`,
+            );
+            break;
+          case 'ignore':
+            break;
         }
         break;
+      }
       case 'remote-stream':
         this._handleMediaRemoteStream(event.peer, event.connectionId, event.stream);
         break;
@@ -1126,6 +1148,11 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
     impl: 'simplepeer' | 'fsm',
+    /** Why the slot is being cleared — the `phase/reason` pair from
+     *  `routeTransportPhase`, or a call-site tag for the paths that close a
+     *  connection directly. Recorded on the FsmClose/SimplePeerClose event so
+     *  a give-up is distinguishable from an ordinary close in the log. */
+    cause = 'close-event',
   ): void {
     console.log('#### GOT CLOSE EVENT ####');
 
@@ -1166,6 +1193,7 @@ export class StreamsStore {
       timestamp: Date.now(),
       event: impl === 'fsm' ? 'FsmClose' : 'SimplePeerClose',
       connectionId,
+      detail: `cause=${cause}`,
     });
     if (wasWebrtcCarrier) {
       // Annotate the downgrade with *why* we left webrtc (§6.6) — the reason
