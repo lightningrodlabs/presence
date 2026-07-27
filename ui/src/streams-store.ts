@@ -43,6 +43,7 @@ import { getModule } from './room/modules/registry';
 import {
   DEFAULT_CONVERSATION_PAYLOAD,
   ConversationPayload,
+  conversationPayloadSupportsFsm,
   parseConversationPayload,
 } from './room/modules/conversation';
 import { RoomClient } from './room/room-client';
@@ -567,6 +568,9 @@ export class StreamsStore {
    * Effective WebRTC implementation for the link between us and `peerB64`.
    *
    * Resolution order:
+   *  0. If the peer's build cannot handle `SdpFsm` at all, the link is
+   *     `'simplepeer'` regardless of anything either side prefers. See
+   *     `conversationPayloadSupportsFsm`.
    *  1. If either side has set a per-peer override (`peerImpl[other]`), the
    *     override applies. If both sides override and disagree, `'fsm'` wins
    *     — it has the marginal-NAT machinery (Perfect Negotiation, session-
@@ -585,6 +589,7 @@ export class StreamsStore {
       myPayload?.peerImpl?.[peerB64],
       peerPayload?.webrtcImpl ?? 'simplepeer',
       peerPayload?.peerImpl?.[this.myPubKeyB64],
+      conversationPayloadSupportsFsm(peerConv ?? null),
     );
   }
 
@@ -598,8 +603,15 @@ export class StreamsStore {
     myOverride: 'simplepeer' | 'fsm' | undefined,
     peerGlobal: 'simplepeer' | 'fsm',
     peerOverride: 'simplepeer' | 'fsm' | undefined,
+    peerSupportsFsm: boolean,
   ): 'simplepeer' | 'fsm' {
-    return resolveWebrtcImpl(myGlobal, myOverride, peerGlobal, peerOverride);
+    return resolveWebrtcImpl({
+      myGlobal,
+      myOverride,
+      peerGlobal,
+      peerOverride,
+      peerSupportsFsm,
+    });
   }
 
   /** Read our own peerImpl map. Defaults to {} if conversation isn't

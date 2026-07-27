@@ -123,12 +123,32 @@ export function decideAutoFlip(input: AutoFlipInputs): AutoFlipDecision {
   };
 }
 
+export type WebrtcImplInputs = {
+  /** This agent's global preference. */
+  myGlobal: 'simplepeer' | 'fsm';
+  /** This agent's per-peer override for the link, if any. */
+  myOverride: 'simplepeer' | 'fsm' | undefined;
+  /** The peer's global preference. */
+  peerGlobal: 'simplepeer' | 'fsm';
+  /** The peer's per-peer override for the link, if any. */
+  peerOverride: 'simplepeer' | 'fsm' | undefined;
+  /**
+   * Whether the peer's *build* can handle the `SdpFsm` signal type at all.
+   * This is a capability, not a preference — see the resolution order.
+   */
+  peerSupportsFsm: boolean;
+};
+
 /**
  * Pure resolver for the per-link impl selection. Same logic as
  * `StreamsStore.webrtcImplForGiven` — extracted here so tests don't
  * need the store and so the rules live in one place.
  *
  * Resolution order:
+ *   0. If the peer's build cannot handle `SdpFsm`, the link is
+ *      `'simplepeer'`. Capability dominates every preference below,
+ *      including an override, because no preference either side holds can
+ *      make an old client parse a signal type it has no handler for.
  *   1. If both sides set an override and they agree, use it.
  *   2. If both sides set an override and disagree, `'fsm'` wins. The FSM
  *      carrier implements Perfect Negotiation, session-ID stale-signal
@@ -139,13 +159,21 @@ export function decideAutoFlip(input: AutoFlipInputs): AutoFlipDecision {
  *   3. If only one side has an override, that override applies.
  *   4. Otherwise the global default applies — `'fsm'` if either side
  *      has `webrtcImpl: 'fsm'`, else `'simplepeer'`.
+ *
+ * Rule 0 is Phase 1 item 6. Without it, the union in rule 4 resolved every
+ * link to `'fsm'` on the strength of *our* global alone, so we sent
+ * `SdpFsm` to peers running v0.14.7 or earlier — releases that contain no
+ * occurrence of that signal type. The failure was directional and
+ * deterministic per pair (the higher pubkey initiates), so roughly half of
+ * all cross-version pairs could never connect, always the same half, which
+ * reads in the field as "I can never connect to that one person"
+ * (MAINTAINABILITY_ASSESSMENT.md §3.8).
  */
 export function resolveWebrtcImpl(
-  myGlobal: 'simplepeer' | 'fsm',
-  myOverride: 'simplepeer' | 'fsm' | undefined,
-  peerGlobal: 'simplepeer' | 'fsm',
-  peerOverride: 'simplepeer' | 'fsm' | undefined,
+  input: WebrtcImplInputs,
 ): 'simplepeer' | 'fsm' {
+  if (!input.peerSupportsFsm) return 'simplepeer';
+  const { myOverride, peerOverride, myGlobal, peerGlobal } = input;
   if (myOverride && peerOverride) {
     if (myOverride === peerOverride) return myOverride;
     return 'fsm';

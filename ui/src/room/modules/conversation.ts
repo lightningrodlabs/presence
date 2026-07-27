@@ -43,12 +43,17 @@ import type { StreamsStore } from '../../streams-store';
  *  Symmetric union over the global `webrtcImpl` field: the effective
  *  default for a link is `'fsm'` if either side picks it, else
  *  `'simplepeer'`. Per-link overrides via `peerImpl` (below) take
- *  precedence over the global default. This avoids a signaling-channel
- *  mismatch (Sdp vs SdpFsm). Default is `'fsm'` — the more capable carrier
- *  on marginal NATs; auto-flip falls back to `'simplepeer'` on failure.
- *  The parser still treats a *missing* field as `'simplepeer'` so peers
- *  running pre-FSM code (which omit the field entirely) are still
- *  recognised as simplepeer clients. */
+ *  precedence over the global default. Default is `'fsm'` — the more
+ *  capable carrier on marginal NATs; auto-flip falls back to
+ *  `'simplepeer'` on failure.
+ *
+ *  All of that is *preference*, and preference is subordinate to
+ *  capability: `resolveWebrtcImpl` pins the link to `'simplepeer'` unless
+ *  `conversationPayloadSupportsFsm` says the peer's build can parse
+ *  `SdpFsm` at all. A missing `webrtcImpl` field parses to `'simplepeer'`,
+ *  but that alone never protected pre-FSM peers — the union resolved the
+ *  link to `'fsm'` on our own global regardless, and we sent them a signal
+ *  type their build has no handler for. */
 export type WebrtcImpl = 'simplepeer' | 'fsm';
 
 export interface ConversationPayload {
@@ -71,10 +76,12 @@ export interface ConversationPayload {
   /** Per-peer impl override. Each entry pins the impl for that one link
    *  regardless of global `webrtcImpl`. Symmetric union: if both sides
    *  set an override for the same link and the values disagree,
-   *  **`'fsm'` wins** (`auto-flip-policy.ts:149-152`, asserted by its own
-   *  tests). Note the consequence: a peer cannot unilaterally pin a link
-   *  back to simplepeer, so the automated toggle below cannot use an
-   *  override to escape a failing FSM link on its own.
+   *  **`'fsm'` wins** (`auto-flip-policy.ts:resolveWebrtcImpl`, asserted by
+   *  its own tests). Note the consequence: a peer cannot unilaterally pin a
+   *  link back to simplepeer, so the automated toggle below cannot use an
+   *  override to escape a failing FSM link on its own. An override cannot
+   *  reach `'fsm'` for a peer whose build lacks the `SdpFsm` handler
+   *  either — capability is checked first.
    *
    *  Used both by the developer per-peer toggle and by the Phase 3
    *  automated failure toggle, which flips a peer's override when an
@@ -89,6 +96,45 @@ export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
   webrtcImpl: 'fsm',
   peerImpl: {},
 };
+
+/**
+ * Whether the peer's *build* can handle the `SdpFsm` signal type.
+ *
+ * This is a capability probe, not a preference read, and it is the gate
+ * `resolveWebrtcImpl` applies before every other rule. `webrtcImpl`,
+ * `fsmWith` and `peerImpl` all entered the conversation payload in the same
+ * commit that put `SdpFsm` on the wire (`2d20e93`, 2026-05-01); every
+ * release through v0.14.7 contains none of them and no `SdpFsm` handler, so
+ * the presence of any one of these fields is an exact marker for a build
+ * that can parse the FSM signaling channel.
+ *
+ * Deliberately independent of `envelope.active`: whether a peer currently
+ * has the conversation module switched on says nothing about what their
+ * build understands. `parseConversationPayload` returns `null` for an
+ * inactive module, which would otherwise read as "not capable".
+ *
+ * Absent or unparseable payload means *not capable*. The conservative
+ * direction is the safe one — SimplePeer interoperates with every released
+ * version, `SdpFsm` interoperates only with v0.14.8 and later.
+ *
+ * Constrains `auto-flip-policy.ts:resolveWebrtcImpl` rule 0 and
+ * `streams-store.ts:webrtcImplFor`.
+ */
+export function conversationPayloadSupportsFsm(
+  envelope: ModuleStateEnvelope | null,
+): boolean {
+  if (!envelope) return false;
+  try {
+    const raw = JSON.parse(envelope.payload);
+    return (
+      raw?.webrtcImpl !== undefined ||
+      raw?.fsmWith !== undefined ||
+      raw?.peerImpl !== undefined
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function parseConversationPayload(
   envelope: ModuleStateEnvelope | null,
@@ -242,12 +288,14 @@ const conversationModule: ModuleDefinition = {
       myPeerImplMap[agentPubKeyB64],
       prevPayload.webrtcImpl,
       prevPayload.peerImpl?.[myPubKey],
+      conversationPayloadSupportsFsm(prev),
     );
     const nextImpl = streamsStore.webrtcImplForGiven(
       streamsStore.myWebrtcImpl(),
       myPeerImplMap[agentPubKeyB64],
       nextPayload.webrtcImpl,
       nextPayload.peerImpl?.[myPubKey],
+      conversationPayloadSupportsFsm(next),
     );
     if (prevImpl !== nextImpl) {
       streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
