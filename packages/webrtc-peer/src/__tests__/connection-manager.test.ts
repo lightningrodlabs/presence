@@ -938,6 +938,75 @@ describe('ConnectionManager', () => {
     });
   });
 
+  /**
+   * In-place FSM replacement is **silent**: `fsm.destroy()` clears handlers
+   * and the peer without transitioning, so no `connection-state-changed` and
+   * no `connection-closed` is emitted for the connection that went away. The
+   * only thing a consumer sees is the *new* connection's `signaling`, under a
+   * new connectionId.
+   *
+   * A consumer that keys its own per-peer state on connectionId — Presence
+   * does — must therefore adopt the new id on `signaling` rather than only
+   * creating state when it has none. If it does not, its record still names
+   * the destroyed connection, and every subsequent connect/close for the live
+   * one is discarded by its own supersede guard: the record is stranded in
+   * whatever state it held at the moment of replacement
+   * (MAINTAINABILITY_ASSESSMENT.md §3.1c, reached without any `failed`).
+   *
+   * These tests pin the emission contract that makes that adoption necessary
+   * and sufficient. Nothing else asserts it, and the consumer side cannot be
+   * tested at all until Phase 6.
+   */
+  describe('in-place FSM replacement is silent', () => {
+    function offerFromB(channel: FakeSignalingChannel, epoch: number, connectionId: string) {
+      channel.createAdapter('agent-bbb').sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId,
+        epoch,
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+    }
+
+    it('replaces the FSM on a higher-epoch offer, under a new connectionId', () => {
+      const { a, channel } = createPair();
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const before = a.manager.getFSM('agent-bbb')!.connectionId;
+
+      offerFromB(channel, 2, 'b-new');
+
+      const after = a.manager.getFSM('agent-bbb')!.connectionId;
+      expect(after).not.toBe(before);
+    });
+
+    it('emits NO connection-closed for the connection it replaced', () => {
+      const { a, channel } = createPair();
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const closed = vi.fn();
+      a.manager.on('connection-closed', closed);
+
+      offerFromB(channel, 2, 'b-new');
+      vi.advanceTimersByTime(10_000);
+
+      // This is the whole finding: the consumer is never told the old
+      // connection died. Its only notice is the new one's signaling.
+      expect(closed).not.toHaveBeenCalled();
+    });
+
+    it('announces the replacement only as a signaling transition on the new id', () => {
+      const { a, channel } = createPair();
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const before = a.manager.getFSM('agent-bbb')!.connectionId;
+      const changes: any[] = [];
+      a.manager.on('connection-state-changed', e => changes.push(e));
+
+      offerFromB(channel, 2, 'b-new');
+
+      const signaling = changes.filter(e => e.data?.toState === 'signaling');
+      expect(signaling.length).toBeGreaterThan(0);
+      expect(signaling.every(e => e.connectionId !== before)).toBe(true);
+    });
+  });
+
   describe('closeConnection', () => {
     it('closes a specific connection', () => {
       const { manager } = createManager();

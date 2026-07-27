@@ -476,16 +476,40 @@ export class StreamsStore {
         const route = routeTransportPhase({
           phase: event.phase,
           impl,
-          hasOpenConnection: !!get(this._openConnections)[event.peer],
+          connectionId: event.connectionId,
+          openConnectionId: get(this._openConnections)[event.peer]?.connectionId,
         });
         switch (route.handler) {
           case 'start-ice-monitor':
+            if (route.slot.action === 'adopt') {
+              // The FSM behind the slot's connectionId was replaced in place
+              // by ConnectionManager (higher-epoch offer, or a new remote
+              // session) via `fsm.destroy()`, which emits no transition — so
+              // no `closed` ever reached us for it. Re-point the slot at the
+              // live connection; leaving the stale id would make every later
+              // connect/close for this peer hit its supersede guard, and a
+              // slot that was `connected: true` at replacement would stay
+              // that way forever. Mirrors the initiator path's supersede
+              // handling in `handleInitAccept`.
+              this.logger.logAgentEvent({
+                agent: event.peer,
+                timestamp: Date.now(),
+                event: 'Superseded',
+                connectionId: route.slot.supersedes,
+                detail: `superseded-by=${event.connectionId}; path=transport-replace`,
+              });
+              this._stopMediaIceMonitor(event.peer, route.slot.supersedes);
+              // Keyed to the old connection; the new monitor sets its own.
+              delete this._iceDisconnectedAt[event.peer];
+            }
             this._startMediaIceMonitor(event.peer, event.connectionId, impl);
-            if (route.installSlot) {
-              // FSM acceptor path: an incoming offer creates an FSM state
-              // without streams-store knowing in advance. Install the
-              // openConnections entry now so subsequent connect/stream
-              // events have a slot to mutate.
+            if (route.slot.action !== 'keep') {
+              // `install`: FSM acceptor path — an incoming offer creates an
+              // FSM without streams-store knowing in advance, so the slot
+              // has to exist for later connect/stream events to mutate.
+              // `adopt`: same write, replacing a slot whose connection is
+              // gone. Both start from `connected: false`, which is the
+              // truth in either case.
               this._openConnections.update(currentValue => {
                 currentValue[event.peer] = {
                   connectionId: event.connectionId,
