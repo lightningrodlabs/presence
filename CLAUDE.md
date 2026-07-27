@@ -18,10 +18,10 @@ Documents in `docs/` are **not** reliable unless they carry a status header. 17 
 
 - The FSM is the default media carrier. SimplePeer is unreachable by default **except** for screen share, which is hard-typed to it across 32 call sites.
 - Signals is a **module-layer fallback**, not a `PeerTransport` — `ui/src/transport/types.ts:26` says so explicitly. The `PeerTransport` interface exists but is never used as a type annotation.
-- There are 21 independent sources of truth about peer liveness, using at least six different time constants. There is no single authority.
-- `ui/` has no typecheck script; `vite build` never checks types, so `"strict": true` in `ui/tsconfig.json` does not run.
-- 315 unit tests exist and pass in under 2 seconds. Nothing runs them: root `npm test` runs zero tests, and CI is disabled by filename.
-- `StreamsStore` cannot be instantiated under `vitest` (`environment: 'node'`, constructor reads `window.sessionStorage`). Characterization tests around the class are not currently possible; extract pure decision functions instead.
+- There are 21 independent sources of truth about peer liveness, using at least six different time constants. There is no single authority. Phase 1 fixed the carrier hole, not this.
+- `nix develop -c npm run verify` is the gate: 421 unit tests plus a `tsc --noEmit` of both workspaces, in under 2 seconds. CI runs the same command on push and PR to `main-0.6`. (Phase 0 landed this; the `ui/` typecheck is green at `strict: true`, but only against a built `packages/webrtc-peer` — `verify` builds it first.)
+- `StreamsStore` cannot be instantiated under `vitest` (`environment: 'node'`, constructor reads `window.sessionStorage`). Characterization tests around the class are not currently possible; extract pure decision functions instead. Phase 6 is the entry criterion for changing that.
+- **Post-Phase 1 carrier facts.** Signals carries a present peer unless WebRTC is `connected` (ICE + DTLS up) — the complement of *media flowing*, not of *an attempt existing*; the rule is in `ui/src/transport/carrier-coverage.ts`. Every `ConnectionPhase` is routed by `routeTransportPhase` (`transport/media-event-policy.ts`), exhaustive over the union, with `failed`/`idle`/`closed` clearing the slot. On FSM links the FSM owns transport recovery and the pong-driven teardown stands down (`transport/stale-connection-policy.ts`); on SimplePeer links it does not. A link resolves to `'fsm'` only if the peer's payload proves their build can parse `SdpFsm` — capability outranks every preference. **None of this is field-validated**; the extracted decisions are covered, their wiring into `streams-store.ts` is not.
 
 ## Target state (not yet true — do not describe as current)
 
