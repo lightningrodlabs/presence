@@ -50,6 +50,7 @@ import { CameraSource, CameraAcquireResult } from './camera-source';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
+import { parseSignalPayload } from './signal-payload';
 
 declare const __APP_VERSION__: string;
 
@@ -4384,7 +4385,14 @@ export class StreamsStore {
 
       if (status.type === 'SdpExchange') {
         const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus.type === 'Connected') {
+        // `currentStatus &&` is required, matching the InitSent and AcceptSent
+        // branches above. A peer can reach here with no entry: `pingAgents`
+        // seeds `_connectionStatuses` every 2s, but `handlePongUi` adds peers to
+        // `_knownAgents` from pong metadata without seeding a status. A peer
+        // learned via pong that sends SdpData before the next ping tick — or an
+        // incoming FSM offer — hits an undefined status, and the TypeError used
+        // to escape into handleSignal's drain.
+        if (currentStatus && currentStatus.type === 'Connected') {
           // If already connected, don't change anything. SdpExchange
           // is also expected to occur when turning on video when
           // already connected.
@@ -5391,16 +5399,43 @@ export class StreamsStore {
     this._signalQueue.push(signal);
     if (this._processingSignal) return;
 
+    // `_processingSignal` is a latch, not a flag: `:5392` above turns every
+    // incoming signal into push-and-return while it is true. If it is ever left
+    // true the room goes permanently silent — pings, pongs, presence, SDP and
+    // module data all arrive on this path — with no error surfaced and no
+    // recovery short of a reload. Two guards keep that from happening:
+    //
+    //   `finally` — the latch is released even if the loop throws.
+    //   per-signal `catch` — one bad signal drops itself, not the rest of the
+    //     queue. Without it a throw would abandon every signal already queued
+    //     behind the offender.
+    //
+    // Handlers are expected to reject malformed input themselves (see
+    // `parseSignalPayload` in signal-payload.ts); this is the backstop for
+    // whatever they miss.
     this._processingSignal = true;
-    while (this._signalQueue.length > 0) {
-      const nextSignal = this._signalQueue.shift()!;
-      if (this.signalDelayMs > 0) {
-        const delay = Math.floor(Math.random() * this.signalDelayMs);
-        await new Promise(resolve => setTimeout(resolve, delay));
+    try {
+      while (this._signalQueue.length > 0) {
+        const nextSignal = this._signalQueue.shift()!;
+        if (this.signalDelayMs > 0) {
+          const delay = Math.floor(Math.random() * this.signalDelayMs);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+        try {
+          await this._processSignal(nextSignal);
+        } catch (e) {
+          this.logger.logCustomMessage(
+            `Dropped signal (${
+              nextSignal.type === 'Message'
+                ? `Message/${nextSignal.msg_type}`
+                : nextSignal.type
+            }): ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
       }
-      await this._processSignal(nextSignal);
+    } finally {
+      this._processingSignal = false;
     }
-    this._processingSignal = false;
   }
 
   private async _processSignal(signal: RoomSignal) {
@@ -6002,7 +6037,14 @@ export class StreamsStore {
     signal: Extract<RoomSignal, { type: 'Message' }>
   ) {
     const pubKey64 = encodeHashToBase64(signal.from_agent);
-    const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
+    const parsedInit = parseSignalPayload<InitPayload>(signal.payload);
+    if (!parsedInit.ok) {
+      this.logger.logCustomMessage(
+        `Dropped InitRequest from ${pubKey64.slice(0, 8)}: ${parsedInit.error}`
+      );
+      return;
+    }
+    const { connection_id, connection_type } = parsedInit.value;
     this.logger.logAgentEvent({
       agent: pubKey64,
       timestamp: Date.now(),
@@ -6094,7 +6136,14 @@ export class StreamsStore {
    */
   async handleInitAccept(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubKey64 = encodeHashToBase64(signal.from_agent);
-    const { connection_id, connection_type } = JSON.parse(signal.payload) as InitPayload;
+    const parsedAccept = parseSignalPayload<InitPayload>(signal.payload);
+    if (!parsedAccept.ok) {
+      this.logger.logCustomMessage(
+        `Dropped InitAccept from ${pubKey64.slice(0, 8)}: ${parsedAccept.error}`
+      );
+      return;
+    }
+    const { connection_id, connection_type } = parsedAccept.value;
     this.logger.logAgentEvent({
       agent: pubKey64,
       timestamp: Date.now(),
@@ -6341,22 +6390,36 @@ export class StreamsStore {
    */
   async handleSdpData(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const { connection_id, data } = JSON.parse(signal.payload) as SdpPayload;
+    const parsedPayload = parseSignalPayload<SdpPayload>(signal.payload);
+    if (!parsedPayload.ok) {
+      this.logger.logCustomMessage(
+        `Dropped SdpData from ${pubkeyB64.slice(0, 8)}: ${parsedPayload.error}`
+      );
+      return;
+    }
+    const { connection_id, data } = parsedPayload.value;
     console.log(`## Got SDP Data from : ${pubkeyB64}:\n`, data);
 
-    let sdpType = 'candidate';
-    try {
-      sdpType = JSON.parse(data).type || 'candidate';
-    } catch {
-      // ignore parse errors
+    // `data` is a second, nested JSON string carrying the SDP itself. It is
+    // parsed twice below — once for the log label, once for the value handed to
+    // the transport — so it gets its own guard rather than riding on the
+    // envelope's.
+    const parsedSdpResult = parseSignalPayload<any>(data);
+    if (!parsedSdpResult.ok) {
+      this.logger.logCustomMessage(
+        `Dropped SdpData from ${pubkeyB64.slice(0, 8)} (connection ${
+          connection_id
+        }): malformed inner SDP — ${parsedSdpResult.error}`
+      );
+      return;
     }
+    const parsedSdp = parsedSdpResult.value;
+    const sdpType = parsedSdp.type || 'candidate';
 
     this._logSdpDataEvent(pubkeyB64, connection_id, sdpType);
 
     // Update connection status
     this.updateConnectionStatus(pubkeyB64, { type: 'SdpExchange' });
-
-    const parsedSdp = JSON.parse(data);
 
     /**
      * Normal video/audio connections
