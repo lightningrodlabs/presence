@@ -414,7 +414,10 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
 export type ReconnectContext = {
   retryCount: number;
   elapsedMs: number;
-  retryReason: 'ice-failed' | 'ice-disconnected' | 'dtls-failed' | 'dtls-stall' | 'data-channel-stall' | 'timeout' | 'error';
+  /** `ice-closed` means `pc.iceConnectionState` reached `closed` — the
+   *  RTCPeerConnection itself is gone, so an ICE restart has nothing to
+   *  restart. `ReconnectPolicy.strategy` forces a full reconnect for it. */
+  retryReason: 'ice-failed' | 'ice-closed' | 'ice-disconnected' | 'dtls-failed' | 'dtls-stall' | 'data-channel-stall' | 'timeout' | 'error';
   lastStrategy: 'ice-restart' | 'full-reconnect';
 };
 

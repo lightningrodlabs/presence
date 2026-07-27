@@ -102,7 +102,13 @@ export class DefaultReconnectPolicy implements ReconnectPolicy {
     // DTLS failure needs a fresh handshake — always full reconnect. A
     // data-channel stall that survived in-place recreate implies a sick SCTP
     // association, so it likewise needs a fresh peer rather than an ICE restart.
-    if (context.retryReason === 'dtls-failed' || context.retryReason === 'data-channel-stall') {
+    // `ice-closed` means the pc is closed outright; `restartIce()` on a closed
+    // pc does nothing, so only a fresh peer can recover.
+    if (
+      context.retryReason === 'dtls-failed' ||
+      context.retryReason === 'data-channel-stall' ||
+      context.retryReason === 'ice-closed'
+    ) {
       return 'full-reconnect';
     }
 
