@@ -8,6 +8,7 @@ import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transp
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import { routeTransportPhase } from './transport/media-event-policy';
+import { computeSignalsTargets } from './transport/carrier-coverage';
 import {
   derived,
   get,
@@ -311,17 +312,16 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
+    // Signals is the complement of *WebRTC carrying media*, not of *a
+    // WebRTC attempt existing*. Decision and rationale live in
+    // `transport/carrier-coverage.ts`.
     this._signalsTargets = derived(
       [this._activeAgents, this._openConnections],
-      ([active, connections]) => {
-        const targets = new Set<AgentPubKeyB64>();
-        for (const pubkey of Object.keys(active)) {
-          if (!connections[pubkey]) {
-            targets.add(pubkey);
-          }
-        }
-        return targets;
-      },
+      ([active, connections]) =>
+        computeSignalsTargets({
+          activeAgents: Object.keys(active),
+          openConnections: connections,
+        }),
     );
 
     // Construct transports. iceServers / trickleICE are getters so the
@@ -2998,15 +2998,22 @@ export class StreamsStore {
   private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
-   * The set of active peers that do NOT have a WebRTC connection. Audio
-   * for these peers should be carried over Holochain remote signals
-   * (the voice encoder path). Precomputed as a derived store so the
-   * voice encoder's pump loop doesn't recompute per-chunk — it just
-   * reads the cached set.
+   * The set of active peers whose media is NOT currently flowing over
+   * WebRTC. Audio and filmstrip video for these peers are carried over
+   * Holochain remote signals. Precomputed as a derived store so the voice
+   * encoder's pump loop doesn't recompute per-chunk — it just reads the
+   * cached set.
    *
-   * Updates when: a peer appears/disappears in _activeAgents, a WebRTC
-   * connection opens/closes in _openConnections, or disableWebrtcWith
-   * changes (which tears down WebRTC, adding the peer to this set).
+   * Membership is the complement of `connected` — ICE + DTLS up — not the
+   * complement of "an entry exists". A peer mid-negotiation, mid-reconnect,
+   * or holding a wedged entry is still carried by signals, so handover is
+   * make-before-break in both directions. The rule and its rationale are in
+   * `transport/carrier-coverage.ts`; the constructor's `derived` is the only
+   * caller.
+   *
+   * Updates when: a peer appears/disappears in _activeAgents, or any
+   * `_openConnections` write changes a peer's `connected` flag — which
+   * includes connect, close, give-up, and the disableWebrtcWith teardown.
    */
   _signalsTargets!: Readable<Set<AgentPubKeyB64>>;
 
