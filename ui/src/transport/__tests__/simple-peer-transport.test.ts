@@ -26,6 +26,17 @@ function setup() {
   return { transport, peers, outgoing, events };
 }
 
+describe('SimplePeerTransport — recovery ownership', () => {
+  it('does not own transport recovery', () => {
+    // The application's pong-driven stale-ICE supervisor is what recovers a
+    // SimplePeer link. `streams-store.ts` reads this to decide whether to
+    // stand that supervisor down; a wrong answer here either races the
+    // transport's recovery or leaves a dead link with nobody recovering it.
+    const { transport } = setup();
+    expect(transport.ownsTransportRecovery).toBe(false);
+  });
+});
+
 describe('SimplePeerTransport — lifecycle', () => {
   it('ensureConnection creates a SimplePeer and emits idle → signaling', () => {
     const { transport, peers, events } = setup();

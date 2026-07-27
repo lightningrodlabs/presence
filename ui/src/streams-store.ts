@@ -5642,8 +5642,11 @@ export class StreamsStore {
       if (this.screenShareStream) {
         // Clean up stale outgoing connection if WebRTC state is dead. Same
         // predicate as the video path — see `stale-connection-policy.ts`.
-        // Screen share is SimplePeer-only, which owns no recovery of its
-        // own, so this supervisor stays in force for it.
+        // Screen share is SimplePeer today, which owns no recovery, so this
+        // supervisor is in force for it. Read from the transport rather
+        // than hardcoded, so porting screen share to the FSM (Phase 3)
+        // stands this down automatically instead of leaving two literals
+        // that no test covers and no compiler checks.
         const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
         if (outgoing) {
           const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
@@ -5651,7 +5654,8 @@ export class StreamsStore {
           const decision = decideStaleConnectionCleanup({
             hasExistingConn: true,
             slotClaimsConnected: !!outgoing.connected,
-            carrierOwnsRecovery: false,
+            carrierOwnsRecovery:
+              this.screenShareOutTransport.ownsTransportRecovery,
             iceState,
             disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
             now: Date.now(),
@@ -5970,8 +5974,9 @@ export class StreamsStore {
       const decision = decideStaleConnectionCleanup({
         hasExistingConn: !!existingConn,
         slotClaimsConnected: !!existingConn?.connected,
-        // The FSM owns its own recovery. Tearing its pc down here races it.
-        carrierOwnsRecovery: activeTransport === this.mediaTransportFsm,
+        // The transport declares whether it recovers itself; we do not
+        // infer it from which transport this is.
+        carrierOwnsRecovery: activeTransport.ownsTransportRecovery,
         iceState,
         disconnectedAt: this._iceDisconnectedAt[pubkeyB64],
         now: Date.now(),
@@ -6087,7 +6092,7 @@ export class StreamsStore {
       const decision = decideStaleConnectionCleanup({
         hasExistingConn: true,
         slotClaimsConnected: !!outgoingScreenShare.connected,
-        carrierOwnsRecovery: false,
+        carrierOwnsRecovery: this.screenShareOutTransport.ownsTransportRecovery,
         iceState,
         disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
         now,
