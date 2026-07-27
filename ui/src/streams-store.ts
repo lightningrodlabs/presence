@@ -4599,9 +4599,36 @@ export class StreamsStore {
       });
       const conn = get(this._openConnections)[pubkey];
       if (conn) {
+        // Repair on the transport that actually owns this peer's
+        // connection. This was `this.mediaTransport` — the bare SimplePeer
+        // transport — whose `addTrack` iterates its *own* connection map.
+        // For a peer on the FSM, which is the default carrier, that map
+        // does not contain them, so the repair was a silent no-op that
+        // still consumed the cooldown and the attempt budget
+        // (MAINTAINABILITY_ASSESSMENT.md §3.12).
+        //
+        // `_activeMediaTransportFor` is the same authority Case 2
+        // (`_tryReplaceTrackRecovery`) already uses, so the two halves of
+        // this recovery family now agree. It is chosen over
+        // `_allMediaTransports()` because addressing the owning transport
+        // is strictly narrower, and over per-peer `pc.addTrack` because
+        // that would need a renegotiation contract the two carriers do not
+        // share — SimplePeer owns its own negotiation, and bypassing its
+        // `addTrack` is not equivalent. Retiring that asymmetry is Phase 4.
+        const transport = this._activeMediaTransportFor(pubkey);
+        if (!transport.hasConnection(pubkey)) {
+          // The slot has outlived the transport's own state; there is
+          // nothing to add a track to. Return without recording an
+          // attempt — burning the budget on a no-op is what let this
+          // defect hide.
+          this.logger.logCustomMessage(
+            `Reconcile skipped [${pubkey.slice(0, 8)}]: no transport connection`,
+          );
+          return;
+        }
         try {
           for (const track of this.mainStream.getTracks()) {
-            this.mediaTransport.addTrack(track, this.mainStream);
+            transport.addTrack(track, this.mainStream);
           }
           this._lastReconcileTime[pubkey] = Date.now();
           this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
