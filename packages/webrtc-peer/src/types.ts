@@ -20,7 +20,6 @@ export type PeerId = string;
  * where direct/srflx paths fail.
  */
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'stun:stun.cloudflare.com:3478' },
   {
     urls: [

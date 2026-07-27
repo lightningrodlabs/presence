@@ -309,7 +309,6 @@ export type TransportImpl = 'simplepeer' | 'fsm';
  * when no `iceServers` getter is wired in (tests).
  */
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'stun:stun.cloudflare.com:3478' },
   {
     urls: [
