@@ -24,7 +24,11 @@ import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
 import { computeSignalsTargets } from './transport/carrier-coverage';
-import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
+import {
+  decideStaleConnectionCleanup,
+  staleTeardownPlan,
+} from './transport/stale-connection-policy';
+import type { StaleTeardownTarget } from './transport/stale-connection-policy';
 import {
   summarizeRtcStats,
   decideTrackRefresh,
@@ -5644,6 +5648,66 @@ export class StreamsStore {
     }
   }
 
+  /**
+   * The one executor for a stale-connection teardown. The predicate that
+   * decides *whether* to tear down is `decideStaleConnectionCleanup`; the
+   * cleanup set — what gets cleared per target — is `staleTeardownPlan`
+   * (both in `transport/stale-connection-policy.ts`). All three supervisor
+   * sites call this: the screen-share check in `handlePingUi`, and the
+   * video and screen-share checks in `handlePongUi`. Site-specific
+   * forensics (console/custom/agent-event logging) stay at the sites.
+   */
+  private _applyStaleTeardown(
+    target: StaleTeardownTarget,
+    pubkeyB64: AgentPubKeyB64,
+    iceState: RTCIceConnectionState | undefined,
+  ): void {
+    const plan = staleTeardownPlan(target);
+    switch (plan.slot) {
+      case 'open-connections': {
+        this._activeMediaTransportFor(pubkeyB64).closeConnection(
+          pubkeyB64,
+          `stale ICE=${iceState}`,
+        );
+        this._openConnections.update(v => {
+          delete v[pubkeyB64];
+          return v;
+        });
+        break;
+      }
+      case 'screen-share-connections-outgoing': {
+        this.screenShareOutTransport.closeConnection(
+          pubkeyB64,
+          `stale ICE=${iceState}`,
+        );
+        this._screenShareConnectionsOutgoing.update(v => {
+          delete v[pubkeyB64];
+          return v;
+        });
+        break;
+      }
+      default: {
+        const exhaustive: never = plan.slot;
+        void exhaustive;
+      }
+    }
+    switch (plan.pendingInits) {
+      case 'video':
+        delete this._pendingInits[pubkeyB64];
+        break;
+      case 'screen-share':
+        delete this._pendingScreenShareInits[pubkeyB64];
+        break;
+      default: {
+        const exhaustive: never = plan.pendingInits;
+        void exhaustive;
+      }
+    }
+    if (plan.clearVideoStreamSlot) {
+      delete this._videoStreams[pubkeyB64];
+    }
+  }
+
   // ********************************************************************************************
   //
   //   S I G N A L   H A N D L E R S
@@ -5835,12 +5899,7 @@ export class StreamsStore {
             graceMs: ICE_DISCONNECTED_GRACE_MS,
           });
           if (decision.action === 'teardown') {
-            this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
-            this._screenShareConnectionsOutgoing.update(v => {
-              delete v[pubkeyB64];
-              return v;
-            });
-            delete this._pendingScreenShareInits[pubkeyB64];
+            this._applyStaleTeardown('screen-share-outgoing', pubkeyB64, iceState);
           }
         }
         const hasOutgoing = Object.keys(
@@ -6164,10 +6223,7 @@ export class StreamsStore {
           event: 'StaleCleanup',
           connectionId: existingConn.connectionId,
         });
-        activeTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
-        this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
-        delete this._pendingInits[pubkeyB64];
-        delete this._videoStreams[pubkeyB64];
+        this._applyStaleTeardown('video', pubkeyB64, iceState);
       }
     }
 
@@ -6273,12 +6329,7 @@ export class StreamsStore {
       });
       if (decision.action === 'teardown') {
         console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
-        this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          delete currentValue[pubkeyB64];
-          return currentValue;
-        });
-        delete this._pendingScreenShareInits[pubkeyB64];
+        this._applyStaleTeardown('screen-share-outgoing', pubkeyB64, iceState);
       }
     }
     const alreadyOpenScreenShareOutgoing = Object.keys(
