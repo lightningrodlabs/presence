@@ -71,6 +71,7 @@ import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
 import { parseSignalPayload } from './signal-payload';
+import { decodeRtcMessage } from './rtc-message-policy';
 
 declare const __APP_VERSION__: string;
 
@@ -1584,82 +1585,50 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     data: unknown,
   ): void {
-    try {
-      const msg: RTCMessage = JSON.parse(data as string);
-      if (msg.type !== 'action') return;
-      if (msg.message === 'video-off') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.video = false;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerVideoOffSignal',
-        });
+    for (const action of decodeRtcMessage(data)) {
+      switch (action.kind) {
+        case 'set-peer-track': {
+          this._openConnections.update(currentValue => {
+            const conn = currentValue[pubKeyB64];
+            if (conn) conn[action.track] = action.enabled;
+            return currentValue;
+          });
+          this.logger.logAgentEvent({
+            agent: pubKeyB64,
+            timestamp: this.clock.now(),
+            event: action.event,
+          });
+          break;
+        }
+        case 'log-input-change': {
+          this.logger.logAgentEvent({
+            agent: pubKeyB64,
+            timestamp: this.clock.now(),
+            event: action.event,
+          });
+          break;
+        }
+        case 'refresh-tracks': {
+          console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
+          this.logger.logCustomMessage(
+            `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
+          );
+          this.refreshTracksForPeer(pubKeyB64);
+          break;
+        }
+        case 'ignore':
+          break;
+        case 'parse-error': {
+          console.warn(
+            `Failed to parse RTCMessage: ${action.detail}. Got message: ${data}}`
+          );
+          break;
+        }
+        default: {
+          const exhaustive: never = action;
+          void exhaustive;
+        }
       }
-      if (msg.message === 'video-on') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.video = true;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerVideoOnSignal',
-        });
-      }
-      if (msg.message === 'audio-off') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.audio = false;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerAudioOffSignal',
-        });
-      }
-      if (msg.message === 'audio-on') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.audio = true;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerAudioOnSignal',
-        });
-      }
-      if (msg.message === 'change-audio-input') {
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerChangeAudioInput',
-        });
-      }
-      if (msg.message === 'change-video-input') {
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerChangeVideoInput',
-        });
-      }
-      if (msg.message === 'request-track-refresh') {
-        console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
-        this.logger.logCustomMessage(
-          `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
-        );
-        this.refreshTracksForPeer(pubKeyB64);
-      }
-    } catch (e) {
-      console.warn(
-        `Failed to parse RTCMessage: ${JSON.stringify(e)}. Got message: ${data}}`
-      );
     }
   }
 
