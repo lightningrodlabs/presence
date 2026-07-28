@@ -1,0 +1,64 @@
+name: nightly-harness
+
+# Phase 1.5 item 4 — the browser-dependent gate. Real RTCPeerConnections,
+# real ICE/DTLS, real AudioDecoder: the failure modes the vitest mocks
+# cannot reproduce (working agreement 7). Nightly, not per-push: the
+# carrier flap rides real ICE consent timeouts and the whole job pulls a
+# browser — too slow and too flaky-prone for the sub-2-second `verify`
+# gate, and a gate that must always run has to stay fast (test.yaml).
+#
+# Gated specs:
+#   - carrier-handover.spec.ts — the field harness: two pages, one real
+#     WebRTC link, silent-drop flap, carrier handover asserted in both
+#     directions plus the declared recovery-window exception.
+#   - voice-playout.spec.ts — the real-WebCodecs playout scheduler test,
+#     with a negative control that reproduces the double-audio bug.
+#
+# Deliberately NOT gated:
+#   - layout.spec.ts — its split-mode baseline is red by design (see
+#     ui/harness/README.md "Known baseline"). A gate that is born red
+#     teaches people to ignore gates; it joins when split-mode is fixed.
+#   - _probe.spec.ts — a diagnostic dump with zero assertions.
+
+on:
+  schedule:
+    # 04:17 UTC nightly — off the top of the hour to dodge the load spike.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # schedule events run against the default branch; the shipped
+          # line is main-0.6 (see CLAUDE.md "Which branch is real").
+          ref: main-0.6
+
+      # Pinned to match flake.nix — same reasoning as test.yaml.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.20.0'
+          cache: npm
+
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+      # The harness pages import @lightningrodlabs/webrtc-peer through its
+      # dist/, same as the ui typecheck.
+      - run: npm run build:packages
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: ui
+
+      - run: npm run test:harness -w ui
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: harness-results
+          path: ui/harness/__results__/
+          retention-days: 14

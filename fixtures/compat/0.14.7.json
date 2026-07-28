@@ -1,0 +1,33 @@
+{
+  "version": "0.14.7",
+  "source": "tag v0.14.7 (c589a6b lineage) — _processSignal arms and sendMessage call sites in ui/src/streams-store.ts; DEFAULT_CONVERSATION_PAYLOAD in ui/src/room/modules/conversation.ts. Derived from released source, not a running client (2026-07-28 decision: backward interop is a non-goal; this entry exists to pin what the current build SENDS to such a peer).",
+  "parses": [
+    "PingUi",
+    "PongUi",
+    "InitRequest",
+    "InitAccept",
+    "SdpData",
+    "LeaveUi",
+    "DiagnosticRequest",
+    "DiagnosticResponse",
+    "ModuleState",
+    "ModuleData"
+  ],
+  "emits": [
+    "PingUi",
+    "PongUi",
+    "InitRequest",
+    "InitAccept",
+    "SdpData",
+    "LeaveUi",
+    "DiagnosticRequest",
+    "DiagnosticResponse",
+    "ModuleState",
+    "ModuleData"
+  ],
+  "defaultConversationPayload": {
+    "micMuted": true,
+    "webrtcDisabled": false,
+    "disableWebrtcWith": []
+  }
+}

@@ -27,6 +27,28 @@
  * `routeTransportPhase` and the ConnectionManager `failed` cleanup provide;
  * without those this predicate would still strand a peer.
  *
+ * **Declared exception — the recovery window** (decided 2026-07-28, Phase
+ * 1.5 item 5; MAINTAINABILITY_ASSESSMENT.md Phase 1 meta-review, residual
+ * edge (a)). During `reconnecting`/`disconnected`, `routeTransportPhase`
+ * returns `ignore`/`'transport-owns-recovery'`
+ * (`media-event-policy.ts:routeTransportPhase`) and nothing flips the
+ * slot's `connected` back to `false`, so a peer stays excluded from
+ * `_signalsTargets` while no media flows — for up to the transport's
+ * recovery window (the 15s SimplePeer ICE grace; the FSM's full reconnect
+ * budget). This is accepted, not accidental: flipping `connected` on every
+ * transient ICE blip would spin the signals carrier up and down on links
+ * that recover in hundreds of milliseconds, and each spin-up is an audio
+ * seam (`decideCarrierSwitch`'s dwell exists for the same reason). The
+ * exception is bounded by the transport's recovery budget and ends in one
+ * of exactly two ways: the transport reports `connected` (media resumed)
+ * or `failed` (slot cleared, signals resumes). The residual risk stands
+ * with it: clearing a wedged FSM slot depends entirely on the FSM emitting
+ * `failed` — `ConnectionManager.fsm.destroy()` emits no transition, and
+ * only the `adopt` route in `routeTransportPhase` covers the known
+ * silent-replacement case. A dwell-then-flip (declare `connected: false`
+ * after N ms of `disconnected`) was considered and rejected until a phase
+ * owns wiring it to one clock — it would be the 22nd liveness source.
+ *
  * Constrains `streams-store.ts:_signalsTargets`.
  */
 

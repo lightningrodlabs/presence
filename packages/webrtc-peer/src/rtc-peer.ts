@@ -166,8 +166,17 @@ export class RTCPeer {
     return new Promise<void>((resolve) => {
       this._taskResolvers.push(resolve);
       this._taskQueue.push(async () => {
-        await task();
-        resolve();
+        // Settle the caller's promise even when the task throws: the drain
+        // loop logs the error and moves on, and a promise that never
+        // resolves strands any caller awaiting handleSignal — the same
+        // stranded-latch failure shape signal-payload.ts exists to prevent
+        // one layer up. destroy() already flushes these resolvers "so they
+        // don't hang"; this makes the throw path honor the same intent.
+        try {
+          await task();
+        } finally {
+          resolve();
+        }
       });
       if (!this._processingTasks) {
         this._drainTaskQueue();

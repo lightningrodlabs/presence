@@ -6,6 +6,7 @@ import {
   RoomInfo,
   RoomSignal,
 } from '../types';
+import type { SignalMsgType } from '../transport/wire-contract';
 
 export class RoomClient extends ZomeClient<RoomSignal> {
   constructor(
@@ -69,8 +70,13 @@ export class RoomClient extends ZomeClient<RoomSignal> {
   /**
    * Send a generic message to the given agents. The msg_type and payload are
    * opaque to the backend — all semantics are defined in the frontend.
+   *
+   * `msgType` is typed against the declared wire surface
+   * (`transport/wire-contract.ts`): putting a new type on the wire requires
+   * adding it to `SIGNAL_MSG_TYPES`, which forces a `WIRE_CONTRACT` row and
+   * the `fixtures/wire-contract.json` update ceremony.
    */
-  async sendMessage(toAgents: AgentPubKey[], msgType: string, payload: string = ''): Promise<void> {
+  async sendMessage(toAgents: AgentPubKey[], msgType: SignalMsgType, payload: string = ''): Promise<void> {
     return this.callZome('send_message', {
       to_agents: toAgents,
       msg_type: msgType,
