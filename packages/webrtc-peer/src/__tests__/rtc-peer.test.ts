@@ -723,4 +723,101 @@ describe('RTCPeer', () => {
       expect(mockPc.addIceCandidate).toHaveBeenCalledWith(remoteCandidate);
     });
   });
+
+  /**
+   * Phase 1.5 item 4 (Phase 0 addendum) — the duplicate-answer
+   * InvalidStateError guard finally gets tests that can fail.
+   *
+   * The guard (`rtc-peer.ts:_handleRemoteDescription` catch arm) is the fix
+   * for the #1 documented production failure: Holochain delivering the same
+   * answer twice, or crossed `ensureConnection` calls, applying an answer
+   * after the exchange already reached `stable`. It had zero coverage
+   * because `MockRTCPeerConnection` could not throw — and would have
+   * survived being inverted. `strictSignalingStateValidation` is the mock
+   * mode that closes that; the first test below is the negative control
+   * proving the mock can reproduce the failure at all.
+   */
+  describe('duplicate-answer InvalidStateError guard', () => {
+    function createStrictPeer(polite = false) {
+      const logger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      };
+      let mockPc: MockRTCPeerConnection;
+      const peer = new RTCPeer({
+        polite,
+        config: DEFAULT_CONFIG,
+        onSignal: vi.fn(),
+        logger,
+        createPeerConnection: (config: RTCConfiguration) => {
+          mockPc = new MockRTCPeerConnection(config);
+          mockPc.strictSignalingStateValidation = true;
+          return mockPc as unknown as RTCPeerConnection;
+        },
+      });
+      return { peer, get mockPc() { return mockPc!; }, logger };
+    }
+
+    it('NEGATIVE CONTROL: the strict mock rejects an answer applied in stable', async () => {
+      // If this test fails, the mock has lost the ability to reproduce the
+      // production failure, and every other test in this describe is
+      // asserting against air.
+      const { mockPc } = createStrictPeer();
+      expect(mockPc.signalingState).toBe('stable');
+      await expect(
+        mockPc.setRemoteDescription({ type: 'answer', sdp: 'dup' }),
+      ).rejects.toMatchObject({ name: 'InvalidStateError' });
+    });
+
+    it('the permissive default still applies the same answer silently — the gap the mode exists to close', async () => {
+      const { mockPc } = createPeer();
+      expect(mockPc.strictSignalingStateValidation).toBe(false);
+      await expect(
+        mockPc.setRemoteDescription({ type: 'answer', sdp: 'dup' }),
+      ).resolves.toBeUndefined();
+    });
+
+    it('swallows a duplicate answer arriving in stable: no error event, no queue error, peer stays usable', async () => {
+      const { peer, mockPc, logger } = createStrictPeer();
+      const errors: unknown[] = [];
+      peer.on('error', e => errors.push(e));
+
+      // Reach stable-after-exchange: we hold a local offer, the answer lands.
+      mockPc.signalingState = 'have-local-offer';
+      await peer.handleSignal({ type: 'answer', sdp: 'answer-1' });
+      expect(mockPc.signalingState).toBe('stable');
+
+      // Holochain delivers the same answer again.
+      await peer.handleSignal({ type: 'answer', sdp: 'answer-1' });
+
+      expect(errors).toEqual([]);
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(mockPc.signalingState).toBe('stable');
+
+      // Still functional: a later remote offer is applied and auto-answered
+      // (the answer path returns the mock to stable).
+      await peer.handleSignal({ type: 'offer', sdp: 'renegotiation' });
+      expect(mockPc.remoteDescription?.sdp).toBe('renegotiation');
+    });
+
+    it('RETHROW ARM: an answer in any non-stable wrong state is NOT swallowed', async () => {
+      // Inverting the guard (swallowing everything) makes this test fail.
+      // A stray answer while we hold the remote offer is a real protocol
+      // violation, not benign duplication — it must surface, and it lands
+      // in the task-queue error log.
+      const { peer, mockPc, logger } = createStrictPeer();
+      mockPc.signalingState = 'have-remote-offer';
+
+      // handleSignal settles even though the task throws (the queue's
+      // finally-resolve); the error itself lands in the task-queue log.
+      await peer.handleSignal({ type: 'answer', sdp: 'stray' });
+
+      expect(logger.error).toHaveBeenCalledWith(
+        'RTCPeer task queue error:',
+        expect.objectContaining({ name: 'InvalidStateError' }),
+      );
+    });
+  });
 });

@@ -36,6 +36,19 @@ export class MockRTCPeerConnection {
   // Internal event handlers
   private _handlers: Map<string, MockEventHandler[]> = new Map();
 
+  /**
+   * Opt-in throwing mode (Phase 1.5 / Phase 0 addendum). When true,
+   * `setRemoteDescription` validates the signaling state like Chrome does
+   * and throws `InvalidStateError` on an illegal transition — most
+   * importantly a duplicate answer arriving in `stable`, the #1 documented
+   * production failure (`rtc-peer.ts` duplicate-answer guard; CLAUDE.md
+   * "Do NOT retry SDP offers"). Off by default so existing tests keep
+   * their permissive mock; the guard's own tests turn it on. Without a
+   * mode that can throw, the guard has no test that can fail — the mock's
+   * missing negative control called out in MAINTAINABILITY_ASSESSMENT.md.
+   */
+  strictSignalingStateValidation = false;
+
   // Track management
   private _senders: MockRTCSender[] = [];
   private _receivers: MockRTCReceiver[] = [];
@@ -71,6 +84,23 @@ export class MockRTCPeerConnection {
   });
 
   setRemoteDescription = vi.fn(async (desc: RTCSessionDescriptionInit) => {
+    if (this.strictSignalingStateValidation) {
+      // Mirrors Chrome's legality table. Throw BEFORE mutating any state,
+      // like the real pc.
+      const state = this.signalingState;
+      const legal =
+        desc.type === 'answer'
+          ? state === 'have-local-offer' || state === 'have-remote-pranswer'
+          : desc.type === 'offer'
+            ? state === 'stable' || state === 'have-remote-offer'
+            : true;
+      if (!legal) {
+        throw new DOMException(
+          `Failed to set remote ${desc.type} sdp: Called in wrong state: ${state}`,
+          'InvalidStateError',
+        );
+      }
+    }
     this.remoteDescription = desc as RTCSessionDescription;
     if (desc.type === 'offer') {
       this._setSignalingState('have-remote-offer');
