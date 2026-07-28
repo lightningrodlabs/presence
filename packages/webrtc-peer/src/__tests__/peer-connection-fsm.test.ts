@@ -229,6 +229,39 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.viewModel.retry?.strategy).toBe('ice-restart');
     });
 
+    it('connected → reconnecting on iceConnectionState=closed', async () => {
+      const ctx = await getConnectedFSM();
+
+      // 'closed' used to be lumped in with 'new'/'checking' as benign, so an
+      // externally-closed pc left the FSM claiming `connected` forever with
+      // no phase change to tell anyone otherwise
+      // (MAINTAINABILITY_ASSESSMENT.md §3.12).
+      ctx.mockPc.simulateIceConnectionState('closed');
+
+      expect(ctx.fsm.state).toBe('reconnecting');
+    });
+
+    it('iceConnectionState=closed forces a full reconnect, not an ICE restart', async () => {
+      const ctx = await getConnectedFSM();
+
+      // restartIce() on a closed pc does nothing; only a fresh peer recovers.
+      ctx.mockPc.simulateIceConnectionState('closed');
+
+      expect(ctx.fsm.viewModel.retry?.strategy).toBe('full-reconnect');
+    });
+
+    it('our own close does not re-enter recovery when the pc reports ICE closed', async () => {
+      const ctx = await getConnectedFSM();
+
+      // `_onEnterState('closed')` sets the state before destroying the peer,
+      // and `_handleTransportFailure` only acts from connected/connecting, so
+      // a self-inflicted ICE 'closed' must stay terminal.
+      ctx.fsm.close('peer left');
+      ctx.mockPc.simulateIceConnectionState('closed');
+
+      expect(ctx.fsm.state).toBe('closed');
+    });
+
     it('connected → closed on explicit close', async () => {
       const ctx = await getConnectedFSM();
 

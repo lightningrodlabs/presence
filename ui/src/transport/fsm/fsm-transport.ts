@@ -64,6 +64,14 @@ export type FsmTransportOptions = PeerTransportOptions & {
 };
 
 export class FsmTransport implements PeerTransport {
+  /**
+   * The FSM owns transport recovery: ICE restart, full reconnect, quadratic
+   * backoff, and the disconnected-grace window all run inside the library.
+   * A consumer that also tears the pc down races it. See
+   * `PeerTransport.ownsTransportRecovery`.
+   */
+  readonly ownsTransportRecovery = true;
+
   private _myAgentId: AgentPubKeyB64;
   private _onOutgoingSignal: (signal: OutgoingSignal) => void;
   private _getIceServers: () => RTCIceServer[];

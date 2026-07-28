@@ -59,6 +59,17 @@ function envelopeSignal(
   };
 }
 
+describe('FsmTransport — recovery ownership', () => {
+  it('owns transport recovery', () => {
+    // The FSM runs ICE restart, full reconnect, backoff and the
+    // disconnected-grace window itself. `streams-store.ts` reads this to
+    // stand its own teardown supervisor down; if this flipped to false the
+    // two controllers would race (MAINTAINABILITY_ASSESSMENT.md §3.4).
+    const { transport } = setup();
+    expect(transport.ownsTransportRecovery).toBe(true);
+  });
+});
+
 describe('FsmTransport — lifecycle', () => {
   it('ensureConnection creates an FSM, allocates a connectionId, transitions to signaling', () => {
     const { transport, pcs, events } = setup();

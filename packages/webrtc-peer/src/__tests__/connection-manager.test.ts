@@ -14,6 +14,7 @@ const activeManagers: ConnectionManager[] = [];
 function createManager(options: {
   agentId?: string;
   signalingChannel?: FakeSignalingChannel;
+  reconnectPolicy?: ConnectionManagerOptions['reconnectPolicy'];
 } = {}) {
   const channel = options.signalingChannel ?? new FakeSignalingChannel();
   const agentId = options.agentId ?? 'agent-aaa';
@@ -23,6 +24,7 @@ function createManager(options: {
     myAgentId: agentId,
     signaling: channel.createAdapter(agentId),
     onTransition: (entry) => transitionLog.push(entry),
+    ...(options.reconnectPolicy ? { reconnectPolicy: options.reconnectPolicy } : {}),
     createPeerConnection: (config) => {
       return new MockRTCPeerConnection(config) as unknown as RTCPeerConnection;
     },
@@ -815,6 +817,193 @@ describe('ConnectionManager', () => {
           }),
         }),
       );
+    });
+  });
+
+  /**
+   * The manager's map cleanup had no coverage of any kind, and the code and
+   * its own comment disagreed: the comment said "closed/failed", the code
+   * tested only `closed`. A give-up therefore left the FSM in the map and
+   * emitted no `connection-closed`, so a consumer keying its connection slot
+   * off that event stayed wrong for the rest of the session
+   * (MAINTAINABILITY_ASSESSMENT.md §3.1c).
+   *
+   * `failedFSM` reaches `failed` the only way it now happens — a transport
+   * failure on an established connection with the retry budget already spent.
+   */
+  describe('map cleanup on terminal states', () => {
+    const giveUpImmediately = {
+      maxAttempts: 1,
+      nextRetryDelayMs: () => null,
+      strategy: () => 'full-reconnect' as const,
+    };
+
+    async function failedFSM() {
+      const { manager } = createManager({ reconnectPolicy: giveUpImmediately });
+      const closed = vi.fn();
+      manager.on('connection-closed', closed);
+
+      manager.ensureConnection('agent-zzz');
+      const fsm = manager.getFSM('agent-zzz')!;
+      await fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      const pc = fsm.peer!.pc as unknown as MockRTCPeerConnection;
+      pc.simulateConnectionState('connected');
+      expect(fsm.state).toBe('connected');
+
+      // Transport dies; the policy has no retries left.
+      pc.simulateIceConnectionState('failed');
+      expect(fsm.state).toBe('failed');
+
+      return { manager, fsm, closed };
+    }
+
+    it('removes a failed connection from the map', async () => {
+      const { manager } = await failedFSM();
+      expect(manager.getFSM('agent-zzz')).toBeDefined(); // deferred by one tick
+
+      vi.advanceTimersByTime(1);
+
+      expect(manager.getFSM('agent-zzz')).toBeUndefined();
+    });
+
+    it('emits connection-closed when a connection gives up', async () => {
+      const { closed } = await failedFSM();
+
+      vi.advanceTimersByTime(1);
+
+      expect(closed).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'connection-closed',
+          remoteAgent: 'agent-zzz',
+        }),
+      );
+    });
+
+    it('closes the failed FSM rather than orphaning its timers', async () => {
+      const { fsm } = await failedFSM();
+
+      vi.advanceTimersByTime(1);
+
+      expect(fsm.state).toBe('closed');
+    });
+
+    it('emits connection-closed exactly once across failed → closed', async () => {
+      const { closed } = await failedFSM();
+
+      // One tick removes it and closes the FSM; closing re-enters the same
+      // handler with toState 'closed', which must not emit a second event.
+      vi.advanceTimersByTime(10_000);
+
+      expect(closed).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets ensureConnection build a fresh connection after a give-up', async () => {
+      const { manager } = await failedFSM();
+      vi.advanceTimersByTime(1);
+
+      manager.ensureConnection('agent-zzz');
+
+      const replacement = manager.getFSM('agent-zzz');
+      expect(replacement).toBeDefined();
+      expect(replacement!.state).toBe('signaling');
+    });
+
+    it('removes a closed connection from the map and emits connection-closed', () => {
+      const { manager } = createManager();
+      const closed = vi.fn();
+      manager.on('connection-closed', closed);
+
+      manager.ensureConnection('agent-bbb');
+      manager.closeConnection('agent-bbb', 'test');
+      vi.advanceTimersByTime(1);
+
+      expect(manager.getFSM('agent-bbb')).toBeUndefined();
+      expect(closed).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not clear the map for transient phases', async () => {
+      const { manager } = createManager();
+      manager.ensureConnection('agent-zzz');
+      const fsm = manager.getFSM('agent-zzz')!;
+      await fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      const pc = fsm.peer!.pc as unknown as MockRTCPeerConnection;
+      pc.simulateConnectionState('connected');
+
+      // Default policy: this goes to `reconnecting`, not `failed`.
+      pc.simulateIceConnectionState('failed');
+      expect(fsm.state).toBe('reconnecting');
+      vi.advanceTimersByTime(1);
+
+      expect(manager.getFSM('agent-zzz')).toBe(fsm);
+    });
+  });
+
+  /**
+   * In-place FSM replacement is **silent**: `fsm.destroy()` clears handlers
+   * and the peer without transitioning, so no `connection-state-changed` and
+   * no `connection-closed` is emitted for the connection that went away. The
+   * only thing a consumer sees is the *new* connection's `signaling`, under a
+   * new connectionId.
+   *
+   * A consumer that keys its own per-peer state on connectionId — Presence
+   * does — must therefore adopt the new id on `signaling` rather than only
+   * creating state when it has none. If it does not, its record still names
+   * the destroyed connection, and every subsequent connect/close for the live
+   * one is discarded by its own supersede guard: the record is stranded in
+   * whatever state it held at the moment of replacement
+   * (MAINTAINABILITY_ASSESSMENT.md §3.1c, reached without any `failed`).
+   *
+   * These tests pin the emission contract that makes that adoption necessary
+   * and sufficient. Nothing else asserts it, and the consumer side cannot be
+   * tested at all until Phase 6.
+   */
+  describe('in-place FSM replacement is silent', () => {
+    function offerFromB(channel: FakeSignalingChannel, epoch: number, connectionId: string) {
+      channel.createAdapter('agent-bbb').sendSignal('agent-aaa', {
+        type: 'offer',
+        connectionId,
+        epoch,
+        data: { type: 'offer', sdp: 'mock-offer' },
+      });
+    }
+
+    it('replaces the FSM on a higher-epoch offer, under a new connectionId', () => {
+      const { a, channel } = createPair();
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const before = a.manager.getFSM('agent-bbb')!.connectionId;
+
+      offerFromB(channel, 2, 'b-new');
+
+      const after = a.manager.getFSM('agent-bbb')!.connectionId;
+      expect(after).not.toBe(before);
+    });
+
+    it('emits NO connection-closed for the connection it replaced', () => {
+      const { a, channel } = createPair();
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const closed = vi.fn();
+      a.manager.on('connection-closed', closed);
+
+      offerFromB(channel, 2, 'b-new');
+      vi.advanceTimersByTime(10_000);
+
+      // This is the whole finding: the consumer is never told the old
+      // connection died. Its only notice is the new one's signaling.
+      expect(closed).not.toHaveBeenCalled();
+    });
+
+    it('announces the replacement only as a signaling transition on the new id', () => {
+      const { a, channel } = createPair();
+      a.manager.ensureConnection('agent-bbb', { epoch: 1 });
+      const before = a.manager.getFSM('agent-bbb')!.connectionId;
+      const changes: any[] = [];
+      a.manager.on('connection-state-changed', e => changes.push(e));
+
+      offerFromB(channel, 2, 'b-new');
+
+      const signaling = changes.filter(e => e.data?.toState === 'signaling');
+      expect(signaling.length).toBeGreaterThan(0);
+      expect(signaling.every(e => e.connectionId !== before)).toBe(true);
     });
   });
 

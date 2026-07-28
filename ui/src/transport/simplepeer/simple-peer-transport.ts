@@ -95,6 +95,13 @@ const PC_POLL_INTERVAL_MS = 50;
 const PC_POLL_MAX_ATTEMPTS = 20;
 
 export class SimplePeerTransport implements PeerTransport {
+  /**
+   * SimplePeer does not recover a dead connection on its own — the
+   * application's pong-driven stale-ICE supervisor is what tears a failed
+   * connection down and re-initiates. See `PeerTransport.ownsTransportRecovery`.
+   */
+  readonly ownsTransportRecovery = false;
+
   private _myAgentId: AgentPubKeyB64;
   private _onOutgoingSignal: (signal: OutgoingSignal) => void;
   private _getIceServers: () => RTCIceServer[];

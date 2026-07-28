@@ -1009,9 +1009,26 @@ export class PeerConnectionFSM {
         this._clearTimer('ice-disconnected-grace');
         this._cancelDtlsWatchdog();
         this._handleTransportFailure('ice-failed');
+      } else if (iceState === 'closed') {
+        // The RTCPeerConnection itself is closed. Previously this was lumped
+        // in with 'new'/'checking' as benign, so the FSM stayed in
+        // `connected` over a dead pc and never emitted a phase change —
+        // leaving every consumer permanently wrong about the link
+        // (MAINTAINABILITY_ASSESSMENT.md §3.12).
+        //
+        // Our own teardown also lands here, and that must stay a no-op:
+        // `_onEnterState('closed')` sets `_state` before calling
+        // `_destroyPeer()`, and `_handleTransportFailure` only acts from
+        // `connected`/`connecting`, so a self-inflicted close falls through
+        // harmlessly. Only an externally-closed pc reaches the transition.
+        this._iceConnected = false;
+        this._iceConnectedAt = null;
+        this._clearTimer('ice-disconnected-grace');
+        this._cancelDtlsWatchdog();
+        this._handleTransportFailure('ice-closed');
       } else {
-        // 'new' / 'checking' / 'closed' — maintain the invariant by
-        // clearing any pending grace timer.
+        // 'new' / 'checking' — maintain the invariant by clearing any
+        // pending grace timer.
         this._clearTimer('ice-disconnected-grace');
       }
     });

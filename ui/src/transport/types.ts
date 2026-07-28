@@ -180,6 +180,25 @@ export interface PeerTransport {
   /** Whether we currently track any state for this peer. */
   hasConnection(peer: AgentPubKeyB64): boolean;
 
+  /**
+   * Whether this transport recovers its own connections — ICE restart,
+   * full reconnect, a disconnected-grace window — without the application
+   * doing anything.
+   *
+   * A consumer running its own teardown-and-reinitiate supervisor against
+   * `pc.iceConnectionState` MUST stand down when this is true, or the two
+   * controllers race and produce the "media flows briefly then suddenly
+   * reconnects" churn (MAINTAINABILITY_ASSESSMENT.md §3.4). The
+   * give-up decision still belongs to the application; the transport
+   * signals it by reaching `failed`.
+   *
+   * Declared on the transport rather than derived by the consumer from the
+   * transport's identity, so that swapping which transport carries a given
+   * stream purpose cannot silently invert the answer. Read by
+   * `streams-store.ts` at all three `decideStaleConnectionCleanup` sites.
+   */
+  readonly ownsTransportRecovery: boolean;
+
   /** Current phase, or 'idle' if no connection. */
   getPhase(peer: AgentPubKeyB64): ConnectionPhase;
 
@@ -290,7 +309,6 @@ export type TransportImpl = 'simplepeer' | 'fsm';
  * when no `iceServers` getter is wired in (tests).
  */
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'stun:stun.cloudflare.com:3478' },
   {
     urls: [

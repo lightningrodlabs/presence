@@ -7,6 +7,9 @@ import {
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
+import { routeTransportPhase } from './transport/media-event-policy';
+import { computeSignalsTargets } from './transport/carrier-coverage';
+import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import {
   derived,
   get,
@@ -40,6 +43,7 @@ import { getModule } from './room/modules/registry';
 import {
   DEFAULT_CONVERSATION_PAYLOAD,
   ConversationPayload,
+  conversationPayloadSupportsFsm,
   parseConversationPayload,
 } from './room/modules/conversation';
 import { RoomClient } from './room/room-client';
@@ -310,17 +314,16 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
+    // Signals is the complement of *WebRTC carrying media*, not of *a
+    // WebRTC attempt existing*. Decision and rationale live in
+    // `transport/carrier-coverage.ts`.
     this._signalsTargets = derived(
       [this._activeAgents, this._openConnections],
-      ([active, connections]) => {
-        const targets = new Set<AgentPubKeyB64>();
-        for (const pubkey of Object.keys(active)) {
-          if (!connections[pubkey]) {
-            targets.add(pubkey);
-          }
-        }
-        return targets;
-      },
+      ([active, connections]) =>
+        computeSignalsTargets({
+          activeAgents: Object.keys(active),
+          openConnections: connections,
+        }),
     );
 
     // Construct transports. iceServers / trickleICE are getters so the
@@ -463,34 +466,79 @@ export class StreamsStore {
 
   private _dispatchMediaEvent(event: TransportEvent, impl: 'simplepeer' | 'fsm'): void {
     switch (event.type) {
-      case 'connection-state-change':
-        if (event.phase === 'signaling') {
-          this._startMediaIceMonitor(event.peer, event.connectionId, impl);
-          // FSM acceptor path: an incoming offer creates an FSM state without
-          // streams-store knowing in advance. Install the openConnections
-          // entry now so subsequent connect/stream events have a slot to
-          // mutate. SimplePeer-acceptor and initiator paths install the
-          // entry directly in handleSdpData / handleInitAccept; we don't
-          // overwrite an existing entry.
-          if (impl === 'fsm' && !get(this._openConnections)[event.peer]) {
-            this._openConnections.update(currentValue => {
-              currentValue[event.peer] = {
-                connectionId: event.connectionId,
-                video: false,
-                audio: false,
-                connected: false,
-                direction: 'duplex',
-              };
-              return currentValue;
-            });
-            this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
-          }
-        } else if (event.phase === 'connected') {
-          this._handleMediaConnected(event.peer, event.connectionId, impl);
-        } else if (event.phase === 'closed') {
-          this._handleMediaClosed(event.peer, event.connectionId, impl);
+      case 'connection-state-change': {
+        // Routing lives in `routeTransportPhase` (transport/media-event-policy.ts),
+        // whose switch is exhaustive over ConnectionPhase. This used to be an
+        // if/else-if over three of eight phases with no else; the five it
+        // dropped included `failed`, which is how a peer ended up with a
+        // `connected: true` slot over a destroyed pc — a rendered pane on a
+        // dead link plus permanent exclusion from `_signalsTargets`.
+        const route = routeTransportPhase({
+          phase: event.phase,
+          impl,
+          connectionId: event.connectionId,
+          openConnectionId: get(this._openConnections)[event.peer]?.connectionId,
+        });
+        switch (route.handler) {
+          case 'start-ice-monitor':
+            if (route.slot.action === 'adopt') {
+              // The FSM behind the slot's connectionId was replaced in place
+              // by ConnectionManager (higher-epoch offer, or a new remote
+              // session) via `fsm.destroy()`, which emits no transition — so
+              // no `closed` ever reached us for it. Re-point the slot at the
+              // live connection; leaving the stale id would make every later
+              // connect/close for this peer hit its supersede guard, and a
+              // slot that was `connected: true` at replacement would stay
+              // that way forever. Mirrors the initiator path's supersede
+              // handling in `handleInitAccept`.
+              this.logger.logAgentEvent({
+                agent: event.peer,
+                timestamp: Date.now(),
+                event: 'Superseded',
+                connectionId: route.slot.supersedes,
+                detail: `superseded-by=${event.connectionId}; path=transport-replace`,
+              });
+              this._stopMediaIceMonitor(event.peer, route.slot.supersedes);
+              // Keyed to the old connection; the new monitor sets its own.
+              delete this._iceDisconnectedAt[event.peer];
+            }
+            this._startMediaIceMonitor(event.peer, event.connectionId, impl);
+            if (route.slot.action !== 'keep') {
+              // `install`: FSM acceptor path — an incoming offer creates an
+              // FSM without streams-store knowing in advance, so the slot
+              // has to exist for later connect/stream events to mutate.
+              // `adopt`: same write, replacing a slot whose connection is
+              // gone. Both start from `connected: false`, which is the
+              // truth in either case.
+              this._openConnections.update(currentValue => {
+                currentValue[event.peer] = {
+                  connectionId: event.connectionId,
+                  video: false,
+                  audio: false,
+                  connected: false,
+                  direction: 'duplex',
+                };
+                return currentValue;
+              });
+              this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
+            }
+            break;
+          case 'media-connected':
+            this._handleMediaConnected(event.peer, event.connectionId, impl);
+            break;
+          case 'media-closed':
+            this._handleMediaClosed(
+              event.peer,
+              event.connectionId,
+              impl,
+              `${event.phase}/${route.reason}`,
+            );
+            break;
+          case 'ignore':
+            break;
         }
         break;
+      }
       case 'remote-stream':
         this._handleMediaRemoteStream(event.peer, event.connectionId, event.stream);
         break;
@@ -544,6 +592,9 @@ export class StreamsStore {
    * Effective WebRTC implementation for the link between us and `peerB64`.
    *
    * Resolution order:
+   *  0. If the peer's build cannot handle `SdpFsm` at all, the link is
+   *     `'simplepeer'` regardless of anything either side prefers. See
+   *     `conversationPayloadSupportsFsm`.
    *  1. If either side has set a per-peer override (`peerImpl[other]`), the
    *     override applies. If both sides override and disagree, `'fsm'` wins
    *     — it has the marginal-NAT machinery (Perfect Negotiation, session-
@@ -562,6 +613,7 @@ export class StreamsStore {
       myPayload?.peerImpl?.[peerB64],
       peerPayload?.webrtcImpl ?? 'simplepeer',
       peerPayload?.peerImpl?.[this.myPubKeyB64],
+      conversationPayloadSupportsFsm(peerConv ?? null),
     );
   }
 
@@ -575,8 +627,15 @@ export class StreamsStore {
     myOverride: 'simplepeer' | 'fsm' | undefined,
     peerGlobal: 'simplepeer' | 'fsm',
     peerOverride: 'simplepeer' | 'fsm' | undefined,
+    peerSupportsFsm: boolean,
   ): 'simplepeer' | 'fsm' {
-    return resolveWebrtcImpl(myGlobal, myOverride, peerGlobal, peerOverride);
+    return resolveWebrtcImpl({
+      myGlobal,
+      myOverride,
+      peerGlobal,
+      peerOverride,
+      peerSupportsFsm,
+    });
   }
 
   /** Read our own peerImpl map. Defaults to {} if conversation isn't
@@ -1126,6 +1185,11 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
     impl: 'simplepeer' | 'fsm',
+    /** Why the slot is being cleared — the `phase/reason` pair from
+     *  `routeTransportPhase`, or a call-site tag for the paths that close a
+     *  connection directly. Recorded on the FsmClose/SimplePeerClose event so
+     *  a give-up is distinguishable from an ordinary close in the log. */
+    cause = 'close-event',
   ): void {
     console.log('#### GOT CLOSE EVENT ####');
 
@@ -1166,6 +1230,7 @@ export class StreamsStore {
       timestamp: Date.now(),
       event: impl === 'fsm' ? 'FsmClose' : 'SimplePeerClose',
       connectionId,
+      detail: `cause=${cause}`,
     });
     if (wasWebrtcCarrier) {
       // Annotate the downgrade with *why* we left webrtc (§6.6) — the reason
@@ -2970,15 +3035,22 @@ export class StreamsStore {
   private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
-   * The set of active peers that do NOT have a WebRTC connection. Audio
-   * for these peers should be carried over Holochain remote signals
-   * (the voice encoder path). Precomputed as a derived store so the
-   * voice encoder's pump loop doesn't recompute per-chunk — it just
-   * reads the cached set.
+   * The set of active peers whose media is NOT currently flowing over
+   * WebRTC. Audio and filmstrip video for these peers are carried over
+   * Holochain remote signals. Precomputed as a derived store so the voice
+   * encoder's pump loop doesn't recompute per-chunk — it just reads the
+   * cached set.
    *
-   * Updates when: a peer appears/disappears in _activeAgents, a WebRTC
-   * connection opens/closes in _openConnections, or disableWebrtcWith
-   * changes (which tears down WebRTC, adding the peer to this set).
+   * Membership is the complement of `connected` — ICE + DTLS up — not the
+   * complement of "an entry exists". A peer mid-negotiation, mid-reconnect,
+   * or holding a wedged entry is still carried by signals, so handover is
+   * make-before-break in both directions. The rule and its rationale are in
+   * `transport/carrier-coverage.ts`; the constructor's `derived` is the only
+   * caller.
+   *
+   * Updates when: a peer appears/disappears in _activeAgents, or any
+   * `_openConnections` write changes a peer's `connected` flag — which
+   * includes connect, close, give-up, and the disableWebrtcWith teardown.
    */
   _signalsTargets!: Readable<Set<AgentPubKeyB64>>;
 
@@ -4551,9 +4623,36 @@ export class StreamsStore {
       });
       const conn = get(this._openConnections)[pubkey];
       if (conn) {
+        // Repair on the transport that actually owns this peer's
+        // connection. This was `this.mediaTransport` — the bare SimplePeer
+        // transport — whose `addTrack` iterates its *own* connection map.
+        // For a peer on the FSM, which is the default carrier, that map
+        // does not contain them, so the repair was a silent no-op that
+        // still consumed the cooldown and the attempt budget
+        // (MAINTAINABILITY_ASSESSMENT.md §3.12).
+        //
+        // `_activeMediaTransportFor` is the same authority Case 2
+        // (`_tryReplaceTrackRecovery`) already uses, so the two halves of
+        // this recovery family now agree. It is chosen over
+        // `_allMediaTransports()` because addressing the owning transport
+        // is strictly narrower, and over per-peer `pc.addTrack` because
+        // that would need a renegotiation contract the two carriers do not
+        // share — SimplePeer owns its own negotiation, and bypassing its
+        // `addTrack` is not equivalent. Retiring that asymmetry is Phase 4.
+        const transport = this._activeMediaTransportFor(pubkey);
+        if (!transport.hasConnection(pubkey)) {
+          // The slot has outlived the transport's own state; there is
+          // nothing to add a track to. Return without recording an
+          // attempt — burning the budget on a no-op is what let this
+          // defect hide.
+          this.logger.logCustomMessage(
+            `Reconcile skipped [${pubkey.slice(0, 8)}]: no transport connection`,
+          );
+          return;
+        }
         try {
           for (const track of this.mainStream.getTracks()) {
-            this.mediaTransport.addTrack(track, this.mainStream);
+            transport.addTrack(track, this.mainStream);
           }
           this._lastReconcileTime[pubkey] = Date.now();
           this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
@@ -5565,19 +5664,28 @@ export class StreamsStore {
       // screen share connection immediately rather than waiting for
       // the next Pong cycle.
       if (this.screenShareStream) {
-        // Clean up stale outgoing connection if WebRTC state is dead.
-        // 'disconnected' is treated as recoverable for ICE_DISCONNECTED_GRACE_MS
-        // (see ICE_DISCONNECTED_GRACE_MS rationale).
+        // Clean up stale outgoing connection if WebRTC state is dead. Same
+        // predicate as the video path — see `stale-connection-policy.ts`.
+        // Screen share is SimplePeer today, which owns no recovery, so this
+        // supervisor is in force for it. Read from the transport rather
+        // than hardcoded, so porting screen share to the FSM (Phase 3)
+        // stands this down automatically instead of leaving two literals
+        // that no test covers and no compiler checks.
         const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
         if (outgoing) {
           const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
           const iceState = pc?.iceConnectionState;
-          const disconnectedAt = this._screenShareIceDisconnectedAt[pubkeyB64];
-          const disconnectedExceededGrace =
-            iceState === 'disconnected' &&
-            !!disconnectedAt &&
-            Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
-          if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
+          const decision = decideStaleConnectionCleanup({
+            hasExistingConn: true,
+            slotClaimsConnected: !!outgoing.connected,
+            carrierOwnsRecovery:
+              this.screenShareOutTransport.ownsTransportRecovery,
+            iceState,
+            disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
+            now: Date.now(),
+            graceMs: ICE_DISCONNECTED_GRACE_MS,
+          });
+          if (decision.action === 'teardown') {
             this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
             this._screenShareConnectionsOutgoing.update(v => {
               delete v[pubkeyB64];
@@ -5877,29 +5985,30 @@ export class StreamsStore {
 
     // Clean up stale video connection if the underlying WebRTC is dead.
     // This allows the normal initiation flow to proceed for a re-joining peer.
-    //
-    // 'disconnected' is treated as recoverable for a grace period: WebRTC
-    // keeps probing the active candidate pair and may transition back to
-    // 'connected' if the path heals. Tearing down on the first 'disconnected'
-    // both aborts that recovery locally and (because the new InitRequest we
-    // would send next supersedes the peer's connection too) interrupts the
-    // peer's recovery as well, producing the symptom of "media flows
-    // briefly then suddenly reconnects" repeatedly. We only tear down on
-    // 'failed'/'closed' immediately; 'disconnected' must persist past
-    // ICE_DISCONNECTED_GRACE_MS.
+    // The predicate lives in `transport/stale-connection-policy.ts` — it is
+    // the same rule the two screen-share sites below apply, and it is where
+    // the grace-window and one-recovery-controller rationale is written down.
     const existingConn = get(this._openConnections)[pubkeyB64];
-    if (existingConn) {
+    {
       const activeTransport = this._activeMediaTransportFor(pubkeyB64);
-      const pc = activeTransport.getRTCPeerConnection(pubkeyB64);
+      const pc = existingConn
+        ? activeTransport.getRTCPeerConnection(pubkeyB64)
+        : undefined;
       const iceState = pc?.iceConnectionState;
-      const disconnectedAt = this._iceDisconnectedAt[pubkeyB64];
-      const disconnectedExceededGrace =
-        iceState === 'disconnected' &&
-        !!disconnectedAt &&
-        Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
-      if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
-        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
-        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState}`);
+      const decision = decideStaleConnectionCleanup({
+        hasExistingConn: !!existingConn,
+        slotClaimsConnected: !!existingConn?.connected,
+        // The transport declares whether it recovers itself; we do not
+        // infer it from which transport this is.
+        carrierOwnsRecovery: activeTransport.ownsTransportRecovery,
+        iceState,
+        disconnectedAt: this._iceDisconnectedAt[pubkeyB64],
+        now: Date.now(),
+        graceMs: ICE_DISCONNECTED_GRACE_MS,
+      });
+      if (existingConn && decision.action === 'teardown') {
+        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
+        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState} ${decision.reason}`);
         this.logger.logAgentEvent({
           agent: pubkeyB64,
           timestamp: Date.now(),
@@ -6003,15 +6112,18 @@ export class StreamsStore {
     if (outgoingScreenShare) {
       const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
       const iceState = pc?.iceConnectionState;
-      // 'disconnected' is treated as recoverable for ICE_DISCONNECTED_GRACE_MS
-      // (see ICE_DISCONNECTED_GRACE_MS rationale).
-      const disconnectedAt = this._screenShareIceDisconnectedAt[pubkeyB64];
-      const disconnectedExceededGrace =
-        iceState === 'disconnected' &&
-        !!disconnectedAt &&
-        Date.now() - disconnectedAt > ICE_DISCONNECTED_GRACE_MS;
-      if (iceState === 'failed' || iceState === 'closed' || disconnectedExceededGrace) {
-        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState})`);
+      // Same predicate as the video path — see `stale-connection-policy.ts`.
+      const decision = decideStaleConnectionCleanup({
+        hasExistingConn: true,
+        slotClaimsConnected: !!outgoingScreenShare.connected,
+        carrierOwnsRecovery: this.screenShareOutTransport.ownsTransportRecovery,
+        iceState,
+        disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
+        now,
+        graceMs: ICE_DISCONNECTED_GRACE_MS,
+      });
+      if (decision.action === 'teardown') {
+        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
         this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
         this._screenShareConnectionsOutgoing.update(currentValue => {
           delete currentValue[pubkeyB64];

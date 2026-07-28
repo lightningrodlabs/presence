@@ -71,37 +71,52 @@ describe('decideCarrierSwitch — webrtc↔signals hysteresis (§6.4)', () => {
 });
 
 describe('resolveWebrtcImpl — symmetric union with per-peer overrides', () => {
+  /** Every case in this block is between two FSM-capable builds. */
+  const capable = (
+    myGlobal: 'simplepeer' | 'fsm',
+    myOverride: 'simplepeer' | 'fsm' | undefined,
+    peerGlobal: 'simplepeer' | 'fsm',
+    peerOverride: 'simplepeer' | 'fsm' | undefined,
+  ) =>
+    resolveWebrtcImpl({
+      myGlobal,
+      myOverride,
+      peerGlobal,
+      peerOverride,
+      peerSupportsFsm: true,
+    });
+
   it('defaults to simplepeer when neither side has a preference', () => {
-    expect(resolveWebrtcImpl('simplepeer', undefined, 'simplepeer', undefined)).toBe(
+    expect(capable('simplepeer', undefined, 'simplepeer', undefined)).toBe(
       'simplepeer',
     );
   });
 
   it('uses fsm when my global preference is fsm', () => {
-    expect(resolveWebrtcImpl('fsm', undefined, 'simplepeer', undefined)).toBe('fsm');
+    expect(capable('fsm', undefined, 'simplepeer', undefined)).toBe('fsm');
   });
 
   it('uses fsm when peer global preference is fsm (symmetric union)', () => {
-    expect(resolveWebrtcImpl('simplepeer', undefined, 'fsm', undefined)).toBe('fsm');
+    expect(capable('simplepeer', undefined, 'fsm', undefined)).toBe('fsm');
   });
 
   it('my override wins over my global', () => {
-    expect(resolveWebrtcImpl('fsm', 'simplepeer', 'simplepeer', undefined)).toBe(
+    expect(capable('fsm', 'simplepeer', 'simplepeer', undefined)).toBe(
       'simplepeer',
     );
-    expect(resolveWebrtcImpl('simplepeer', 'fsm', 'simplepeer', undefined)).toBe('fsm');
+    expect(capable('simplepeer', 'fsm', 'simplepeer', undefined)).toBe('fsm');
   });
 
   it('peer override wins over my global when I have no override', () => {
-    expect(resolveWebrtcImpl('fsm', undefined, 'fsm', 'simplepeer')).toBe('simplepeer');
-    expect(resolveWebrtcImpl('simplepeer', undefined, 'simplepeer', 'fsm')).toBe('fsm');
+    expect(capable('fsm', undefined, 'fsm', 'simplepeer')).toBe('simplepeer');
+    expect(capable('simplepeer', undefined, 'simplepeer', 'fsm')).toBe('fsm');
   });
 
   it('agreeing overrides apply unchanged', () => {
-    expect(resolveWebrtcImpl('fsm', 'simplepeer', 'fsm', 'simplepeer')).toBe(
+    expect(capable('fsm', 'simplepeer', 'fsm', 'simplepeer')).toBe(
       'simplepeer',
     );
-    expect(resolveWebrtcImpl('simplepeer', 'fsm', 'simplepeer', 'fsm')).toBe('fsm');
+    expect(capable('simplepeer', 'fsm', 'simplepeer', 'fsm')).toBe('fsm');
   });
 
   it('disagreeing overrides resolve to fsm (marginal-NAT-favoring tiebreaker)', () => {
@@ -109,15 +124,62 @@ describe('resolveWebrtcImpl — symmetric union with per-peer overrides', () => 
     // already in a regime where the FSM's Perfect-Negotiation /
     // session-ID / backoff machinery is most likely to help. See
     // WEBRTC_CARRIER_ANALYSIS.md.
-    expect(resolveWebrtcImpl('fsm', 'simplepeer', 'fsm', 'fsm')).toBe('fsm');
-    expect(resolveWebrtcImpl('simplepeer', 'fsm', 'simplepeer', 'simplepeer')).toBe(
+    expect(capable('fsm', 'simplepeer', 'fsm', 'fsm')).toBe('fsm');
+    expect(capable('simplepeer', 'fsm', 'simplepeer', 'simplepeer')).toBe(
       'fsm',
     );
   });
 
   it('overrides outrank globals on both sides', () => {
     // Both global=fsm but I override to simplepeer — link uses simplepeer.
-    expect(resolveWebrtcImpl('fsm', 'simplepeer', 'fsm', undefined)).toBe('simplepeer');
+    expect(capable('fsm', 'simplepeer', 'fsm', undefined)).toBe('simplepeer');
+  });
+});
+
+describe('resolveWebrtcImpl — capability dominates preference (§3.8)', () => {
+  /**
+   * The interop bug: our global default is `'fsm'`, and the union rule made
+   * that alone enough to resolve the link to `'fsm'` — so we sent `SdpFsm`
+   * to peers whose build has no handler for it. Every preference shape has
+   * to yield to the capability.
+   */
+  const PREFERENCE_SHAPES = [
+    { myGlobal: 'fsm', myOverride: undefined, peerGlobal: 'simplepeer', peerOverride: undefined },
+    { myGlobal: 'fsm', myOverride: 'fsm', peerGlobal: 'simplepeer', peerOverride: undefined },
+    { myGlobal: 'simplepeer', myOverride: 'fsm', peerGlobal: 'fsm', peerOverride: 'fsm' },
+    { myGlobal: 'fsm', myOverride: 'fsm', peerGlobal: 'fsm', peerOverride: 'fsm' },
+    { myGlobal: 'simplepeer', myOverride: undefined, peerGlobal: 'fsm', peerOverride: undefined },
+  ] as const;
+
+  it.each(PREFERENCE_SHAPES)(
+    'resolves to simplepeer for a peer that cannot parse SdpFsm (%o)',
+    shape => {
+      expect(resolveWebrtcImpl({ ...shape, peerSupportsFsm: false })).toBe(
+        'simplepeer',
+      );
+    },
+  );
+
+  it('still reaches fsm for the same shapes when the peer is capable', () => {
+    // Negative control: the gate must not be the only thing deciding.
+    const anyFsm = PREFERENCE_SHAPES.map(shape =>
+      resolveWebrtcImpl({ ...shape, peerSupportsFsm: true }),
+    );
+    expect(anyFsm).toContain('fsm');
+  });
+
+  it('an incapable peer is simplepeer even when I explicitly override to fsm', () => {
+    // No preference either side holds can make an old client understand a
+    // signal type it has no handler for.
+    expect(
+      resolveWebrtcImpl({
+        myGlobal: 'fsm',
+        myOverride: 'fsm',
+        peerGlobal: 'fsm',
+        peerOverride: 'fsm',
+        peerSupportsFsm: false,
+      }),
+    ).toBe('simplepeer');
   });
 });
 

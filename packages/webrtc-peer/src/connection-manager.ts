@@ -503,20 +503,42 @@ export class ConnectionManager {
           });
         }
 
-        // Clean up closed/failed connections from the map
-        if (entry.toState === 'closed') {
+        // Clean up connections that will not recover on their own.
+        //
+        // `closed` is terminal. `failed` is reached only once the FSM has
+        // exhausted its own reconnect budget: it then auto-transitions to
+        // `idle` after 5s, and entering `idle` from `failed` calls
+        // `_destroyPeer()`. So from `failed` onward there is no live
+        // RTCPeerConnection behind this entry and no path back without a
+        // fresh `ensureConnection`.
+        //
+        // The comment here used to say "closed/failed" while the code
+        // tested only `closed`, so a give-up left the FSM in the map and
+        // emitted no `connection-closed`. Consumers that key their own
+        // connection slot off that event never learned the link was dead —
+        // see MAINTAINABILITY_ASSESSMENT.md §3.1(c). Asserted by
+        // `__tests__/connection-manager.test.ts` ("map cleanup on terminal
+        // states").
+        if (entry.toState === 'closed' || entry.toState === 'failed') {
+          const gaveUp = entry.toState === 'failed';
           // Defer cleanup to avoid modifying map during iteration
           setTimeout(() => {
             const current = this._connections.get(remoteAgent);
-            if (current === fsm) {
-              this._connections.delete(remoteAgent);
-              this._emitManagerEvent({
-                type: 'connection-closed',
-                remoteAgent,
-                connectionId,
-              });
-              this._notifyViewModelChange();
-            }
+            if (current !== fsm) return;
+            this._connections.delete(remoteAgent);
+            // A `closed` FSM has already released its peer and timers. A
+            // `failed` one still holds the failed-cleanup timer (and, until
+            // it fires, the pc), so close it explicitly rather than
+            // orphaning it. `close()` transitions failed -> closed, which
+            // re-enters this handler; the `current !== fsm` guard above
+            // makes the second pass a no-op.
+            if (gaveUp) fsm.close('retry budget exhausted (failed)');
+            this._emitManagerEvent({
+              type: 'connection-closed',
+              remoteAgent,
+              connectionId,
+            });
+            this._notifyViewModelChange();
           }, 0);
         }
       },
