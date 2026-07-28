@@ -35,6 +35,7 @@ import {
   STALE_CYCLES_REFRESH_THRESHOLD,
 } from './transport/track-health-policy';
 import type { RtcStatsReportLike } from './transport/track-health-policy';
+import { decideInitRetry } from './transport/init-retry-policy';
 import {
   derived,
   get,
@@ -6235,18 +6236,32 @@ export class StreamsStore {
     // module is active AND WebRTC is not disabled for this peer.
     if (conversationActive && !peerWebrtcDisabled && !this.webrtcGloballyDisabled) {
       const pendingInits = this._pendingInits[pubkeyB64];
-      if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
-        if (!pendingInits) {
-          console.log('#### SENDING FIRST INIT REQUEST.');
-          const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
-          if (lastDisconnect) {
-            const gap = this.clock.now() - lastDisconnect;
-            this.logger.logCustomMessage(
-              `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
-            );
+      const decision = decideInitRetry({
+        kind: 'video',
+        alreadyOpen: !!alreadyOpen,
+        myPubKeyB64: this.myPubKeyB64,
+        peerPubKeyB64: pubkeyB64,
+        pendingInitT0s: pendingInits?.map(init => init.t0),
+        now,
+        retryThresholdMs: INIT_RETRY_THRESHOLD,
+      });
+      switch (decision.action) {
+        case 'send-init': {
+          if (decision.reason === 'no-pending-init') {
+            console.log('#### SENDING FIRST INIT REQUEST.');
+            const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
+            if (lastDisconnect) {
+              const gap = this.clock.now() - lastDisconnect;
+              this.logger.logCustomMessage(
+                `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
+              );
+            }
+          } else {
+            console.log(`#--# SENDING INIT REQUEST NUMBER ${decision.attempt}.`);
           }
           const newConnectionId = uuidv4();
           this._pendingInits[pubkeyB64] = [
+            ...(pendingInits ?? []),
             { connectionId: newConnectionId, t0: now },
           ];
           await this.roomClient.sendMessage(
@@ -6255,30 +6270,29 @@ export class StreamsStore {
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
           );
           this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-        } else {
-          console.log(
-            `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
-          );
-          const latestInit = pendingInits.sort(
-            (init_a, init_b) => init_b.t0 - init_a.t0
-          )[0];
-          if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
-            const newConnectionId = uuidv4();
-            pendingInits.push({ connectionId: newConnectionId, t0: now });
-            this._pendingInits[pubkeyB64] = pendingInits;
-            await this.roomClient.sendMessage(
-              [signal.from_agent],
-              'InitRequest',
-              JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-            );
-            this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-          }
+          break;
         }
-      } else if (!alreadyOpen && !pendingInits) {
-        this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
-      } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
-        // If the connection is already open, reconcile with our expected stream state
-        this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
+        case 'await-peer-init':
+          this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
+          break;
+        case 'hold': {
+          if (decision.reason === 'within-threshold') {
+            // Inherited: the inline code printed the "sending" line before
+            // the threshold check, so it logs on held pongs too.
+            console.log(
+              `#--# SENDING INIT REQUEST NUMBER ${(pendingInits?.length ?? 0) + 1}.`
+            );
+          }
+          if (decision.reason === 'already-open' && metaDataExt?.data.streamInfo) {
+            // If the connection is already open, reconcile with our expected stream state
+            this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
+          }
+          break;
+        }
+        default: {
+          const exhaustive: never = decision;
+          void exhaustive;
+        }
       }
     }
 
@@ -6336,46 +6350,70 @@ export class StreamsStore {
       get(this._screenShareConnectionsOutgoing)
     ).includes(pubkeyB64);
     const pendingScreenShareInits = this._pendingScreenShareInits[pubkeyB64];
-    if (!!this.screenShareStream && !alreadyOpenScreenShareOutgoing) {
-      if (!pendingScreenShareInits) {
-        console.log('#### SENDING FIRST SCREEN SHARE INIT REQUEST.');
-        const newConnectionId = uuidv4();
-        this._pendingScreenShareInits[pubkeyB64] = [
-          { connectionId: newConnectionId, t0: now },
-        ];
-        await this.roomClient.sendMessage(
-          [signal.from_agent],
-          'InitRequest',
-          JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
-        );
-        this.updateScreenShareConnectionStatus(pubkeyB64, {
-          type: 'InitSent',
-        });
-      } else {
-        console.log(
-          `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${
-            pendingScreenShareInits.length + 1
-          }.`
-        );
-        const latestInit = pendingScreenShareInits.sort(
-          (init_a, init_b) => init_b.t0 - init_a.t0
-        )[0];
-        if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
+    if (this.screenShareStream) {
+      const decision = decideInitRetry({
+        kind: 'screen-share',
+        alreadyOpen: alreadyOpenScreenShareOutgoing,
+        myPubKeyB64: this.myPubKeyB64,
+        peerPubKeyB64: pubkeyB64,
+        pendingInitT0s: pendingScreenShareInits?.map(init => init.t0),
+        now,
+        retryThresholdMs: INIT_RETRY_THRESHOLD,
+      });
+      switch (decision.action) {
+        case 'send-init': {
+          if (decision.reason === 'no-pending-init') {
+            console.log('#### SENDING FIRST SCREEN SHARE INIT REQUEST.');
+          } else {
+            console.log(
+              `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${decision.attempt}.`
+            );
+          }
           const newConnectionId = uuidv4();
-          pendingScreenShareInits.push({
-            connectionId: newConnectionId,
-            t0: now,
-          });
-          this._pendingScreenShareInits[pubkeyB64] = pendingScreenShareInits;
+          this._pendingScreenShareInits[pubkeyB64] = [
+            ...(pendingScreenShareInits ?? []),
+            { connectionId: newConnectionId, t0: now },
+          ];
           await this.roomClient.sendMessage(
             [signal.from_agent],
             'InitRequest',
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
           );
+          this.updateScreenShareConnectionStatus(pubkeyB64, {
+            type: 'InitSent',
+          });
+          break;
         }
-        this.updateScreenShareConnectionStatus(pubkeyB64, {
-          type: 'InitSent',
-        });
+        case 'hold': {
+          if (decision.reason === 'within-threshold') {
+            // Inherited: the inline code printed the "sending" line before
+            // the threshold check, so it logs on held pongs too.
+            console.log(
+              `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${
+                (pendingScreenShareInits?.length ?? 0) + 1
+              }.`
+            );
+          }
+          if (decision.setStatusInitSent) {
+            // Divergence kept from the inline code: the screen path
+            // re-asserts InitSent on every pong while within the retry
+            // threshold; the video path does not. See the header of
+            // transport/init-retry-policy.ts.
+            this.updateScreenShareConnectionStatus(pubkeyB64, {
+              type: 'InitSent',
+            });
+          }
+          break;
+        }
+        case 'await-peer-init':
+          // Unreachable for screen share — the sharer has no tie-break to
+          // defer on — but the switch stays exhaustive rather than
+          // asserting unreachability at a distance.
+          break;
+        default: {
+          const exhaustive: never = decision;
+          void exhaustive;
+        }
       }
     }
   }
