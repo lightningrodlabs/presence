@@ -26,6 +26,12 @@ import { routeTransportPhase, decideSlotWrite } from './transport/media-event-po
 import { computeSignalsTargets } from './transport/carrier-coverage';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import {
+  summarizeRtcStats,
+  decideTrackRefresh,
+  STALE_CYCLES_REFRESH_THRESHOLD,
+} from './transport/track-health-policy';
+import type { RtcStatsReportLike } from './transport/track-health-policy';
+import {
   derived,
   get,
   Readable,
@@ -5578,109 +5584,41 @@ export class StreamsStore {
 
       try {
         const stats = await pc.getStats();
-        let audioBytes = 0;
-        let videoBytes = 0;
-        // Per-kind jitter/loss. Prefer audio for display when available
-        // (more time-sensitive); fall back to video otherwise.
-        let audioJitter: number | null = null;
-        let audioPacketsReceived = 0;
-        let audioPacketsLost = 0;
-        let videoJitter: number | null = null;
-        let videoPacketsReceived = 0;
-        let videoPacketsLost = 0;
-        let rttMs: number | null = null;
-        let candPairRttMs: number | null = null;
+        const reports: RtcStatsReportLike[] = [];
+        stats.forEach((report: RtcStatsReportLike) => reports.push(report));
+        const summary = summarizeRtcStats(reports);
 
-        stats.forEach((report: any) => {
-          if (report.type === 'inbound-rtp') {
-            const kind = report.kind || report.mediaType;
-            if (kind === 'audio') {
-              audioBytes = report.bytesReceived || 0;
-              if (typeof report.jitter === 'number') audioJitter = report.jitter;
-              audioPacketsReceived = report.packetsReceived || 0;
-              audioPacketsLost = report.packetsLost || 0;
-            } else if (kind === 'video') {
-              videoBytes = report.bytesReceived || 0;
-              if (typeof report.jitter === 'number') videoJitter = report.jitter;
-              videoPacketsReceived = report.packetsReceived || 0;
-              videoPacketsLost = report.packetsLost || 0;
-            }
-          }
-          // RTT from remote-inbound-rtp (our outgoing direction).
-          if (report.type === 'remote-inbound-rtp' &&
-              typeof report.roundTripTime === 'number') {
-            rttMs = Math.round(report.roundTripTime * 1000);
-          }
-          // Fallback: candidate-pair gives ICE-level RTT.
-          if (report.type === 'candidate-pair' &&
-              report.state === 'succeeded' &&
-              typeof report.currentRoundTripTime === 'number') {
-            candPairRttMs = Math.round(report.currentRoundTripTime * 1000);
-          }
-        });
-
-        if (rttMs === null) rttMs = candPairRttMs;
-
-        // Pick whichever kind has data. Audio is preferred when both
-        // are flowing. If neither, leave jitter/loss null.
-        const hasAudio = audioPacketsReceived + audioPacketsLost > 0;
-        const hasVideo = videoPacketsReceived + videoPacketsLost > 0;
-        const jitter = hasAudio
-          ? audioJitter
-          : (hasVideo ? videoJitter : null);
-        const pktsRecv = hasAudio
-          ? audioPacketsReceived
-          : (hasVideo ? videoPacketsReceived : 0);
-        const pktsLost = hasAudio
-          ? audioPacketsLost
-          : (hasVideo ? videoPacketsLost : 0);
-        const totalPackets = pktsRecv + pktsLost;
-
-        const jitterRounded = jitter !== null
-          ? Math.round((jitter as number) * 1000 * 10) / 10
-          : null;
-        const lossRounded = totalPackets > 0
-          ? Math.round((pktsLost / totalPackets) * 1000) / 10
-          : null;
         this.webrtcStats.set(pubKeyB64, {
-          rttMs,
-          jitterMs: jitterRounded,
-          lossPercent: lossRounded,
+          rttMs: summary.rttMs,
+          jitterMs: summary.jitterMs,
+          lossPercent: summary.lossPercent,
         });
         this._maybeEmitQualityChange(
           pubKeyB64,
           'webrtc',
-          rttMs,
-          jitterRounded,
-          lossRounded,
+          summary.rttMs,
+          summary.jitterMs,
+          summary.lossPercent,
         );
 
-        const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
-        const stale = this._staleCycles[pubKeyB64] || { audio: 0, video: 0 };
+        const decision = decideTrackRefresh({
+          videoExpected: connInfo.video,
+          audioExpected: connInfo.audio,
+          audioBytes: summary.audioBytes,
+          videoBytes: summary.videoBytes,
+          lastBytes: this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 },
+          staleCycles: this._staleCycles[pubKeyB64] || { audio: 0, video: 0 },
+          staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
+        });
 
-        // Check video
-        if (connInfo.video && videoBytes > 0) {
-          if (videoBytes === lastBytes.video) {
-            stale.video++;
-          } else {
-            stale.video = 0;
-          }
-        }
+        this._lastBytesReceived[pubKeyB64] = {
+          audio: summary.audioBytes,
+          video: summary.videoBytes,
+        };
+        this._staleCycles[pubKeyB64] = decision.nextStale;
 
-        // Check audio
-        if (connInfo.audio && audioBytes > 0) {
-          if (audioBytes === lastBytes.audio) {
-            stale.audio++;
-          } else {
-            stale.audio = 0;
-          }
-        }
-
-        this._lastBytesReceived[pubKeyB64] = { audio: audioBytes, video: videoBytes };
-        this._staleCycles[pubKeyB64] = stale;
-
-        // If 2+ consecutive stale cycles (4+ seconds), request track refresh
-        if (stale.video >= 2 || stale.audio >= 2) {
+        if (decision.action === 'request-refresh') {
+          const stale = decision.nextStale;
           console.warn(
             `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
           );
