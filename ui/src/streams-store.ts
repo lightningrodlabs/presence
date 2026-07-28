@@ -107,6 +107,38 @@ const ICE_DISCONNECTED_GRACE_MS = 15000;
 const INIT_RETRY_THRESHOLD = 5000;
 
 /**
+ * TTL for pending handshake reservations — InitRequests we sent
+ * (`_pendingInits`, keyed by `t0`) and Accepts we received
+ * (`_pendingAccepts`, keyed by `createdAt`), plus their screen-share
+ * twins. Serves the connection-establishment predicate: an entry older
+ * than this belongs to a handshake that will never complete, and only
+ * caps state growth — the retry loop is governed by
+ * INIT_RETRY_THRESHOLD, which this deliberately exceeds by 4x so a live
+ * retry cycle is never truncated. Swept from `pingAgents` on the ping
+ * cadence. (Phase 2 item 7: previously only the accepts had this;
+ * `_pendingInits` grew unboundedly against an unresponsive peer.)
+ */
+const PENDING_HANDSHAKE_TTL_MS = 20000;
+
+/**
+ * Drop entries older than `ttlMs` from a pending-handshake map,
+ * deleting agents whose lists empty out. Pure; exported for tests.
+ */
+export function pruneExpiredPending<T>(
+  map: Record<string, T[]>,
+  timeOf: (entry: T) => number,
+  now: number,
+  ttlMs: number
+): Record<string, T[]> {
+  const out: Record<string, T[]> = {};
+  for (const [agent, entries] of Object.entries(map)) {
+    const remaining = entries.filter(e => now - timeOf(e) <= ttlMs);
+    if (remaining.length > 0) out[agent] = remaining;
+  }
+  return out;
+}
+
+/**
  * A store that handles the creation and management of WebRTC streams with
  * holochain peers
  */
@@ -1345,6 +1377,11 @@ export class StreamsStore {
     this._lastDisconnectTime[pubKeyB64] = this.clock.now();
 
     delete this._videoStreams[pubKeyB64];
+    // A closed connection's pending InitRequests are dead reservations:
+    // clearing them lets the next pong cycle re-initiate immediately
+    // instead of waiting out INIT_RETRY_THRESHOLD against a stale t0
+    // (Phase 2 item 7 — inits get close-path cleanup like accepts).
+    delete this._pendingInits[pubKeyB64];
 
     this._openConnections.update(currentValue => {
       delete currentValue[pubKeyB64];
@@ -2325,31 +2362,20 @@ export class StreamsStore {
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
 
-    // Cleanup stale pending accepts older than 20 seconds. Pending accepts
-    // are now just connectionId reservations — the transport owns the peer
-    // lifecycle, so dropping the entry is the entire teardown.
+    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
+    // Accepts are connectionId reservations — the transport owns the peer
+    // lifecycle, so dropping the entry is the entire teardown. Inits are
+    // our sent-InitRequest records; without the sweep they grow one entry
+    // per 5s retry for as long as a peer stays unresponsive.
     const now = this.clock.now();
-    const PENDING_ACCEPT_TTL = 20000;
-    for (const [agent, accepts] of Object.entries(this._pendingAccepts)) {
-      const remaining = accepts.filter(a => now - a.createdAt <= PENDING_ACCEPT_TTL);
-      if (remaining.length === accepts.length) continue;
-      if (remaining.length > 0) {
-        this._pendingAccepts[agent] = remaining;
-      } else {
-        delete this._pendingAccepts[agent];
-      }
-    }
-    for (const [agent, accepts] of Object.entries(
-      this._pendingScreenShareAccepts
-    )) {
-      const remaining = accepts.filter(a => now - a.createdAt <= PENDING_ACCEPT_TTL);
-      if (remaining.length === accepts.length) continue;
-      if (remaining.length > 0) {
-        this._pendingScreenShareAccepts[agent] = remaining;
-      } else {
-        delete this._pendingScreenShareAccepts[agent];
-      }
-    }
+    this._pendingAccepts = pruneExpiredPending(
+      this._pendingAccepts, a => a.createdAt, now, PENDING_HANDSHAKE_TTL_MS);
+    this._pendingScreenShareAccepts = pruneExpiredPending(
+      this._pendingScreenShareAccepts, a => a.createdAt, now, PENDING_HANDSHAKE_TTL_MS);
+    this._pendingInits = pruneExpiredPending(
+      this._pendingInits, i => i.t0, now, PENDING_HANDSHAKE_TTL_MS);
+    this._pendingScreenShareInits = pruneExpiredPending(
+      this._pendingScreenShareInits, i => i.t0, now, PENDING_HANDSHAKE_TTL_MS);
 
     // Health check for dead tracks (bytesReceived stall detection)
     await this._checkTrackHealth();
