@@ -9,6 +9,7 @@
     "test:watch": "vitest",
     "harness": "vite --port 5599 --strictPort --clearScreen false",
     "test:layout": "playwright test",
+    "test:harness": "playwright test carrier-handover voice-playout",
     "lint": "eslint --ext .ts,.html . --ignore-path .gitignore && prettier \"**/*.ts\" --check --ignore-path .gitignore",
     "format": "eslint --ext .ts,.html . --fix --ignore-path .gitignore && prettier \"**/*.ts\" --write --ignore-path .gitignore",
     "package": "rimraf dist && rimraf dist.zip && npm run build && cd dist && bestzip ../dist.zip *"

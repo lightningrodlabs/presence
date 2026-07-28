@@ -40,6 +40,7 @@ import { ConnectionManager, DEFAULT_CONFIG } from '@lightningrodlabs/webrtc-peer
 import type {
   ConnectionConfig,
   FSMTransitionEntry,
+  ReconnectPolicy,
   SignalingAdapter,
   SignalMessage,
   Unsubscribe as FsmUnsubscribe,
@@ -56,6 +57,11 @@ export type FsmTransportOptions = PeerTransportOptions & {
   configOverrides?: Partial<ConnectionConfig>;
   /** Test seam: factory for RTCPeerConnection. */
   createPeerConnection?: (config: RTCConfiguration) => RTCPeerConnection;
+  /** Test seam: retry/backoff policy override, passed through to
+   *  ConnectionManager. The carrier-handover harness injects a short
+   *  budget so a silent peer drop reaches `failed` in seconds, not
+   *  minutes; production uses the library default. */
+  reconnectPolicy?: ReconnectPolicy;
   /** Forensic hook fired on every FSM state transition. Carries the
    *  trigger string the FSM logs internally — wire this up in the
    *  application layer (e.g. log as `FsmTransition` events) to make
@@ -133,6 +139,7 @@ export class FsmTransport implements PeerTransport {
       signaling: adapter,
       config: this._config,
       createPeerConnection: options.createPeerConnection,
+      reconnectPolicy: options.reconnectPolicy,
       onTransition: options.onTransition,
     });
 

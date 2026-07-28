@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Carrier handover harness</title>
+    <style>
+      body { font: 13px/1.4 monospace; margin: 1rem; }
+      #state { white-space: pre; }
+    </style>
+  </head>
+  <body>
+    <h3>Carrier handover harness (Phase 1.5 item 4)</h3>
+    <p>
+      Open as <code>?me=A&amp;peer=B</code> in one page and
+      <code>?me=B&amp;peer=A</code> in another (same origin — signaling rides a
+      BroadcastChannel). Driven by <code>carrier-handover.spec.ts</code>.
+    </p>
+    <div id="state">loading…</div>
+    <script type="module" src="./carrier-handover-harness.ts"></script>
+  </body>
+</html>

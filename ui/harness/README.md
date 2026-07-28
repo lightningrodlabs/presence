@@ -1,3 +1,27 @@
+# Harnesses
+
+Browser-real test rigs for the parts of the app the vitest mocks cannot
+reproduce. Two live here:
+
+- **Carrier handover** (`carrier-handover-harness.*`, `carrier-handover.spec.ts`)
+  — Phase 1.5's field harness. Two pages, each an agent running the
+  production `FsmTransport`/`ConnectionManager` over a **real
+  RTCPeerConnection** (loopback ICE + DTLS), signaling relayed over a
+  `BroadcastChannel` with Holochain's fire-and-forget semantics. The spec
+  establishes a link, silently kills one side (page close — no goodbye on
+  the wire; CDP network emulation does not touch WebRTC's UDP sockets, so
+  this is the honest flap), and asserts the carrier-coverage invariant in
+  both directions plus the declared recovery-window exception. Fidelity
+  statement and the one modeled seam (the streams-store wiring mirror) are
+  in the harness file header. Runs nightly
+  (`.github/workflows/nightly-harness.yaml`) via `npm run test:harness`.
+- **Voice playout** (`voice-playout-harness.*`, `voice-playout.spec.ts`) —
+  real-WebCodecs tier of the Symptom B investigation; see its header.
+  Also in the nightly gate.
+- **Layout** (below) — NOT in any gate yet: its split-mode baseline is red
+  by design; it joins the nightly gate when split-mode is unified onto the
+  grid model.
+
 # Layout harness
 
 A tight feedback loop for the video-tile layout, runnable outside the
