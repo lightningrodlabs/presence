@@ -4,6 +4,7 @@ import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
 import type { CameraAcquireResult } from '../../camera-source';
+import { Clock, systemClock } from '../../clock';
 
 /**
  * Video-filmstrip module — sends low-fps JPEG video frames over Holochain
@@ -56,9 +57,6 @@ export type FilmstripCaptureSize = typeof FILMSTRIP_CAPTURE_SIZES[number];
 
 const DEFAULT_CAPTURE_SIDE = 192;
 
-/** How long to keep a stale received filmstrip showing before TTL'ing it. */
-const RECEIVE_TTL_MS = 3000;
-
 /**
  * Delay before revoking a swapped-out blob URL. Must be safely larger
  * than the clip cadence and any reasonable JS event-loop hiccup,
@@ -110,6 +108,11 @@ type FilmstripPayload = FilmstripClipPayload | FilmstripStopPayload;
  * has actually stopped (without managing to send a stop signal — e.g.
  * the sender's tab crashed). Normal stops use the explicit stop
  * payload and clear immediately.
+ *
+ * This is a display-hold TTL, not a liveness window: liveness is
+ * MEDIA_LIVE_WINDOW_MS in presence-policy.ts. It is deliberately longer
+ * than that window so the last frame doesn't flicker to the avatar at
+ * normal clip cadence.
  */
 const RECEIVE_INACTIVITY_TTL_MS = 5000;
 
@@ -126,8 +129,6 @@ export interface FilmstripFrame {
    * clips without t0.
    */
   captureT0Ms: number;
-  /** Wall-clock ms when this frame was received locally. */
-  receivedAt: number;
 }
 
 interface PeerFilmstripState {
@@ -186,6 +187,9 @@ export interface VideoSignalsStats {
 
 class FilmstripController {
   private store: StreamsStore | null = null;
+
+  /** Store clock while bound (see bind()); systemClock otherwise. */
+  private _clock: Clock = systemClock;
 
   // ----- send side -----
   private cameraHandle: CameraAcquireResult | null = null;
@@ -279,6 +283,11 @@ class FilmstripController {
 
   bind(store: StreamsStore) {
     this.store = store;
+    // Presence-relevant stamps (peerLastRecvMs) share the store's clock so
+    // the freshness comparisons in streams-store read the same timebase.
+    // Wire-timestamp arithmetic (jitter/transit vs the sender's payload.ts)
+    // and the display-hold TTL deliberately stay on wall-clock timers.
+    this._clock = store.clock;
   }
 
   unbind() {
@@ -298,6 +307,7 @@ class FilmstripController {
     this.peerLastRecvMs.clear();
     this.signalsVideoStats.clear();
     this.store = null;
+    this._clock = systemClock;
   }
 
   // ----- send side --------------------------------------------------------
@@ -432,7 +442,9 @@ class FilmstripController {
       t0: msg.t0,
       data: bytesToBase64(buf),
     };
-    const sentAt = Date.now();
+    // Local send stamp on the store's timebase, matching peerLastRecvMs
+    // so consumers never compare two clocks (PR #4 F2).
+    const sentAt = this._clock.now();
     for (const peer of targets) {
       this.peerLastSentMs.set(peer, sentAt);
     }
@@ -565,7 +577,7 @@ class FilmstripController {
     }
 
     const now = Date.now();
-    this.peerLastRecvMs.set(agentPubKeyB64, now);
+    this.peerLastRecvMs.set(agentPubKeyB64, this._clock.now());
 
     // --- stats accounting ---
     // Loss: any seq gap > 0 implies missed clips.
@@ -659,7 +671,6 @@ class FilmstripController {
       // Legacy clips lack t0; their ts is stamped at clip end, so the
       // first frame was captured ~ (n-1) periods earlier.
       captureT0Ms: payload.t0 ?? payload.ts - (payload.n - 1) * payload.p,
-      receivedAt: Date.now(),
     };
     state.latest = frame;
 
@@ -763,17 +774,6 @@ class FilmstripController {
   /** Most recently received filmstrip for a peer, or null. */
   getLatest(agentPubKeyB64: string): FilmstripFrame | null {
     return this.peers.get(agentPubKeyB64)?.latest ?? null;
-  }
-
-  /**
-   * True iff a filmstrip arrived from this peer within RECEIVE_TTL_MS.
-   * Render code uses this to decide whether to show the filmstrip overlay
-   * or fall back to the static avatar.
-   */
-  hasFreshFrame(agentPubKeyB64: string): boolean {
-    const latest = this.peers.get(agentPubKeyB64)?.latest;
-    if (!latest) return false;
-    return Date.now() - latest.receivedAt < RECEIVE_TTL_MS;
   }
 }
 

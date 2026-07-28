@@ -4,6 +4,21 @@ import {
   decodeHashFromBase64,
   encodeHashToBase64,
 } from '@holochain/client';
+import { Clock, systemClock } from './clock';
+import {
+  computeActiveAgents,
+  computePresentPeers,
+  decidePresenceSoundEvents,
+  INITIAL_PRESENCE_SOUND_STATE,
+  isMediaLive,
+  lastSeenBucket,
+  MEDIA_LIVE_WINDOW_MS,
+  OBSERVER_FRESHNESS_MS,
+  PING_INTERVAL,
+  PRESENCE_LEAVE_DWELL_MS,
+  PRESENT_STALENESS_MS,
+  type PresenceSoundState,
+} from './presence-policy';
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
@@ -67,6 +82,19 @@ declare const __APP_VERSION__: string;
 const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
+ * How often the ICE monitors poll for a connection's `RTCPeerConnection`
+ * to appear, and how many times before giving up. The budget
+ * (100ms * 150 = 15s) is `SDP_EXCHANGE_TIMEOUT`: past that the connection
+ * this monitor exists to observe has itself been given up on, so an
+ * unbounded poll is observing nothing. Serves the connection-establishment
+ * predicate; reuses that predicate's clock rather than introducing a
+ * threshold of its own.
+ */
+const ICE_MONITOR_ATTACH_POLL_MS = 100;
+const ICE_MONITOR_ATTACH_MAX_ATTEMPTS =
+  SDP_EXCHANGE_TIMEOUT / ICE_MONITOR_ATTACH_POLL_MS;
+
+/**
  * How long an established peer may sit in iceConnectionState 'disconnected'
  * before stale-cleanup tears it down. WebRTC treats 'disconnected' as
  * recoverable: it keeps probing the active candidate pair and may transition
@@ -91,17 +119,37 @@ const ICE_DISCONNECTED_GRACE_MS = 15000;
  */
 const INIT_RETRY_THRESHOLD = 5000;
 
-export const PING_INTERVAL = 2000;
+/**
+ * TTL for pending handshake reservations — InitRequests we sent
+ * (`_pendingInits`, keyed by `t0`) and Accepts we received
+ * (`_pendingAccepts`, keyed by `createdAt`), plus their screen-share
+ * twins. Serves the connection-establishment predicate: an entry older
+ * than this belongs to a handshake that will never complete, and only
+ * caps state growth — the retry loop is governed by
+ * INIT_RETRY_THRESHOLD, which this deliberately exceeds by 4x so a live
+ * retry cycle is never truncated. Swept from `pingAgents` on the ping
+ * cadence. (Phase 2 item 7: previously only the accepts had this;
+ * `_pendingInits` grew unboundedly against an unresponsive peer.)
+ */
+const PENDING_HANDSHAKE_TTL_MS = 20000;
 
 /**
- * A peer with media frames received within this window on the signals
- * carrier (voice or filmstrip video) — or with a connected WebRTC
- * connection — is treated as present regardless of ping/pong staleness.
- * Holochain-signal ping/pong can go stale (>3*PING_INTERVAL) during a
- * signal-relay hiccup while media keeps flowing fine; without this the
- * peer's pane would be wrongly removed. See `isPeerMediaLive`.
+ * Drop entries older than `ttlMs` from a pending-handshake map,
+ * deleting agents whose lists empty out. Pure; exported for tests.
  */
-const MEDIA_LIVE_WINDOW_MS = 3000;
+export function pruneExpiredPending<T>(
+  map: Record<string, T[]>,
+  timeOf: (entry: T) => number,
+  now: number,
+  ttlMs: number
+): Record<string, T[]> {
+  const out: Record<string, T[]> = {};
+  for (const [agent, entries] of Object.entries(map)) {
+    const remaining = entries.filter(e => now - timeOf(e) <= ttlMs);
+    if (remaining.length > 0) out[agent] = remaining;
+  }
+  return out;
+}
 
 /**
  * A store that handles the creation and management of WebRTC streams with
@@ -110,9 +158,17 @@ const MEDIA_LIVE_WINDOW_MS = 3000;
 export class StreamsStore {
   private roomClient: RoomClient;
 
+  /**
+   * The single time authority (Phase 2 item 1). Every timing read and
+   * timer in this class — and in the controllers bound to it — goes
+   * through this clock so tests can drive staleness windows and retry
+   * cycles deterministically with a ManualClock.
+   */
+  readonly clock: Clock;
+
   myPubKeyB64: AgentPubKeyB64;
 
-  private signalUnsubscribe: () => void;
+  private signalUnsubscribe: (() => void) | null = null;
 
   private pingInterval: number | undefined;
 
@@ -190,9 +246,9 @@ export class StreamsStore {
    * Transport-agnostic microphone owner. Consumers (WebRTC audio, the
    * voice module, a future transcription module) acquire a track from it
    * rather than calling getUserMedia themselves. See ui/src/mic-source.ts
-   * for the full rationale.
+   * for the full rationale. Assigned in start().
    */
-  micSource: MicSource;
+  micSource!: MicSource;
 
   /**
    * Transport-agnostic camera owner. Mirrors `micSource` for video.
@@ -204,9 +260,9 @@ export class StreamsStore {
    * its open/close branches. videoOn/videoOff own the keepalive-aware
    * peer wiring directly because the keepalive replaceTrack pattern
    * (NAT-keepalive on videoOff, replaceTrack on videoOn) doesn't fit
-   * cleanly into a generic open/close handler.
+   * cleanly into a generic open/close handler. Assigned in start().
    */
-  cameraSource: CameraSource;
+  cameraSource!: CameraSource;
 
   /**
    * Whether the voice encoder is currently running (sending audio to
@@ -270,40 +326,112 @@ export class StreamsStore {
   constructor(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
-    logger: PresenceLogger
+    logger: PresenceLogger,
+    clock: Clock = systemClock
   ) {
     this.roomStore = roomStore;
     this.screenSourceSelection = screenSourceSelection;
     this.logger = logger;
+    this.clock = clock;
     const roomClient = roomStore.client;
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
 
-    const ACTIVE_AGENT_STALENESS = 3 * PING_INTERVAL;
     this._activeAgents = derived(
-      [this._knownAgents, this.blockedAgents] as [Writable<Record<AgentPubKeyB64, AgentInfo>>, Writable<AgentPubKeyB64[]>],
-      ([knownAgents, blocked]) => {
-        const now = Date.now();
-        const active: Record<AgentPubKeyB64, AgentInfo> = {};
-        for (const [pubkey, info] of Object.entries(knownAgents)) {
-          if (
-            pubkey !== this.myPubKeyB64 &&
-            !blocked.includes(pubkey) &&
-            info.lastSeen !== undefined &&
-            now - info.lastSeen < ACTIVE_AGENT_STALENESS
-          ) {
-            active[pubkey] = info;
-          }
-        }
-        return active;
-      },
+      [this._knownAgents, this.blockedAgents, this._presenceTick] as [
+        Writable<Record<AgentPubKeyB64, AgentInfo>>,
+        Writable<AgentPubKeyB64[]>,
+        Writable<number>,
+      ],
+      ([knownAgents, blocked, _tick]) =>
+        computeActiveAgents({
+          knownAgents,
+          blocked,
+          myPubKey: this.myPubKeyB64,
+          now: this.clock.now(),
+          stalenessMs: PRESENT_STALENESS_MS,
+        }),
     );
 
-    // TODO potentially move this to a connect() method which also returns
-    // the Unsubscribe function
+    // The **present** predicate: ping-fresh OR media-flowing. THE
+    // authority for every join/leave-shaped effect — chimes, tiles, grid
+    // counts, phantom exclusion. The controllers' recv maps are not
+    // stores, so the _presenceTick dependency is what re-evaluates the
+    // media half once per ping cadence.
+    this._presentPeers = derived(
+      [this._activeAgents, this._openConnections, this._presenceTick] as [
+        Readable<Record<AgentPubKeyB64, AgentInfo>>,
+        Writable<Record<AgentPubKeyB64, OpenConnectionInfo>>,
+        Writable<number>,
+      ],
+      ([active, connections, _tick]) =>
+        computePresentPeers({
+          activeAgents: Object.keys(active),
+          openConnections: connections,
+          lastVoiceMs: voiceController.peerLastRecvMs,
+          lastFilmstripMs: filmstripController.peerLastRecvMs,
+          blocked: get(this.blockedAgents),
+          myPubKey: this.myPubKeyB64,
+          now: this.clock.now(),
+          mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+        }),
+    );
+
+    // Signals is the complement of *WebRTC carrying media*, not of *a
+    // WebRTC attempt existing*. Decision and rationale live in
+    // `transport/carrier-coverage.ts`.
+    //
+    // Its input is the **present** set, not `_activeAgents`: the invariant
+    // is "for every peer that is PRESENT, at least one carrier must be
+    // actively transmitting", and since Phase 2 `present` has a real
+    // definition that includes media-flowing peers whose pongs have gone
+    // stale. Keying on `_activeAgents` was §3.1(b) — such a peer kept a
+    // tile and kept being heard while silently dropping out of our send
+    // set, i.e. one-way audio.
+    //
+    // Yes, this is partly self-referential for the signals-only case: we
+    // send to them because we hear them. That is intended and bounded —
+    // media-only presence decays within MEDIA_LIVE_WINDOW_MS (3s), which
+    // is *tighter* than the 6s ping window, so a peer who genuinely stops
+    // sending leaves the set faster than ping staleness would remove them.
+    // The alternative (ping-fresh only) makes the carrier that is
+    // demonstrably working the one we refuse to use.
+    this._signalsTargets = derived(
+      [this._presentPeers, this._openConnections],
+      ([present, connections]) =>
+        computeSignalsTargets({
+          presentPeers: present,
+          openConnections: connections,
+        }),
+    );
+    // Construction ends here: fields and derived stores only, no
+    // subscriptions, no transports, no browser APIs. Everything that
+    // touches the ambient world (window, navigator, the signal bus, the
+    // module singletons) happens in start(), so a test can hold an
+    // inactive instance in a node environment. `static connect` is the
+    // one production caller of both.
+  }
+
+  /**
+   * Activate the store: subscribe to Holochain signals, construct the
+   * WebRTC transports, register device listeners, create the mic/camera
+   * sources and bind the module controllers. Constructing joins nothing;
+   * starting joins the room's signal fabric. Idempotence is NOT provided —
+   * call exactly once, then disconnect() to tear down.
+   */
+  start(): void {
     this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
       this.handleSignal(signal)
     );
+
+    // Drive the presence tick from the store clock so _activeAgents
+    // re-evaluates staleness once per ping cadence even when no store
+    // write happens (Phase 2 item 4).
+    this._presenceTickInterval = this.clock.setInterval(
+      () => this._presenceTick.update(n => n + 1),
+      PING_INTERVAL
+    );
+
     const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
@@ -315,17 +443,6 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
-    // Signals is the complement of *WebRTC carrying media*, not of *a
-    // WebRTC attempt existing*. Decision and rationale live in
-    // `transport/carrier-coverage.ts`.
-    this._signalsTargets = derived(
-      [this._activeAgents, this._openConnections],
-      ([active, connections]) =>
-        computeSignalsTargets({
-          activeAgents: Object.keys(active),
-          openConnections: connections,
-        }),
-    );
 
     // Construct transports. iceServers / trickleICE are getters so the
     // transport always uses the current values (TURN credentials, trickle
@@ -494,7 +611,7 @@ export class StreamsStore {
               // handling in `handleInitAccept`.
               this.logger.logAgentEvent({
                 agent: event.peer,
-                timestamp: Date.now(),
+                timestamp: this.clock.now(),
                 event: 'Superseded',
                 connectionId: route.slot.supersedes,
                 detail: `superseded-by=${event.connectionId}; path=transport-replace`,
@@ -586,7 +703,7 @@ export class StreamsStore {
   ): void {
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'FsmEstablishmentTimeline',
       connectionId,
       detail:
@@ -733,9 +850,10 @@ export class StreamsStore {
     // retry race still anchor t0 at the actual signaling boundary rather
     // than at the moment pc finally appears.
     if (!this._iceTimings[key]) {
-      this._iceTimings[key] = { t0: Date.now(), impl };
+      this._iceTimings[key] = { t0: this.clock.now(), impl };
     }
     const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
+    let attempts = 0;
     const attach = () => {
       // Gate inside attach (not at function entry) so a re-entry from a
       // second `signaling` transition keeps polling for pc when the first
@@ -746,7 +864,18 @@ export class StreamsStore {
       if (this._iceMonitorsAttached.has(key)) return;
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
-        setTimeout(attach, 100);
+        // Bounded: a connection torn down before its pc materialises used
+        // to poll forever (PR #4 F3). The budget is the SDP-exchange
+        // timeout — past it the connection this monitor exists for has
+        // itself been given up on, so there is nothing left to observe.
+        attempts += 1;
+        if (attempts > ICE_MONITOR_ATTACH_MAX_ATTEMPTS) {
+          this.logger.logCustomMessage(
+            `ICE monitor [${pubKeyB64.slice(0, 8)}]: gave up waiting for pc after ${attempts} attempts connId=${connectionId.slice(0, 8)}`
+          );
+          return;
+        }
+        this.clock.setTimeout(attach, ICE_MONITOR_ATTACH_POLL_MS);
         return;
       }
       this._iceMonitorsAttached.add(key);
@@ -763,14 +892,14 @@ export class StreamsStore {
         // disconnect/recover cycles must not overwrite the initial timing.
         const t = this._iceTimings[key];
         if (t && t.tIceConnected === undefined && (state === 'connected' || state === 'completed')) {
-          t.tIceConnected = Date.now();
+          t.tIceConnected = this.clock.now();
         }
         if (t) t.finalIceState = state;
         // Maintain the invariant: an entry exists iff iceState is
         // currently 'disconnected'. The cleanup paths use a grace
         // period before treating 'disconnected' as terminal.
         if (state === 'disconnected') {
-          this._iceDisconnectedAt[pubKeyB64] = Date.now();
+          this._iceDisconnectedAt[pubKeyB64] = this.clock.now();
         } else {
           delete this._iceDisconnectedAt[pubKeyB64];
         }
@@ -803,7 +932,7 @@ export class StreamsStore {
           // metric refers to the initial gather only.
           const t = this._iceTimings[key];
           if (t && t.tGatherComplete === undefined) {
-            t.tGatherComplete = Date.now();
+            t.tGatherComplete = this.clock.now();
             t.relay = hasRelay;
           }
         }
@@ -851,7 +980,7 @@ export class StreamsStore {
     const t = this._iceTimings[key];
     if (!t || t.emitted) return;
     t.emitted = true;
-    const now = Date.now();
+    const now = this.clock.now();
     const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
     const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
     const connect = now - t.t0;
@@ -893,7 +1022,7 @@ export class StreamsStore {
     const t = this._iceTimings[key];
     if (!t || t.emitted) return;
     t.emitted = true;
-    const now = Date.now();
+    const now = this.clock.now();
     const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
     const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
     const elapsed = now - t.t0;
@@ -918,16 +1047,25 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     transport: SimplePeerTransport,
   ): void {
+    let attempts = 0;
     const attach = () => {
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
-        setTimeout(attach, 100);
+        // Bounded for the same reason as the media monitor (PR #4 F3).
+        attempts += 1;
+        if (attempts > ICE_MONITOR_ATTACH_MAX_ATTEMPTS) {
+          this.logger.logCustomMessage(
+            `Screen-share ICE monitor [${pubKeyB64.slice(0, 8)}]: gave up waiting for pc after ${attempts} attempts`
+          );
+          return;
+        }
+        this.clock.setTimeout(attach, ICE_MONITOR_ATTACH_POLL_MS);
         return;
       }
       pc.addEventListener('iceconnectionstatechange', () => {
         const state = pc.iceConnectionState;
         if (state === 'disconnected') {
-          this._screenShareIceDisconnectedAt[pubKeyB64] = Date.now();
+          this._screenShareIceDisconnectedAt[pubKeyB64] = this.clock.now();
         } else {
           delete this._screenShareIceDisconnectedAt[pubKeyB64];
         }
@@ -1049,7 +1187,7 @@ export class StreamsStore {
     if (peerB64 && report.length > 0) {
       this.logger.logAgentEvent({
         agent: peerB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'SenderParams',
         detail: report.join(' | '),
       });
@@ -1076,7 +1214,7 @@ export class StreamsStore {
       if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'SupersededConnect',
           connectionId,
           detail: `superseded-by=${slotWrite.supersededBy}`,
@@ -1092,7 +1230,7 @@ export class StreamsStore {
     this._conversationParticipants.add(pubKeyB64);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'Connected',
       connectionId,
     });
@@ -1100,7 +1238,7 @@ export class StreamsStore {
     // Audio carrier flipped from signals → webrtc (impl-specific) for this peer.
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'CarrierSwitch',
       connectionId,
       detail: `signals->${impl}`,
@@ -1145,7 +1283,7 @@ export class StreamsStore {
 
     // After ICE settles, sample the selected candidate pair to detect
     // relay (TURN) usage so the UI can flag it.
-    setTimeout(async () => {
+    this.clock.setTimeout(async () => {
       try {
         const pc = transport.getRTCPeerConnection(pubKeyB64);
         if (!pc) return;
@@ -1223,7 +1361,7 @@ export class StreamsStore {
       if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'SupersededClose',
           connectionId,
           detail: `superseded-by=${slotWrite.supersededBy}`,
@@ -1243,7 +1381,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: impl === 'fsm' ? 'FsmClose' : 'SimplePeerClose',
       connectionId,
       detail: `cause=${cause}`,
@@ -1256,7 +1394,7 @@ export class StreamsStore {
       const reason = this._lastWebrtcExitReason.get(pubKeyB64) ?? 'unknown';
       this.logger.logAgentEvent({
         agent: pubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'CarrierSwitch',
         connectionId,
         detail: `${impl}->signals reason="${reason}"`,
@@ -1264,9 +1402,14 @@ export class StreamsStore {
     }
     this._lastWebrtcExitReason.delete(pubKeyB64);
     this._lastQualityBucket.delete(pubKeyB64);
-    this._lastDisconnectTime[pubKeyB64] = Date.now();
+    this._lastDisconnectTime[pubKeyB64] = this.clock.now();
 
     delete this._videoStreams[pubKeyB64];
+    // A closed connection's pending InitRequests are dead reservations:
+    // clearing them lets the next pong cycle re-initiate immediately
+    // instead of waiting out INIT_RETRY_THRESHOLD against a stale t0
+    // (Phase 2 item 7 — inits get close-path cleanup like accepts).
+    delete this._pendingInits[pubKeyB64];
 
     this._openConnections.update(currentValue => {
       delete currentValue[pubKeyB64];
@@ -1332,7 +1475,7 @@ export class StreamsStore {
     );
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'StreamReceived',
       connectionId,
     });
@@ -1377,7 +1520,7 @@ export class StreamsStore {
     console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'SimplePeerTrack',
       connectionId,
     });
@@ -1399,7 +1542,7 @@ export class StreamsStore {
     console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'TrackArrivedMuted',
     });
 
@@ -1413,12 +1556,12 @@ export class StreamsStore {
       });
     }
 
-    const unmuteTimeout = setTimeout(() => {
+    const unmuteTimeout = this.clock.setTimeout(() => {
       if (track.muted) {
         console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'TrackUnmuteTimeout',
         });
         this._setTrackReady(pubKeyB64, connectionId, track);
@@ -1426,11 +1569,11 @@ export class StreamsStore {
     }, 5000);
 
     track.onunmute = () => {
-      clearTimeout(unmuteTimeout);
+      this.clock.clearTimeout(unmuteTimeout);
       console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
       this.logger.logAgentEvent({
         agent: pubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'TrackUnmuted',
       });
       this._setTrackReady(pubKeyB64, connectionId, track);
@@ -1452,7 +1595,7 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerVideoOffSignal',
         });
       }
@@ -1464,7 +1607,7 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerVideoOnSignal',
         });
       }
@@ -1476,7 +1619,7 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerAudioOffSignal',
         });
       }
@@ -1488,21 +1631,21 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerAudioOnSignal',
         });
       }
       if (msg.message === 'change-audio-input') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerChangeAudioInput',
         });
       }
       if (msg.message === 'change-video-input') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerChangeVideoInput',
         });
       }
@@ -1534,7 +1677,7 @@ export class StreamsStore {
     if (currentOnError && currentOnError.connectionId !== connectionId) {
       this.logger.logAgentEvent({
         agent: pubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'SupersededError',
         connectionId,
         detail: `superseded-by=${currentOnError.connectionId}; err=${error.message || error}`,
@@ -1554,7 +1697,7 @@ export class StreamsStore {
     this._flushSdpAggregatesForConnection(connectionId);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: errLabel,
       connectionId,
       detail: error.message || String(error),
@@ -1987,6 +2130,7 @@ export class StreamsStore {
       screenSourceSelection,
       logger
     );
+    streamsStore.start();
 
     // Wait for allAgents to load before first ping so we actually have peers to contact
     await new Promise<void>((resolve) => {
@@ -2010,8 +2154,10 @@ export class StreamsStore {
 
     // ping all agents that are not already connected to you every PING_INTERVAL milliseconds
     await streamsStore.pingAgents();
-    streamsStore.pingInterval = window.setInterval(async () => {
-      await streamsStore.pingAgents();
+    streamsStore.pingInterval = streamsStore.clock.setInterval(() => {
+      streamsStore.pingAgents().catch(e => {
+        console.error('pingAgents failed:', e);
+      });
     }, PING_INTERVAL);
 
     // Page-lifecycle forensics: correlate disconnect() calls with whether
@@ -2036,10 +2182,10 @@ export class StreamsStore {
       document.removeEventListener('visibilitychange', onVisibility);
     };
 
-    setTimeout(async () => {
+    streamsStore.clock.setTimeout(async () => {
       const mediaDevices = await navigator.mediaDevices.enumerateDevices();
       streamsStore.mediaDevices.set(mediaDevices);
-    });
+    }, 0);
     return streamsStore;
   }
 
@@ -2060,7 +2206,11 @@ export class StreamsStore {
       this.roomClient.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
     }
 
-    if (this.pingInterval) window.clearInterval(this.pingInterval);
+    if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
+    if (this._presenceTickInterval !== undefined) {
+      this.clock.clearInterval(this._presenceTickInterval);
+      this._presenceTickInterval = undefined;
+    }
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -2091,6 +2241,10 @@ export class StreamsStore {
     if (this._signalsTargetsUnsub) {
       this._signalsTargetsUnsub();
       this._signalsTargetsUnsub = null;
+    }
+    if (this._presentPeersUnsub) {
+      this._presentPeersUnsub();
+      this._presentPeersUnsub = null;
     }
     // Release the WebRTC mic handle and force-close the MicSource (which
     // stops the underlying track and closes the shared AudioContext).
@@ -2171,6 +2325,54 @@ export class StreamsStore {
 
   onEvent(cb: (ev: StoreEventPayload) => any) {
     this.eventCallback = cb;
+    // Arm the presence-sound decision here rather than in start(): the
+    // subscription fires immediately with the current present set, and
+    // any decision made before a listener exists is a *lost* event that
+    // still marks the peer sounded — so a pong landing in the window
+    // between StreamsStore.connect() and room-view's firstUpdated meant
+    // that peer never chimed at all (PR #4 F6). Arming at registration
+    // makes the first evaluation deterministic: whoever is present at
+    // that instant is seeded silently, and every change after it sounds.
+    this._armPresenceSounds();
+  }
+
+  /**
+   * Subscribe the join/leave sound decision to the present predicate.
+   * Keys off `_presentPeers` — NOT raw `_activeAgents` — so a pong gap
+   * with media still flowing produces no sound, and a genuine departure
+   * sounds only after the leave dwell. Replaces room-view's direct
+   * `_activeAgents` diff (the mechanism behind the leave-then-join chime
+   * blip). Fires on every `_presenceTick`, which is what expires the
+   * dwell. Idempotent: re-registering a callback re-uses the existing
+   * subscription and its accumulated state.
+   */
+  private _armPresenceSounds(): void {
+    if (this._presentPeersUnsub) return;
+    let seeded = false;
+    this._presentPeersUnsub = this._presentPeers.subscribe(present => {
+      // The subscribe() call itself delivers the current set. Adopt it as
+      // the baseline instead of chiming for peers who were already here
+      // when we started listening.
+      if (!seeded) {
+        seeded = true;
+        this._presenceSoundState = { sounded: [...present], pendingLeave: {} };
+        return;
+      }
+      const decision = decidePresenceSoundEvents({
+        state: this._presenceSoundState,
+        present,
+        now: this.clock.now(),
+        leaveDwellMs: PRESENCE_LEAVE_DWELL_MS,
+      });
+      this._presenceSoundState = decision.state;
+      for (const ev of decision.events) {
+        this.eventCallback({
+          type:
+            ev.kind === 'join' ? 'peer-joined-presence' : 'peer-left-presence',
+          pubKeyB64: ev.peer,
+        });
+      }
+    });
   }
 
   async pingAgents() {
@@ -2232,37 +2434,26 @@ export class StreamsStore {
     await this.roomStore.client.sendMessage(
       agentsToPing,
       'PingUi',
-      JSON.stringify({ t0: Date.now() }),
+      JSON.stringify({ t0: this.clock.now() }),
     );
 
     // Log our stream state
     this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
 
-    // Cleanup stale pending accepts older than 20 seconds. Pending accepts
-    // are now just connectionId reservations — the transport owns the peer
-    // lifecycle, so dropping the entry is the entire teardown.
-    const now = Date.now();
-    const PENDING_ACCEPT_TTL = 20000;
-    for (const [agent, accepts] of Object.entries(this._pendingAccepts)) {
-      const remaining = accepts.filter(a => now - a.createdAt <= PENDING_ACCEPT_TTL);
-      if (remaining.length === accepts.length) continue;
-      if (remaining.length > 0) {
-        this._pendingAccepts[agent] = remaining;
-      } else {
-        delete this._pendingAccepts[agent];
-      }
-    }
-    for (const [agent, accepts] of Object.entries(
-      this._pendingScreenShareAccepts
-    )) {
-      const remaining = accepts.filter(a => now - a.createdAt <= PENDING_ACCEPT_TTL);
-      if (remaining.length === accepts.length) continue;
-      if (remaining.length > 0) {
-        this._pendingScreenShareAccepts[agent] = remaining;
-      } else {
-        delete this._pendingScreenShareAccepts[agent];
-      }
-    }
+    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
+    // Accepts are connectionId reservations — the transport owns the peer
+    // lifecycle, so dropping the entry is the entire teardown. Inits are
+    // our sent-InitRequest records; without the sweep they grow one entry
+    // per 5s retry for as long as a peer stays unresponsive.
+    const now = this.clock.now();
+    this._pendingAccepts = pruneExpiredPending(
+      this._pendingAccepts, a => a.createdAt, now, PENDING_HANDSHAKE_TTL_MS);
+    this._pendingScreenShareAccepts = pruneExpiredPending(
+      this._pendingScreenShareAccepts, a => a.createdAt, now, PENDING_HANDSHAKE_TTL_MS);
+    this._pendingInits = pruneExpiredPending(
+      this._pendingInits, i => i.t0, now, PENDING_HANDSHAKE_TTL_MS);
+    this._pendingScreenShareInits = pruneExpiredPending(
+      this._pendingScreenShareInits, i => i.t0, now, PENDING_HANDSHAKE_TTL_MS);
 
     // Health check for dead tracks (bytesReceived stall detection)
     await this._checkTrackHealth();
@@ -2289,7 +2480,7 @@ export class StreamsStore {
    *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
    */
   private _emitPresenceForensics(): void {
-    const now = Date.now();
+    const now = this.clock.now();
 
     const known = get(this._knownAgents);
     const blocked = get(this.blockedAgents);
@@ -2370,7 +2561,7 @@ export class StreamsStore {
   async changeVideoInput(deviceId: string) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'ChangeMyVideoInput',
     });
     // CameraSource owns the device-switch path: it stores the new id,
@@ -2437,7 +2628,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyVideoOn',
     });
 
@@ -2569,7 +2760,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyVideoOff',
     });
     this.eventCallback({
@@ -2580,7 +2771,7 @@ export class StreamsStore {
   async changeAudioInput(deviceId: string) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'ChangeMyAudioInput',
     });
     console.log('Changing audio input to: ', deviceId);
@@ -2609,7 +2800,7 @@ export class StreamsStore {
   async audioOn(enabled: boolean) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyAudioOn',
     });
 
@@ -2689,7 +2880,7 @@ export class StreamsStore {
     console.log('### AUDIO OFF');
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyAudioOff',
     });
 
@@ -2834,7 +3025,7 @@ export class StreamsStore {
       );
     this.disconnectFromPeerVideo(pubKey64);
     this.disconnectFromPeerScreen(pubKey64);
-    setTimeout(() => {
+    this.clock.setTimeout(() => {
       this._connectionStatuses.update(currentValue => {
         const connectionStatuses = currentValue;
         connectionStatuses[pubKey64] = {
@@ -3051,11 +3242,11 @@ export class StreamsStore {
   private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
-   * The set of active peers whose media is NOT currently flowing over
-   * WebRTC. Audio and filmstrip video for these peers are carried over
-   * Holochain remote signals. Precomputed as a derived store so the voice
-   * encoder's pump loop doesn't recompute per-chunk — it just reads the
-   * cached set.
+   * The set of **present** peers whose media is NOT currently flowing
+   * over WebRTC. Audio and filmstrip video for these peers are carried
+   * over Holochain remote signals. Precomputed as a derived store so the
+   * voice encoder's pump loop doesn't recompute per-chunk — it just reads
+   * the cached set.
    *
    * Membership is the complement of `connected` — ICE + DTLS up — not the
    * complement of "an entry exists". A peer mid-negotiation, mid-reconnect,
@@ -3064,7 +3255,8 @@ export class StreamsStore {
    * `transport/carrier-coverage.ts`; the constructor's `derived` is the only
    * caller.
    *
-   * Updates when: a peer appears/disappears in _activeAgents, or any
+   * Updates when: a peer enters/leaves `_presentPeers` (which includes the
+   * presence tick re-evaluating the media-flowing half), or any
    * `_openConnections` write changes a peer's `connected` flag — which
    * includes connect, close, give-up, and the disableWebrtcWith teardown.
    */
@@ -3162,6 +3354,33 @@ export class StreamsStore {
    * Excludes self and blocked agents.
    */
   _activeAgents!: Readable<Record<AgentPubKeyB64, AgentInfo>>;
+
+  /**
+   * The presence clock's tick, incremented every PING_INTERVAL from
+   * `start()`. `_activeAgents` derives from it so staleness is evaluated
+   * on a tick rather than only when `_knownAgents` happens to be written —
+   * previously eviction waited for `pingAgents`' next write, making real
+   * eviction latency 6–8s instead of the declared 6s (§3.2 note).
+   * Public like the other underscore stores so tests can fire a tick
+   * without arming the interval (which lives in start()).
+   */
+  _presenceTick: Writable<number> = writable(0);
+
+  private _presenceTickInterval: number | undefined;
+
+  /**
+   * The **present** predicate: ping-fresh OR media-flowing peers, in
+   * stable tile order. Defined in the constructor from
+   * `computePresentPeers` (presence-policy.ts); the one authority for
+   * chimes, tiles, grid counts and phantom exclusion.
+   */
+  _presentPeers!: Readable<AgentPubKeyB64[]>;
+
+  /** State of the join/leave sound decision; see decidePresenceSoundEvents. */
+  private _presenceSoundState: PresenceSoundState = INITIAL_PRESENCE_SOUND_STATE;
+
+  /** Unsubscribe from the _presentPeers sound subscription. */
+  private _presentPeersUnsub: (() => void) | null = null;
 
   /**
    * The statuses of WebRTC main stream connections to peers
@@ -3271,7 +3490,7 @@ export class StreamsStore {
       moduleId,
       active: true,
       payload: actualPayload,
-      updatedAt: Date.now(),
+      updatedAt: this.clock.now(),
     };
     this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
     await this._broadcastModuleState(envelope);
@@ -3284,7 +3503,7 @@ export class StreamsStore {
       moduleId,
       active: false,
       payload: '',
-      updatedAt: Date.now(),
+      updatedAt: this.clock.now(),
     };
     this._myModuleStates.update(s => {
       const next = { ...s };
@@ -3300,7 +3519,7 @@ export class StreamsStore {
       moduleId,
       active: true,
       payload,
-      updatedAt: Date.now(),
+      updatedAt: this.clock.now(),
     };
     this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
     await this._broadcastModuleState(envelope);
@@ -3361,17 +3580,14 @@ export class StreamsStore {
   }
 
   /**
-   * Freshness bucket for the last pong we received from a peer. Thresholds
-   * match `lastSeenToColor` in agent-connection-status-icon.ts so broadcast
-   * and locally-rendered dots pick the same bucket.
+   * Freshness bucket for the last pong we received from a peer. The
+   * decision lives in presence-policy.ts and is shared with the
+   * status-icon rendering, so broadcast and locally-rendered dots pick
+   * the same bucket by construction.
    */
   lastSeenBucket(peerB64: AgentPubKeyB64): LastSeenBucket {
     const known = get(this._knownAgents)[peerB64];
-    if (!known || typeof known.lastSeen !== 'number') return 'unknown';
-    const age = Date.now() - known.lastSeen;
-    if (age < 15_000) return 'fresh';
-    if (age < 30_000) return 'stale';
-    return 'gone';
+    return lastSeenBucket(known?.lastSeen, this.clock.now());
   }
 
   /**
@@ -3398,8 +3614,12 @@ export class StreamsStore {
       (this._staleCycles[peerB64]?.audio ?? 0) < 2;
     if (webrtcAudioLive) return 'webrtc';
 
+    // Same media-flowing window as isMediaLive / computePresentPeers —
+    // one window per predicate. (Was a bespoke 2000ms literal.)
     const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
-    const signalsLive = !!lastRecv && Date.now() - lastRecv < 2000;
+    const signalsLive =
+      lastRecv !== undefined &&
+      this.clock.now() - lastRecv < MEDIA_LIVE_WINDOW_MS;
     if (signalsLive) return 'signals';
 
     // No flow. Peer intent comes BEFORE the negotiation check: a stale
@@ -3451,13 +3671,12 @@ export class StreamsStore {
     else audio = 'off';
 
     // Video is 'live' if WebRTC has an active video track OR we've
-    // received a filmstrip clip from this peer within the freshness
+    // received a filmstrip clip from this peer within the media-flowing
     // window (signals carrier carrying low-bandwidth video).
-    const FILMSTRIP_LIVE_WINDOW_MS = 3000;
     const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
     const filmstripLive =
       lastFilmstripMs !== undefined &&
-      Date.now() - lastFilmstripMs < FILMSTRIP_LIVE_WINDOW_MS;
+      this.clock.now() - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS;
     const video: PeerLinkSnapshot['video'] =
       conn?.video || filmstripLive
         ? 'live'
@@ -3479,28 +3698,30 @@ export class StreamsStore {
    * carrier: a connected WebRTC connection, or signals-carrier voice or
    * filmstrip-video frames received within `MEDIA_LIVE_WINDOW_MS`.
    *
-   * Used by `globalPresenceSet()` so that a peer with live media is never
-   * pruned by ping/pong staleness alone. A Holochain-signal hiccup of more
-   * than 3*PING_INTERVAL must not remove the pane of a peer we can still
-   * see and hear. WebRTC connections that failed/closed or exceeded the
-   * ICE disconnected grace are already removed from `_openConnections`, so
-   * a surviving `connected` entry is genuinely live.
+   * The media-flowing half of the **present** predicate. The predicate
+   * itself is `computePresentPeers` (`presence-policy.ts`), which calls
+   * the same `isMediaLive`; this method is the per-peer question, used by
+   * `_presenceReason` and the phantom/observer paths. A Holochain-signal
+   * hiccup of more than PRESENT_STALENESS_MS must not remove the pane of
+   * a peer we can still see and hear.
+   *
+   * Note what `connected` does and does not prove: it means the transport
+   * last reported ICE + DTLS up. During the declared recovery-window
+   * exception (`transport/carrier-coverage.ts`) that claim can be stale
+   * for the length of the transport's recovery budget, and a wedged FSM
+   * slot depends on the FSM emitting `failed` to be cleared. (This
+   * docblock previously asserted the opposite — that a surviving
+   * `connected` entry is "genuinely live" — one of the 17 false
+   * assertions in MAINTAINABILITY_ASSESSMENT.md §3.10.)
    */
   isPeerMediaLive(peerB64: AgentPubKeyB64): boolean {
-    if (get(this._openConnections)[peerB64]?.connected) return true;
-    const now = Date.now();
-    const lastVoice = voiceController.peerLastRecvMs.get(peerB64);
-    if (lastVoice !== undefined && now - lastVoice < MEDIA_LIVE_WINDOW_MS) {
-      return true;
-    }
-    const lastFilmstrip = filmstripController.peerLastRecvMs.get(peerB64);
-    if (
-      lastFilmstrip !== undefined &&
-      now - lastFilmstrip < MEDIA_LIVE_WINDOW_MS
-    ) {
-      return true;
-    }
-    return false;
+    return isMediaLive({
+      webrtcConnected: !!get(this._openConnections)[peerB64]?.connected,
+      lastVoiceMs: voiceController.peerLastRecvMs.get(peerB64),
+      lastFilmstripMs: filmstripController.peerLastRecvMs.get(peerB64),
+      now: this.clock.now(),
+      windowMs: MEDIA_LIVE_WINDOW_MS,
+    });
   }
 
   /**
@@ -3524,28 +3745,17 @@ export class StreamsStore {
     // tile must include me. Excluding self happens at the per-tile level
     // (drop the observer from each tile's iteration), not here.
     out.add(this.myPubKeyB64);
-    // My own active agents.
-    for (const k of Object.keys(get(this._activeAgents))) {
-      if (!blocked.has(k)) out.add(k);
-    }
-    // Peers with live media on either carrier. Ping/pong staleness must
-    // not prune a peer we can still see or hear: a Holochain-signal hiccup
-    // would otherwise remove the pane of a peer whose WebRTC (or
-    // signals-carrier) media is flowing fine. See `isPeerMediaLive`.
-    const mediaCandidates = new Set<AgentPubKeyB64>([
-      ...Object.keys(get(this._openConnections)),
-      ...voiceController.peerLastRecvMs.keys(),
-      ...filmstripController.peerLastRecvMs.keys(),
-    ]);
-    for (const k of mediaCandidates) {
-      if (k === this.myPubKeyB64 || blocked.has(k)) continue;
-      if (this.isPeerMediaLive(k)) out.add(k);
+    // Everyone present to us directly — ping-fresh OR media-flowing on
+    // either carrier (the present predicate; excludes self and blocked).
+    // Ping/pong staleness must not prune a peer we can still see or hear.
+    for (const k of get(this._presentPeers)) {
+      out.add(k);
     }
     // Anyone a *fresh* observer reports as present. We require the
     // observer's broadcast itself to be recent so that an observer who
     // dropped out doesn't keep ghost peers in the set forever.
-    const now = Date.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const now = this.clock.now();
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3577,10 +3787,14 @@ export class StreamsStore {
    */
   phantomAgents(): AgentPubKeyB64[] {
     const active = get(this._activeAgents);
+    // The present predicate (ping-fresh OR media-flowing) is the one
+    // authority for "we see them directly"; a phantom is an observer
+    // report about a peer who is NOT present to us.
+    const present = new Set(get(this._presentPeers));
     const blocked = new Set(get(this.blockedAgents));
     const out = new Set<AgentPubKeyB64>();
-    const now = Date.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const now = this.clock.now();
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3592,8 +3806,7 @@ export class StreamsStore {
       for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
         if (peerKey === this.myPubKeyB64) continue;
         if (blocked.has(peerKey)) continue;
-        if (active[peerKey]) continue; // we already see them directly (ping-fresh)
-        if (this.isPeerMediaLive(peerKey)) continue; // ...or via live media despite stale pong
+        if (present.has(peerKey)) continue; // we already see them directly
         if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
           out.add(peerKey);
         }
@@ -3609,8 +3822,8 @@ export class StreamsStore {
    */
   observersSeeing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
-    const now = Date.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const now = this.clock.now();
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3633,8 +3846,8 @@ export class StreamsStore {
    */
   observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
-    const now = Date.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const now = this.clock.now();
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3692,7 +3905,7 @@ export class StreamsStore {
       console.log(`toggleDisableWebrtc: re-enabled WebRTC for ${peerB64.slice(0, 8)}`);
       this.logger.logAgentEvent({
         agent: peerB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcEnable',
         detail: 'per-peer',
       });
@@ -3701,7 +3914,7 @@ export class StreamsStore {
       console.log(`toggleDisableWebrtc: disabled WebRTC for ${peerB64.slice(0, 8)}`);
       this.logger.logAgentEvent({
         agent: peerB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcDisable',
         detail: 'per-peer',
       });
@@ -3726,7 +3939,7 @@ export class StreamsStore {
     await this._syncConversationPayload({ webrtcImpl: impl });
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: impl === 'fsm' ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
       detail: `impl=${impl} (global)`,
     });
@@ -3773,7 +3986,7 @@ export class StreamsStore {
       window.localStorage.setItem('disableAllWebrtc', 'true');
       this.logger.logAgentEvent({
         agent: this.myPubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcDisable',
         detail: 'global',
       });
@@ -3797,7 +4010,7 @@ export class StreamsStore {
       window.localStorage.removeItem('disableAllWebrtc');
       this.logger.logAgentEvent({
         agent: this.myPubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcEnable',
         detail: 'global',
       });
@@ -3808,7 +4021,7 @@ export class StreamsStore {
     });
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: mode === 'fsm' ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
       detail: `impl=${mode} (global)`,
     });
@@ -3849,7 +4062,7 @@ export class StreamsStore {
     payload.peerImpl = nextPeerImpl;
     this.logger.logAgentEvent({
       agent: peerB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'WebrtcImplFlip',
       detail: `${prevOverride ?? 'inherit'}->${impl ?? 'inherit'}; reason=${reason}`,
     });
@@ -3914,7 +4127,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: peerB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: carrier === 'signals' ? 'MyWebrtcDisable' : 'MyWebrtcEnable',
       detail: `carrier=${previous}->${carrier} (per-peer)`,
     });
@@ -3969,7 +4182,7 @@ export class StreamsStore {
    * so both sides reconnect on the new impl in lockstep.
    */
   private async _maybeAutoFlipImpl(peerB64: AgentPubKeyB64): Promise<void> {
-    const now = Date.now();
+    const now = this.clock.now();
 
     // Carrier-switch hysteresis (§6.4): bias toward staying on a healthy webrtc
     // transport. Since §6.1 an FSM phase of `connected` means ICE+DTLS are up —
@@ -4623,7 +4836,7 @@ export class StreamsStore {
     const reconcileCount = this._reconcileAttemptCount[pubkey] || 0;
     const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
     const lastReconcile = this._lastReconcileTime[pubkey] || 0;
-    if (Date.now() - lastReconcile < cooldown) return;
+    if (this.clock.now() - lastReconcile < cooldown) return;
 
     if (!this.mainStream) return;
 
@@ -4634,7 +4847,7 @@ export class StreamsStore {
       );
       this.logger.logAgentEvent({
         agent: pubkey,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'ReconcileStream',
       });
       const conn = get(this._openConnections)[pubkey];
@@ -4670,7 +4883,7 @@ export class StreamsStore {
           for (const track of this.mainStream.getTracks()) {
             transport.addTrack(track, this.mainStream);
           }
-          this._lastReconcileTime[pubkey] = Date.now();
+          this._lastReconcileTime[pubkey] = this.clock.now();
           this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
         } catch (e: any) {
           console.warn('Failed to re-add stream during reconcile:', e.message);
@@ -4692,7 +4905,7 @@ export class StreamsStore {
       const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'audio');
       if (!perceived || perceived.muted) {
         needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileAudio' });
+        this.logger.logAgentEvent({ agent: pubkey, timestamp: this.clock.now(), event: 'ReconcileAudio' });
       }
     }
 
@@ -4701,7 +4914,7 @@ export class StreamsStore {
       const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'video');
       if (!perceived || perceived.muted) {
         needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileVideo' });
+        this.logger.logAgentEvent({ agent: pubkey, timestamp: this.clock.now(), event: 'ReconcileVideo' });
       }
     }
 
@@ -4721,7 +4934,7 @@ export class StreamsStore {
       this._cloneStreamRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
     }
 
-    this._lastReconcileTime[pubkey] = Date.now();
+    this._lastReconcileTime[pubkey] = this.clock.now();
     this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
   }
 
@@ -4878,7 +5091,7 @@ export class StreamsStore {
   private _startDiagnosticAttempt(peerB64: AgentPubKeyB64, attempt: number): void {
     this._pendingDiagnosticRequests.update(curr => ({
       ...curr,
-      [peerB64]: { attempts: attempt, startedAt: Date.now() },
+      [peerB64]: { attempts: attempt, startedAt: this.clock.now() },
     }));
 
     const peerHash = decodeHashFromBase64(peerB64);
@@ -4888,7 +5101,7 @@ export class StreamsStore {
       );
     });
 
-    setTimeout(() => {
+    this.clock.setTimeout(() => {
       const stillPending = get(this._pendingDiagnosticRequests)[peerB64];
       // Response arrived (handler cleared pending) or user re-triggered
       // a fresh attempt that supersedes this one.
@@ -4979,7 +5192,7 @@ export class StreamsStore {
     merged.sort((a, b) => a.timestamp - b.timestamp);
 
     return {
-      generatedAt: Date.now(),
+      generatedAt: this.clock.now(),
       localAgent: this.myPubKeyB64,
       remoteAgent: pubKeyB64,
       hasRemoteLogs: !!remoteSnapshot,
@@ -5058,7 +5271,7 @@ export class StreamsStore {
     merged.sort((a, b) => a.timestamp - b.timestamp);
 
     return {
-      generatedAt: Date.now(),
+      generatedAt: this.clock.now(),
       localAgent: this.myPubKeyB64,
       respondingPeers,
       entries: merged,
@@ -5140,7 +5353,7 @@ export class StreamsStore {
       (lossPercent !== null ? ` loss=${lossPercent}%` : '');
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'QualityBucketChange',
       detail,
     });
@@ -5161,7 +5374,7 @@ export class StreamsStore {
     sdpType: string,
   ): void {
     const key = `${agent}:${connectionId}:${sdpType}`;
-    const now = Date.now();
+    const now = this.clock.now();
     const entry = this._sdpDataAggregates.get(key);
     const withinWindow = entry && (now - entry.lastTimestamp) < StreamsStore.SDP_AGGREGATE_WINDOW_MS;
 
@@ -5270,7 +5483,7 @@ export class StreamsStore {
    * the periodic bookkeeping.
    */
   private _flushStaleSdpAggregates(): void {
-    const now = Date.now();
+    const now = this.clock.now();
     for (const [key, entry] of this._sdpDataAggregates) {
       if ((now - entry.lastTimestamp) >= StreamsStore.SDP_AGGREGATE_WINDOW_MS) {
         if (entry.count > 1) this._emitSdpAggregateSummary(entry);
@@ -5310,7 +5523,7 @@ export class StreamsStore {
    */
   private _checkAudibilityOutages(): void {
     const OUTAGE_THRESHOLD_MS = 30_000;
-    const now = Date.now();
+    const now = this.clock.now();
     const presence = this.globalPresenceSet();
     const others = get(this._othersConnectionStatuses);
 
@@ -5554,7 +5767,7 @@ export class StreamsStore {
         const nextSignal = this._signalQueue.shift()!;
         if (this.signalDelayMs > 0) {
           const delay = Math.floor(Math.random() * this.signalDelayMs);
-          await new Promise(resolve => setTimeout(resolve, delay));
+          await new Promise<void>(resolve => this.clock.setTimeout(resolve, delay));
         }
         try {
           await this._processSignal(nextSignal);
@@ -5711,7 +5924,7 @@ export class StreamsStore {
               this.screenShareOutTransport.ownsTransportRecovery,
             iceState,
             disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
-            now: Date.now(),
+            now: this.clock.now(),
             graceMs: ICE_DISCONNECTED_GRACE_MS,
           });
           if (decision.action === 'teardown') {
@@ -5731,7 +5944,7 @@ export class StreamsStore {
           console.log(`#### SENDING SCREEN SHARE INIT REQUEST ON PING FROM ${pubkeyB64.slice(0, 8)}`);
           const newConnectionId = uuidv4();
           this._pendingScreenShareInits[pubkeyB64] = [
-            { connectionId: newConnectionId, t0: Date.now() },
+            { connectionId: newConnectionId, t0: this.clock.now() },
           ];
           await this.roomClient.sendMessage(
             [signal.from_agent],
@@ -5755,7 +5968,7 @@ export class StreamsStore {
     console.log(`#### GOT LeaveUi FROM ${pubkeyB64.slice(0, 8)}`);
     this.logger.logAgentEvent({
       agent: pubkeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'PeerLeave',
     });
     this._lastQualityBucket.delete(pubkeyB64);
@@ -5764,10 +5977,10 @@ export class StreamsStore {
     // because peer drops from the presence set on next tick.
     const outage = this._outageStates.get(pubkeyB64);
     if (outage?.emitted) {
-      const durationSec = Math.floor((Date.now() - outage.startedAt) / 1000);
+      const durationSec = Math.floor((this.clock.now() - outage.startedAt) / 1000);
       this.logger.logAgentEvent({
         agent: pubkeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'AudibilityOutageEnd',
         detail: `${durationSec}s; peer left`,
       });
@@ -5841,7 +6054,7 @@ export class StreamsStore {
    */
   async handlePongUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const now = Date.now();
+    const now = this.clock.now();
     // Pong timing is captured via agentPongMetadataLogs (with deduplication).
     // No need for a per-pong SimpleEvent entry — it just adds noise.
     // Update their connection statuses and the list of known agents
@@ -5864,7 +6077,7 @@ export class StreamsStore {
       // Smooth with EWMA so single-cycle jitter doesn't make the display
       // jump around. Alpha = 0.3 gives ~3-sample effective window.
       if (typeof metaData.data.pingT0 === 'number') {
-        const rtt = Date.now() - metaData.data.pingT0;
+        const rtt = this.clock.now() - metaData.data.pingT0;
         if (rtt >= 0 && rtt < 60000) {
           const prev = this._signalsRttEwma.get(pubkeyB64) ?? rtt;
           const next = Math.round(0.3 * rtt + 0.7 * prev);
@@ -5913,12 +6126,12 @@ export class StreamsStore {
         const maybeKnownAgent = knownAgents[pubkeyB64];
         if (maybeKnownAgent) {
           maybeKnownAgent.appVersion = metaData.data.appVersion;
-          maybeKnownAgent.lastSeen = Date.now();
+          maybeKnownAgent.lastSeen = this.clock.now();
         } else {
           knownAgents[pubkeyB64] = {
             pubkey: pubkeyB64,
             type: 'told',
-            lastSeen: Date.now(),
+            lastSeen: this.clock.now(),
             appVersion: metaData.data.appVersion,
           };
         }
@@ -6032,7 +6245,7 @@ export class StreamsStore {
         carrierOwnsRecovery: activeTransport.ownsTransportRecovery,
         iceState,
         disconnectedAt: this._iceDisconnectedAt[pubkeyB64],
-        now: Date.now(),
+        now: this.clock.now(),
         graceMs: ICE_DISCONNECTED_GRACE_MS,
       });
       if (existingConn && decision.action === 'teardown') {
@@ -6040,7 +6253,7 @@ export class StreamsStore {
         this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState} ${decision.reason}`);
         this.logger.logAgentEvent({
           agent: pubkeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'StaleCleanup',
           connectionId: existingConn.connectionId,
         });
@@ -6064,7 +6277,7 @@ export class StreamsStore {
           console.log('#### SENDING FIRST INIT REQUEST.');
           const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
           if (lastDisconnect) {
-            const gap = Date.now() - lastDisconnect;
+            const gap = this.clock.now() - lastDisconnect;
             this.logger.logCustomMessage(
               `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
             );
@@ -6228,7 +6441,7 @@ export class StreamsStore {
     const { connection_id, connection_type } = parsedInit.value;
     this.logger.logAgentEvent({
       agent: pubKey64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'InitRequest',
       connectionId: connection_id,
     });
@@ -6241,7 +6454,7 @@ export class StreamsStore {
     // Log retry gap if this is a reconnection attempt
     const lastDisconnect = this._lastDisconnectTime[pubKey64];
     if (lastDisconnect) {
-      const gap = Date.now() - lastDisconnect;
+      const gap = this.clock.now() - lastDisconnect;
       this.logger.logCustomMessage(
         `Retry gap [${pubKey64.slice(0, 8)}]: ${gap}ms since last disconnect`
       );
@@ -6268,7 +6481,7 @@ export class StreamsStore {
       // up the current mainStream so our tracks land in the answer.
       const accept: PendingAccept = {
         connectionId: connection_id,
-        createdAt: Date.now(),
+        createdAt: this.clock.now(),
       };
       const allPendingAccepts = this._pendingAccepts;
       const pendingAcceptsForAgent = allPendingAccepts[pubKey64];
@@ -6291,7 +6504,7 @@ export class StreamsStore {
     if (connection_type === 'screen') {
       const accept: PendingAccept = {
         connectionId: connection_id,
-        createdAt: Date.now(),
+        createdAt: this.clock.now(),
       };
       const allPendingScreenShareAccepts = this._pendingScreenShareAccepts;
       const pendingScreenShareAcceptsForAgent =
@@ -6327,7 +6540,7 @@ export class StreamsStore {
     const { connection_id, connection_type } = parsedAccept.value;
     this.logger.logAgentEvent({
       agent: pubKey64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'InitAccept',
       connectionId: connection_id,
     });
@@ -6359,7 +6572,7 @@ export class StreamsStore {
             pi => pi.connectionId === connection_id
           );
           if (matchingInit) {
-            const rtt = Date.now() - matchingInit.t0;
+            const rtt = this.clock.now() - matchingInit.t0;
             this.logger.logCustomMessage(
               `Signaling RTT [${pubKey64.slice(0, 8)}]: ${rtt}ms`
             );
@@ -6422,7 +6635,7 @@ export class StreamsStore {
             );
             this.logger.logAgentEvent({
               agent: pubKey64,
-              timestamp: Date.now(),
+              timestamp: this.clock.now(),
               event: 'Superseded',
               connectionId: priorOpenForInitAccept.connectionId,
               detail: `superseded-by=${connection_id}; path=initiator`,
@@ -6441,7 +6654,7 @@ export class StreamsStore {
           this.updateConnectionStatus(pubKey64, { type: 'SdpExchange' });
 
           // SDP exchange timeout: if still not connected after 15s, clean up and retry
-          setTimeout(() => {
+          this.clock.setTimeout(() => {
             const currentStatus = get(this._connectionStatuses)[pubKey64];
             if (currentStatus && currentStatus.type === 'SdpExchange') {
               this.logger.logCustomMessage(
@@ -6684,7 +6897,7 @@ export class StreamsStore {
             );
             this.logger.logAgentEvent({
               agent: pubkeyB64,
-              timestamp: Date.now(),
+              timestamp: this.clock.now(),
               event: 'Superseded',
               connectionId: priorOpenForSdp.connectionId,
               detail: `superseded-by=${connection_id}; path=acceptor`,
@@ -6792,7 +7005,7 @@ export class StreamsStore {
       sessionId: this.logger.sessionId,
       agentEvents: flatEvents,
       customLogs: recentCustomLogs,
-      generatedAt: Date.now(),
+      generatedAt: this.clock.now(),
     };
 
     const payload = JSON.stringify(snapshot);

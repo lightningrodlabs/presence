@@ -82,8 +82,15 @@ export function carrierFor(slot: WebrtcSlot | undefined): CarrierCoverage {
 }
 
 export type SignalsTargetsInputs = {
-  /** Peers currently considered present (`_activeAgents` keys). */
-  activeAgents: readonly AgentPubKeyB64[];
+  /**
+   * The **present** set — `StreamsStore._presentPeers`, i.e. ping-fresh
+   * OR media-flowing (`presence-policy.ts:computePresentPeers`). NOT
+   * `_activeAgents` keys: the invariant above says "for every peer that
+   * is present", and a peer whose pongs went stale while their signals
+   * voice keeps arriving is present. Keying this on ping-freshness alone
+   * was §3.1(b) — we kept hearing them, they stopped hearing us.
+   */
+  presentPeers: readonly AgentPubKeyB64[];
   /** `_openConnections`. Only `connected` is read. */
   openConnections: Readonly<Record<AgentPubKeyB64, WebrtcSlot>>;
 };
@@ -97,7 +104,7 @@ export function computeSignalsTargets(
   input: SignalsTargetsInputs,
 ): Set<AgentPubKeyB64> {
   const targets = new Set<AgentPubKeyB64>();
-  for (const pubkey of input.activeAgents) {
+  for (const pubkey of input.presentPeers) {
     if (carrierFor(input.openConnections[pubkey]).carrier === 'signals') {
       targets.add(pubkey);
     }
