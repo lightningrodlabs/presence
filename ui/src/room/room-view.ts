@@ -307,10 +307,6 @@ export class RoomView extends LitElement {
   @state()
   _reconnectAudio = new Audio('old-phone-ring-connect.mp3#t=0,3.5');
 
-  /** Tracks the previous set of active agent pubkeys for diffing.
-   * Used to detect signal-level presence changes (agent appear/disappear)
-   * and play join/leave sounds, independent of WebRTC state. */
-
   @state()
   _showAttachmentsPanel = false;
 
