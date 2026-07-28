@@ -180,10 +180,10 @@ describe('staleTeardownPlan — the cleanup sets, pinned', () => {
     });
   });
 
-  it('screen-share teardown clears the outgoing slot and screen pending inits, no stream slot', () => {
+  it('screen-share teardown clears the outgoing slot only — no pending map (Phase 3), no stream slot', () => {
     expect(staleTeardownPlan('screen-share-outgoing')).toEqual({
       slot: 'screen-share-connections-outgoing',
-      pendingInits: 'screen-share',
+      pendingInits: 'none',
       clearVideoStreamSlot: false,
     });
   });

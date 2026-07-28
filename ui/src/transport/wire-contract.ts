@@ -56,6 +56,7 @@ export const SIGNAL_MSG_TYPES = [
   'InitAccept',
   'SdpData',
   'SdpFsm',
+  'SdpFsmScreen',
   'LeaveUi',
   'DiagnosticRequest',
   'DiagnosticResponse',
@@ -81,12 +82,21 @@ export function isSignalMsgType(x: string): x is SignalMsgType {
  *  channel; v0.14.8+). */
 export const CAP_SDP_FSM = 'sdp-fsm';
 
-export type WireCap = typeof CAP_SDP_FSM;
+/** The peer's build can parse the `SdpFsmScreen` signal type (FSM screen-
+ *  share signaling channel; Phase 3 screen-share port, post-v0.14.8).
+ *  A peer without it never receives our screen share — v0.14.8 and older
+ *  drove screen share over SimplePeer/`SdpData`, which Phase 3 retires. */
+export const CAP_SDP_FSM_SCREEN = 'sdp-fsm-screen';
+
+export type WireCap = typeof CAP_SDP_FSM | typeof CAP_SDP_FSM_SCREEN;
 
 /** The capabilities this build declares in its conversation payload
  *  (`ConversationPayload.caps`). A future wire feature adds a string here —
  *  not a bespoke field-presence probe. */
-export const WIRE_CAPS = [CAP_SDP_FSM] as const satisfies readonly WireCap[];
+export const WIRE_CAPS = [
+  CAP_SDP_FSM,
+  CAP_SDP_FSM_SCREEN,
+] as const satisfies readonly WireCap[];
 
 // ---------------------------------------------------------------------------
 // The contract
@@ -125,6 +135,11 @@ export const WIRE_CONTRACT: Record<SignalMsgType, SignalTypeContract> = {
   InitAccept: { emits: true, parses: true, requiresCap: null },
   SdpData: { emits: true, parses: true, requiresCap: null },
   SdpFsm: { emits: true, parses: true, requiresCap: CAP_SDP_FSM },
+  // Production gate: `StreamsStore._ensureOutgoingScreenShare` initiates a
+  // screen-share connection only when `conversationPayloadCaps` contains
+  // this capability; the answering side only ever emits toward a sharer
+  // that already emitted. Pinned with the model in compat-corpus.test.ts.
+  SdpFsmScreen: { emits: true, parses: true, requiresCap: CAP_SDP_FSM_SCREEN },
   LeaveUi: { emits: true, parses: true, requiresCap: null },
   DiagnosticRequest: { emits: true, parses: true, requiresCap: null },
   DiagnosticResponse: { emits: true, parses: true, requiresCap: null },

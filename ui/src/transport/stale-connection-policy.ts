@@ -139,13 +139,17 @@ export type StaleTeardownTarget = 'video' | 'screen-share-outgoing';
 export type StaleTeardownPlan = {
   /** The connection slot to delete after closing the transport connection. */
   slot: 'open-connections' | 'screen-share-connections-outgoing';
-  /** The pending-init map to clear, so the next pong re-initiates cleanly. */
-  pendingInits: 'video' | 'screen-share';
+  /**
+   * The pending-init map to clear, so the next pong re-initiates cleanly.
+   * `none` for screen share since Phase 3 retired its InitRequest
+   * handshake — the FSM owns retry and there is no reservation to clear.
+   */
+  pendingInits: 'video' | 'none';
   /**
    * Whether to drop the peer's entry in `_videoStreams`. Only the video
-   * teardown has a per-peer stream slot to clear; outgoing screen share
-   * never stores one (`_screenShareStreams` is written nowhere — see the
-   * unscheduled-defects table in MAINTAINABILITY_ASSESSMENT.md).
+   * teardown has a per-peer stream slot to clear; `_screenShareStreams`
+   * (wired by Phase 3) tracks *incoming* shares and is cleared by the
+   * incoming-side close/error handlers, never by this outgoing teardown.
    */
   clearVideoStreamSlot: boolean;
 };
@@ -168,7 +172,7 @@ export function staleTeardownPlan(target: StaleTeardownTarget): StaleTeardownPla
     case 'screen-share-outgoing':
       return {
         slot: 'screen-share-connections-outgoing',
-        pendingInits: 'screen-share',
+        pendingInits: 'none',
         clearVideoStreamSlot: false,
       };
     default: {

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   CAP_SDP_FSM,
+  CAP_SDP_FSM_SCREEN,
   SIGNAL_MSG_TYPES,
   WIRE_CONTRACT,
   emittableSignalTypes,
@@ -177,6 +178,29 @@ describe('compat corpus — pinned resolutions', () => {
 
     // And everything we emit, we parse — same-version self-consistency.
     for (const t of sent) expect(WIRE_CONTRACT[t].parses).toBe(true);
+  });
+
+  it('SdpFsmScreen flows only on a declared sdp-fsm-screen cap — released peers never receive it', () => {
+    // The screen-share port (Phase 3 item 2) replaced the SimplePeer/
+    // SdpData screen channel with SdpFsmScreen. No released build parses
+    // it: 0.14.7 resolves baseline-only, 0.14.8's field-probe fallback
+    // yields only sdp-fsm. The production gate is
+    // `StreamsStore._ensureOutgoingScreenShare`'s capability check, fed
+    // from the same `conversationPayloadCaps` read as this model.
+    for (const version of ['0.14.7', '0.14.8']) {
+      const { sent } = currentBuildSendsTo(
+        byVersion[version].defaultConversationPayload,
+      );
+      expect(sent, `${version} must not receive SdpFsmScreen`).not.toContain(
+        'SdpFsmScreen',
+      );
+    }
+    // Same-version links declare the cap and do receive it.
+    expect(DEFAULT_CONVERSATION_PAYLOAD.caps).toContain(CAP_SDP_FSM_SCREEN);
+    const { sent } = currentBuildSendsTo(
+      DEFAULT_CONVERSATION_PAYLOAD as unknown as Record<string, unknown>,
+    );
+    expect(sent).toContain('SdpFsmScreen');
   });
 
   it('an empty caps declaration outranks the field probe (declaration wins)', () => {
