@@ -145,6 +145,10 @@ test.describe('carrier handover across a real WebRTC link', () => {
     const recoveryEntries = post.filter(
       e => e.phase === 'reconnecting' || e.phase === 'disconnected',
     );
+    // Non-empty, or the exception assertions below pass vacuously and
+    // "repealing the exception is a failing test" stops being true
+    // (PR #3 review finding F3).
+    expect(recoveryEntries.length).toBeGreaterThan(0);
     for (const entry of recoveryEntries) {
       expect(entry, `recovery entry deviates from declared exception: ${JSON.stringify(entry)}`).toMatchObject({
         onSignals: false,

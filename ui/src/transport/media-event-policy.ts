@@ -93,6 +93,109 @@ function slotActionFor(input: TransportPhaseInputs): SlotAction {
   return { action: 'adopt', supersedes: input.openConnectionId };
 }
 
+/** The `_openConnections` fields the slot-write decision reads and writes.
+ *  Deliberately narrow: `OpenConnectionInfo` satisfies it structurally. */
+export type SlotState = { connectionId: string; connected: boolean };
+
+/** The three route outcomes that touch the slot, as a discriminated input.
+ *  `ignore` routes never reach this decision. */
+export type SlotEvent =
+  | { kind: 'signaling'; slot: SlotAction }
+  | { kind: 'connected' }
+  | { kind: 'closed' };
+
+export type SlotWrite =
+  /** Create the slot fresh. Both `install` and `replace` start from
+   *  `connected: false` — that is the truth in either case, and preserving
+   *  a stale `connected: true` across an adopt is exactly the drift the
+   *  PR #3 review caught in the harness mirror (finding F1). */
+  | { write: 'install'; slot: SlotState }
+  | { write: 'replace'; slot: SlotState; supersedes: string }
+  | { write: 'set-connected'; slot: SlotState }
+  | { write: 'clear' }
+  | {
+      write: 'none';
+      reason: 'kept' | 'superseded' | 'no-slot';
+      /** For 'superseded': the live connectionId that outranks the event's. */
+      supersededBy?: string;
+    };
+
+/**
+ * The single slot-transition decision, executed by BOTH
+ * `StreamsStore._dispatchMediaEvent` / `_handleMediaConnected` /
+ * `_handleMediaClosed` and the carrier-handover harness
+ * (`ui/harness/carrier-handover-harness.ts`). Before this existed the
+ * harness carried a hand-written mirror of these rules, and the mirror had
+ * already drifted (adopt kept the stale `connected`; connect skipped the
+ * supersede guard) — in the same PR that introduced it. A shared decision
+ * makes that drift a compile error instead of a header caveat.
+ *
+ * Guard semantics preserved verbatim from the store:
+ *  - `connected`/`closed` for a connectionId that does not match the slot's
+ *    is superseded — a newer connection owns the slot; do not touch it.
+ *  - `connected`/`closed` with no slot at all is a drop (closed mid-handshake
+ *    / duplicate close respectively; the store stops the ICE monitor on the
+ *    latter — a side effect, not a slot write).
+ *
+ * Constrains `streams-store.ts:_dispatchMediaEvent`,
+ * `_handleMediaConnected`, `_handleMediaClosed`.
+ */
+export function decideSlotWrite(
+  ev: SlotEvent,
+  eventConnectionId: string,
+  current: SlotState | undefined,
+): SlotWrite {
+  switch (ev.kind) {
+    case 'signaling': {
+      const slot = ev.slot;
+      switch (slot.action) {
+        case 'install':
+          return {
+            write: 'install',
+            slot: { connectionId: eventConnectionId, connected: false },
+          };
+        case 'adopt':
+          return {
+            write: 'replace',
+            slot: { connectionId: eventConnectionId, connected: false },
+            supersedes: slot.supersedes,
+          };
+        case 'keep':
+          return { write: 'none', reason: 'kept' };
+      }
+      const exhaustiveAction: never = slot;
+      return exhaustiveAction;
+    }
+    case 'connected': {
+      if (!current) return { write: 'none', reason: 'no-slot' };
+      if (current.connectionId !== eventConnectionId) {
+        return {
+          write: 'none',
+          reason: 'superseded',
+          supersededBy: current.connectionId,
+        };
+      }
+      return {
+        write: 'set-connected',
+        slot: { connectionId: current.connectionId, connected: true },
+      };
+    }
+    case 'closed': {
+      if (!current) return { write: 'none', reason: 'no-slot' };
+      if (current.connectionId !== eventConnectionId) {
+        return {
+          write: 'none',
+          reason: 'superseded',
+          supersededBy: current.connectionId,
+        };
+      }
+      return { write: 'clear' };
+    }
+  }
+  const exhaustive: never = ev;
+  return exhaustive;
+}
+
 export function routeTransportPhase(
   input: TransportPhaseInputs,
 ): TransportPhaseRoute {

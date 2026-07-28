@@ -109,6 +109,14 @@ export type SignalTypeContract = {
  * Keyed off the real union, so a new `SignalMsgType` member is a compile
  * error here until its row is added — the tripwire that forces the fixture
  * ceremony below.
+ *
+ * Adding a `requiresCap` row is NOT enough on its own: `emittableSignalTypes`
+ * is the declared model, not the production emission path. A new gated type
+ * obliges (1) a production gate keyed on the same capability read
+ * (`conversationPayloadCaps` — for `SdpFsm` it is `resolveWebrtcImpl`
+ * rule 0), and (2) a paired pin in `compat-corpus.test.ts` holding the model
+ * and the gate together, as the existing SdpFsm pins do. Without both, the
+ * corpus would certify safety the runtime does not enforce.
  */
 export const WIRE_CONTRACT: Record<SignalMsgType, SignalTypeContract> = {
   PingUi: { emits: true, parses: true, requiresCap: null },

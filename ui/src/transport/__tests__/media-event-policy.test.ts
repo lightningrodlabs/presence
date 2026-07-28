@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { routeTransportPhase } from '../media-event-policy';
+import { routeTransportPhase, decideSlotWrite } from '../media-event-policy';
 import type { TransportPhaseRoute } from '../media-event-policy';
 import type { ConnectionPhase } from '../types';
 
@@ -168,5 +168,83 @@ describe('routeTransportPhase — slot identity', () => {
         reason: 'signaling-started',
       });
     }
+  });
+});
+
+describe('decideSlotWrite — the slot transition, shared by store and harness', () => {
+  // PR #3 review finding F1: the harness's hand-written mirror of these
+  // rules drifted from the store before it merged — adopt preserved a stale
+  // `connected: true`, and connect skipped the supersede guard. These rows
+  // pin both, and the shared function makes a re-divergence impossible
+  // rather than merely tested.
+
+  const live = { connectionId: 'live-1', connected: true };
+  const establishing = { connectionId: 'live-1', connected: false };
+
+  it('signaling/install creates the slot at connected: false', () => {
+    expect(
+      decideSlotWrite({ kind: 'signaling', slot: { action: 'install' } }, 'new-1', undefined),
+    ).toEqual({ write: 'install', slot: { connectionId: 'new-1', connected: false } });
+  });
+
+  it('signaling/adopt REPLACES the slot at connected: false — never preserves the stale claim (F1a pin)', () => {
+    expect(
+      decideSlotWrite(
+        { kind: 'signaling', slot: { action: 'adopt', supersedes: 'dead-0' } },
+        'new-1',
+        live,
+      ),
+    ).toEqual({
+      write: 'replace',
+      slot: { connectionId: 'new-1', connected: false },
+      supersedes: 'dead-0',
+    });
+  });
+
+  it('signaling/keep writes nothing', () => {
+    expect(
+      decideSlotWrite({ kind: 'signaling', slot: { action: 'keep' } }, 'live-1', establishing),
+    ).toEqual({ write: 'none', reason: 'kept' });
+  });
+
+  it('connected with the matching id sets connected: true', () => {
+    expect(decideSlotWrite({ kind: 'connected' }, 'live-1', establishing)).toEqual({
+      write: 'set-connected',
+      slot: { connectionId: 'live-1', connected: true },
+    });
+  });
+
+  it('connected with a mismatched id is superseded — the old peer must not mutate the new slot (F1b pin)', () => {
+    expect(decideSlotWrite({ kind: 'connected' }, 'old-0', live)).toEqual({
+      write: 'none',
+      reason: 'superseded',
+      supersededBy: 'live-1',
+    });
+  });
+
+  it('connected with no slot is a drop (closed mid-handshake)', () => {
+    expect(decideSlotWrite({ kind: 'connected' }, 'any', undefined)).toEqual({
+      write: 'none',
+      reason: 'no-slot',
+    });
+  });
+
+  it('closed with the matching id clears the slot', () => {
+    expect(decideSlotWrite({ kind: 'closed' }, 'live-1', live)).toEqual({ write: 'clear' });
+  });
+
+  it('closed with a mismatched id is superseded — a newer connection owns the slot', () => {
+    expect(decideSlotWrite({ kind: 'closed' }, 'old-0', live)).toEqual({
+      write: 'none',
+      reason: 'superseded',
+      supersededBy: 'live-1',
+    });
+  });
+
+  it('closed with no slot is a duplicate close — nothing to write', () => {
+    expect(decideSlotWrite({ kind: 'closed' }, 'live-1', undefined)).toEqual({
+      write: 'none',
+      reason: 'no-slot',
+    });
   });
 });

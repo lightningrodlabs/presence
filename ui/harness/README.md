@@ -11,9 +11,10 @@ reproduce. Two live here:
   establishes a link, silently kills one side (page close — no goodbye on
   the wire; CDP network emulation does not touch WebRTC's UDP sockets, so
   this is the honest flap), and asserts the carrier-coverage invariant in
-  both directions plus the declared recovery-window exception. Fidelity
-  statement and the one modeled seam (the streams-store wiring mirror) are
-  in the harness file header. Runs nightly
+  both directions plus the declared recovery-window exception. The slot
+  rules are shared code (`decideSlotWrite`, executed by store and harness
+  alike); the fidelity statement and the one modeled seam (the dispatch
+  glue) are in the harness file header. Runs nightly
   (`.github/workflows/nightly-harness.yaml`) via `npm run test:harness`.
 - **Voice playout** (`voice-playout-harness.*`, `voice-playout.spec.ts`) —
   real-WebCodecs tier of the Symptom B investigation; see its header.

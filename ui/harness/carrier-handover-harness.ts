@@ -14,17 +14,19 @@
  * `_openConnections[peer]`. So the fidelity statement is:
  *
  *   REAL:    RTCPeerConnection, ICE/DTLS state machine, ConnectionManager,
- *            FsmTransport, routeTransportPhase, carrierFor,
+ *            FsmTransport, routeTransportPhase, decideSlotWrite (the slot
+ *            rules the store itself executes), carrierFor,
  *            computeSignalsTargets, reconnect/backoff behavior.
- *   MODELED: the ~40 lines of streams-store wiring that connect transport
- *            events to the slot table (mirrored here from
- *            `_dispatchMediaEvent`; `StreamsStore` itself cannot run
- *            without Holochain — MAINTAINABILITY_ASSESSMENT.md §3.6).
+ *   MODELED: only the glue — route.handler → SlotEvent, and applying the
+ *            returned SlotWrite to a plain table (`StreamsStore` itself
+ *            cannot run without Holochain — MAINTAINABILITY_ASSESSMENT.md
+ *            §3.6).
  *
- * A divergence between this mirror and the real wiring is exactly the kind
- * of bug the harness cannot catch — Phase 6 (constructible orchestrator)
- * retires that gap; until then this is the highest-fidelity check the
- * carrier logic gets against a real network stack.
+ * A divergence in that glue is the kind of bug the harness cannot catch —
+ * Phase 6 (constructible orchestrator) retires the gap entirely; until then
+ * this is the highest-fidelity check the carrier logic gets against a real
+ * network stack. (The slot rules themselves stopped being glue when they
+ * moved into `decideSlotWrite`: the store executes the same function.)
  *
  * Timeouts and the reconnect budget are shortened via the transport's test
  * seams so a silent peer drop reaches `failed` in tens of seconds, not
@@ -35,7 +37,11 @@
  */
 
 import { FsmTransport } from '../src/transport/fsm/fsm-transport';
-import { routeTransportPhase } from '../src/transport/media-event-policy';
+import {
+  routeTransportPhase,
+  decideSlotWrite,
+  type SlotEvent,
+} from '../src/transport/media-event-policy';
 import { computeSignalsTargets, carrierFor } from '../src/transport/carrier-coverage';
 import type { OutgoingSignal, TransportEvent, ConnectionPhase } from '../src/transport/types';
 import { DefaultReconnectPolicy } from '@lightningrodlabs/webrtc-peer';
@@ -87,10 +93,14 @@ function onSignalsNow(): boolean {
 }
 
 /**
- * Mirror of `StreamsStore._dispatchMediaEvent`'s connection-state-change
- * arm — route via the production policy, apply the slot action. Kept as
- * close to the real wiring as the store's privacy allows; see the fidelity
- * note in the file header.
+ * `StreamsStore._dispatchMediaEvent`'s connection-state-change arm: route
+ * via the production policy, then EXECUTE the production slot decision —
+ * `decideSlotWrite` is the same function the store runs, so the slot rules
+ * here cannot drift from the app's (PR #3 review finding F1: the previous
+ * hand-written mirror had already diverged on the adopt and
+ * connected-supersede paths before it merged). What remains modeled is
+ * only this glue: route.handler → SlotEvent, and applying the returned
+ * write to a plain table.
  */
 function applyPhaseEvent(event: Extract<TransportEvent, { type: 'connection-state-change' }>): void {
   const route = routeTransportPhase({
@@ -100,29 +110,29 @@ function applyPhaseEvent(event: Extract<TransportEvent, { type: 'connection-stat
     openConnectionId: slots[event.peer]?.connectionId,
   });
 
-  switch (route.handler) {
-    case 'start-ice-monitor': {
-      const slot = route.slot;
-      if (slot.action === 'install') {
-        slots[event.peer] = { connectionId: event.connectionId, connected: false };
-      } else if (slot.action === 'adopt') {
-        slots[event.peer] = {
-          connectionId: event.connectionId,
-          connected: slots[event.peer].connected,
-        };
-      }
-      break;
-    }
-    case 'media-connected':
-      slots[event.peer] = { connectionId: event.connectionId, connected: true };
-      break;
-    case 'media-closed':
-      if (slots[event.peer]?.connectionId === event.connectionId) {
+  const slotEvent: SlotEvent | null =
+    route.handler === 'start-ice-monitor'
+      ? { kind: 'signaling', slot: route.slot }
+      : route.handler === 'media-connected'
+        ? { kind: 'connected' }
+        : route.handler === 'media-closed'
+          ? { kind: 'closed' }
+          : null;
+
+  if (slotEvent) {
+    const write = decideSlotWrite(slotEvent, event.connectionId, slots[event.peer]);
+    switch (write.write) {
+      case 'install':
+      case 'replace':
+      case 'set-connected':
+        slots[event.peer] = write.slot;
+        break;
+      case 'clear':
         delete slots[event.peer];
-      }
-      break;
-    case 'ignore':
-      break;
+        break;
+      case 'none':
+        break;
+    }
   }
 
   timeline.push({

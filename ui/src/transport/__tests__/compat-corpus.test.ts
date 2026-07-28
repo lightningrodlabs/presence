@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,16 +108,16 @@ function currentBuildSendsTo(payload: Record<string, unknown>): {
   return { sent, impl };
 }
 
-describe('compat corpus — interop invariant', () => {
-  const corpus = loadCorpus();
+const CORPUS = loadCorpus();
 
+describe('compat corpus — interop invariant', () => {
   it('has at least the two released entries', () => {
-    const versions = corpus.map(e => e.version);
+    const versions = CORPUS.map(e => e.version);
     expect(versions).toContain('0.14.7');
     expect(versions).toContain('0.14.8');
   });
 
-  for (const entry of loadCorpus()) {
+  for (const entry of CORPUS) {
     it(`sends nothing that ${entry.version} cannot parse`, () => {
       const { sent } = currentBuildSendsTo(entry.defaultConversationPayload);
       const unparseable = sent.filter(t => !entry.parses.includes(t));
@@ -142,8 +143,7 @@ describe('compat corpus — interop invariant', () => {
 });
 
 describe('compat corpus — pinned resolutions', () => {
-  const corpus = loadCorpus();
-  const byVersion = Object.fromEntries(corpus.map(e => [e.version, e]));
+  const byVersion = Object.fromEntries(CORPUS.map(e => [e.version, e]));
 
   it('a 0.14.7 peer resolves to simplepeer and never receives SdpFsm (rule 0)', () => {
     const { sent, impl } = currentBuildSendsTo(
@@ -205,9 +205,17 @@ describe('compat corpus — release dump ceremony', () => {
           'are immutable — bump ui/package.json version before dumping.',
       );
     }
+    let rev = 'unknown rev';
+    try {
+      rev = execSync('git rev-parse --short HEAD', { cwd: CORPUS_DIR })
+        .toString()
+        .trim();
+    } catch {
+      // Provenance degrades gracefully outside a git checkout.
+    }
     const entry: CompatEntry = {
       version,
-      source: `dumped from source by compat-corpus.test.ts at release ${version}`,
+      source: `dumped from source by compat-corpus.test.ts at release ${version} (${rev})`,
       parses: SIGNAL_MSG_TYPES.filter(t => WIRE_CONTRACT[t].parses),
       emits: SIGNAL_MSG_TYPES.filter(t => WIRE_CONTRACT[t].emits),
       defaultConversationPayload: JSON.parse(

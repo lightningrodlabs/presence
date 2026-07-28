@@ -7,7 +7,7 @@ import {
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
-import { routeTransportPhase } from './transport/media-event-policy';
+import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
 import { computeSignalsTargets } from './transport/carrier-coverage';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import {
@@ -504,24 +504,31 @@ export class StreamsStore {
               delete this._iceDisconnectedAt[event.peer];
             }
             this._startMediaIceMonitor(event.peer, event.connectionId, impl);
-            if (route.slot.action !== 'keep') {
+            {
               // `install`: FSM acceptor path — an incoming offer creates an
               // FSM without streams-store knowing in advance, so the slot
               // has to exist for later connect/stream events to mutate.
-              // `adopt`: same write, replacing a slot whose connection is
-              // gone. Both start from `connected: false`, which is the
-              // truth in either case.
-              this._openConnections.update(currentValue => {
-                currentValue[event.peer] = {
-                  connectionId: event.connectionId,
-                  video: false,
-                  audio: false,
-                  connected: false,
-                  direction: 'duplex',
-                };
-                return currentValue;
-              });
-              this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
+              // `replace` (adopt): same write, replacing a slot whose
+              // connection is gone. The decision — including that both start
+              // from `connected: false` — is `decideSlotWrite`, shared with
+              // the carrier-handover harness so the two cannot drift.
+              const slotWrite = decideSlotWrite(
+                { kind: 'signaling', slot: route.slot },
+                event.connectionId,
+                get(this._openConnections)[event.peer],
+              );
+              if (slotWrite.write === 'install' || slotWrite.write === 'replace') {
+                this._openConnections.update(currentValue => {
+                  currentValue[event.peer] = {
+                    ...slotWrite.slot,
+                    video: false,
+                    audio: false,
+                    direction: 'duplex',
+                  };
+                  return currentValue;
+                });
+                this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
+              }
             }
             break;
           case 'media-connected':
@@ -1055,23 +1062,27 @@ export class StreamsStore {
     impl: 'simplepeer' | 'fsm',
   ): void {
     const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
-    // Supersede guard: an old peer that completed ICE after being replaced
-    // would otherwise mutate the new connection's slot.
+    // Guards live in `decideSlotWrite` (shared with the carrier-handover
+    // harness): superseded — an old peer that completed ICE after being
+    // replaced must not mutate the new connection's slot; no-slot — likely
+    // closed mid-handshake, drop.
     const currentOnConnect = get(this._openConnections)[pubKeyB64];
-    if (currentOnConnect && currentOnConnect.connectionId !== connectionId) {
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'SupersededConnect',
-        connectionId,
-        detail: `superseded-by=${currentOnConnect.connectionId}`,
-      });
-      // Transport already handled supersede destroy on its side.
-      return;
-    }
-    if (!currentOnConnect) {
-      // Connected event for a peer no longer in _openConnections — likely
-      // closed mid-handshake. Drop.
+    const slotWrite = decideSlotWrite(
+      { kind: 'connected' },
+      connectionId,
+      currentOnConnect,
+    );
+    if (slotWrite.write !== 'set-connected') {
+      if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededConnect',
+          connectionId,
+          detail: `superseded-by=${slotWrite.supersededBy}`,
+        });
+        // Transport already handled supersede destroy on its side.
+      }
       return;
     }
     console.log('#### CONNECTED with', pubKeyB64);
@@ -1195,32 +1206,35 @@ export class StreamsStore {
   ): void {
     console.log('#### GOT CLOSE EVENT ####');
 
-    // Supersede guard: the current entry for this peer points at a
-    // different connectionId means a newer connection has taken over and
-    // we must NOT wipe its state.
-    const currentOnClose = get(this._openConnections)[pubKeyB64];
-    if (currentOnClose && currentOnClose.connectionId !== connectionId) {
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: Date.now(),
-        event: 'SupersededClose',
-        connectionId,
-        detail: `superseded-by=${currentOnClose.connectionId}`,
-      });
-      return;
-    }
-
-    // Duplicate-close guard: the first close already deleted
+    // Guards live in `decideSlotWrite` (shared with the carrier-handover
+    // harness). Superseded: the slot points at a different connectionId, a
+    // newer connection has taken over and we must NOT wipe its state.
+    // No-slot: duplicate close — the first close already deleted
     // _openConnections[peer], cleared analyser/stats, and fired
-    // peer-disconnected. A second close event for the same connectionId
-    // would emit a redundant SimplePeerClose/FsmClose and re-fire
-    // peer-disconnected on consumers.
-    if (!currentOnClose) {
-      this._stopMediaIceMonitor(pubKeyB64, connectionId);
+    // peer-disconnected; a second would emit a redundant
+    // SimplePeerClose/FsmClose and re-fire peer-disconnected on consumers.
+    const currentOnClose = get(this._openConnections)[pubKeyB64];
+    const slotWrite = decideSlotWrite(
+      { kind: 'closed' },
+      connectionId,
+      currentOnClose,
+    );
+    if (slotWrite.write !== 'clear') {
+      if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
+        this.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: Date.now(),
+          event: 'SupersededClose',
+          connectionId,
+          detail: `superseded-by=${slotWrite.supersededBy}`,
+        });
+      } else {
+        this._stopMediaIceMonitor(pubKeyB64, connectionId);
+      }
       return;
     }
 
-    const closingConn = currentOnClose;
+    const closingConn = currentOnClose!;
     const wasWebrtcCarrier = !!closingConn?.connected;
 
     // Flush any in-flight SdpData bursts for this connection so the
