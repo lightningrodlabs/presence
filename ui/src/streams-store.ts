@@ -7,8 +7,15 @@ import {
 import { Clock, systemClock } from './clock';
 import {
   computeActiveAgents,
+  computePresentPeers,
+  decidePresenceSoundEvents,
+  INITIAL_PRESENCE_SOUND_STATE,
+  isMediaLive,
+  MEDIA_LIVE_WINDOW_MS,
   PING_INTERVAL,
+  PRESENCE_LEAVE_DWELL_MS,
   PRESENT_STALENESS_MS,
+  type PresenceSoundState,
 } from './presence-policy';
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
@@ -96,16 +103,6 @@ const ICE_DISCONNECTED_GRACE_MS = 15000;
  * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent
  */
 const INIT_RETRY_THRESHOLD = 5000;
-
-/**
- * A peer with media frames received within this window on the signals
- * carrier (voice or filmstrip video) — or with a connected WebRTC
- * connection — is treated as present regardless of ping/pong staleness.
- * Holochain-signal ping/pong can go stale (>3*PING_INTERVAL) during a
- * signal-relay hiccup while media keeps flowing fine; without this the
- * peer's pane would be wrongly removed. See `isPeerMediaLive`.
- */
-const MEDIA_LIVE_WINDOW_MS = 3000;
 
 /**
  * A store that handles the creation and management of WebRTC streams with
@@ -320,6 +317,30 @@ export class StreamsStore {
           openConnections: connections,
         }),
     );
+
+    // The **present** predicate: ping-fresh OR media-flowing. THE
+    // authority for every join/leave-shaped effect — chimes, tiles, grid
+    // counts, phantom exclusion. The controllers' recv maps are not
+    // stores, so the _presenceTick dependency is what re-evaluates the
+    // media half once per ping cadence.
+    this._presentPeers = derived(
+      [this._activeAgents, this._openConnections, this._presenceTick] as [
+        Readable<Record<AgentPubKeyB64, AgentInfo>>,
+        Writable<Record<AgentPubKeyB64, OpenConnectionInfo>>,
+        Writable<number>,
+      ],
+      ([active, connections, _tick]) =>
+        computePresentPeers({
+          activeAgents: Object.keys(active),
+          openConnections: connections,
+          lastVoiceMs: voiceController.peerLastRecvMs,
+          lastFilmstripMs: filmstripController.peerLastRecvMs,
+          blocked: get(this.blockedAgents),
+          myPubKey: this.myPubKeyB64,
+          now: this.clock.now(),
+          mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+        }),
+    );
     // Construction ends here: fields and derived stores only, no
     // subscriptions, no transports, no browser APIs. Everything that
     // touches the ambient world (window, navigator, the signal bus, the
@@ -347,6 +368,29 @@ export class StreamsStore {
       () => this._presenceTick.update(n => n + 1),
       PING_INTERVAL
     );
+
+    // Join/leave sounds key off the present predicate — NOT raw
+    // _activeAgents — so a pong gap with media still flowing produces no
+    // sound, and a genuine departure sounds only after the leave dwell.
+    // Replaces room-view's direct _activeAgents diff (the mechanism
+    // behind the leave-then-join chime blip). The subscription fires on
+    // every _presenceTick, which is what expires the dwell.
+    this._presentPeersUnsub = this._presentPeers.subscribe(present => {
+      const decision = decidePresenceSoundEvents({
+        state: this._presenceSoundState,
+        present,
+        now: this.clock.now(),
+        leaveDwellMs: PRESENCE_LEAVE_DWELL_MS,
+      });
+      this._presenceSoundState = decision.state;
+      for (const ev of decision.events) {
+        this.eventCallback({
+          type:
+            ev.kind === 'join' ? 'peer-joined-presence' : 'peer-left-presence',
+          pubKeyB64: ev.peer,
+        });
+      }
+    });
     const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
@@ -2129,6 +2173,10 @@ export class StreamsStore {
       this._signalsTargetsUnsub();
       this._signalsTargetsUnsub = null;
     }
+    if (this._presentPeersUnsub) {
+      this._presentPeersUnsub();
+      this._presentPeersUnsub = null;
+    }
     // Release the WebRTC mic handle and force-close the MicSource (which
     // stops the underlying track and closes the shared AudioContext).
     if (this._webrtcMicHandle) {
@@ -3214,6 +3262,20 @@ export class StreamsStore {
   private _presenceTickInterval: number | undefined;
 
   /**
+   * The **present** predicate: ping-fresh OR media-flowing peers, in
+   * stable tile order. Defined in the constructor from
+   * `computePresentPeers` (presence-policy.ts); the one authority for
+   * chimes, tiles, grid counts and phantom exclusion.
+   */
+  _presentPeers!: Readable<AgentPubKeyB64[]>;
+
+  /** State of the join/leave sound decision; see decidePresenceSoundEvents. */
+  private _presenceSoundState: PresenceSoundState = INITIAL_PRESENCE_SOUND_STATE;
+
+  /** Unsubscribe from the _presentPeers sound subscription. */
+  private _presentPeersUnsub: (() => void) | null = null;
+
+  /**
    * The statuses of WebRTC main stream connections to peers
    */
   _connectionStatuses: Writable<ConnectionStatuses> = writable({});
@@ -3537,20 +3599,13 @@ export class StreamsStore {
    * a surviving `connected` entry is genuinely live.
    */
   isPeerMediaLive(peerB64: AgentPubKeyB64): boolean {
-    if (get(this._openConnections)[peerB64]?.connected) return true;
-    const now = this.clock.now();
-    const lastVoice = voiceController.peerLastRecvMs.get(peerB64);
-    if (lastVoice !== undefined && now - lastVoice < MEDIA_LIVE_WINDOW_MS) {
-      return true;
-    }
-    const lastFilmstrip = filmstripController.peerLastRecvMs.get(peerB64);
-    if (
-      lastFilmstrip !== undefined &&
-      now - lastFilmstrip < MEDIA_LIVE_WINDOW_MS
-    ) {
-      return true;
-    }
-    return false;
+    return isMediaLive({
+      webrtcConnected: !!get(this._openConnections)[peerB64]?.connected,
+      lastVoiceMs: voiceController.peerLastRecvMs.get(peerB64),
+      lastFilmstripMs: filmstripController.peerLastRecvMs.get(peerB64),
+      now: this.clock.now(),
+      windowMs: MEDIA_LIVE_WINDOW_MS,
+    });
   }
 
   /**
@@ -3574,22 +3629,11 @@ export class StreamsStore {
     // tile must include me. Excluding self happens at the per-tile level
     // (drop the observer from each tile's iteration), not here.
     out.add(this.myPubKeyB64);
-    // My own active agents.
-    for (const k of Object.keys(get(this._activeAgents))) {
-      if (!blocked.has(k)) out.add(k);
-    }
-    // Peers with live media on either carrier. Ping/pong staleness must
-    // not prune a peer we can still see or hear: a Holochain-signal hiccup
-    // would otherwise remove the pane of a peer whose WebRTC (or
-    // signals-carrier) media is flowing fine. See `isPeerMediaLive`.
-    const mediaCandidates = new Set<AgentPubKeyB64>([
-      ...Object.keys(get(this._openConnections)),
-      ...voiceController.peerLastRecvMs.keys(),
-      ...filmstripController.peerLastRecvMs.keys(),
-    ]);
-    for (const k of mediaCandidates) {
-      if (k === this.myPubKeyB64 || blocked.has(k)) continue;
-      if (this.isPeerMediaLive(k)) out.add(k);
+    // Everyone present to us directly — ping-fresh OR media-flowing on
+    // either carrier (the present predicate; excludes self and blocked).
+    // Ping/pong staleness must not prune a peer we can still see or hear.
+    for (const k of get(this._presentPeers)) {
+      out.add(k);
     }
     // Anyone a *fresh* observer reports as present. We require the
     // observer's broadcast itself to be recent so that an observer who
@@ -3627,6 +3671,10 @@ export class StreamsStore {
    */
   phantomAgents(): AgentPubKeyB64[] {
     const active = get(this._activeAgents);
+    // The present predicate (ping-fresh OR media-flowing) is the one
+    // authority for "we see them directly"; a phantom is an observer
+    // report about a peer who is NOT present to us.
+    const present = new Set(get(this._presentPeers));
     const blocked = new Set(get(this.blockedAgents));
     const out = new Set<AgentPubKeyB64>();
     const now = this.clock.now();
@@ -3642,8 +3690,7 @@ export class StreamsStore {
       for (const [peerKey, snap] of Object.entries(obs.peerLinks)) {
         if (peerKey === this.myPubKeyB64) continue;
         if (blocked.has(peerKey)) continue;
-        if (active[peerKey]) continue; // we already see them directly (ping-fresh)
-        if (this.isPeerMediaLive(peerKey)) continue; // ...or via live media despite stale pong
+        if (present.has(peerKey)) continue; // we already see them directly
         if (snap.lastSeen === 'fresh' || snap.lastSeen === 'stale') {
           out.add(peerKey);
         }

@@ -365,6 +365,22 @@ export type StoreEventPayload =
       type: 'peer-leave';
       pubKeyB64: AgentPubKeyB64;
     }
+  /**
+   * Presence-predicate transitions (present = ping-fresh OR
+   * media-flowing; see presence-policy.ts). Emitted by the store's
+   * decidePresenceSoundEvents subscription — joins immediately, leaves
+   * after the dwell — and consumed by room-view for the join/leave
+   * chimes. Distinct from peer-connected/peer-disconnected, which are
+   * WebRTC connection events.
+   */
+  | {
+      type: 'peer-joined-presence';
+      pubKeyB64: AgentPubKeyB64;
+    }
+  | {
+      type: 'peer-left-presence';
+      pubKeyB64: AgentPubKeyB64;
+    }
   | {
       type: 'peer-screen-share-connected';
       pubKeyB64: AgentPubKeyB64;

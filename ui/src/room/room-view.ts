@@ -169,6 +169,17 @@ export class RoomView extends LitElement {
     () => [this.streamsStore]
   );
 
+  /**
+   * The present predicate (ping-fresh OR media-flowing), in stable tile
+   * order. The one authority for tiles and grid counts — see
+   * presence-policy.ts.
+   */
+  _presentPeers = new StoreSubscriber(
+    this,
+    () => this.streamsStore._presentPeers,
+    () => [this.streamsStore]
+  );
+
   _receivedDiagnosticLogs = new StoreSubscriber(
     this,
     () => this.streamsStore._receivedDiagnosticLogs,
@@ -299,8 +310,6 @@ export class RoomView extends LitElement {
   /** Tracks the previous set of active agent pubkeys for diffing.
    * Used to detect signal-level presence changes (agent appear/disappear)
    * and play join/leave sounds, independent of WebRTC state. */
-  private _prevActiveAgentKeys = new Set<string>();
-  private _activeAgentsUnsubscribe: (() => void) | null = null;
 
   @state()
   _showAttachmentsPanel = false;
@@ -477,11 +486,18 @@ export class RoomView extends LitElement {
         }
         case 'peer-leave': {
           // Agent left the room — clear maximize if they were maximized.
-          // Leave sound now plays on signal-level presence (agent
-          // disappears from _activeAgents), not here.
+          // The leave sound plays on 'peer-left-presence', not here.
           if (this._maximizedVideo === event.pubKeyB64) {
             this._maximizedVideo = undefined;
           }
+          break;
+        }
+        case 'peer-joined-presence': {
+          this._joinAudio.play().catch(() => {});
+          break;
+        }
+        case 'peer-left-presence': {
+          this._leaveAudio.play().catch(() => {});
           break;
         }
         case 'peer-stream': {
@@ -531,27 +547,12 @@ export class RoomView extends LitElement {
     this._joinAudio.volume = 0.07;
     this._reconnectAudio.volume = 0.1;
 
-    // Subscribe to signal-level presence changes. Play join/leave sounds
-    // when agents appear/disappear in _activeAgents (driven by ping/pong),
-    // independent of WebRTC connection state. This means the user hears
-    // someone arrive the moment their pong lands, not when (or if) WebRTC
-    // establishes.
-    this._activeAgentsUnsubscribe = this.streamsStore._activeAgents.subscribe(
-      agents => {
-        const currentKeys = new Set(Object.keys(agents));
-        for (const key of currentKeys) {
-          if (!this._prevActiveAgentKeys.has(key)) {
-            this._joinAudio.play().catch(() => {});
-          }
-        }
-        for (const key of this._prevActiveAgentKeys) {
-          if (!currentKeys.has(key)) {
-            this._leaveAudio.play().catch(() => {});
-          }
-        }
-        this._prevActiveAgentKeys = currentKeys;
-      }
-    );
+    // Join/leave sounds arrive as 'peer-joined-presence' /
+    // 'peer-left-presence' store events (see the onEvent handler above),
+    // decided by the store against the present predicate with a leave
+    // dwell — not by diffing _activeAgents here. Replaces the direct
+    // _activeAgents diff, which chimed leave-then-join on a pong gap
+    // while media kept flowing.
 
     this._roomInfo = await this.roomStore.client.getRoomInfo();
 
@@ -683,28 +684,16 @@ export class RoomView extends LitElement {
    * layouts. Setting state only when it changes avoids re-render loops.
    */
   /**
-   * Peers that should have a visible tile: everyone fresh on the presence
-   * ping (`_activeAgents`) PLUS anyone whose WebRTC media is still live
-   * (`_openConnections[k].connected`) even though their signaling pongs have
-   * gone stale. Signaling-pong staleness alone must never remove a tile whose
-   * media is flowing — a transient Holochain-signal hiccup (or a third peer
-   * congesting the shared signals carrier) would otherwise drop a peer we can
-   * still see and hear. streams-store applies the same guard to the presence
-   * overlay (`isPeerMediaLive` / `globalPresenceSet`); this keeps the main
-   * video grid consistent with it. De-duplicated, active-first ordering.
+   * Peers that should have a visible tile: the present predicate
+   * (ping-fresh OR media-flowing on either carrier), from the store's
+   * `_presentPeers`. One authority for tiles, grid counts and chimes —
+   * see presence-policy.ts. This also closes the old divergence where a
+   * signals-only peer with stale pongs was audible but tile-less
+   * (`_visiblePeers` used to test only `conn?.connected`, contradicting
+   * its own docblock).
    */
   private _visiblePeers(): AgentPubKeyB64[] {
-    const active = this._activeAgents.value;
-    const conns = this._openConnections.value;
-    const out: AgentPubKeyB64[] = Object.keys(active);
-    const seen = new Set<string>(out);
-    for (const [pubkeyB64, conn] of Object.entries(conns)) {
-      if (conn?.connected && !seen.has(pubkeyB64)) {
-        seen.add(pubkeyB64);
-        out.push(pubkeyB64);
-      }
-    }
-    return out;
+    return this._presentPeers.value;
   }
 
   private _updateGrid() {
@@ -839,7 +828,6 @@ export class RoomView extends LitElement {
     if (this.pingInterval) window.clearInterval(this.pingInterval);
     window.removeEventListener('resize', this._onWindowResize);
     if (this._unsubscribe) this._unsubscribe();
-    if (this._activeAgentsUnsubscribe) this._activeAgentsUnsubscribe();
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect('room-view-disconnectedCallback');
   }
@@ -855,8 +843,8 @@ export class RoomView extends LitElement {
     // layout sizing. Without this the layout class is computed for fewer
     // tiles than actually render, and every tile is oversized.
     const phantomCount = this.streamsStore.phantomAgents().length;
-    const videoOnlyCount =
-      Object.keys(this._activeAgents.value).length + 1 + phantomCount;
+    // Same count as _updateGrid: present peers + self + phantoms.
+    const videoOnlyCount = this._visiblePeers().length + 1 + phantomCount;
     const totalCount = videoOnlyCount + activeShareCount;
 
     // In split mode, size items based on their panel's count
@@ -2897,7 +2885,7 @@ export class RoomView extends LitElement {
           ? (() => {
               // n must match _updateGrid's count: peers + phantoms + self (unless hidden).
               const n =
-                Object.keys(this._activeAgents.value).length +
+                this._visiblePeers().length +
                 this.streamsStore.phantomAgents().length +
                 (this._selfViewHidden ? 0 : 1);
               const lastK = ((n - 1) % this._gridCols) + 1;

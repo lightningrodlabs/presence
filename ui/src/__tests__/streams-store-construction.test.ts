@@ -94,6 +94,23 @@ describe('StreamsStore construction/activation split', () => {
     expect(Object.keys(get(store._activeAgents))).toEqual([]);
   });
 
+  it('derives _presentPeers as ping-fresh plus media-connected peers (item 5)', () => {
+    const clock = new ManualClock(100_000);
+    const store = makeUnstartedStore(clock);
+    store._knownAgents.set({
+      [peerA]: { pubkey: peerA, type: 'known', lastSeen: clock.now(), appVersion: undefined },
+    });
+    // peerB has no fresh pong but a connected WebRTC slot — still present.
+    store._openConnections.set({
+      [peerB]: { connected: true } as never,
+    });
+    expect(get(store._presentPeers)).toEqual([peerA, peerB]);
+
+    // Drop the connection: peerB leaves the present set.
+    store._openConnections.set({});
+    expect(get(store._presentPeers)).toEqual([peerA]);
+  });
+
   it('derives _signalsTargets from active agents before start()', () => {
     const clock = new ManualClock(100_000);
     const store = makeUnstartedStore(clock);

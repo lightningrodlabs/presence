@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   computeActiveAgents,
+  computePresentPeers,
+  decidePresenceSoundEvents,
+  INITIAL_PRESENCE_SOUND_STATE,
+  isMediaLive,
+  MEDIA_LIVE_WINDOW_MS,
   PING_INTERVAL,
+  PRESENCE_LEAVE_DWELL_MS,
   PRESENT_STALENESS_MS,
+  type PresenceSoundState,
 } from './presence-policy';
 import type { AgentInfo } from './types';
 
@@ -93,5 +100,228 @@ describe('computeActiveAgents', () => {
 
   it('staleness window is 3 ping ticks (the present predicate clock)', () => {
     expect(PRESENT_STALENESS_MS).toBe(3 * PING_INTERVAL);
+  });
+});
+
+describe('isMediaLive', () => {
+  const base = { now: NOW, windowMs: MEDIA_LIVE_WINDOW_MS };
+
+  const table: Array<{
+    name: string;
+    webrtcConnected: boolean;
+    lastVoiceMs?: number;
+    lastFilmstripMs?: number;
+    expected: boolean;
+  }> = [
+    { name: 'webrtc connected alone is live', webrtcConnected: true, expected: true },
+    { name: 'nothing at all is not live', webrtcConnected: false, expected: false },
+    {
+      name: 'voice inside the window is live',
+      webrtcConnected: false,
+      lastVoiceMs: NOW - MEDIA_LIVE_WINDOW_MS + 1,
+      expected: true,
+    },
+    {
+      name: 'voice exactly at the window edge is not live (strict <)',
+      webrtcConnected: false,
+      lastVoiceMs: NOW - MEDIA_LIVE_WINDOW_MS,
+      expected: false,
+    },
+    {
+      name: 'filmstrip inside the window is live',
+      webrtcConnected: false,
+      lastFilmstripMs: NOW - 100,
+      expected: true,
+    },
+    {
+      name: 'stale voice but fresh filmstrip is live',
+      webrtcConnected: false,
+      lastVoiceMs: NOW - 60_000,
+      lastFilmstripMs: NOW - 100,
+      expected: true,
+    },
+  ];
+
+  for (const row of table) {
+    it(row.name, () => {
+      expect(
+        isMediaLive({
+          webrtcConnected: row.webrtcConnected,
+          lastVoiceMs: row.lastVoiceMs,
+          lastFilmstripMs: row.lastFilmstripMs,
+          ...base,
+        })
+      ).toBe(row.expected);
+    });
+  }
+});
+
+describe('computePresentPeers', () => {
+  const base = {
+    blocked: [] as string[],
+    myPubKey: 'me',
+    now: NOW,
+    mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+  };
+  const noVoice = new Map<string, number>();
+  const noFilmstrip = new Map<string, number>();
+
+  it('ping-fresh peers are present in their given order', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        activeAgents: ['b', 'a'],
+        openConnections: {},
+        lastVoiceMs: noVoice,
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual(['b', 'a']);
+  });
+
+  it('a connected WebRTC peer with stale pongs is still present', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        activeAgents: [],
+        openConnections: { a: { connected: true } },
+        lastVoiceMs: noVoice,
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual(['a']);
+  });
+
+  it('a signals-voice peer with stale pongs is still present (closes the audio-with-no-tile divergence)', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        activeAgents: [],
+        openConnections: {},
+        lastVoiceMs: new Map([['a', NOW - 100]]),
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual(['a']);
+  });
+
+  it('a non-connected slot with no recent media is not present', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        activeAgents: [],
+        openConnections: { a: { connected: false } },
+        lastVoiceMs: noVoice,
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual([]);
+  });
+
+  it('media-only extras come after active peers, sorted', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        activeAgents: ['z'],
+        openConnections: { c: { connected: true }, b: { connected: true } },
+        lastVoiceMs: noVoice,
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual(['z', 'b', 'c']);
+  });
+
+  it('excludes self and blocked from the media half too', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        blocked: ['a'],
+        activeAgents: [],
+        openConnections: { a: { connected: true }, me: { connected: true } },
+        lastVoiceMs: noVoice,
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual([]);
+  });
+
+  it('does not duplicate a peer both ping-fresh and media-live', () => {
+    expect(
+      computePresentPeers({
+        ...base,
+        activeAgents: ['a'],
+        openConnections: { a: { connected: true } },
+        lastVoiceMs: noVoice,
+        lastFilmstripMs: noFilmstrip,
+      })
+    ).toEqual(['a']);
+  });
+});
+
+describe('decidePresenceSoundEvents', () => {
+  const DWELL = PRESENCE_LEAVE_DWELL_MS;
+
+  const step = (
+    state: PresenceSoundState,
+    present: string[],
+    now: number
+  ) => decidePresenceSoundEvents({ state, present, now, leaveDwellMs: DWELL });
+
+  it('a new peer joins immediately', () => {
+    const r = step(INITIAL_PRESENCE_SOUND_STATE, ['a'], NOW);
+    expect(r.events).toEqual([{ kind: 'join', peer: 'a', reason: 'appeared' }]);
+    expect(r.state.sounded).toEqual(['a']);
+  });
+
+  it('an unchanged present set produces no events', () => {
+    const r1 = step(INITIAL_PRESENCE_SOUND_STATE, ['a'], NOW);
+    const r2 = step(r1.state, ['a'], NOW + PING_INTERVAL);
+    expect(r2.events).toEqual([]);
+  });
+
+  it('a departure produces no event until the dwell elapses', () => {
+    const r1 = step(INITIAL_PRESENCE_SOUND_STATE, ['a'], NOW);
+    const r2 = step(r1.state, [], NOW + PING_INTERVAL);
+    expect(r2.events).toEqual([]);
+    expect(r2.state.sounded).toEqual(['a']); // still audibly present
+    const r3 = step(r2.state, [], NOW + PING_INTERVAL + DWELL);
+    expect(r3.events).toEqual([
+      { kind: 'leave', peer: 'a', reason: 'dwell-elapsed' },
+    ]);
+    expect(r3.state.sounded).toEqual([]);
+  });
+
+  it('a flap shorter than the dwell produces no sound at all (the reported bug)', () => {
+    const r1 = step(INITIAL_PRESENCE_SOUND_STATE, ['a'], NOW);
+    // Peer vanishes from the present set (pong gap), then reappears
+    // before the dwell elapses.
+    const r2 = step(r1.state, [], NOW + PING_INTERVAL);
+    const r3 = step(r2.state, ['a'], NOW + PING_INTERVAL + DWELL - 1);
+    expect(r2.events).toEqual([]);
+    expect(r3.events).toEqual([]); // no leave, and no re-join either
+    expect(r3.state.sounded).toEqual(['a']);
+    expect(r3.state.pendingLeave).toEqual({});
+  });
+
+  it('dwell expiry is evaluated on a tick with an unchanged (still absent) set', () => {
+    const r1 = step(INITIAL_PRESENCE_SOUND_STATE, ['a'], NOW);
+    const r2 = step(r1.state, [], NOW + 1000);
+    // Ticks keep arriving with the same empty set; only the one past the
+    // dwell emits.
+    const r3 = step(r2.state, [], NOW + 1000 + DWELL - 1);
+    expect(r3.events).toEqual([]);
+    const r4 = step(r3.state, [], NOW + 1000 + DWELL);
+    expect(r4.events).toEqual([
+      { kind: 'leave', peer: 'a', reason: 'dwell-elapsed' },
+    ]);
+  });
+
+  it('a join and an unrelated leave can happen in one step', () => {
+    const r1 = step(INITIAL_PRESENCE_SOUND_STATE, ['a'], NOW);
+    const r2 = step(r1.state, [], NOW + 1000);
+    const r3 = step(r2.state, ['b'], NOW + 1000 + DWELL);
+    expect(r3.events).toEqual([
+      { kind: 'leave', peer: 'a', reason: 'dwell-elapsed' },
+      { kind: 'join', peer: 'b', reason: 'appeared' },
+    ]);
+    expect(r3.state.sounded).toEqual(['b']);
+  });
+
+  it('leave dwell is 2 ping ticks (the present predicate clock)', () => {
+    expect(PRESENCE_LEAVE_DWELL_MS).toBe(2 * PING_INTERVAL);
   });
 });
