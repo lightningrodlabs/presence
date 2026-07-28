@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ManualClock } from './clock';
+import { ManualClock } from './clock.testing';
 
 describe('ManualClock', () => {
   it('starts at the given time and advances by the requested amount', () => {

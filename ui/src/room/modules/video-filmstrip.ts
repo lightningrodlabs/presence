@@ -129,8 +129,6 @@ export interface FilmstripFrame {
    * clips without t0.
    */
   captureT0Ms: number;
-  /** Wall-clock ms when this frame was received locally. */
-  receivedAt: number;
 }
 
 interface PeerFilmstripState {
@@ -444,7 +442,9 @@ class FilmstripController {
       t0: msg.t0,
       data: bytesToBase64(buf),
     };
-    const sentAt = Date.now();
+    // Local send stamp on the store's timebase, matching peerLastRecvMs
+    // so consumers never compare two clocks (PR #4 F2).
+    const sentAt = this._clock.now();
     for (const peer of targets) {
       this.peerLastSentMs.set(peer, sentAt);
     }
@@ -671,7 +671,6 @@ class FilmstripController {
       // Legacy clips lack t0; their ts is stamped at clip end, so the
       // first frame was captured ~ (n-1) periods earlier.
       captureT0Ms: payload.t0 ?? payload.ts - (payload.n - 1) * payload.p,
-      receivedAt: Date.now(),
     };
     state.latest = frame;
 

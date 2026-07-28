@@ -82,6 +82,19 @@ declare const __APP_VERSION__: string;
 const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
+ * How often the ICE monitors poll for a connection's `RTCPeerConnection`
+ * to appear, and how many times before giving up. The budget
+ * (100ms * 150 = 15s) is `SDP_EXCHANGE_TIMEOUT`: past that the connection
+ * this monitor exists to observe has itself been given up on, so an
+ * unbounded poll is observing nothing. Serves the connection-establishment
+ * predicate; reuses that predicate's clock rather than introducing a
+ * threshold of its own.
+ */
+const ICE_MONITOR_ATTACH_POLL_MS = 100;
+const ICE_MONITOR_ATTACH_MAX_ATTEMPTS =
+  SDP_EXCHANGE_TIMEOUT / ICE_MONITOR_ATTACH_POLL_MS;
+
+/**
  * How long an established peer may sit in iceConnectionState 'disconnected'
  * before stale-cleanup tears it down. WebRTC treats 'disconnected' as
  * recoverable: it keeps probing the active candidate pair and may transition
@@ -340,18 +353,6 @@ export class StreamsStore {
         }),
     );
 
-    // Signals is the complement of *WebRTC carrying media*, not of *a
-    // WebRTC attempt existing*. Decision and rationale live in
-    // `transport/carrier-coverage.ts`.
-    this._signalsTargets = derived(
-      [this._activeAgents, this._openConnections],
-      ([active, connections]) =>
-        computeSignalsTargets({
-          activeAgents: Object.keys(active),
-          openConnections: connections,
-        }),
-    );
-
     // The **present** predicate: ping-fresh OR media-flowing. THE
     // authority for every join/leave-shaped effect — chimes, tiles, grid
     // counts, phantom exclusion. The controllers' recv maps are not
@@ -373,6 +374,34 @@ export class StreamsStore {
           myPubKey: this.myPubKeyB64,
           now: this.clock.now(),
           mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+        }),
+    );
+
+    // Signals is the complement of *WebRTC carrying media*, not of *a
+    // WebRTC attempt existing*. Decision and rationale live in
+    // `transport/carrier-coverage.ts`.
+    //
+    // Its input is the **present** set, not `_activeAgents`: the invariant
+    // is "for every peer that is PRESENT, at least one carrier must be
+    // actively transmitting", and since Phase 2 `present` has a real
+    // definition that includes media-flowing peers whose pongs have gone
+    // stale. Keying on `_activeAgents` was §3.1(b) — such a peer kept a
+    // tile and kept being heard while silently dropping out of our send
+    // set, i.e. one-way audio.
+    //
+    // Yes, this is partly self-referential for the signals-only case: we
+    // send to them because we hear them. That is intended and bounded —
+    // media-only presence decays within MEDIA_LIVE_WINDOW_MS (3s), which
+    // is *tighter* than the 6s ping window, so a peer who genuinely stops
+    // sending leaves the set faster than ping staleness would remove them.
+    // The alternative (ping-fresh only) makes the carrier that is
+    // demonstrably working the one we refuse to use.
+    this._signalsTargets = derived(
+      [this._presentPeers, this._openConnections],
+      ([present, connections]) =>
+        computeSignalsTargets({
+          presentPeers: present,
+          openConnections: connections,
         }),
     );
     // Construction ends here: fields and derived stores only, no
@@ -403,28 +432,6 @@ export class StreamsStore {
       PING_INTERVAL
     );
 
-    // Join/leave sounds key off the present predicate — NOT raw
-    // _activeAgents — so a pong gap with media still flowing produces no
-    // sound, and a genuine departure sounds only after the leave dwell.
-    // Replaces room-view's direct _activeAgents diff (the mechanism
-    // behind the leave-then-join chime blip). The subscription fires on
-    // every _presenceTick, which is what expires the dwell.
-    this._presentPeersUnsub = this._presentPeers.subscribe(present => {
-      const decision = decidePresenceSoundEvents({
-        state: this._presenceSoundState,
-        present,
-        now: this.clock.now(),
-        leaveDwellMs: PRESENCE_LEAVE_DWELL_MS,
-      });
-      this._presenceSoundState = decision.state;
-      for (const ev of decision.events) {
-        this.eventCallback({
-          type:
-            ev.kind === 'join' ? 'peer-joined-presence' : 'peer-left-presence',
-          pubKeyB64: ev.peer,
-        });
-      }
-    });
     const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
@@ -846,6 +853,7 @@ export class StreamsStore {
       this._iceTimings[key] = { t0: this.clock.now(), impl };
     }
     const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
+    let attempts = 0;
     const attach = () => {
       // Gate inside attach (not at function entry) so a re-entry from a
       // second `signaling` transition keeps polling for pc when the first
@@ -856,7 +864,18 @@ export class StreamsStore {
       if (this._iceMonitorsAttached.has(key)) return;
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
-        this.clock.setTimeout(attach, 100);
+        // Bounded: a connection torn down before its pc materialises used
+        // to poll forever (PR #4 F3). The budget is the SDP-exchange
+        // timeout — past it the connection this monitor exists for has
+        // itself been given up on, so there is nothing left to observe.
+        attempts += 1;
+        if (attempts > ICE_MONITOR_ATTACH_MAX_ATTEMPTS) {
+          this.logger.logCustomMessage(
+            `ICE monitor [${pubKeyB64.slice(0, 8)}]: gave up waiting for pc after ${attempts} attempts connId=${connectionId.slice(0, 8)}`
+          );
+          return;
+        }
+        this.clock.setTimeout(attach, ICE_MONITOR_ATTACH_POLL_MS);
         return;
       }
       this._iceMonitorsAttached.add(key);
@@ -1028,10 +1047,19 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     transport: SimplePeerTransport,
   ): void {
+    let attempts = 0;
     const attach = () => {
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
-        this.clock.setTimeout(attach, 100);
+        // Bounded for the same reason as the media monitor (PR #4 F3).
+        attempts += 1;
+        if (attempts > ICE_MONITOR_ATTACH_MAX_ATTEMPTS) {
+          this.logger.logCustomMessage(
+            `Screen-share ICE monitor [${pubKeyB64.slice(0, 8)}]: gave up waiting for pc after ${attempts} attempts`
+          );
+          return;
+        }
+        this.clock.setTimeout(attach, ICE_MONITOR_ATTACH_POLL_MS);
         return;
       }
       pc.addEventListener('iceconnectionstatechange', () => {
@@ -2297,6 +2325,54 @@ export class StreamsStore {
 
   onEvent(cb: (ev: StoreEventPayload) => any) {
     this.eventCallback = cb;
+    // Arm the presence-sound decision here rather than in start(): the
+    // subscription fires immediately with the current present set, and
+    // any decision made before a listener exists is a *lost* event that
+    // still marks the peer sounded — so a pong landing in the window
+    // between StreamsStore.connect() and room-view's firstUpdated meant
+    // that peer never chimed at all (PR #4 F6). Arming at registration
+    // makes the first evaluation deterministic: whoever is present at
+    // that instant is seeded silently, and every change after it sounds.
+    this._armPresenceSounds();
+  }
+
+  /**
+   * Subscribe the join/leave sound decision to the present predicate.
+   * Keys off `_presentPeers` — NOT raw `_activeAgents` — so a pong gap
+   * with media still flowing produces no sound, and a genuine departure
+   * sounds only after the leave dwell. Replaces room-view's direct
+   * `_activeAgents` diff (the mechanism behind the leave-then-join chime
+   * blip). Fires on every `_presenceTick`, which is what expires the
+   * dwell. Idempotent: re-registering a callback re-uses the existing
+   * subscription and its accumulated state.
+   */
+  private _armPresenceSounds(): void {
+    if (this._presentPeersUnsub) return;
+    let seeded = false;
+    this._presentPeersUnsub = this._presentPeers.subscribe(present => {
+      // The subscribe() call itself delivers the current set. Adopt it as
+      // the baseline instead of chiming for peers who were already here
+      // when we started listening.
+      if (!seeded) {
+        seeded = true;
+        this._presenceSoundState = { sounded: [...present], pendingLeave: {} };
+        return;
+      }
+      const decision = decidePresenceSoundEvents({
+        state: this._presenceSoundState,
+        present,
+        now: this.clock.now(),
+        leaveDwellMs: PRESENCE_LEAVE_DWELL_MS,
+      });
+      this._presenceSoundState = decision.state;
+      for (const ev of decision.events) {
+        this.eventCallback({
+          type:
+            ev.kind === 'join' ? 'peer-joined-presence' : 'peer-left-presence',
+          pubKeyB64: ev.peer,
+        });
+      }
+    });
   }
 
   async pingAgents() {
@@ -3166,11 +3242,11 @@ export class StreamsStore {
   private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
-   * The set of active peers whose media is NOT currently flowing over
-   * WebRTC. Audio and filmstrip video for these peers are carried over
-   * Holochain remote signals. Precomputed as a derived store so the voice
-   * encoder's pump loop doesn't recompute per-chunk — it just reads the
-   * cached set.
+   * The set of **present** peers whose media is NOT currently flowing
+   * over WebRTC. Audio and filmstrip video for these peers are carried
+   * over Holochain remote signals. Precomputed as a derived store so the
+   * voice encoder's pump loop doesn't recompute per-chunk — it just reads
+   * the cached set.
    *
    * Membership is the complement of `connected` — ICE + DTLS up — not the
    * complement of "an entry exists". A peer mid-negotiation, mid-reconnect,
@@ -3179,7 +3255,8 @@ export class StreamsStore {
    * `transport/carrier-coverage.ts`; the constructor's `derived` is the only
    * caller.
    *
-   * Updates when: a peer appears/disappears in _activeAgents, or any
+   * Updates when: a peer enters/leaves `_presentPeers` (which includes the
+   * presence tick re-evaluating the media-flowing half), or any
    * `_openConnections` write changes a peer's `connected` flag — which
    * includes connect, close, give-up, and the disableWebrtcWith teardown.
    */
@@ -3621,12 +3698,21 @@ export class StreamsStore {
    * carrier: a connected WebRTC connection, or signals-carrier voice or
    * filmstrip-video frames received within `MEDIA_LIVE_WINDOW_MS`.
    *
-   * Used by `globalPresenceSet()` so that a peer with live media is never
-   * pruned by ping/pong staleness alone. A Holochain-signal hiccup of more
-   * than 3*PING_INTERVAL must not remove the pane of a peer we can still
-   * see and hear. WebRTC connections that failed/closed or exceeded the
-   * ICE disconnected grace are already removed from `_openConnections`, so
-   * a surviving `connected` entry is genuinely live.
+   * The media-flowing half of the **present** predicate. The predicate
+   * itself is `computePresentPeers` (`presence-policy.ts`), which calls
+   * the same `isMediaLive`; this method is the per-peer question, used by
+   * `_presenceReason` and the phantom/observer paths. A Holochain-signal
+   * hiccup of more than PRESENT_STALENESS_MS must not remove the pane of
+   * a peer we can still see and hear.
+   *
+   * Note what `connected` does and does not prove: it means the transport
+   * last reported ICE + DTLS up. During the declared recovery-window
+   * exception (`transport/carrier-coverage.ts`) that claim can be stale
+   * for the length of the transport's recovery budget, and a wedged FSM
+   * slot depends on the FSM emitting `failed` to be cleared. (This
+   * docblock previously asserted the opposite — that a surviving
+   * `connected` entry is "genuinely live" — one of the 17 false
+   * assertions in MAINTAINABILITY_ASSESSMENT.md §3.10.)
    */
   isPeerMediaLive(peerB64: AgentPubKeyB64): boolean {
     return isMediaLive({

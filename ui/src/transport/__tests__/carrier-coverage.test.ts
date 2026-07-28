@@ -32,7 +32,7 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
    * the signals carrier unless WebRTC is actually connected for them.
    */
   it('leaves no present peer without a carrier', () => {
-    const activeAgents = ['a', 'b', 'c', 'd'];
+    const presentPeers = ['a', 'b', 'c', 'd'];
     const openConnections = {
       a: { connected: true },
       b: { connected: false },
@@ -40,9 +40,9 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
       // d has no entry at all
     };
 
-    const targets = computeSignalsTargets({ activeAgents, openConnections });
+    const targets = computeSignalsTargets({ presentPeers, openConnections });
 
-    for (const peer of activeAgents) {
+    for (const peer of presentPeers) {
       const covered =
         targets.has(peer) || openConnections[peer as 'a']?.connected === true;
       expect(covered, `${peer} has no carrier`).toBe(true);
@@ -56,7 +56,7 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
     // carry anything — a silence window on every attempt, reopened on
     // every retry (§3.1a).
     const targets = computeSignalsTargets({
-      activeAgents: ['peer'],
+      presentPeers: ['peer'],
       openConnections: { peer: { connected: false } },
     });
 
@@ -65,7 +65,7 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
 
   it('stands down once WebRTC is connected', () => {
     const targets = computeSignalsTargets({
-      activeAgents: ['peer'],
+      presentPeers: ['peer'],
       openConnections: { peer: { connected: true } },
     });
 
@@ -74,11 +74,11 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
 
   it('resumes when a connected peer drops back to not-connected', () => {
     const before = computeSignalsTargets({
-      activeAgents: ['peer'],
+      presentPeers: ['peer'],
       openConnections: { peer: { connected: true } },
     });
     const after = computeSignalsTargets({
-      activeAgents: ['peer'],
+      presentPeers: ['peer'],
       openConnections: { peer: { connected: false } },
     });
 
@@ -91,7 +91,7 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
     // routing fixes clear it, but even if one survives, the peer keeps a
     // carrier rather than going permanently silent.
     const targets = computeSignalsTargets({
-      activeAgents: ['ghost'],
+      presentPeers: ['ghost'],
       openConnections: { ghost: { connected: false } },
     });
 
@@ -100,7 +100,7 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
 
   it('never targets a peer who is not present', () => {
     const targets = computeSignalsTargets({
-      activeAgents: ['a'],
+      presentPeers: ['a'],
       openConnections: { a: { connected: false }, gone: { connected: false } },
     });
 
@@ -109,7 +109,7 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
 
   it('is empty when every present peer is on WebRTC', () => {
     const targets = computeSignalsTargets({
-      activeAgents: ['a', 'b'],
+      presentPeers: ['a', 'b'],
       openConnections: { a: { connected: true }, b: { connected: true } },
     });
 

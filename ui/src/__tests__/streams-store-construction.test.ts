@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import { StreamsStore } from '../streams-store';
-import { ManualClock } from '../clock';
+import { ManualClock } from '../clock.testing';
+import { MEDIA_LIVE_WINDOW_MS, PRESENT_STALENESS_MS } from '../presence-policy';
+import { voiceController } from '../room/modules/voice';
 import type { RoomStore } from '../room/room-store';
 import type { PresenceLogger } from '../logging';
 
@@ -111,12 +113,53 @@ describe('StreamsStore construction/activation split', () => {
     expect(get(store._presentPeers)).toEqual([peerA]);
   });
 
-  it('derives _signalsTargets from active agents before start()', () => {
+  it('derives _signalsTargets from the present set before start()', () => {
     const clock = new ManualClock(100_000);
     const store = makeUnstartedStore(clock);
     store._knownAgents.set({
       [peerA]: { pubkey: peerA, type: 'known', lastSeen: clock.now(), appVersion: undefined },
     });
     expect(get(store._signalsTargets)).toEqual(new Set([peerA]));
+  });
+
+  it('keeps a media-live peer with stale pongs in _signalsTargets (PR #4 F1)', () => {
+    // §3.1(b): a peer whose pongs go stale while their signals voice keeps
+    // arriving is present. Keying the send set on ping-freshness alone
+    // meant we kept hearing them while they stopped hearing us — one-way
+    // audio, and after Phase 2's tile fix, a silent one.
+    const clock = new ManualClock(100_000);
+    const store = makeUnstartedStore(clock);
+    store._knownAgents.set({
+      [peerA]: { pubkey: peerA, type: 'known', lastSeen: clock.now(), appVersion: undefined },
+    });
+    voiceController.peerLastRecvMs.set(peerA, clock.now());
+
+    // Past the ping-staleness window but inside the media-live window:
+    // no longer ping-fresh, still present, still a signals target.
+    clock.advance(PRESENT_STALENESS_MS + 1);
+    voiceController.peerLastRecvMs.set(peerA, clock.now());
+    store._presenceTick.update(n => n + 1);
+
+    expect(Object.keys(get(store._activeAgents))).toEqual([]);
+    expect(get(store._presentPeers)).toEqual([peerA]);
+    expect(get(store._signalsTargets)).toEqual(new Set([peerA]));
+
+    // Let the media go stale too: now genuinely absent, and dropped.
+    clock.advance(MEDIA_LIVE_WINDOW_MS + 1);
+    store._presenceTick.update(n => n + 1);
+    expect(get(store._presentPeers)).toEqual([]);
+    expect(get(store._signalsTargets)).toEqual(new Set());
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('excludes a webrtc-connected peer from _signalsTargets (handover still stands down)', () => {
+    const clock = new ManualClock(100_000);
+    const store = makeUnstartedStore(clock);
+    store._knownAgents.set({
+      [peerA]: { pubkey: peerA, type: 'known', lastSeen: clock.now(), appVersion: undefined },
+    });
+    store._openConnections.set({ [peerA]: { connected: true } as never });
+    expect(get(store._presentPeers)).toEqual([peerA]);
+    expect(get(store._signalsTargets)).toEqual(new Set());
   });
 });

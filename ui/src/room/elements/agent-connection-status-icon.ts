@@ -80,6 +80,13 @@ export class AgentConnectionStatusIcon extends LitElement {
    * Observer-computed bucket when broadcast; otherwise derived from the
    * raw `lastSeen` timestamp with the shared bucket decision in
    * presence-policy.ts — the thresholds are no longer duplicated here.
+   *
+   * The fallback compares against wall clock deliberately: every caller
+   * that could supply a *locally*-stamped `lastSeen` now passes
+   * `lastSeenBucket` instead (room-view's my-video / my-screen-share
+   * paths), so the only input that reaches this line is a remote peer's
+   * timestamp — a cross-peer wire comparison, which wall clock is the
+   * correct timebase for.
    */
   private _effectiveLastSeenBucket(): LastSeenBucket {
     return this.lastSeenBucket ?? lastSeenBucket(this.lastSeen, Date.now());

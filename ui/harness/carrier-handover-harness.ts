@@ -87,7 +87,7 @@ let transport: FsmTransport | null = null;
 
 function onSignalsNow(): boolean {
   return computeSignalsTargets({
-    activeAgents: [PEER],
+    presentPeers: [PEER],
     openConnections: slots,
   }).has(PEER);
 }

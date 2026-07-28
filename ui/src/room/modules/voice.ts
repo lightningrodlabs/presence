@@ -404,7 +404,10 @@ class VoiceController {
       this.redBuffer.push(frame);
       while (this.redBuffer.length > this.redundancy) this.redBuffer.shift();
     }
-    const now = Date.now();
+    // Local send stamp (not a wire timestamp — `wts` above is that, and
+    // stays wall-clock). The stats panel compares this against
+    // peerLastRecvMs, so both must share the store's timebase (PR #4 F2).
+    const now = this._clock.now();
     for (const peer of targets) {
       this.peerLastSentMs.set(peer, now);
     }

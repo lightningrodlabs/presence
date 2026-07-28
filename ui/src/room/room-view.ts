@@ -117,9 +117,6 @@ export class RoomView extends LitElement {
   _logTimestampCheckbox!: HTMLInputElement;
 
   @state()
-  pingInterval: number | undefined;
-
-  @state()
   assetStoreContent: AsyncStatus<AssetStoreContent> | undefined;
 
   _customLogTimestamp: number | undefined;
@@ -821,7 +818,9 @@ export class RoomView extends LitElement {
   };
 
   disconnectedCallback(): void {
-    if (this.pingInterval) window.clearInterval(this.pingInterval);
+    // The ping interval is owned by StreamsStore (cleared in disconnect()
+    // below); room-view's own never-assigned handle and its no-op
+    // clearInterval are gone (PR #4 F7).
     window.removeEventListener('resize', this._onWindowResize);
     if (this._unsubscribe) this._unsubscribe();
     this.removeEventListener('click', this.sideClickListener);
@@ -839,8 +838,14 @@ export class RoomView extends LitElement {
     // layout sizing. Without this the layout class is computed for fewer
     // tiles than actually render, and every tile is oversized.
     const phantomCount = this.streamsStore.phantomAgents().length;
-    // Same count as _updateGrid: present peers + self + phantoms.
-    const videoOnlyCount = this._visiblePeers().length + 1 + phantomCount;
+    // Same count as _updateGrid and the CSS-var n: present peers +
+    // phantoms + self, and self only when it actually occupies a grid
+    // slot. Honouring _selfViewHidden here is what makes all three agree
+    // unconditionally rather than only when self-view is visible (PR #4 F7).
+    const videoOnlyCount =
+      this._visiblePeers().length +
+      phantomCount +
+      (this._selfViewHidden ? 0 : 1);
     const totalCount = videoOnlyCount + activeShareCount;
 
     // In split mode, size items based on their panel's count
@@ -1122,10 +1127,19 @@ export class RoomView extends LitElement {
     }
   }
 
+  /**
+   * The WebRTC-status diagnostics panel. It partitions known agents by
+   * `_connectionStatuses` — whether a WebRTC negotiation/connection
+   * exists — which is NOT the present predicate: a signals-only peer is
+   * present, holds a tile, and is audible while appearing here as having
+   * no WebRTC link. The headings say so rather than calling this
+   * "Present"/"Absent", which read as a third, contradictory presence
+   * model (PR #4 F4).
+   */
   renderConnectionStatuses() {
     const knownAgentsKeysB64 = Object.keys(this._knownAgents.value);
 
-    const presentAgents = knownAgentsKeysB64
+    const webrtcLinkedAgents = knownAgentsKeysB64
       .filter(pubkeyB64 => {
         const status = this._connectionStatuses.value[pubkeyB64];
         return (
@@ -1135,7 +1149,7 @@ export class RoomView extends LitElement {
         );
       })
       .sort((key_a, key_b) => key_a.localeCompare(key_b));
-    const absentAgents = knownAgentsKeysB64
+    const webrtcUnlinkedAgents = knownAgentsKeysB64
       .filter(pubkeyB64 => {
         const status = this._connectionStatuses.value[pubkeyB64];
         return (
@@ -1149,12 +1163,12 @@ export class RoomView extends LitElement {
         style="padding-left: 10px; align-items: flex-start; margin-top: 10px; height: 100%;"
       >
         <div class="column" style="align-items: flex-end;">
-          <div class="connectivity-title">Present</div>
+          <div class="connectivity-title">WebRTC link</div>
           <hr class="divider" />
         </div>
-        ${presentAgents.length > 0
+        ${webrtcLinkedAgents.length > 0
           ? repeat(
-              presentAgents,
+              webrtcLinkedAgents,
               pubkey => pubkey,
               pubkey => html`
                 <agent-connection-status
@@ -1168,16 +1182,16 @@ export class RoomView extends LitElement {
             )
           : html`<span
               style="color: #c3c9eb; font-size: 20px; font-style: italic; margin-top: 10px; opacity: 0.8;"
-              >no one else present.</span
+              >no WebRTC links.</span
             >`}
-        ${absentAgents.length > 0
+        ${webrtcUnlinkedAgents.length > 0
           ? html`
               <div class="column" style="align-items: flex-end;">
-                <div class="connectivity-title">Absent</div>
+                <div class="connectivity-title">No WebRTC link</div>
                 <hr class="divider" />
               </div>
               ${repeat(
-                absentAgents,
+                webrtcUnlinkedAgents,
                 pubkey => pubkey,
                 pubkey => html`
                   <agent-connection-status
@@ -2652,7 +2666,7 @@ export class RoomView extends LitElement {
             // that agent themselves" — so it stays 'told' forever once we've
             // had direct contact. Gate on `lastSeen === undefined` so the
             // indicator clears as soon as a direct pong arrives (pong handler
-            // in streams-store stamps `lastSeen = Date.now()`; agents learned
+            // in streams-store stamps `lastSeen = clock.now()`; agents learned
             // only via another peer's knownAgents metadata are written with
             // `lastSeen: undefined`).
             const onlyToldAbout = !!(
@@ -2688,7 +2702,15 @@ export class RoomView extends LitElement {
               | import('../types').LastSeenBucket
               | undefined;
 
-            if (type === 'my-video') {
+            if (type === 'my-screen-share') {
+              // Our own view of this peer: bucket it here, where the store
+              // clock is available. Leaving it undefined pushed the icon
+              // onto its wall-clock fallback against a clock-stamped
+              // local `lastSeen` — two timebases (PR #4 F2). The icon's
+              // remaining fallback now only ever sees a remote peer's
+              // stamp, which is a legitimate wire comparison.
+              lastSeenBucket = this.streamsStore.lastSeenBucket(innerPubkey);
+            } else if (type === 'my-video') {
               const snap = this.streamsStore.peerLinkFor(innerPubkey);
               audioStatus = snap.audio;
               videoStatus = snap.video;
@@ -3125,13 +3147,17 @@ export class RoomView extends LitElement {
                 : html``}
 
               <!--
-                Signaling-held indicator. When media is live but this peer's
-                presence pongs have gone stale (the tile is only surviving
-                because of the media-live guard in _visiblePeers), surface a
-                quiet amber marker so the user understands the link is
-                degraded-but-recovering and does NOT manually tear it down.
+                Signaling-held indicator. This tile is rendered from the
+                present predicate; if the peer is NOT in _activeAgents,
+                the only reason they are present is media-flowing — on
+                either carrier. Surface a quiet amber marker so the user
+                understands the link is degraded-but-recovering and does
+                NOT manually tear it down. (Was additionally gated on
+                conn?.connected, which covered only the WebRTC half and
+                so missed the signals-only peer whose tile Phase 2
+                deliberately preserves — PR #4 F1.)
               -->
-              ${conn?.connected && !this._activeAgents.value[pubkeyB64]
+              ${!this._activeAgents.value[pubkeyB64]
                 ? html`
                     <sl-tooltip
                       hoist

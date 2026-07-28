@@ -159,7 +159,9 @@ export class PeerStatsPanel extends LitElement {
     // entry can show "webrtc" while media has stopped flowing. The flow
     // glyph surfaces the truth: recent frames in/out, per direction.
     const FLOW_WINDOW_MS = 2000;
-    const now = Date.now();
+    // signalsLastRecv/-Sent are stamped from the store clock, so the
+    // freshness comparison must read the same clock (PR #4 F2).
+    const now = this.streamsStore.clock.now();
     let tx = false;
     let rx = false;
     if (carrier === 'signals') {
