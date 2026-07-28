@@ -3,6 +3,7 @@ import { FsmTransport, type FsmSignalEnvelope } from '../fsm-transport';
 import type { IncomingSignal, OutgoingSignal, TransportEvent } from '../../types';
 import {
   MockRTCPeerConnection,
+  MockRTCDataChannel,
   createMockTrack,
   createMockStream,
   waitFor,
@@ -310,6 +311,145 @@ describe('FsmTransport — data channel send', () => {
   it('send drops silently for unknown peers', () => {
     const { transport } = setup();
     expect(() => transport.send('unknown', 'hello')).not.toThrow();
+  });
+});
+
+describe('FsmTransport — media event adaptation (remote-stream / remote-track / data-channel-message)', () => {
+  /**
+   * These three events are the ones that carry all media and data off the
+   * wire; until this block they had zero adapter coverage
+   * (MAINTAINABILITY_ASSESSMENT.md Phase 3 item 1). Each test drives the
+   * underlying MockRTCPeerConnection the way a real pc fires — `track`
+   * events and data-channel `message` events — and asserts the event that
+   * leaves the transport, including the peer/connectionId attribution the
+   * store's dispatch keys on.
+   */
+
+  it('a remote track with a stream emits remote-track carrying track, stream, peer and connectionId', async () => {
+    const { transport, pcs, events } = setup();
+    const connectionId = transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    const stream = createMockStream(false, true);
+    const track = stream.getVideoTracks()[0];
+    pcs[0].simulateTrack(track, [stream]);
+
+    const trackEvents = events.filter((e) => e.type === 'remote-track');
+    expect(trackEvents).toHaveLength(1);
+    expect(trackEvents[0]).toMatchObject({
+      type: 'remote-track',
+      peer: PEER_B,
+      connectionId,
+      track,
+      stream,
+    });
+  });
+
+  it('the first track of a stream also emits remote-stream with that stream', async () => {
+    const { transport, pcs, events } = setup();
+    const connectionId = transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    const stream = createMockStream(true, true);
+    pcs[0].simulateTrack(stream.getAudioTracks()[0], [stream]);
+
+    const streamEvents = events.filter((e) => e.type === 'remote-stream');
+    expect(streamEvents).toHaveLength(1);
+    expect(streamEvents[0]).toMatchObject({
+      type: 'remote-stream',
+      peer: PEER_B,
+      connectionId,
+      stream,
+    });
+  });
+
+  it('a second track on the SAME stream emits remote-track again but remote-stream only once', async () => {
+    // RtcPeer dedupes 'stream' by stream.id (`_emittedStreamIds`): a
+    // 2-track stream must not produce 2 identical remote-stream emissions,
+    // or the store would re-run its stream-arrival side effects per track.
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    const stream = createMockStream(true, true);
+    pcs[0].simulateTrack(stream.getAudioTracks()[0], [stream]);
+    pcs[0].simulateTrack(stream.getVideoTracks()[0], [stream]);
+
+    expect(events.filter((e) => e.type === 'remote-track')).toHaveLength(2);
+    expect(events.filter((e) => e.type === 'remote-stream')).toHaveLength(1);
+  });
+
+  it('a track arriving with no stream emits remote-track (stream undefined) and no remote-stream', async () => {
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    pcs[0].simulateTrack(createMockTrack('audio'), []);
+
+    const trackEvents = events.filter((e) => e.type === 'remote-track');
+    expect(trackEvents).toHaveLength(1);
+    expect(
+      trackEvents[0].type === 'remote-track' ? trackEvents[0].stream : null,
+    ).toBeUndefined();
+    expect(events.filter((e) => e.type === 'remote-stream')).toHaveLength(0);
+  });
+
+  it('a message on the locally-created data channel emits data-channel-message with the payload', async () => {
+    const { transport, pcs, events } = setup();
+    const connectionId = transport.ensureConnection(PEER_B);
+    // The FSM creates its local 'data' channel when the RtcPeer is built.
+    await waitFor(() => pcs.length > 0 && pcs[0].createDataChannel.mock.calls.length > 0);
+
+    const dc = pcs[0].createDataChannel.mock.results[0]
+      .value as unknown as MockRTCDataChannel;
+    dc.simulateOpen();
+    dc.simulateMessage('{"type":"action","message":"audio-off"}');
+
+    const dataEvents = events.filter((e) => e.type === 'data-channel-message');
+    expect(dataEvents).toHaveLength(1);
+    expect(dataEvents[0]).toMatchObject({
+      type: 'data-channel-message',
+      peer: PEER_B,
+      connectionId,
+      data: '{"type":"action","message":"audio-off"}',
+    });
+  });
+
+  it('a message on a remote-initiated data channel is also delivered as data-channel-message', async () => {
+    // RtcPeer listens for `datachannel` on the pc and wires `message` on
+    // every remote channel; both halves of the duplex channel must reach
+    // the same transport event.
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    const remoteDc = pcs[0].simulateDataChannel('data');
+    remoteDc.simulateOpen();
+    remoteDc.simulateMessage('from-remote');
+
+    const dataEvents = events.filter((e) => e.type === 'data-channel-message');
+    expect(dataEvents).toHaveLength(1);
+    expect(dataEvents[0]).toMatchObject({
+      type: 'data-channel-message',
+      peer: PEER_B,
+      data: 'from-remote',
+    });
+  });
+
+  it('negative control: without simulateTrack/simulateMessage none of the three events fire', async () => {
+    // Proves the mock is the thing producing these events (so the
+    // assertions above can fail), not some ambient emission on connect.
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+    expect(
+      events.filter(
+        (e) =>
+          e.type === 'remote-track' ||
+          e.type === 'remote-stream' ||
+          e.type === 'data-channel-message',
+      ),
+    ).toHaveLength(0);
   });
 });
 
