@@ -1,0 +1,83 @@
+{
+  "signalTypes": {
+    "PingUi": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "PongUi": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "InitRequest": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "InitAccept": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "SdpData": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "SdpFsm": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": "sdp-fsm"
+    },
+    "LeaveUi": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "DiagnosticRequest": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "DiagnosticResponse": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "ModuleState": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    },
+    "ModuleData": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": null
+    }
+  },
+  "caps": [
+    "sdp-fsm"
+  ],
+  "conversationPayload": {
+    "writes": [
+      "micMuted",
+      "webrtcDisabled",
+      "disableWebrtcWith",
+      "webrtcImpl",
+      "peerImpl",
+      "caps"
+    ],
+    "reads": [
+      "micMuted",
+      "webrtcDisabled",
+      "disableWebrtcWith",
+      "webrtcImpl",
+      "peerImpl",
+      "caps",
+      "muted",
+      "signalsOnlyWith",
+      "fsmWith"
+    ]
+  }
+}

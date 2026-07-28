@@ -43,9 +43,10 @@ import { getModule } from './room/modules/registry';
 import {
   DEFAULT_CONVERSATION_PAYLOAD,
   ConversationPayload,
-  conversationPayloadSupportsFsm,
+  conversationPayloadCaps,
   parseConversationPayload,
 } from './room/modules/conversation';
+import { CAP_SDP_FSM, isSignalMsgType } from './transport/wire-contract';
 import { RoomClient } from './room/room-client';
 import { RoomStore } from './room/room-store';
 import { PresenceLogger } from './logging';
@@ -592,9 +593,10 @@ export class StreamsStore {
    * Effective WebRTC implementation for the link between us and `peerB64`.
    *
    * Resolution order:
-   *  0. If the peer's build cannot handle `SdpFsm` at all, the link is
+   *  0. If the peer's build has not declared (or, for pre-caps builds, is
+   *     not inferred to hold) the `sdp-fsm` capability, the link is
    *     `'simplepeer'` regardless of anything either side prefers. See
-   *     `conversationPayloadSupportsFsm`.
+   *     `conversationPayloadCaps`.
    *  1. If either side has set a per-peer override (`peerImpl[other]`), the
    *     override applies. If both sides override and disagree, `'fsm'` wins
    *     — it has the marginal-NAT machinery (Perfect Negotiation, session-
@@ -613,7 +615,7 @@ export class StreamsStore {
       myPayload?.peerImpl?.[peerB64],
       peerPayload?.webrtcImpl ?? 'simplepeer',
       peerPayload?.peerImpl?.[this.myPubKeyB64],
-      conversationPayloadSupportsFsm(peerConv ?? null),
+      conversationPayloadCaps(peerConv ?? null).has(CAP_SDP_FSM),
     );
   }
 
@@ -5567,7 +5569,18 @@ export class StreamsStore {
   private async _processSignal(signal: RoomSignal) {
     switch (signal.type) {
       case 'Message': {
-        switch (signal.msg_type) {
+        // Narrow the wire string to the declared union
+        // (`wire-contract.ts:SIGNAL_MSG_TYPES`), then switch exhaustively:
+        // a union member without a handler arm is a compile error, so a new
+        // signal type cannot be added to the wire and silently dropped
+        // here. An *unknown* string (a peer on a newer build) drops one
+        // signal with a warn, never the session.
+        const msgType = signal.msg_type;
+        if (!isSignalMsgType(msgType)) {
+          console.warn('Unknown msg_type:', msgType);
+          break;
+        }
+        switch (msgType) {
           case 'PingUi':
             await this.handlePingUi(signal);
             break;
@@ -5601,8 +5614,10 @@ export class StreamsStore {
           case 'ModuleData':
             this.handleModuleData(signal);
             break;
-          default:
-            console.warn('Unknown msg_type:', signal.msg_type);
+          default: {
+            const _exhaustive: never = msgType;
+            void _exhaustive;
+          }
         }
         break;
       }
