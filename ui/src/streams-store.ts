@@ -1628,6 +1628,14 @@ export class StreamsStore {
           break;
         }
         case 'ignore':
+          // `not-action` frames (text, primitives) stay silent — they are
+          // not this handler's traffic. An unknown *action* message is
+          // worth a trace: it usually means the peer runs a newer build.
+          if (action.reason === 'unknown-action') {
+            this.logger.logCustomMessage(
+              `Unknown RTCMessage action from [${pubKeyB64.slice(0, 8)}] — newer peer build? Frame: ${data}`
+            );
+          }
           break;
         case 'parse-error': {
           console.warn(
