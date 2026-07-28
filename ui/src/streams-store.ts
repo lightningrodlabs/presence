@@ -2127,7 +2127,9 @@ export class StreamsStore {
     // ping all agents that are not already connected to you every PING_INTERVAL milliseconds
     await streamsStore.pingAgents();
     streamsStore.pingInterval = streamsStore.clock.setInterval(() => {
-      streamsStore.pingAgents().catch(() => {});
+      streamsStore.pingAgents().catch(e => {
+        console.error('pingAgents failed:', e);
+      });
     }, PING_INTERVAL);
 
     // Page-lifecycle forensics: correlate disconnect() calls with whether
