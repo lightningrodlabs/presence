@@ -5,6 +5,7 @@ import {
   decidePresenceSoundEvents,
   INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
+  lastSeenBucket,
   MEDIA_LIVE_WINDOW_MS,
   PING_INTERVAL,
   PRESENCE_LEAVE_DWELL_MS,
@@ -101,6 +102,30 @@ describe('computeActiveAgents', () => {
   it('staleness window is 3 ping ticks (the present predicate clock)', () => {
     expect(PRESENT_STALENESS_MS).toBe(3 * PING_INTERVAL);
   });
+});
+
+describe('lastSeenBucket', () => {
+  const table: Array<{
+    name: string;
+    lastSeen: number | undefined;
+    expected: string;
+  }> = [
+    { name: 'no timestamp is unknown', lastSeen: undefined, expected: 'unknown' },
+    { name: 'just seen is fresh', lastSeen: NOW, expected: 'fresh' },
+    { name: '14.999s is fresh', lastSeen: NOW - 14_999, expected: 'fresh' },
+    { name: '15s exactly is stale', lastSeen: NOW - 15_000, expected: 'stale' },
+    { name: '29.999s is stale', lastSeen: NOW - 29_999, expected: 'stale' },
+    { name: '30s exactly is gone', lastSeen: NOW - 30_000, expected: 'gone' },
+    // A timestamp of 0 is a real timestamp, not absence (the !lastSeen
+    // bug class the stale-connection policy also had to close).
+    { name: 'timestamp 0 with now 0 is fresh', lastSeen: 0, expected: 'fresh' },
+  ];
+  for (const row of table) {
+    it(row.name, () => {
+      const now = row.lastSeen === 0 ? 0 : NOW;
+      expect(lastSeenBucket(row.lastSeen, now)).toBe(row.expected);
+    });
+  }
 });
 
 describe('isMediaLive', () => {

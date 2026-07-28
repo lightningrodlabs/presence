@@ -28,6 +28,7 @@ import {
   lastSeenBucketToColor,
   lastSeenBucketToText,
 } from '../../utils';
+import { lastSeenBucket } from '../../presence-policy';
 import { sharedStyles } from '../../sharedStyles';
 import '../../shared/holo-identicon';
 
@@ -74,6 +75,15 @@ export class AgentConnectionStatusIcon extends LitElement {
 
   @property()
   lastSeen: number | undefined;
+
+  /**
+   * Observer-computed bucket when broadcast; otherwise derived from the
+   * raw `lastSeen` timestamp with the shared bucket decision in
+   * presence-policy.ts — the thresholds are no longer duplicated here.
+   */
+  private _effectiveLastSeenBucket(): LastSeenBucket {
+    return this.lastSeenBucket ?? lastSeenBucket(this.lastSeen, Date.now());
+  }
 
   @property({ type: String })
   audioStatus: 'live' | 'stale' | 'muted' | 'off' | undefined;
@@ -198,19 +208,16 @@ export class AgentConnectionStatusIcon extends LitElement {
                   hoist
                   class="tooltip-filled"
                   placement="bottom"
-                  content="${this.lastSeenBucket !== undefined
-                    ? lastSeenBucketToText(this.lastSeenBucket)
-                    : lastSeenToText(this.lastSeen)}"
-                  style="--sl-tooltip-background-color: ${this.lastSeenBucket !==
-                  undefined
-                    ? lastSeenBucketToColor(this.lastSeenBucket)
-                    : lastSeenToColor(this.lastSeen)};"
+                  content="${lastSeenBucketToText(this._effectiveLastSeenBucket())}"
+                  style="--sl-tooltip-background-color: ${lastSeenBucketToColor(
+                    this._effectiveLastSeenBucket()
+                  )};"
                 >
                   <div
                     class="last-seen-indicator"
-                    style="background: ${this.lastSeenBucket !== undefined
-                      ? lastSeenBucketToColor(this.lastSeenBucket)
-                      : lastSeenToColor(this.lastSeen)};"
+                    style="background: ${lastSeenBucketToColor(
+                      this._effectiveLastSeenBucket()
+                    )};"
                   ></div>
                 </sl-tooltip>
               `}
@@ -354,24 +361,6 @@ export class AgentConnectionStatusIcon extends LitElement {
       }
     `,
   ];
-}
-
-function lastSeenToText(lastSeen: number | undefined): string {
-  if (!lastSeen) return 'No remote signals received in the last 30 seconds.';
-  const now = Date.now();
-  if (now - lastSeen < 15000)
-    return 'Last remote signal received no longer than 15 seconds ago.';
-  if (now - lastSeen < 30000)
-    return 'Last remote signal received no longer than 30 seconds ago.';
-  return 'No remote signals received in the last 30 seconds.';
-}
-
-function lastSeenToColor(lastSeen: number | undefined): string {
-  if (!lastSeen) return 'gray';
-  const now = Date.now();
-  if (now - lastSeen < 15000) return '#48e708';
-  if (now - lastSeen < 30000) return '#ffd900';
-  return 'gray';
 }
 
 function audioTrackColor(

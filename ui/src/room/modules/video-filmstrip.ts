@@ -57,9 +57,6 @@ export type FilmstripCaptureSize = typeof FILMSTRIP_CAPTURE_SIZES[number];
 
 const DEFAULT_CAPTURE_SIDE = 192;
 
-/** How long to keep a stale received filmstrip showing before TTL'ing it. */
-const RECEIVE_TTL_MS = 3000;
-
 /**
  * Delay before revoking a swapped-out blob URL. Must be safely larger
  * than the clip cadence and any reasonable JS event-loop hiccup,
@@ -111,6 +108,11 @@ type FilmstripPayload = FilmstripClipPayload | FilmstripStopPayload;
  * has actually stopped (without managing to send a stop signal — e.g.
  * the sender's tab crashed). Normal stops use the explicit stop
  * payload and clear immediately.
+ *
+ * This is a display-hold TTL, not a liveness window: liveness is
+ * MEDIA_LIVE_WINDOW_MS in presence-policy.ts. It is deliberately longer
+ * than that window so the last frame doesn't flicker to the avatar at
+ * normal clip cadence.
  */
 const RECEIVE_INACTIVITY_TTL_MS = 5000;
 
@@ -773,17 +775,6 @@ class FilmstripController {
   /** Most recently received filmstrip for a peer, or null. */
   getLatest(agentPubKeyB64: string): FilmstripFrame | null {
     return this.peers.get(agentPubKeyB64)?.latest ?? null;
-  }
-
-  /**
-   * True iff a filmstrip arrived from this peer within RECEIVE_TTL_MS.
-   * Render code uses this to decide whether to show the filmstrip overlay
-   * or fall back to the static avatar.
-   */
-  hasFreshFrame(agentPubKeyB64: string): boolean {
-    const latest = this.peers.get(agentPubKeyB64)?.latest;
-    if (!latest) return false;
-    return Date.now() - latest.receivedAt < RECEIVE_TTL_MS;
   }
 }
 

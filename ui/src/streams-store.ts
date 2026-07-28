@@ -11,7 +11,9 @@ import {
   decidePresenceSoundEvents,
   INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
+  lastSeenBucket,
   MEDIA_LIVE_WINDOW_MS,
+  OBSERVER_FRESHNESS_MS,
   PING_INTERVAL,
   PRESENCE_LEAVE_DWELL_MS,
   PRESENT_STALENESS_MS,
@@ -3473,17 +3475,14 @@ export class StreamsStore {
   }
 
   /**
-   * Freshness bucket for the last pong we received from a peer. Thresholds
-   * match `lastSeenToColor` in agent-connection-status-icon.ts so broadcast
-   * and locally-rendered dots pick the same bucket.
+   * Freshness bucket for the last pong we received from a peer. The
+   * decision lives in presence-policy.ts and is shared with the
+   * status-icon rendering, so broadcast and locally-rendered dots pick
+   * the same bucket by construction.
    */
   lastSeenBucket(peerB64: AgentPubKeyB64): LastSeenBucket {
     const known = get(this._knownAgents)[peerB64];
-    if (!known || typeof known.lastSeen !== 'number') return 'unknown';
-    const age = this.clock.now() - known.lastSeen;
-    if (age < 15_000) return 'fresh';
-    if (age < 30_000) return 'stale';
-    return 'gone';
+    return lastSeenBucket(known?.lastSeen, this.clock.now());
   }
 
   /**
@@ -3510,8 +3509,12 @@ export class StreamsStore {
       (this._staleCycles[peerB64]?.audio ?? 0) < 2;
     if (webrtcAudioLive) return 'webrtc';
 
+    // Same media-flowing window as isMediaLive / computePresentPeers —
+    // one window per predicate. (Was a bespoke 2000ms literal.)
     const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
-    const signalsLive = !!lastRecv && this.clock.now() - lastRecv < 2000;
+    const signalsLive =
+      lastRecv !== undefined &&
+      this.clock.now() - lastRecv < MEDIA_LIVE_WINDOW_MS;
     if (signalsLive) return 'signals';
 
     // No flow. Peer intent comes BEFORE the negotiation check: a stale
@@ -3563,13 +3566,12 @@ export class StreamsStore {
     else audio = 'off';
 
     // Video is 'live' if WebRTC has an active video track OR we've
-    // received a filmstrip clip from this peer within the freshness
+    // received a filmstrip clip from this peer within the media-flowing
     // window (signals carrier carrying low-bandwidth video).
-    const FILMSTRIP_LIVE_WINDOW_MS = 3000;
     const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
     const filmstripLive =
       lastFilmstripMs !== undefined &&
-      this.clock.now() - lastFilmstripMs < FILMSTRIP_LIVE_WINDOW_MS;
+      this.clock.now() - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS;
     const video: PeerLinkSnapshot['video'] =
       conn?.video || filmstripLive
         ? 'live'
@@ -3639,7 +3641,7 @@ export class StreamsStore {
     // observer's broadcast itself to be recent so that an observer who
     // dropped out doesn't keep ghost peers in the set forever.
     const now = this.clock.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3678,7 +3680,7 @@ export class StreamsStore {
     const blocked = new Set(get(this.blockedAgents));
     const out = new Set<AgentPubKeyB64>();
     const now = this.clock.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3707,7 +3709,7 @@ export class StreamsStore {
   observersSeeing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
     const now = this.clock.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];
@@ -3731,7 +3733,7 @@ export class StreamsStore {
   observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
     const now = this.clock.now();
-    const observerStaleness = 2.8 * PING_INTERVAL;
+    const observerStaleness = OBSERVER_FRESHNESS_MS;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
       const obs = others[observerKey];

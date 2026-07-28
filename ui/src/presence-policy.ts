@@ -8,7 +8,7 @@
  * without a named predicate).
  */
 import type { AgentPubKeyB64 } from '@holochain/client';
-import type { AgentInfo } from './types';
+import type { AgentInfo, LastSeenBucket } from './types';
 
 /**
  * Cadence of the presence clock: pings go out and the staleness tick
@@ -23,6 +23,36 @@ export const PING_INTERVAL = 2000;
  * without a flap.
  */
 export const PRESENT_STALENESS_MS = 3 * PING_INTERVAL;
+
+/**
+ * Freshness window for **observer testimony** (another peer's broadcast
+ * peerLinks / connection statuses): testimony older than this is ignored
+ * so a departed observer cannot keep ghost peers alive. Slightly under
+ * the present staleness window so remote claims never outlive the
+ * direct evidence they summarize. Previously the literal
+ * `2.8 * PING_INTERVAL` at five call sites.
+ */
+export const OBSERVER_FRESHNESS_MS = 2.8 * PING_INTERVAL;
+
+/**
+ * The **reachable** buckets for the last direct pong from a peer, shown
+ * as the status dot and broadcast in peerLinks. One decision for the
+ * store (`StreamsStore.lastSeenBucket`) and the status-icon rendering,
+ * which previously hand-duplicated the 15s/30s thresholds.
+ */
+export const LAST_SEEN_FRESH_MS = 15_000;
+export const LAST_SEEN_GONE_MS = 30_000;
+
+export function lastSeenBucket(
+  lastSeen: number | undefined,
+  now: number
+): LastSeenBucket {
+  if (typeof lastSeen !== 'number') return 'unknown';
+  const age = now - lastSeen;
+  if (age < LAST_SEEN_FRESH_MS) return 'fresh';
+  if (age < LAST_SEEN_GONE_MS) return 'stale';
+  return 'gone';
+}
 
 export interface ActiveAgentsSnapshot {
   knownAgents: Record<AgentPubKeyB64, AgentInfo>;

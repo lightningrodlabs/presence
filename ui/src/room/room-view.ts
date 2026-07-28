@@ -75,7 +75,7 @@ import {
   writeLocalStorage,
 } from '../utils';
 import { StreamsStore } from '../streams-store';
-import { PING_INTERVAL } from '../presence-policy';
+import { OBSERVER_FRESHNESS_MS } from '../presence-policy';
 import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
 import { getAllModules, getModule, getShareModules } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
@@ -2574,7 +2574,7 @@ export class RoomView extends LitElement {
       // statuses.lastUpdated is stamped from the store's clock, so the
       // freshness comparison must read the same clock.
       const now = this.streamsStore.clock.now();
-      staleInfo = now - statuses.lastUpdated > 2.8 * PING_INTERVAL;
+      staleInfo = now - statuses.lastUpdated > OBSERVER_FRESHNESS_MS;
 
       switch (type) {
         case 'video': {
