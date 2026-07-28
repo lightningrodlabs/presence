@@ -62,6 +62,28 @@ describe('StreamsStore construction/activation split', () => {
     expect(Object.keys(get(store._activeAgents))).toEqual([]);
   });
 
+  it('evicts a stale agent on a presence tick with no _knownAgents write (item 4)', () => {
+    const clock = new ManualClock(100_000);
+    const store = makeUnstartedStore(clock);
+    store._knownAgents.set({
+      [peerA]: { pubkey: peerA, type: 'known', lastSeen: clock.now(), appVersion: undefined },
+    });
+
+    // Keep a live subscription so the derived store re-evaluates on
+    // dependency writes rather than only on get().
+    const seen: string[][] = [];
+    const unsub = store._activeAgents.subscribe(v => seen.push(Object.keys(v)));
+    expect(seen[seen.length - 1]).toEqual([peerA]);
+
+    // Past the staleness window, no _knownAgents write: the tick alone
+    // must evict. (start() arms this tick on the store clock every
+    // PING_INTERVAL; here we fire it directly.)
+    clock.advance(7000);
+    store._presenceTick.update(n => n + 1);
+    expect(seen[seen.length - 1]).toEqual([]);
+    unsub();
+  });
+
   it('excludes blocked agents from _activeAgents', () => {
     const clock = new ManualClock(100_000);
     const store = makeUnstartedStore(clock);

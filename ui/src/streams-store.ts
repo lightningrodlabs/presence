@@ -294,8 +294,12 @@ export class StreamsStore {
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
 
     this._activeAgents = derived(
-      [this._knownAgents, this.blockedAgents] as [Writable<Record<AgentPubKeyB64, AgentInfo>>, Writable<AgentPubKeyB64[]>],
-      ([knownAgents, blocked]) =>
+      [this._knownAgents, this.blockedAgents, this._presenceTick] as [
+        Writable<Record<AgentPubKeyB64, AgentInfo>>,
+        Writable<AgentPubKeyB64[]>,
+        Writable<number>,
+      ],
+      ([knownAgents, blocked, _tick]) =>
         computeActiveAgents({
           knownAgents,
           blocked,
@@ -334,6 +338,14 @@ export class StreamsStore {
   start(): void {
     this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
       this.handleSignal(signal)
+    );
+
+    // Drive the presence tick from the store clock so _activeAgents
+    // re-evaluates staleness once per ping cadence even when no store
+    // write happens (Phase 2 item 4).
+    this._presenceTickInterval = this.clock.setInterval(
+      () => this._presenceTick.update(n => n + 1),
+      PING_INTERVAL
     );
     const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
     this.blockedAgents.set(
@@ -2082,6 +2094,10 @@ export class StreamsStore {
     }
 
     if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
+    if (this._presenceTickInterval !== undefined) {
+      this.clock.clearInterval(this._presenceTickInterval);
+      this._presenceTickInterval = undefined;
+    }
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -3183,6 +3199,19 @@ export class StreamsStore {
    * Excludes self and blocked agents.
    */
   _activeAgents!: Readable<Record<AgentPubKeyB64, AgentInfo>>;
+
+  /**
+   * The presence clock's tick, incremented every PING_INTERVAL from
+   * `start()`. `_activeAgents` derives from it so staleness is evaluated
+   * on a tick rather than only when `_knownAgents` happens to be written —
+   * previously eviction waited for `pingAgents`' next write, making real
+   * eviction latency 6–8s instead of the declared 6s (§3.2 note).
+   * Public like the other underscore stores so tests can fire a tick
+   * without arming the interval (which lives in start()).
+   */
+  _presenceTick: Writable<number> = writable(0);
+
+  private _presenceTickInterval: number | undefined;
 
   /**
    * The statuses of WebRTC main stream connections to peers
