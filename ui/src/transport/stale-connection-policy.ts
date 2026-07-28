@@ -7,8 +7,11 @@
  * dead? The predicate was written inline three times, verbatim
  * (MAINTAINABILITY_ASSESSMENT.md §3.9) — once for video and twice for
  * outgoing screen share — each followed by a different cleanup set. This
- * file is now the single authority for the *predicate*; the three cleanup
- * sets remain divergent and are Phase 2b's problem.
+ * file is the single authority for the *predicate*, and (since Phase 2b)
+ * for the *cleanup sets*: `staleTeardownPlan` states, per target, which
+ * slot and pending map a teardown clears, and
+ * `StreamsStore._applyStaleTeardown` is the one executor all three sites
+ * call.
  *
  * Two behavioural changes are folded in, both deliberate:
  *
@@ -120,4 +123,57 @@ export function decideStaleConnectionCleanup(
   }
 
   return { action: 'keep', reason: 'ice-healthy' };
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup sets (Phase 2b)
+// ---------------------------------------------------------------------------
+
+/** Which kind of connection a stale teardown is clearing. */
+export type StaleTeardownTarget = 'video' | 'screen-share-outgoing';
+
+/**
+ * What a stale teardown must clear, per target. Every field names a
+ * `StreamsStore` structure; `_applyStaleTeardown` is the single executor.
+ */
+export type StaleTeardownPlan = {
+  /** The connection slot to delete after closing the transport connection. */
+  slot: 'open-connections' | 'screen-share-connections-outgoing';
+  /** The pending-init map to clear, so the next pong re-initiates cleanly. */
+  pendingInits: 'video' | 'screen-share';
+  /**
+   * Whether to drop the peer's entry in `_videoStreams`. Only the video
+   * teardown has a per-peer stream slot to clear; outgoing screen share
+   * never stores one (`_screenShareStreams` is written nowhere — see the
+   * unscheduled-defects table in MAINTAINABILITY_ASSESSMENT.md).
+   */
+  clearVideoStreamSlot: boolean;
+};
+
+/**
+ * The formerly-divergent cleanup sets, stated once. Two of the three call
+ * sites share the `screen-share-outgoing` row; the divergence between the
+ * rows is real (different slots, different pending maps, only video has a
+ * stream slot), and the table test pins it so an edit to one row is a
+ * visible decision rather than a drift.
+ */
+export function staleTeardownPlan(target: StaleTeardownTarget): StaleTeardownPlan {
+  switch (target) {
+    case 'video':
+      return {
+        slot: 'open-connections',
+        pendingInits: 'video',
+        clearVideoStreamSlot: true,
+      };
+    case 'screen-share-outgoing':
+      return {
+        slot: 'screen-share-connections-outgoing',
+        pendingInits: 'screen-share',
+        clearVideoStreamSlot: false,
+      };
+    default: {
+      const exhaustive: never = target;
+      return exhaustive;
+    }
+  }
 }

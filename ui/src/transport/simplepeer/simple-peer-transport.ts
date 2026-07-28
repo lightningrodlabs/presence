@@ -157,8 +157,12 @@ export class SimplePeerTransport implements PeerTransport {
       }
       // Different connectionId — caller wants a fresh attempt. Close old first.
       // Emit close synchronously so listeners observe the supersede in order;
-      // SimplePeer's own 'close' event will still fire later but its handler
-      // will detect the slot has been replaced and skip.
+      // SimplePeer's own 'close' event will still fire later and its handler
+      // re-emits a duplicate closed state-change (kept for forensics) — it
+      // only skips mutating the replaced slot. Downstream consumers of
+      // 'closed' must therefore be idempotent; see
+      // __tests__/transport-emit-invariant.test.ts, which pins both the
+      // synchronous emit and the duplicate.
       this._closeStateInternal(peer, existing, 'superseded by new connectionId');
     } else if (existing && TERMINAL_PHASES.has(existing.phase)) {
       // Stale terminal state — drop it, create fresh below.

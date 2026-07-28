@@ -24,7 +24,18 @@ import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
 import { computeSignalsTargets } from './transport/carrier-coverage';
-import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
+import {
+  decideStaleConnectionCleanup,
+  staleTeardownPlan,
+} from './transport/stale-connection-policy';
+import type { StaleTeardownTarget } from './transport/stale-connection-policy';
+import {
+  summarizeRtcStats,
+  decideTrackRefresh,
+  STALE_CYCLES_REFRESH_THRESHOLD,
+} from './transport/track-health-policy';
+import type { RtcStatsReportLike } from './transport/track-health-policy';
+import { decideInitRetry } from './transport/init-retry-policy';
 import {
   derived,
   get,
@@ -71,6 +82,7 @@ import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
 import { parseSignalPayload } from './signal-payload';
+import { decodeRtcMessage } from './rtc-message-policy';
 
 declare const __APP_VERSION__: string;
 
@@ -1584,82 +1596,58 @@ export class StreamsStore {
     pubKeyB64: AgentPubKeyB64,
     data: unknown,
   ): void {
-    try {
-      const msg: RTCMessage = JSON.parse(data as string);
-      if (msg.type !== 'action') return;
-      if (msg.message === 'video-off') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.video = false;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerVideoOffSignal',
-        });
+    for (const action of decodeRtcMessage(data)) {
+      switch (action.kind) {
+        case 'set-peer-track': {
+          this._openConnections.update(currentValue => {
+            const conn = currentValue[pubKeyB64];
+            if (conn) conn[action.track] = action.enabled;
+            return currentValue;
+          });
+          this.logger.logAgentEvent({
+            agent: pubKeyB64,
+            timestamp: this.clock.now(),
+            event: action.event,
+          });
+          break;
+        }
+        case 'log-input-change': {
+          this.logger.logAgentEvent({
+            agent: pubKeyB64,
+            timestamp: this.clock.now(),
+            event: action.event,
+          });
+          break;
+        }
+        case 'refresh-tracks': {
+          console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
+          this.logger.logCustomMessage(
+            `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
+          );
+          this.refreshTracksForPeer(pubKeyB64);
+          break;
+        }
+        case 'ignore':
+          // `not-action` frames (text, primitives) stay silent — they are
+          // not this handler's traffic. An unknown *action* message is
+          // worth a trace: it usually means the peer runs a newer build.
+          if (action.reason === 'unknown-action') {
+            this.logger.logCustomMessage(
+              `Unknown RTCMessage action from [${pubKeyB64.slice(0, 8)}] — newer peer build? Frame: ${data}`
+            );
+          }
+          break;
+        case 'parse-error': {
+          console.warn(
+            `Failed to parse RTCMessage: ${action.detail}. Got message: ${data}}`
+          );
+          break;
+        }
+        default: {
+          const exhaustive: never = action;
+          void exhaustive;
+        }
       }
-      if (msg.message === 'video-on') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.video = true;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerVideoOnSignal',
-        });
-      }
-      if (msg.message === 'audio-off') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.audio = false;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerAudioOffSignal',
-        });
-      }
-      if (msg.message === 'audio-on') {
-        this._openConnections.update(currentValue => {
-          const conn = currentValue[pubKeyB64];
-          if (conn) conn.audio = true;
-          return currentValue;
-        });
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerAudioOnSignal',
-        });
-      }
-      if (msg.message === 'change-audio-input') {
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerChangeAudioInput',
-        });
-      }
-      if (msg.message === 'change-video-input') {
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'PeerChangeVideoInput',
-        });
-      }
-      if (msg.message === 'request-track-refresh') {
-        console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
-        this.logger.logCustomMessage(
-          `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
-        );
-        this.refreshTracksForPeer(pubKeyB64);
-      }
-    } catch (e) {
-      console.warn(
-        `Failed to parse RTCMessage: ${JSON.stringify(e)}. Got message: ${data}}`
-      );
     }
   }
 
@@ -5609,109 +5597,41 @@ export class StreamsStore {
 
       try {
         const stats = await pc.getStats();
-        let audioBytes = 0;
-        let videoBytes = 0;
-        // Per-kind jitter/loss. Prefer audio for display when available
-        // (more time-sensitive); fall back to video otherwise.
-        let audioJitter: number | null = null;
-        let audioPacketsReceived = 0;
-        let audioPacketsLost = 0;
-        let videoJitter: number | null = null;
-        let videoPacketsReceived = 0;
-        let videoPacketsLost = 0;
-        let rttMs: number | null = null;
-        let candPairRttMs: number | null = null;
+        const reports: RtcStatsReportLike[] = [];
+        stats.forEach((report: RtcStatsReportLike) => reports.push(report));
+        const summary = summarizeRtcStats(reports);
 
-        stats.forEach((report: any) => {
-          if (report.type === 'inbound-rtp') {
-            const kind = report.kind || report.mediaType;
-            if (kind === 'audio') {
-              audioBytes = report.bytesReceived || 0;
-              if (typeof report.jitter === 'number') audioJitter = report.jitter;
-              audioPacketsReceived = report.packetsReceived || 0;
-              audioPacketsLost = report.packetsLost || 0;
-            } else if (kind === 'video') {
-              videoBytes = report.bytesReceived || 0;
-              if (typeof report.jitter === 'number') videoJitter = report.jitter;
-              videoPacketsReceived = report.packetsReceived || 0;
-              videoPacketsLost = report.packetsLost || 0;
-            }
-          }
-          // RTT from remote-inbound-rtp (our outgoing direction).
-          if (report.type === 'remote-inbound-rtp' &&
-              typeof report.roundTripTime === 'number') {
-            rttMs = Math.round(report.roundTripTime * 1000);
-          }
-          // Fallback: candidate-pair gives ICE-level RTT.
-          if (report.type === 'candidate-pair' &&
-              report.state === 'succeeded' &&
-              typeof report.currentRoundTripTime === 'number') {
-            candPairRttMs = Math.round(report.currentRoundTripTime * 1000);
-          }
-        });
-
-        if (rttMs === null) rttMs = candPairRttMs;
-
-        // Pick whichever kind has data. Audio is preferred when both
-        // are flowing. If neither, leave jitter/loss null.
-        const hasAudio = audioPacketsReceived + audioPacketsLost > 0;
-        const hasVideo = videoPacketsReceived + videoPacketsLost > 0;
-        const jitter = hasAudio
-          ? audioJitter
-          : (hasVideo ? videoJitter : null);
-        const pktsRecv = hasAudio
-          ? audioPacketsReceived
-          : (hasVideo ? videoPacketsReceived : 0);
-        const pktsLost = hasAudio
-          ? audioPacketsLost
-          : (hasVideo ? videoPacketsLost : 0);
-        const totalPackets = pktsRecv + pktsLost;
-
-        const jitterRounded = jitter !== null
-          ? Math.round((jitter as number) * 1000 * 10) / 10
-          : null;
-        const lossRounded = totalPackets > 0
-          ? Math.round((pktsLost / totalPackets) * 1000) / 10
-          : null;
         this.webrtcStats.set(pubKeyB64, {
-          rttMs,
-          jitterMs: jitterRounded,
-          lossPercent: lossRounded,
+          rttMs: summary.rttMs,
+          jitterMs: summary.jitterMs,
+          lossPercent: summary.lossPercent,
         });
         this._maybeEmitQualityChange(
           pubKeyB64,
           'webrtc',
-          rttMs,
-          jitterRounded,
-          lossRounded,
+          summary.rttMs,
+          summary.jitterMs,
+          summary.lossPercent,
         );
 
-        const lastBytes = this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 };
-        const stale = this._staleCycles[pubKeyB64] || { audio: 0, video: 0 };
+        const decision = decideTrackRefresh({
+          videoExpected: connInfo.video,
+          audioExpected: connInfo.audio,
+          audioBytes: summary.audioBytes,
+          videoBytes: summary.videoBytes,
+          lastBytes: this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 },
+          staleCycles: this._staleCycles[pubKeyB64] || { audio: 0, video: 0 },
+          staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
+        });
 
-        // Check video
-        if (connInfo.video && videoBytes > 0) {
-          if (videoBytes === lastBytes.video) {
-            stale.video++;
-          } else {
-            stale.video = 0;
-          }
-        }
+        this._lastBytesReceived[pubKeyB64] = {
+          audio: summary.audioBytes,
+          video: summary.videoBytes,
+        };
+        this._staleCycles[pubKeyB64] = decision.nextStale;
 
-        // Check audio
-        if (connInfo.audio && audioBytes > 0) {
-          if (audioBytes === lastBytes.audio) {
-            stale.audio++;
-          } else {
-            stale.audio = 0;
-          }
-        }
-
-        this._lastBytesReceived[pubKeyB64] = { audio: audioBytes, video: videoBytes };
-        this._staleCycles[pubKeyB64] = stale;
-
-        // If 2+ consecutive stale cycles (4+ seconds), request track refresh
-        if (stale.video >= 2 || stale.audio >= 2) {
+        if (decision.action === 'request-refresh') {
+          const stale = decision.nextStale;
           console.warn(
             `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
           );
@@ -5734,6 +5654,66 @@ export class StreamsStore {
       } catch (e) {
         // getStats may fail if connection was already closed
       }
+    }
+  }
+
+  /**
+   * The one executor for a stale-connection teardown. The predicate that
+   * decides *whether* to tear down is `decideStaleConnectionCleanup`; the
+   * cleanup set — what gets cleared per target — is `staleTeardownPlan`
+   * (both in `transport/stale-connection-policy.ts`). All three supervisor
+   * sites call this: the screen-share check in `handlePingUi`, and the
+   * video and screen-share checks in `handlePongUi`. Site-specific
+   * forensics (console/custom/agent-event logging) stay at the sites.
+   */
+  private _applyStaleTeardown(
+    target: StaleTeardownTarget,
+    pubkeyB64: AgentPubKeyB64,
+    iceState: RTCIceConnectionState | undefined,
+  ): void {
+    const plan = staleTeardownPlan(target);
+    switch (plan.slot) {
+      case 'open-connections': {
+        this._activeMediaTransportFor(pubkeyB64).closeConnection(
+          pubkeyB64,
+          `stale ICE=${iceState}`,
+        );
+        this._openConnections.update(v => {
+          delete v[pubkeyB64];
+          return v;
+        });
+        break;
+      }
+      case 'screen-share-connections-outgoing': {
+        this.screenShareOutTransport.closeConnection(
+          pubkeyB64,
+          `stale ICE=${iceState}`,
+        );
+        this._screenShareConnectionsOutgoing.update(v => {
+          delete v[pubkeyB64];
+          return v;
+        });
+        break;
+      }
+      default: {
+        const exhaustive: never = plan.slot;
+        void exhaustive;
+      }
+    }
+    switch (plan.pendingInits) {
+      case 'video':
+        delete this._pendingInits[pubkeyB64];
+        break;
+      case 'screen-share':
+        delete this._pendingScreenShareInits[pubkeyB64];
+        break;
+      default: {
+        const exhaustive: never = plan.pendingInits;
+        void exhaustive;
+      }
+    }
+    if (plan.clearVideoStreamSlot) {
+      delete this._videoStreams[pubkeyB64];
     }
   }
 
@@ -5928,12 +5908,7 @@ export class StreamsStore {
             graceMs: ICE_DISCONNECTED_GRACE_MS,
           });
           if (decision.action === 'teardown') {
-            this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
-            this._screenShareConnectionsOutgoing.update(v => {
-              delete v[pubkeyB64];
-              return v;
-            });
-            delete this._pendingScreenShareInits[pubkeyB64];
+            this._applyStaleTeardown('screen-share-outgoing', pubkeyB64, iceState);
           }
         }
         const hasOutgoing = Object.keys(
@@ -6257,10 +6232,7 @@ export class StreamsStore {
           event: 'StaleCleanup',
           connectionId: existingConn.connectionId,
         });
-        activeTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
-        this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
-        delete this._pendingInits[pubkeyB64];
-        delete this._videoStreams[pubkeyB64];
+        this._applyStaleTeardown('video', pubkeyB64, iceState);
       }
     }
 
@@ -6272,18 +6244,32 @@ export class StreamsStore {
     // module is active AND WebRTC is not disabled for this peer.
     if (conversationActive && !peerWebrtcDisabled && !this.webrtcGloballyDisabled) {
       const pendingInits = this._pendingInits[pubkeyB64];
-      if (!alreadyOpen && pubkeyB64 < this.myPubKeyB64) {
-        if (!pendingInits) {
-          console.log('#### SENDING FIRST INIT REQUEST.');
-          const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
-          if (lastDisconnect) {
-            const gap = this.clock.now() - lastDisconnect;
-            this.logger.logCustomMessage(
-              `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
-            );
+      const decision = decideInitRetry({
+        kind: 'video',
+        alreadyOpen: !!alreadyOpen,
+        myPubKeyB64: this.myPubKeyB64,
+        peerPubKeyB64: pubkeyB64,
+        pendingInitT0s: pendingInits?.map(init => init.t0),
+        now,
+        retryThresholdMs: INIT_RETRY_THRESHOLD,
+      });
+      switch (decision.action) {
+        case 'send-init': {
+          if (decision.reason === 'no-pending-init') {
+            console.log('#### SENDING FIRST INIT REQUEST.');
+            const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
+            if (lastDisconnect) {
+              const gap = this.clock.now() - lastDisconnect;
+              this.logger.logCustomMessage(
+                `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
+              );
+            }
+          } else {
+            console.log(`#--# SENDING INIT REQUEST NUMBER ${decision.attempt}.`);
           }
           const newConnectionId = uuidv4();
           this._pendingInits[pubkeyB64] = [
+            ...(pendingInits ?? []),
             { connectionId: newConnectionId, t0: now },
           ];
           await this.roomClient.sendMessage(
@@ -6292,30 +6278,29 @@ export class StreamsStore {
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
           );
           this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-        } else {
-          console.log(
-            `#--# SENDING INIT REQUEST NUMBER ${pendingInits.length + 1}.`
-          );
-          const latestInit = pendingInits.sort(
-            (init_a, init_b) => init_b.t0 - init_a.t0
-          )[0];
-          if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
-            const newConnectionId = uuidv4();
-            pendingInits.push({ connectionId: newConnectionId, t0: now });
-            this._pendingInits[pubkeyB64] = pendingInits;
-            await this.roomClient.sendMessage(
-              [signal.from_agent],
-              'InitRequest',
-              JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-            );
-            this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-          }
+          break;
         }
-      } else if (!alreadyOpen && !pendingInits) {
-        this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
-      } else if (alreadyOpen && metaDataExt?.data.streamInfo) {
-        // If the connection is already open, reconcile with our expected stream state
-        this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
+        case 'await-peer-init':
+          this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
+          break;
+        case 'hold': {
+          if (decision.reason === 'within-threshold') {
+            // Inherited: the inline code printed the "sending" line before
+            // the threshold check, so it logs on held pongs too.
+            console.log(
+              `#--# SENDING INIT REQUEST NUMBER ${(pendingInits?.length ?? 0) + 1}.`
+            );
+          }
+          if (decision.reason === 'already-open' && metaDataExt?.data.streamInfo) {
+            // If the connection is already open, reconcile with our expected stream state
+            this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
+          }
+          break;
+        }
+        default: {
+          const exhaustive: never = decision;
+          void exhaustive;
+        }
       }
     }
 
@@ -6366,58 +6351,77 @@ export class StreamsStore {
       });
       if (decision.action === 'teardown') {
         console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
-        this.screenShareOutTransport.closeConnection(pubkeyB64, `stale ICE=${iceState}`);
-        this._screenShareConnectionsOutgoing.update(currentValue => {
-          delete currentValue[pubkeyB64];
-          return currentValue;
-        });
-        delete this._pendingScreenShareInits[pubkeyB64];
+        this._applyStaleTeardown('screen-share-outgoing', pubkeyB64, iceState);
       }
     }
     const alreadyOpenScreenShareOutgoing = Object.keys(
       get(this._screenShareConnectionsOutgoing)
     ).includes(pubkeyB64);
     const pendingScreenShareInits = this._pendingScreenShareInits[pubkeyB64];
-    if (!!this.screenShareStream && !alreadyOpenScreenShareOutgoing) {
-      if (!pendingScreenShareInits) {
-        console.log('#### SENDING FIRST SCREEN SHARE INIT REQUEST.');
-        const newConnectionId = uuidv4();
-        this._pendingScreenShareInits[pubkeyB64] = [
-          { connectionId: newConnectionId, t0: now },
-        ];
-        await this.roomClient.sendMessage(
-          [signal.from_agent],
-          'InitRequest',
-          JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
-        );
-        this.updateScreenShareConnectionStatus(pubkeyB64, {
-          type: 'InitSent',
-        });
-      } else {
-        console.log(
-          `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${
-            pendingScreenShareInits.length + 1
-          }.`
-        );
-        const latestInit = pendingScreenShareInits.sort(
-          (init_a, init_b) => init_b.t0 - init_a.t0
-        )[0];
-        if (now - latestInit.t0 > INIT_RETRY_THRESHOLD) {
+    if (this.screenShareStream) {
+      const decision = decideInitRetry({
+        kind: 'screen-share',
+        alreadyOpen: alreadyOpenScreenShareOutgoing,
+        myPubKeyB64: this.myPubKeyB64,
+        peerPubKeyB64: pubkeyB64,
+        pendingInitT0s: pendingScreenShareInits?.map(init => init.t0),
+        now,
+        retryThresholdMs: INIT_RETRY_THRESHOLD,
+      });
+      switch (decision.action) {
+        case 'send-init': {
+          if (decision.reason === 'no-pending-init') {
+            console.log('#### SENDING FIRST SCREEN SHARE INIT REQUEST.');
+          } else {
+            console.log(
+              `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${decision.attempt}.`
+            );
+          }
           const newConnectionId = uuidv4();
-          pendingScreenShareInits.push({
-            connectionId: newConnectionId,
-            t0: now,
-          });
-          this._pendingScreenShareInits[pubkeyB64] = pendingScreenShareInits;
+          this._pendingScreenShareInits[pubkeyB64] = [
+            ...(pendingScreenShareInits ?? []),
+            { connectionId: newConnectionId, t0: now },
+          ];
           await this.roomClient.sendMessage(
             [signal.from_agent],
             'InitRequest',
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'screen' }),
           );
+          this.updateScreenShareConnectionStatus(pubkeyB64, {
+            type: 'InitSent',
+          });
+          break;
         }
-        this.updateScreenShareConnectionStatus(pubkeyB64, {
-          type: 'InitSent',
-        });
+        case 'hold': {
+          if (decision.reason === 'within-threshold') {
+            // Inherited: the inline code printed the "sending" line before
+            // the threshold check, so it logs on held pongs too.
+            console.log(
+              `#--# SENDING SCREEN SHARE INIT REQUEST NUMBER ${
+                (pendingScreenShareInits?.length ?? 0) + 1
+              }.`
+            );
+          }
+          if (decision.setStatusInitSent) {
+            // Divergence kept from the inline code: the screen path
+            // re-asserts InitSent on every pong while within the retry
+            // threshold; the video path does not. See the header of
+            // transport/init-retry-policy.ts.
+            this.updateScreenShareConnectionStatus(pubkeyB64, {
+              type: 'InitSent',
+            });
+          }
+          break;
+        }
+        case 'await-peer-init':
+          // Unreachable for screen share — the sharer has no tie-break to
+          // defer on — but the switch stays exhaustive rather than
+          // asserting unreachability at a distance.
+          break;
+        default: {
+          const exhaustive: never = decision;
+          void exhaustive;
+        }
       }
     }
   }
@@ -6687,7 +6691,11 @@ export class StreamsStore {
       const agentPendingScreenShareInits =
         this._pendingScreenShareInits[pubKey64];
       if (
-        !Object.keys(this._screenShareConnectionsOutgoing).includes(pubKey64)
+        // `get()` matters: Object.keys on the Writable itself enumerates
+        // store methods, never a pubkey, so this guard was dead-true and a
+        // duplicate InitAccept could re-initiate over a live outgoing
+        // share (MAINTAINABILITY_ASSESSMENT.md, unscheduled-defects table).
+        !Object.keys(get(this._screenShareConnectionsOutgoing)).includes(pubKey64)
       ) {
         if (!agentPendingScreenShareInits) {
           console.warn(
