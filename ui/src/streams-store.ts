@@ -121,7 +121,7 @@ export class StreamsStore {
 
   myPubKeyB64: AgentPubKeyB64;
 
-  private signalUnsubscribe: () => void;
+  private signalUnsubscribe: (() => void) | null = null;
 
   private pingInterval: number | undefined;
 
@@ -199,9 +199,9 @@ export class StreamsStore {
    * Transport-agnostic microphone owner. Consumers (WebRTC audio, the
    * voice module, a future transcription module) acquire a track from it
    * rather than calling getUserMedia themselves. See ui/src/mic-source.ts
-   * for the full rationale.
+   * for the full rationale. Assigned in start().
    */
-  micSource: MicSource;
+  micSource!: MicSource;
 
   /**
    * Transport-agnostic camera owner. Mirrors `micSource` for video.
@@ -213,9 +213,9 @@ export class StreamsStore {
    * its open/close branches. videoOn/videoOff own the keepalive-aware
    * peer wiring directly because the keepalive replaceTrack pattern
    * (NAT-keepalive on videoOff, replaceTrack on videoOn) doesn't fit
-   * cleanly into a generic open/close handler.
+   * cleanly into a generic open/close handler. Assigned in start().
    */
-  cameraSource: CameraSource;
+  cameraSource!: CameraSource;
 
   /**
    * Whether the voice encoder is currently running (sending audio to
@@ -310,8 +310,33 @@ export class StreamsStore {
       },
     );
 
-    // TODO potentially move this to a connect() method which also returns
-    // the Unsubscribe function
+    // Signals is the complement of *WebRTC carrying media*, not of *a
+    // WebRTC attempt existing*. Decision and rationale live in
+    // `transport/carrier-coverage.ts`.
+    this._signalsTargets = derived(
+      [this._activeAgents, this._openConnections],
+      ([active, connections]) =>
+        computeSignalsTargets({
+          activeAgents: Object.keys(active),
+          openConnections: connections,
+        }),
+    );
+    // Construction ends here: fields and derived stores only, no
+    // subscriptions, no transports, no browser APIs. Everything that
+    // touches the ambient world (window, navigator, the signal bus, the
+    // module singletons) happens in start(), so a test can hold an
+    // inactive instance in a node environment. `static connect` is the
+    // one production caller of both.
+  }
+
+  /**
+   * Activate the store: subscribe to Holochain signals, construct the
+   * WebRTC transports, register device listeners, create the mic/camera
+   * sources and bind the module controllers. Constructing joins nothing;
+   * starting joins the room's signal fabric. Idempotence is NOT provided —
+   * call exactly once, then disconnect() to tear down.
+   */
+  start(): void {
     this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
       this.handleSignal(signal)
     );
@@ -326,17 +351,6 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
-    // Signals is the complement of *WebRTC carrying media*, not of *a
-    // WebRTC attempt existing*. Decision and rationale live in
-    // `transport/carrier-coverage.ts`.
-    this._signalsTargets = derived(
-      [this._activeAgents, this._openConnections],
-      ([active, connections]) =>
-        computeSignalsTargets({
-          activeAgents: Object.keys(active),
-          openConnections: connections,
-        }),
-    );
 
     // Construct transports. iceServers / trickleICE are getters so the
     // transport always uses the current values (TURN credentials, trickle
@@ -1998,6 +2012,7 @@ export class StreamsStore {
       screenSourceSelection,
       logger
     );
+    streamsStore.start();
 
     // Wait for allAgents to load before first ping so we actually have peers to contact
     await new Promise<void>((resolve) => {
