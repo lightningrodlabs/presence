@@ -74,7 +74,8 @@ import {
   sortConnectionStatuses,
   writeLocalStorage,
 } from '../utils';
-import { PING_INTERVAL, StreamsStore } from '../streams-store';
+import { StreamsStore } from '../streams-store';
+import { PING_INTERVAL } from '../presence-policy';
 import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
 import { getAllModules, getModule, getShareModules } from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';

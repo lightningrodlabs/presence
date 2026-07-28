@@ -5,6 +5,11 @@ import {
   encodeHashToBase64,
 } from '@holochain/client';
 import { Clock, systemClock } from './clock';
+import {
+  computeActiveAgents,
+  PING_INTERVAL,
+  PRESENT_STALENESS_MS,
+} from './presence-policy';
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
@@ -91,8 +96,6 @@ const ICE_DISCONNECTED_GRACE_MS = 15000;
  * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent
  */
 const INIT_RETRY_THRESHOLD = 5000;
-
-export const PING_INTERVAL = 2000;
 
 /**
  * A peer with media frames received within this window on the signals
@@ -290,24 +293,16 @@ export class StreamsStore {
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
 
-    const ACTIVE_AGENT_STALENESS = 3 * PING_INTERVAL;
     this._activeAgents = derived(
       [this._knownAgents, this.blockedAgents] as [Writable<Record<AgentPubKeyB64, AgentInfo>>, Writable<AgentPubKeyB64[]>],
-      ([knownAgents, blocked]) => {
-        const now = this.clock.now();
-        const active: Record<AgentPubKeyB64, AgentInfo> = {};
-        for (const [pubkey, info] of Object.entries(knownAgents)) {
-          if (
-            pubkey !== this.myPubKeyB64 &&
-            !blocked.includes(pubkey) &&
-            info.lastSeen !== undefined &&
-            now - info.lastSeen < ACTIVE_AGENT_STALENESS
-          ) {
-            active[pubkey] = info;
-          }
-        }
-        return active;
-      },
+      ([knownAgents, blocked]) =>
+        computeActiveAgents({
+          knownAgents,
+          blocked,
+          myPubKey: this.myPubKeyB64,
+          now: this.clock.now(),
+          stalenessMs: PRESENT_STALENESS_MS,
+        }),
     );
 
     // Signals is the complement of *WebRTC carrying media*, not of *a
