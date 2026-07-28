@@ -6645,7 +6645,11 @@ export class StreamsStore {
       const agentPendingScreenShareInits =
         this._pendingScreenShareInits[pubKey64];
       if (
-        !Object.keys(this._screenShareConnectionsOutgoing).includes(pubKey64)
+        // `get()` matters: Object.keys on the Writable itself enumerates
+        // store methods, never a pubkey, so this guard was dead-true and a
+        // duplicate InitAccept could re-initiate over a live outgoing
+        // share (MAINTAINABILITY_ASSESSMENT.md, unscheduled-defects table).
+        !Object.keys(get(this._screenShareConnectionsOutgoing)).includes(pubKey64)
       ) {
         if (!agentPendingScreenShareInits) {
           console.warn(
