@@ -4,6 +4,7 @@ import {
   decodeHashFromBase64,
   encodeHashToBase64,
 } from '@holochain/client';
+import { Clock, systemClock } from './clock';
 import { SimplePeerTransport, FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent, PeerTransport } from './transport';
 import { decideAutoFlip, decideCarrierSwitch, resolveWebrtcImpl } from './transport/auto-flip-policy';
@@ -109,6 +110,14 @@ const MEDIA_LIVE_WINDOW_MS = 3000;
  */
 export class StreamsStore {
   private roomClient: RoomClient;
+
+  /**
+   * The single time authority (Phase 2 item 1). Every timing read and
+   * timer in this class — and in the controllers bound to it — goes
+   * through this clock so tests can drive staleness windows and retry
+   * cycles deterministically with a ManualClock.
+   */
+  readonly clock: Clock;
 
   myPubKeyB64: AgentPubKeyB64;
 
@@ -270,11 +279,13 @@ export class StreamsStore {
   constructor(
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
-    logger: PresenceLogger
+    logger: PresenceLogger,
+    clock: Clock = systemClock
   ) {
     this.roomStore = roomStore;
     this.screenSourceSelection = screenSourceSelection;
     this.logger = logger;
+    this.clock = clock;
     const roomClient = roomStore.client;
     this.roomClient = roomClient;
     this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
@@ -283,7 +294,7 @@ export class StreamsStore {
     this._activeAgents = derived(
       [this._knownAgents, this.blockedAgents] as [Writable<Record<AgentPubKeyB64, AgentInfo>>, Writable<AgentPubKeyB64[]>],
       ([knownAgents, blocked]) => {
-        const now = Date.now();
+        const now = this.clock.now();
         const active: Record<AgentPubKeyB64, AgentInfo> = {};
         for (const [pubkey, info] of Object.entries(knownAgents)) {
           if (
@@ -494,7 +505,7 @@ export class StreamsStore {
               // handling in `handleInitAccept`.
               this.logger.logAgentEvent({
                 agent: event.peer,
-                timestamp: Date.now(),
+                timestamp: this.clock.now(),
                 event: 'Superseded',
                 connectionId: route.slot.supersedes,
                 detail: `superseded-by=${event.connectionId}; path=transport-replace`,
@@ -586,7 +597,7 @@ export class StreamsStore {
   ): void {
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'FsmEstablishmentTimeline',
       connectionId,
       detail:
@@ -733,7 +744,7 @@ export class StreamsStore {
     // retry race still anchor t0 at the actual signaling boundary rather
     // than at the moment pc finally appears.
     if (!this._iceTimings[key]) {
-      this._iceTimings[key] = { t0: Date.now(), impl };
+      this._iceTimings[key] = { t0: this.clock.now(), impl };
     }
     const transport = impl === 'fsm' ? this.mediaTransportFsm : this.mediaTransport;
     const attach = () => {
@@ -746,7 +757,7 @@ export class StreamsStore {
       if (this._iceMonitorsAttached.has(key)) return;
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
-        setTimeout(attach, 100);
+        this.clock.setTimeout(attach, 100);
         return;
       }
       this._iceMonitorsAttached.add(key);
@@ -763,14 +774,14 @@ export class StreamsStore {
         // disconnect/recover cycles must not overwrite the initial timing.
         const t = this._iceTimings[key];
         if (t && t.tIceConnected === undefined && (state === 'connected' || state === 'completed')) {
-          t.tIceConnected = Date.now();
+          t.tIceConnected = this.clock.now();
         }
         if (t) t.finalIceState = state;
         // Maintain the invariant: an entry exists iff iceState is
         // currently 'disconnected'. The cleanup paths use a grace
         // period before treating 'disconnected' as terminal.
         if (state === 'disconnected') {
-          this._iceDisconnectedAt[pubKeyB64] = Date.now();
+          this._iceDisconnectedAt[pubKeyB64] = this.clock.now();
         } else {
           delete this._iceDisconnectedAt[pubKeyB64];
         }
@@ -803,7 +814,7 @@ export class StreamsStore {
           // metric refers to the initial gather only.
           const t = this._iceTimings[key];
           if (t && t.tGatherComplete === undefined) {
-            t.tGatherComplete = Date.now();
+            t.tGatherComplete = this.clock.now();
             t.relay = hasRelay;
           }
         }
@@ -851,7 +862,7 @@ export class StreamsStore {
     const t = this._iceTimings[key];
     if (!t || t.emitted) return;
     t.emitted = true;
-    const now = Date.now();
+    const now = this.clock.now();
     const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
     const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
     const connect = now - t.t0;
@@ -893,7 +904,7 @@ export class StreamsStore {
     const t = this._iceTimings[key];
     if (!t || t.emitted) return;
     t.emitted = true;
-    const now = Date.now();
+    const now = this.clock.now();
     const ice = t.tIceConnected !== undefined ? t.tIceConnected - t.t0 : -1;
     const gather = t.tGatherComplete !== undefined ? t.tGatherComplete - t.t0 : -1;
     const elapsed = now - t.t0;
@@ -921,13 +932,13 @@ export class StreamsStore {
     const attach = () => {
       const pc = transport.getRTCPeerConnection(pubKeyB64);
       if (!pc) {
-        setTimeout(attach, 100);
+        this.clock.setTimeout(attach, 100);
         return;
       }
       pc.addEventListener('iceconnectionstatechange', () => {
         const state = pc.iceConnectionState;
         if (state === 'disconnected') {
-          this._screenShareIceDisconnectedAt[pubKeyB64] = Date.now();
+          this._screenShareIceDisconnectedAt[pubKeyB64] = this.clock.now();
         } else {
           delete this._screenShareIceDisconnectedAt[pubKeyB64];
         }
@@ -1049,7 +1060,7 @@ export class StreamsStore {
     if (peerB64 && report.length > 0) {
       this.logger.logAgentEvent({
         agent: peerB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'SenderParams',
         detail: report.join(' | '),
       });
@@ -1076,7 +1087,7 @@ export class StreamsStore {
       if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'SupersededConnect',
           connectionId,
           detail: `superseded-by=${slotWrite.supersededBy}`,
@@ -1092,7 +1103,7 @@ export class StreamsStore {
     this._conversationParticipants.add(pubKeyB64);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'Connected',
       connectionId,
     });
@@ -1100,7 +1111,7 @@ export class StreamsStore {
     // Audio carrier flipped from signals → webrtc (impl-specific) for this peer.
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'CarrierSwitch',
       connectionId,
       detail: `signals->${impl}`,
@@ -1145,7 +1156,7 @@ export class StreamsStore {
 
     // After ICE settles, sample the selected candidate pair to detect
     // relay (TURN) usage so the UI can flag it.
-    setTimeout(async () => {
+    this.clock.setTimeout(async () => {
       try {
         const pc = transport.getRTCPeerConnection(pubKeyB64);
         if (!pc) return;
@@ -1223,7 +1234,7 @@ export class StreamsStore {
       if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'SupersededClose',
           connectionId,
           detail: `superseded-by=${slotWrite.supersededBy}`,
@@ -1243,7 +1254,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: impl === 'fsm' ? 'FsmClose' : 'SimplePeerClose',
       connectionId,
       detail: `cause=${cause}`,
@@ -1256,7 +1267,7 @@ export class StreamsStore {
       const reason = this._lastWebrtcExitReason.get(pubKeyB64) ?? 'unknown';
       this.logger.logAgentEvent({
         agent: pubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'CarrierSwitch',
         connectionId,
         detail: `${impl}->signals reason="${reason}"`,
@@ -1264,7 +1275,7 @@ export class StreamsStore {
     }
     this._lastWebrtcExitReason.delete(pubKeyB64);
     this._lastQualityBucket.delete(pubKeyB64);
-    this._lastDisconnectTime[pubKeyB64] = Date.now();
+    this._lastDisconnectTime[pubKeyB64] = this.clock.now();
 
     delete this._videoStreams[pubKeyB64];
 
@@ -1332,7 +1343,7 @@ export class StreamsStore {
     );
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'StreamReceived',
       connectionId,
     });
@@ -1377,7 +1388,7 @@ export class StreamsStore {
     console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'SimplePeerTrack',
       connectionId,
     });
@@ -1399,7 +1410,7 @@ export class StreamsStore {
     console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'TrackArrivedMuted',
     });
 
@@ -1413,12 +1424,12 @@ export class StreamsStore {
       });
     }
 
-    const unmuteTimeout = setTimeout(() => {
+    const unmuteTimeout = this.clock.setTimeout(() => {
       if (track.muted) {
         console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'TrackUnmuteTimeout',
         });
         this._setTrackReady(pubKeyB64, connectionId, track);
@@ -1426,11 +1437,11 @@ export class StreamsStore {
     }, 5000);
 
     track.onunmute = () => {
-      clearTimeout(unmuteTimeout);
+      this.clock.clearTimeout(unmuteTimeout);
       console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
       this.logger.logAgentEvent({
         agent: pubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'TrackUnmuted',
       });
       this._setTrackReady(pubKeyB64, connectionId, track);
@@ -1452,7 +1463,7 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerVideoOffSignal',
         });
       }
@@ -1464,7 +1475,7 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerVideoOnSignal',
         });
       }
@@ -1476,7 +1487,7 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerAudioOffSignal',
         });
       }
@@ -1488,21 +1499,21 @@ export class StreamsStore {
         });
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerAudioOnSignal',
         });
       }
       if (msg.message === 'change-audio-input') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerChangeAudioInput',
         });
       }
       if (msg.message === 'change-video-input') {
         this.logger.logAgentEvent({
           agent: pubKeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'PeerChangeVideoInput',
         });
       }
@@ -1534,7 +1545,7 @@ export class StreamsStore {
     if (currentOnError && currentOnError.connectionId !== connectionId) {
       this.logger.logAgentEvent({
         agent: pubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'SupersededError',
         connectionId,
         detail: `superseded-by=${currentOnError.connectionId}; err=${error.message || error}`,
@@ -1554,7 +1565,7 @@ export class StreamsStore {
     this._flushSdpAggregatesForConnection(connectionId);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: errLabel,
       connectionId,
       detail: error.message || String(error),
@@ -2010,8 +2021,8 @@ export class StreamsStore {
 
     // ping all agents that are not already connected to you every PING_INTERVAL milliseconds
     await streamsStore.pingAgents();
-    streamsStore.pingInterval = window.setInterval(async () => {
-      await streamsStore.pingAgents();
+    streamsStore.pingInterval = streamsStore.clock.setInterval(() => {
+      streamsStore.pingAgents().catch(() => {});
     }, PING_INTERVAL);
 
     // Page-lifecycle forensics: correlate disconnect() calls with whether
@@ -2036,10 +2047,10 @@ export class StreamsStore {
       document.removeEventListener('visibilitychange', onVisibility);
     };
 
-    setTimeout(async () => {
+    streamsStore.clock.setTimeout(async () => {
       const mediaDevices = await navigator.mediaDevices.enumerateDevices();
       streamsStore.mediaDevices.set(mediaDevices);
-    });
+    }, 0);
     return streamsStore;
   }
 
@@ -2060,7 +2071,7 @@ export class StreamsStore {
       this.roomClient.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
     }
 
-    if (this.pingInterval) window.clearInterval(this.pingInterval);
+    if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -2232,7 +2243,7 @@ export class StreamsStore {
     await this.roomStore.client.sendMessage(
       agentsToPing,
       'PingUi',
-      JSON.stringify({ t0: Date.now() }),
+      JSON.stringify({ t0: this.clock.now() }),
     );
 
     // Log our stream state
@@ -2241,7 +2252,7 @@ export class StreamsStore {
     // Cleanup stale pending accepts older than 20 seconds. Pending accepts
     // are now just connectionId reservations — the transport owns the peer
     // lifecycle, so dropping the entry is the entire teardown.
-    const now = Date.now();
+    const now = this.clock.now();
     const PENDING_ACCEPT_TTL = 20000;
     for (const [agent, accepts] of Object.entries(this._pendingAccepts)) {
       const remaining = accepts.filter(a => now - a.createdAt <= PENDING_ACCEPT_TTL);
@@ -2289,7 +2300,7 @@ export class StreamsStore {
    *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
    */
   private _emitPresenceForensics(): void {
-    const now = Date.now();
+    const now = this.clock.now();
 
     const known = get(this._knownAgents);
     const blocked = get(this.blockedAgents);
@@ -2370,7 +2381,7 @@ export class StreamsStore {
   async changeVideoInput(deviceId: string) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'ChangeMyVideoInput',
     });
     // CameraSource owns the device-switch path: it stores the new id,
@@ -2437,7 +2448,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyVideoOn',
     });
 
@@ -2569,7 +2580,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyVideoOff',
     });
     this.eventCallback({
@@ -2580,7 +2591,7 @@ export class StreamsStore {
   async changeAudioInput(deviceId: string) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'ChangeMyAudioInput',
     });
     console.log('Changing audio input to: ', deviceId);
@@ -2609,7 +2620,7 @@ export class StreamsStore {
   async audioOn(enabled: boolean) {
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyAudioOn',
     });
 
@@ -2689,7 +2700,7 @@ export class StreamsStore {
     console.log('### AUDIO OFF');
     this.logger.logAgentEvent({
       agent: encodeHashToBase64(this.roomClient.client.myPubKey),
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'MyAudioOff',
     });
 
@@ -2834,7 +2845,7 @@ export class StreamsStore {
       );
     this.disconnectFromPeerVideo(pubKey64);
     this.disconnectFromPeerScreen(pubKey64);
-    setTimeout(() => {
+    this.clock.setTimeout(() => {
       this._connectionStatuses.update(currentValue => {
         const connectionStatuses = currentValue;
         connectionStatuses[pubKey64] = {
@@ -3271,7 +3282,7 @@ export class StreamsStore {
       moduleId,
       active: true,
       payload: actualPayload,
-      updatedAt: Date.now(),
+      updatedAt: this.clock.now(),
     };
     this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
     await this._broadcastModuleState(envelope);
@@ -3284,7 +3295,7 @@ export class StreamsStore {
       moduleId,
       active: false,
       payload: '',
-      updatedAt: Date.now(),
+      updatedAt: this.clock.now(),
     };
     this._myModuleStates.update(s => {
       const next = { ...s };
@@ -3300,7 +3311,7 @@ export class StreamsStore {
       moduleId,
       active: true,
       payload,
-      updatedAt: Date.now(),
+      updatedAt: this.clock.now(),
     };
     this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
     await this._broadcastModuleState(envelope);
@@ -3368,7 +3379,7 @@ export class StreamsStore {
   lastSeenBucket(peerB64: AgentPubKeyB64): LastSeenBucket {
     const known = get(this._knownAgents)[peerB64];
     if (!known || typeof known.lastSeen !== 'number') return 'unknown';
-    const age = Date.now() - known.lastSeen;
+    const age = this.clock.now() - known.lastSeen;
     if (age < 15_000) return 'fresh';
     if (age < 30_000) return 'stale';
     return 'gone';
@@ -3399,7 +3410,7 @@ export class StreamsStore {
     if (webrtcAudioLive) return 'webrtc';
 
     const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
-    const signalsLive = !!lastRecv && Date.now() - lastRecv < 2000;
+    const signalsLive = !!lastRecv && this.clock.now() - lastRecv < 2000;
     if (signalsLive) return 'signals';
 
     // No flow. Peer intent comes BEFORE the negotiation check: a stale
@@ -3457,7 +3468,7 @@ export class StreamsStore {
     const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
     const filmstripLive =
       lastFilmstripMs !== undefined &&
-      Date.now() - lastFilmstripMs < FILMSTRIP_LIVE_WINDOW_MS;
+      this.clock.now() - lastFilmstripMs < FILMSTRIP_LIVE_WINDOW_MS;
     const video: PeerLinkSnapshot['video'] =
       conn?.video || filmstripLive
         ? 'live'
@@ -3488,7 +3499,7 @@ export class StreamsStore {
    */
   isPeerMediaLive(peerB64: AgentPubKeyB64): boolean {
     if (get(this._openConnections)[peerB64]?.connected) return true;
-    const now = Date.now();
+    const now = this.clock.now();
     const lastVoice = voiceController.peerLastRecvMs.get(peerB64);
     if (lastVoice !== undefined && now - lastVoice < MEDIA_LIVE_WINDOW_MS) {
       return true;
@@ -3544,7 +3555,7 @@ export class StreamsStore {
     // Anyone a *fresh* observer reports as present. We require the
     // observer's broadcast itself to be recent so that an observer who
     // dropped out doesn't keep ghost peers in the set forever.
-    const now = Date.now();
+    const now = this.clock.now();
     const observerStaleness = 2.8 * PING_INTERVAL;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
@@ -3579,7 +3590,7 @@ export class StreamsStore {
     const active = get(this._activeAgents);
     const blocked = new Set(get(this.blockedAgents));
     const out = new Set<AgentPubKeyB64>();
-    const now = Date.now();
+    const now = this.clock.now();
     const observerStaleness = 2.8 * PING_INTERVAL;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
@@ -3609,7 +3620,7 @@ export class StreamsStore {
    */
   observersSeeing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
-    const now = Date.now();
+    const now = this.clock.now();
     const observerStaleness = 2.8 * PING_INTERVAL;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
@@ -3633,7 +3644,7 @@ export class StreamsStore {
    */
   observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
-    const now = Date.now();
+    const now = this.clock.now();
     const observerStaleness = 2.8 * PING_INTERVAL;
     const others = get(this._othersConnectionStatuses);
     for (const observerKey of Object.keys(others)) {
@@ -3692,7 +3703,7 @@ export class StreamsStore {
       console.log(`toggleDisableWebrtc: re-enabled WebRTC for ${peerB64.slice(0, 8)}`);
       this.logger.logAgentEvent({
         agent: peerB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcEnable',
         detail: 'per-peer',
       });
@@ -3701,7 +3712,7 @@ export class StreamsStore {
       console.log(`toggleDisableWebrtc: disabled WebRTC for ${peerB64.slice(0, 8)}`);
       this.logger.logAgentEvent({
         agent: peerB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcDisable',
         detail: 'per-peer',
       });
@@ -3726,7 +3737,7 @@ export class StreamsStore {
     await this._syncConversationPayload({ webrtcImpl: impl });
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: impl === 'fsm' ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
       detail: `impl=${impl} (global)`,
     });
@@ -3773,7 +3784,7 @@ export class StreamsStore {
       window.localStorage.setItem('disableAllWebrtc', 'true');
       this.logger.logAgentEvent({
         agent: this.myPubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcDisable',
         detail: 'global',
       });
@@ -3797,7 +3808,7 @@ export class StreamsStore {
       window.localStorage.removeItem('disableAllWebrtc');
       this.logger.logAgentEvent({
         agent: this.myPubKeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'MyWebrtcEnable',
         detail: 'global',
       });
@@ -3808,7 +3819,7 @@ export class StreamsStore {
     });
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: mode === 'fsm' ? 'MyWebrtcEnable' : 'MyWebrtcDisable',
       detail: `impl=${mode} (global)`,
     });
@@ -3849,7 +3860,7 @@ export class StreamsStore {
     payload.peerImpl = nextPeerImpl;
     this.logger.logAgentEvent({
       agent: peerB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'WebrtcImplFlip',
       detail: `${prevOverride ?? 'inherit'}->${impl ?? 'inherit'}; reason=${reason}`,
     });
@@ -3914,7 +3925,7 @@ export class StreamsStore {
 
     this.logger.logAgentEvent({
       agent: peerB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: carrier === 'signals' ? 'MyWebrtcDisable' : 'MyWebrtcEnable',
       detail: `carrier=${previous}->${carrier} (per-peer)`,
     });
@@ -3969,7 +3980,7 @@ export class StreamsStore {
    * so both sides reconnect on the new impl in lockstep.
    */
   private async _maybeAutoFlipImpl(peerB64: AgentPubKeyB64): Promise<void> {
-    const now = Date.now();
+    const now = this.clock.now();
 
     // Carrier-switch hysteresis (§6.4): bias toward staying on a healthy webrtc
     // transport. Since §6.1 an FSM phase of `connected` means ICE+DTLS are up —
@@ -4623,7 +4634,7 @@ export class StreamsStore {
     const reconcileCount = this._reconcileAttemptCount[pubkey] || 0;
     const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
     const lastReconcile = this._lastReconcileTime[pubkey] || 0;
-    if (Date.now() - lastReconcile < cooldown) return;
+    if (this.clock.now() - lastReconcile < cooldown) return;
 
     if (!this.mainStream) return;
 
@@ -4634,7 +4645,7 @@ export class StreamsStore {
       );
       this.logger.logAgentEvent({
         agent: pubkey,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'ReconcileStream',
       });
       const conn = get(this._openConnections)[pubkey];
@@ -4670,7 +4681,7 @@ export class StreamsStore {
           for (const track of this.mainStream.getTracks()) {
             transport.addTrack(track, this.mainStream);
           }
-          this._lastReconcileTime[pubkey] = Date.now();
+          this._lastReconcileTime[pubkey] = this.clock.now();
           this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
         } catch (e: any) {
           console.warn('Failed to re-add stream during reconcile:', e.message);
@@ -4692,7 +4703,7 @@ export class StreamsStore {
       const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'audio');
       if (!perceived || perceived.muted) {
         needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileAudio' });
+        this.logger.logAgentEvent({ agent: pubkey, timestamp: this.clock.now(), event: 'ReconcileAudio' });
       }
     }
 
@@ -4701,7 +4712,7 @@ export class StreamsStore {
       const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'video');
       if (!perceived || perceived.muted) {
         needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: Date.now(), event: 'ReconcileVideo' });
+        this.logger.logAgentEvent({ agent: pubkey, timestamp: this.clock.now(), event: 'ReconcileVideo' });
       }
     }
 
@@ -4721,7 +4732,7 @@ export class StreamsStore {
       this._cloneStreamRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
     }
 
-    this._lastReconcileTime[pubkey] = Date.now();
+    this._lastReconcileTime[pubkey] = this.clock.now();
     this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
   }
 
@@ -4878,7 +4889,7 @@ export class StreamsStore {
   private _startDiagnosticAttempt(peerB64: AgentPubKeyB64, attempt: number): void {
     this._pendingDiagnosticRequests.update(curr => ({
       ...curr,
-      [peerB64]: { attempts: attempt, startedAt: Date.now() },
+      [peerB64]: { attempts: attempt, startedAt: this.clock.now() },
     }));
 
     const peerHash = decodeHashFromBase64(peerB64);
@@ -4888,7 +4899,7 @@ export class StreamsStore {
       );
     });
 
-    setTimeout(() => {
+    this.clock.setTimeout(() => {
       const stillPending = get(this._pendingDiagnosticRequests)[peerB64];
       // Response arrived (handler cleared pending) or user re-triggered
       // a fresh attempt that supersedes this one.
@@ -4979,7 +4990,7 @@ export class StreamsStore {
     merged.sort((a, b) => a.timestamp - b.timestamp);
 
     return {
-      generatedAt: Date.now(),
+      generatedAt: this.clock.now(),
       localAgent: this.myPubKeyB64,
       remoteAgent: pubKeyB64,
       hasRemoteLogs: !!remoteSnapshot,
@@ -5058,7 +5069,7 @@ export class StreamsStore {
     merged.sort((a, b) => a.timestamp - b.timestamp);
 
     return {
-      generatedAt: Date.now(),
+      generatedAt: this.clock.now(),
       localAgent: this.myPubKeyB64,
       respondingPeers,
       entries: merged,
@@ -5140,7 +5151,7 @@ export class StreamsStore {
       (lossPercent !== null ? ` loss=${lossPercent}%` : '');
     this.logger.logAgentEvent({
       agent: pubKeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'QualityBucketChange',
       detail,
     });
@@ -5161,7 +5172,7 @@ export class StreamsStore {
     sdpType: string,
   ): void {
     const key = `${agent}:${connectionId}:${sdpType}`;
-    const now = Date.now();
+    const now = this.clock.now();
     const entry = this._sdpDataAggregates.get(key);
     const withinWindow = entry && (now - entry.lastTimestamp) < StreamsStore.SDP_AGGREGATE_WINDOW_MS;
 
@@ -5270,7 +5281,7 @@ export class StreamsStore {
    * the periodic bookkeeping.
    */
   private _flushStaleSdpAggregates(): void {
-    const now = Date.now();
+    const now = this.clock.now();
     for (const [key, entry] of this._sdpDataAggregates) {
       if ((now - entry.lastTimestamp) >= StreamsStore.SDP_AGGREGATE_WINDOW_MS) {
         if (entry.count > 1) this._emitSdpAggregateSummary(entry);
@@ -5310,7 +5321,7 @@ export class StreamsStore {
    */
   private _checkAudibilityOutages(): void {
     const OUTAGE_THRESHOLD_MS = 30_000;
-    const now = Date.now();
+    const now = this.clock.now();
     const presence = this.globalPresenceSet();
     const others = get(this._othersConnectionStatuses);
 
@@ -5554,7 +5565,7 @@ export class StreamsStore {
         const nextSignal = this._signalQueue.shift()!;
         if (this.signalDelayMs > 0) {
           const delay = Math.floor(Math.random() * this.signalDelayMs);
-          await new Promise(resolve => setTimeout(resolve, delay));
+          await new Promise<void>(resolve => this.clock.setTimeout(resolve, delay));
         }
         try {
           await this._processSignal(nextSignal);
@@ -5711,7 +5722,7 @@ export class StreamsStore {
               this.screenShareOutTransport.ownsTransportRecovery,
             iceState,
             disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
-            now: Date.now(),
+            now: this.clock.now(),
             graceMs: ICE_DISCONNECTED_GRACE_MS,
           });
           if (decision.action === 'teardown') {
@@ -5731,7 +5742,7 @@ export class StreamsStore {
           console.log(`#### SENDING SCREEN SHARE INIT REQUEST ON PING FROM ${pubkeyB64.slice(0, 8)}`);
           const newConnectionId = uuidv4();
           this._pendingScreenShareInits[pubkeyB64] = [
-            { connectionId: newConnectionId, t0: Date.now() },
+            { connectionId: newConnectionId, t0: this.clock.now() },
           ];
           await this.roomClient.sendMessage(
             [signal.from_agent],
@@ -5755,7 +5766,7 @@ export class StreamsStore {
     console.log(`#### GOT LeaveUi FROM ${pubkeyB64.slice(0, 8)}`);
     this.logger.logAgentEvent({
       agent: pubkeyB64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'PeerLeave',
     });
     this._lastQualityBucket.delete(pubkeyB64);
@@ -5764,10 +5775,10 @@ export class StreamsStore {
     // because peer drops from the presence set on next tick.
     const outage = this._outageStates.get(pubkeyB64);
     if (outage?.emitted) {
-      const durationSec = Math.floor((Date.now() - outage.startedAt) / 1000);
+      const durationSec = Math.floor((this.clock.now() - outage.startedAt) / 1000);
       this.logger.logAgentEvent({
         agent: pubkeyB64,
-        timestamp: Date.now(),
+        timestamp: this.clock.now(),
         event: 'AudibilityOutageEnd',
         detail: `${durationSec}s; peer left`,
       });
@@ -5841,7 +5852,7 @@ export class StreamsStore {
    */
   async handlePongUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const now = Date.now();
+    const now = this.clock.now();
     // Pong timing is captured via agentPongMetadataLogs (with deduplication).
     // No need for a per-pong SimpleEvent entry — it just adds noise.
     // Update their connection statuses and the list of known agents
@@ -5864,7 +5875,7 @@ export class StreamsStore {
       // Smooth with EWMA so single-cycle jitter doesn't make the display
       // jump around. Alpha = 0.3 gives ~3-sample effective window.
       if (typeof metaData.data.pingT0 === 'number') {
-        const rtt = Date.now() - metaData.data.pingT0;
+        const rtt = this.clock.now() - metaData.data.pingT0;
         if (rtt >= 0 && rtt < 60000) {
           const prev = this._signalsRttEwma.get(pubkeyB64) ?? rtt;
           const next = Math.round(0.3 * rtt + 0.7 * prev);
@@ -5913,12 +5924,12 @@ export class StreamsStore {
         const maybeKnownAgent = knownAgents[pubkeyB64];
         if (maybeKnownAgent) {
           maybeKnownAgent.appVersion = metaData.data.appVersion;
-          maybeKnownAgent.lastSeen = Date.now();
+          maybeKnownAgent.lastSeen = this.clock.now();
         } else {
           knownAgents[pubkeyB64] = {
             pubkey: pubkeyB64,
             type: 'told',
-            lastSeen: Date.now(),
+            lastSeen: this.clock.now(),
             appVersion: metaData.data.appVersion,
           };
         }
@@ -6032,7 +6043,7 @@ export class StreamsStore {
         carrierOwnsRecovery: activeTransport.ownsTransportRecovery,
         iceState,
         disconnectedAt: this._iceDisconnectedAt[pubkeyB64],
-        now: Date.now(),
+        now: this.clock.now(),
         graceMs: ICE_DISCONNECTED_GRACE_MS,
       });
       if (existingConn && decision.action === 'teardown') {
@@ -6040,7 +6051,7 @@ export class StreamsStore {
         this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState} ${decision.reason}`);
         this.logger.logAgentEvent({
           agent: pubkeyB64,
-          timestamp: Date.now(),
+          timestamp: this.clock.now(),
           event: 'StaleCleanup',
           connectionId: existingConn.connectionId,
         });
@@ -6064,7 +6075,7 @@ export class StreamsStore {
           console.log('#### SENDING FIRST INIT REQUEST.');
           const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
           if (lastDisconnect) {
-            const gap = Date.now() - lastDisconnect;
+            const gap = this.clock.now() - lastDisconnect;
             this.logger.logCustomMessage(
               `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
             );
@@ -6228,7 +6239,7 @@ export class StreamsStore {
     const { connection_id, connection_type } = parsedInit.value;
     this.logger.logAgentEvent({
       agent: pubKey64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'InitRequest',
       connectionId: connection_id,
     });
@@ -6241,7 +6252,7 @@ export class StreamsStore {
     // Log retry gap if this is a reconnection attempt
     const lastDisconnect = this._lastDisconnectTime[pubKey64];
     if (lastDisconnect) {
-      const gap = Date.now() - lastDisconnect;
+      const gap = this.clock.now() - lastDisconnect;
       this.logger.logCustomMessage(
         `Retry gap [${pubKey64.slice(0, 8)}]: ${gap}ms since last disconnect`
       );
@@ -6268,7 +6279,7 @@ export class StreamsStore {
       // up the current mainStream so our tracks land in the answer.
       const accept: PendingAccept = {
         connectionId: connection_id,
-        createdAt: Date.now(),
+        createdAt: this.clock.now(),
       };
       const allPendingAccepts = this._pendingAccepts;
       const pendingAcceptsForAgent = allPendingAccepts[pubKey64];
@@ -6291,7 +6302,7 @@ export class StreamsStore {
     if (connection_type === 'screen') {
       const accept: PendingAccept = {
         connectionId: connection_id,
-        createdAt: Date.now(),
+        createdAt: this.clock.now(),
       };
       const allPendingScreenShareAccepts = this._pendingScreenShareAccepts;
       const pendingScreenShareAcceptsForAgent =
@@ -6327,7 +6338,7 @@ export class StreamsStore {
     const { connection_id, connection_type } = parsedAccept.value;
     this.logger.logAgentEvent({
       agent: pubKey64,
-      timestamp: Date.now(),
+      timestamp: this.clock.now(),
       event: 'InitAccept',
       connectionId: connection_id,
     });
@@ -6359,7 +6370,7 @@ export class StreamsStore {
             pi => pi.connectionId === connection_id
           );
           if (matchingInit) {
-            const rtt = Date.now() - matchingInit.t0;
+            const rtt = this.clock.now() - matchingInit.t0;
             this.logger.logCustomMessage(
               `Signaling RTT [${pubKey64.slice(0, 8)}]: ${rtt}ms`
             );
@@ -6422,7 +6433,7 @@ export class StreamsStore {
             );
             this.logger.logAgentEvent({
               agent: pubKey64,
-              timestamp: Date.now(),
+              timestamp: this.clock.now(),
               event: 'Superseded',
               connectionId: priorOpenForInitAccept.connectionId,
               detail: `superseded-by=${connection_id}; path=initiator`,
@@ -6441,7 +6452,7 @@ export class StreamsStore {
           this.updateConnectionStatus(pubKey64, { type: 'SdpExchange' });
 
           // SDP exchange timeout: if still not connected after 15s, clean up and retry
-          setTimeout(() => {
+          this.clock.setTimeout(() => {
             const currentStatus = get(this._connectionStatuses)[pubKey64];
             if (currentStatus && currentStatus.type === 'SdpExchange') {
               this.logger.logCustomMessage(
@@ -6684,7 +6695,7 @@ export class StreamsStore {
             );
             this.logger.logAgentEvent({
               agent: pubkeyB64,
-              timestamp: Date.now(),
+              timestamp: this.clock.now(),
               event: 'Superseded',
               connectionId: priorOpenForSdp.connectionId,
               detail: `superseded-by=${connection_id}; path=acceptor`,
@@ -6792,7 +6803,7 @@ export class StreamsStore {
       sessionId: this.logger.sessionId,
       agentEvents: flatEvents,
       customLogs: recentCustomLogs,
-      generatedAt: Date.now(),
+      generatedAt: this.clock.now(),
     };
 
     const payload = JSON.stringify(snapshot);

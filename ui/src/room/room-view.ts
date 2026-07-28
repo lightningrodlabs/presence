@@ -624,7 +624,7 @@ export class RoomView extends LitElement {
   }
 
   openCustomEventLogDialog() {
-    this._customLogTimestamp = Date.now();
+    this._customLogTimestamp = this.streamsStore.clock.now();
     this._showCustomLogDialog = true;
   }
 
@@ -2582,7 +2582,9 @@ export class RoomView extends LitElement {
 
       knownAgents = statuses.knownAgents;
       perceivedStreamInfo = statuses.perceivedStreamInfo;
-      const now = Date.now();
+      // statuses.lastUpdated is stamped from the store's clock, so the
+      // freshness comparison must read the same clock.
+      const now = this.streamsStore.clock.now();
       staleInfo = now - statuses.lastUpdated > 2.8 * PING_INTERVAL;
 
       switch (type) {

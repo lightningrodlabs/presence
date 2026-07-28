@@ -6,6 +6,7 @@ import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
 import type { MicAcquireResult } from '../../mic-source';
+import { Clock, systemClock } from '../../clock';
 
 /**
  * Voice module — sends audio to all peers in the room over Holochain remote
@@ -106,6 +107,9 @@ const PLAYBACK_RESET_DRIFT_MS = 400;
 class VoiceController {
   private store: StreamsStore | null = null;
 
+  /** Store clock while bound (see bind()); systemClock otherwise. */
+  private _clock: Clock = systemClock;
+
   // Send-side state (capture pipeline)
   private micHandle: MicAcquireResult | null = null;
   private encoder: any = null; // AudioEncoder
@@ -163,6 +167,11 @@ class VoiceController {
 
   bind(store: StreamsStore) {
     this.store = store;
+    // Presence-relevant stamps (peerLastRecvMs) share the store's clock so
+    // the freshness comparisons in streams-store read the same timebase.
+    // Wire-timestamp arithmetic (jitter/transit vs the sender's payload.ts)
+    // deliberately stays on wall-clock Date.now().
+    this._clock = store.clock;
   }
 
   unbind() {
@@ -181,6 +190,7 @@ class VoiceController {
     // StreamsStore.disconnect → MicSource.dispose.
     this.audioContext = null;
     this.store = null;
+    this._clock = systemClock;
   }
 
   // ----- arrival/leave squelch (synth, no assets) ------------------------
@@ -461,7 +471,7 @@ class VoiceController {
       return;
     }
 
-    this.peerLastRecvMs.set(agentPubKeyB64, Date.now());
+    this.peerLastRecvMs.set(agentPubKeyB64, this._clock.now());
 
     // --- jitter: EWMA of absolute deviation of packet inter-arrival from the
     // 20ms Opus nominal period. alpha = 0.1 for slow smoothing. Measured per

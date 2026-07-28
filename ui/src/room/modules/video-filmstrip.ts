@@ -4,6 +4,7 @@ import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
 import type { CameraAcquireResult } from '../../camera-source';
+import { Clock, systemClock } from '../../clock';
 
 /**
  * Video-filmstrip module — sends low-fps JPEG video frames over Holochain
@@ -187,6 +188,9 @@ export interface VideoSignalsStats {
 class FilmstripController {
   private store: StreamsStore | null = null;
 
+  /** Store clock while bound (see bind()); systemClock otherwise. */
+  private _clock: Clock = systemClock;
+
   // ----- send side -----
   private cameraHandle: CameraAcquireResult | null = null;
   /**
@@ -279,6 +283,11 @@ class FilmstripController {
 
   bind(store: StreamsStore) {
     this.store = store;
+    // Presence-relevant stamps (peerLastRecvMs) share the store's clock so
+    // the freshness comparisons in streams-store read the same timebase.
+    // Wire-timestamp arithmetic (jitter/transit vs the sender's payload.ts)
+    // and the display-hold TTL deliberately stay on wall-clock timers.
+    this._clock = store.clock;
   }
 
   unbind() {
@@ -298,6 +307,7 @@ class FilmstripController {
     this.peerLastRecvMs.clear();
     this.signalsVideoStats.clear();
     this.store = null;
+    this._clock = systemClock;
   }
 
   // ----- send side --------------------------------------------------------
@@ -565,7 +575,7 @@ class FilmstripController {
     }
 
     const now = Date.now();
-    this.peerLastRecvMs.set(agentPubKeyB64, now);
+    this.peerLastRecvMs.set(agentPubKeyB64, this._clock.now());
 
     // --- stats accounting ---
     // Loss: any seq gap > 0 implies missed clips.
