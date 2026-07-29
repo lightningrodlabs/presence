@@ -19,6 +19,7 @@ import {
   PRESENT_STALENESS_MS,
   type PresenceSoundState,
 } from './presence-policy';
+import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
@@ -3528,57 +3529,25 @@ export class StreamsStore {
    * this peer right now, and via what carrier?"
    */
   audioLinkFor(peerB64: AgentPubKeyB64): AudioLinkState {
-    if (get(this.blockedAgents).includes(peerB64)) return 'blocked';
-
-    const bucket = this.lastSeenBucket(peerB64);
-    if (bucket === 'gone' || bucket === 'unknown') return 'absent';
-
-    const conn = get(this._openConnections)[peerB64];
-    const status = get(this._connectionStatuses)[peerB64];
-
-    // Active flow takes precedence over everything else: if audio is
-    // actually arriving, the link is working regardless of any stale
-    // intent or status flags.
-    const webrtcAudioLive =
-      !!conn?.connected &&
-      !!conn?.audio &&
-      (this._staleCycles[peerB64]?.audio ?? 0) < 2;
-    if (webrtcAudioLive) return 'webrtc';
-
-    // Same media-flowing window as isMediaLive / computePresentPeers —
-    // one window per predicate. (Was a bespoke 2000ms literal.)
-    const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
-    const signalsLive =
-      lastRecv !== undefined &&
-      this.clock.now() - lastRecv < MEDIA_LIVE_WINDOW_MS;
-    if (signalsLive) return 'signals';
-
-    // No flow. Peer intent comes BEFORE the negotiation check: a stale
-    // ConnectionStatus stuck in InitSent/AcceptSent (e.g. left over from
-    // before webrtc was globally disabled) would otherwise mask the fact
-    // that the peer is intentionally muted. Muted is the more accurate
-    // answer when both could apply.
+    // The decision — including the contract that observed media flow
+    // beats the signals-reachability veto — lives in
+    // `peer-link-policy.ts:decideAudioLink`. This method only gathers
+    // the snapshot.
     const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
-    if (peerConv) {
-      const payload = parseConversationPayload(peerConv);
-      if (payload?.micMuted) return 'muted';
-    }
-
-    // Genuine in-progress negotiation (no flow, peer not muted).
-    if (status) {
-      switch (status.type) {
-        case 'AwaitingInit':
-        case 'InitSent':
-        case 'AcceptSent':
-        case 'SdpExchange':
-          return 'negotiating';
-        default:
-          break;
-      }
-    }
-
-    // Reachable, not muted, no flow and not negotiating — broken.
-    return 'down';
+    const payload = peerConv ? parseConversationPayload(peerConv) : null;
+    return decideAudioLink({
+      blocked: get(this.blockedAgents).includes(peerB64),
+      reachableBucket: this.lastSeenBucket(peerB64),
+      slot: get(this._openConnections)[peerB64],
+      audioStaleCycles: this._staleCycles[peerB64]?.audio ?? 0,
+      lastVoiceMs: voiceController.peerLastRecvMs.get(peerB64),
+      now: this.clock.now(),
+      // Same media-flowing window as isMediaLive / computePresentPeers —
+      // one window per predicate. (Was a bespoke 2000ms literal.)
+      mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+      peerMicMuted: !!payload?.micMuted,
+      statusType: get(this._connectionStatuses)[peerB64]?.type,
+    });
   }
 
   /**
@@ -3586,42 +3555,18 @@ export class StreamsStore {
    * can render "how I see each other agent."
    */
   peerLinkFor(peerB64: AgentPubKeyB64): PeerLinkSnapshot {
-    const conn = get(this._openConnections)[peerB64];
-    const audioLink = this.audioLinkFor(peerB64);
-
-    let carrier: PeerLinkSnapshot['carrier'];
-    if (audioLink === 'webrtc') carrier = 'webrtc';
-    else if (audioLink === 'signals') carrier = 'signals';
-    else if (conn?.connected) carrier = 'webrtc';
-    else carrier = 'none';
-
-    let audio: PeerLinkSnapshot['audio'];
-    if (audioLink === 'webrtc' || audioLink === 'signals') audio = 'live';
-    else if (audioLink === 'muted') audio = 'muted';
-    else if (conn?.connected && conn.audio) audio = 'stale';
-    else audio = 'off';
-
-    // Video is 'live' if WebRTC has an active video track OR we've
-    // received a filmstrip clip from this peer within the media-flowing
-    // window (signals carrier carrying low-bandwidth video).
+    // Field semantics (carrier vs the carrierFor authority, the 'stale'
+    // audio arm) are documented on `buildPeerLinkSnapshot`
+    // (`peer-link-policy.ts`); this method only gathers the snapshot.
     const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
-    const filmstripLive =
-      lastFilmstripMs !== undefined &&
-      this.clock.now() - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS;
-    const video: PeerLinkSnapshot['video'] =
-      conn?.video || filmstripLive
-        ? 'live'
-        : conn?.videoMuted
-          ? 'muted'
-          : 'off';
-
-    return {
-      audioLink,
-      carrier,
-      audio,
-      video,
+    return buildPeerLinkSnapshot({
+      audioLink: this.audioLinkFor(peerB64),
+      slot: get(this._openConnections)[peerB64],
+      filmstripLive:
+        lastFilmstripMs !== undefined &&
+        this.clock.now() - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS,
       lastSeen: this.lastSeenBucket(peerB64),
-    };
+    });
   }
 
   /**
@@ -3713,7 +3658,7 @@ export class StreamsStore {
    * vanishing in lockstep with everyone else's link failure.
    *
    * Whether anyone has a *working* link is exposed separately via
-   * `observersConnectedTo()` so the placeholder can label the observer
+   * `observersHearing()` so the placeholder can label the observer
    * list accurately.
    */
   phantomAgents(): AgentPubKeyB64[] {
@@ -3770,12 +3715,19 @@ export class StreamsStore {
   }
 
   /**
-   * Subset of `observersSeeing` who additionally have a working or
-   * in-progress audio link to the phantom. Used to pick the observer-list
-   * label: "connected via" when this is non-empty, "last seen by"
-   * otherwise.
+   * Subset of `observersSeeing` who report actually hearing the phantom
+   * (audioLink 'webrtc' or 'signals'). Used to pick the observer-list
+   * label: "heard by" when this is non-empty, "last seen by" otherwise.
+   *
+   * Was `observersConnectedTo`, which also counted 'negotiating' links
+   * and labeled the result "connected via" — presenting an in-flight
+   * handshake, or signals reachability, as "connected". Phase 4 item 4:
+   * that word is reserved for ICE + DTLS up; what this list can honestly
+   * claim about a phantom is audibility. Declared behavior change: an
+   * observer whose only link to the phantom is a pending negotiation now
+   * falls back to the "last seen by" framing.
    */
-  observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
+  observersHearing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
     const now = this.clock.now();
     const observerStaleness = OBSERVER_FRESHNESS_MS;
@@ -3786,11 +3738,7 @@ export class StreamsStore {
       if (now - obs.lastUpdated > observerStaleness) continue;
       const snap = obs.peerLinks[peerB64];
       if (!snap) continue;
-      if (
-        snap.audioLink === 'webrtc' ||
-        snap.audioLink === 'signals' ||
-        snap.audioLink === 'negotiating'
-      ) {
+      if (snap.audioLink === 'webrtc' || snap.audioLink === 'signals') {
         out.push(observerKey);
       }
     }
