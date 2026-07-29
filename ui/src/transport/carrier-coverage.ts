@@ -34,7 +34,7 @@
  * (`media-event-policy.ts:routeTransportPhase`) and nothing flips the
  * slot's `connected` back to `false`, so a peer stays excluded from
  * `_signalsTargets` while no media flows — for up to the transport's
- * recovery window (the 15s SimplePeer ICE grace; the FSM's full reconnect
+ * recovery window (the FSM's disconnected-grace plus full-reconnect
  * budget). This is accepted, not accidental: flipping `connected` on every
  * transient ICE blip would spin the signals carrier up and down on links
  * that recover in hundreds of milliseconds, and each spin-up is an audio

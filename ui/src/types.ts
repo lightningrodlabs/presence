@@ -53,17 +53,6 @@ export type PendingInit = {
   t0: number;
 };
 
-export type PendingAccept = {
-  /**
-   * UUID to identify the connection
-   */
-  connectionId: ConnectionId;
-  /**
-   * Timestamp when this PendingAccept was created, used for cleanup of stale entries.
-   */
-  createdAt: number;
-};
-
 export type StreamInfo = {
   active: boolean;
 };
@@ -426,14 +415,6 @@ export type DescendentRoom = {
 export type InitPayload = {
   connection_id: string;
   connection_type?: string;
-};
-
-/**
- * Typed payload for SdpData messages
- */
-export type SdpPayload = {
-  connection_id: string;
-  data: string;
 };
 
 export type RoomSignal =

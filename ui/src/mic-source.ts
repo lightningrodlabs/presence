@@ -75,7 +75,7 @@ export interface MicSourceBindings {
   ) => void;
   /**
    * Called after `setMuted` flips the mute flag. Lets the store fan out
-   * the enabled/disabled state to `mainStreamClones` — see simple-peer
+   * the enabled/disabled state to `mainStreamClones` — see the (retired) simple-peer
    * issue #606 for why clones need their own enable/disable passes.
    */
   onMutedChange: (muted: boolean) => void;

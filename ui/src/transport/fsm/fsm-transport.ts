@@ -2,7 +2,9 @@
  * FsmTransport — wraps the hand-rolled WebRTC ConnectionManager (Phase 2)
  * behind the PeerTransport interface.
  *
- * Differences from SimplePeerTransport that the wrapper papers over:
+ * Differences from the (retired, Phase 3) SimplePeerTransport that the
+ * wrapper papers over — kept because they document why the interface is
+ * shaped the way it is:
  *   - The FSM allocates its own per-peer connectionId at ensureConnection
  *     time. The connectionId hint passed by the application is ignored;
  *     callers must use the returned ConnectionId.
@@ -269,7 +271,7 @@ export class FsmTransport implements PeerTransport {
    * session. Use when the data channel is stuck but the media transport is
    * healthy. Returns true if a live connection received the call. The FSM also
    * does this automatically via its data-channel watchdog; this is the manual
-   * escape valve. FSM transport only (SimplePeer has no equivalent).
+   * escape valve.
    */
   recreateDataChannel(peer: AgentPubKeyB64): boolean {
     return this._manager.recreateDataChannel(peer);
@@ -397,7 +399,7 @@ export class FsmTransport implements PeerTransport {
   }
 
   /**
-   * Escape hatch matching SimplePeerTransport.getRTCPeerConnection — exposes
+   * Escape hatch — exposes
    * the underlying RTCPeerConnection for ICE diagnostics, stats poll, and
    * per-peer track recovery. This is the bridge that lets the existing
    * streams-store diagnostic and recovery code work for FSM peers

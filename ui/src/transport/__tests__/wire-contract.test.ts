@@ -6,6 +6,7 @@ import {
   WIRE_CONTRACT,
   WIRE_CAPS,
   CAP_SDP_FSM,
+  CAP_SDP_FSM_SCREEN,
   isSignalMsgType,
   emittableSignalTypes,
   wireContractSnapshot,
@@ -81,15 +82,24 @@ describe('emittableSignalTypes — the emission rule', () => {
     expect(emittableSignalTypes(new Set())).toEqual(baseline);
   });
 
-  it('the baseline set excludes SdpFsm and nothing else among emitted types', () => {
+  it('the baseline set excludes exactly the capability-gated types', () => {
     const emitted = SIGNAL_MSG_TYPES.filter(t => WIRE_CONTRACT[t].emits);
-    expect(emitted.filter(t => !baseline.includes(t))).toEqual(['SdpFsm']);
+    expect(emitted.filter(t => !baseline.includes(t))).toEqual([
+      'SdpFsm',
+      'SdpFsmScreen',
+    ]);
   });
 
   it('declaring sdp-fsm adds exactly SdpFsm', () => {
     const withFsm = emittableSignalTypes(new Set([CAP_SDP_FSM]));
     expect(withFsm).toContain('SdpFsm');
     expect(withFsm.filter(t => t !== 'SdpFsm')).toEqual(baseline);
+  });
+
+  it('declaring sdp-fsm-screen adds exactly SdpFsmScreen', () => {
+    const withScreen = emittableSignalTypes(new Set([CAP_SDP_FSM_SCREEN]));
+    expect(withScreen).toContain('SdpFsmScreen');
+    expect(withScreen.filter(t => t !== 'SdpFsmScreen')).toEqual(baseline);
   });
 
   it('unknown capability strings gate nothing on', () => {

@@ -46,27 +46,14 @@ describe('routeTransportPhase — every ConnectionPhase is routed', () => {
     expect(table.map(([phase]) => phase).sort()).toEqual([...ALL_PHASES].sort());
   });
 
-  it.each(table)('fsm/%s routes as expected', (phase, expected) => {
+  it.each(table)('%s routes as expected', (phase, expected) => {
     expect(
       routeTransportPhase({
         phase,
-        impl: 'fsm',
         connectionId: 'c1',
         openConnectionId: undefined,
       }),
     ).toEqual(expected);
-  });
-
-  it.each(ALL_PHASES)('simplepeer/%s never returns an unhandled route', phase => {
-    const route = routeTransportPhase({
-      phase,
-      impl: 'simplepeer',
-      connectionId: 'c1',
-      openConnectionId: undefined,
-    });
-    expect(['start-ice-monitor', 'media-connected', 'media-closed', 'ignore']).toContain(
-      route.handler,
-    );
   });
 });
 
@@ -80,44 +67,37 @@ describe('routeTransportPhase — the carrier-coverage invariant', () => {
   const TERMINAL: ConnectionPhase[] = ['failed', 'idle', 'closed'];
 
   it.each(TERMINAL)('%s clears the connection slot', phase => {
-    for (const impl of ['fsm', 'simplepeer'] as const) {
-      expect(
-        routeTransportPhase({
-          phase,
-          impl,
-          connectionId: 'c1',
-          openConnectionId: 'c1',
-        }).handler,
-      ).toBe('media-closed');
-    }
+    expect(
+      routeTransportPhase({
+        phase,
+        connectionId: 'c1',
+        openConnectionId: 'c1',
+      }).handler,
+    ).toBe('media-closed');
   });
 
   const TRANSIENT: ConnectionPhase[] = ['reconnecting', 'disconnected', 'connecting'];
 
   it.each(TRANSIENT)('%s does not clear the slot — the transport owns recovery', phase => {
-    for (const impl of ['fsm', 'simplepeer'] as const) {
-      expect(
-        routeTransportPhase({
-          phase,
-          impl,
-          connectionId: 'c1',
-          openConnectionId: 'c1',
-        }).handler,
-      ).toBe('ignore');
-    }
+    expect(
+      routeTransportPhase({
+        phase,
+        connectionId: 'c1',
+        openConnectionId: 'c1',
+      }).handler,
+    ).toBe('ignore');
   });
 });
 
 describe('routeTransportPhase — slot identity', () => {
   const signaling = (
-    impl: 'simplepeer' | 'fsm',
     connectionId: string,
     openConnectionId: string | undefined,
   ) =>
-    routeTransportPhase({ phase: 'signaling', impl, connectionId, openConnectionId });
+    routeTransportPhase({ phase: 'signaling', connectionId, openConnectionId });
 
   it('installs a slot for an FSM peer that has none (acceptor path)', () => {
-    expect(signaling('fsm', 'new', undefined)).toEqual({
+    expect(signaling('new', undefined)).toEqual({
       handler: 'start-ice-monitor',
       slot: { action: 'install' },
       reason: 'signaling-started',
@@ -125,7 +105,7 @@ describe('routeTransportPhase — slot identity', () => {
   });
 
   it('keeps a slot that already names this connection', () => {
-    expect(signaling('fsm', 'same', 'same')).toEqual({
+    expect(signaling('same', 'same')).toEqual({
       handler: 'start-ice-monitor',
       slot: { action: 'keep' },
       reason: 'signaling-started',
@@ -143,7 +123,7 @@ describe('routeTransportPhase — slot identity', () => {
    * pane over a dead link, permanently excluded from `_signalsTargets`.
    */
   it('adopts the live connection when the slot names a replaced one', () => {
-    expect(signaling('fsm', 'new', 'stale')).toEqual({
+    expect(signaling('new', 'stale')).toEqual({
       handler: 'start-ice-monitor',
       slot: { action: 'adopt', supersedes: 'stale' },
       reason: 'signaling-started',
@@ -151,24 +131,12 @@ describe('routeTransportPhase — slot identity', () => {
   });
 
   it('carries the superseded id so the caller can retire its per-connection state', () => {
-    const route = signaling('fsm', 'new', 'stale');
+    const route = signaling('new', 'stale');
     expect(route.handler).toBe('start-ice-monitor');
     if (route.handler !== 'start-ice-monitor') throw new Error('unreachable');
     expect(route.slot).toEqual({ action: 'adopt', supersedes: 'stale' });
   });
 
-  it('never touches the slot for SimplePeer — the store owns both its paths', () => {
-    // SimplePeer honours the connectionId the store hands it, so a mismatch
-    // here would mean the store superseding itself; adopting would fight the
-    // supersede semantics handleSdpData / handleInitAccept rely on.
-    for (const open of [undefined, 'same', 'stale']) {
-      expect(signaling('simplepeer', 'same', open)).toEqual({
-        handler: 'start-ice-monitor',
-        slot: { action: 'keep' },
-        reason: 'signaling-started',
-      });
-    }
-  });
 });
 
 describe('decideSlotWrite — the slot transition, shared by store and harness', () => {

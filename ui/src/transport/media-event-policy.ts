@@ -25,8 +25,6 @@ import type { ConnectionPhase } from './types';
 export type TransportPhaseInputs = {
   /** The phase the transport just entered. */
   phase: ConnectionPhase;
-  /** Which media transport emitted the event. */
-  impl: 'simplepeer' | 'fsm';
   /** The connectionId this event belongs to. */
   connectionId: string;
   /**
@@ -44,8 +42,8 @@ export type TransportPhaseInputs = {
  * - `install` — no slot exists. The FSM acceptor path builds a connection
  *   from an incoming offer without streams-store knowing in advance, so
  *   the slot has to be created here for later connect/stream events to
- *   have something to mutate. The SimplePeer acceptor and both initiator
- *   paths create it themselves in `handleSdpData` / `handleInitAccept`.
+ *   have something to mutate. The initiator path creates it itself in
+ *   `handleInitAccept` (video) / `_ensureOutgoingScreenShare` (screen).
  *
  * - `adopt` — a slot exists but holds a *different* connectionId, so the
  *   FSM behind it is gone. `ConnectionManager` replaces an FSM in place on
@@ -66,8 +64,7 @@ export type TransportPhaseInputs = {
  *   peer and destroys the old one synchronously before creating the new
  *   one, so the newest `signaling` event is authoritative by construction.
  *
- * - `keep` — the slot already matches, or this is SimplePeer, whose slot
- *   the store owns.
+ * - `keep` — the slot already matches.
  */
 export type SlotAction =
   | { action: 'install' }
@@ -84,10 +81,6 @@ export type TransportPhaseRoute =
   | { handler: 'ignore'; reason: 'establishing' | 'transport-owns-recovery' };
 
 function slotActionFor(input: TransportPhaseInputs): SlotAction {
-  // SimplePeer honours the connectionId the store hands it, and the store
-  // writes the slot itself on both its paths. Nothing to do here, and
-  // adopting would fight the supersede semantics those paths rely on.
-  if (input.impl !== 'fsm') return { action: 'keep' };
   if (input.openConnectionId === undefined) return { action: 'install' };
   if (input.openConnectionId === input.connectionId) return { action: 'keep' };
   return { action: 'adopt', supersedes: input.openConnectionId };

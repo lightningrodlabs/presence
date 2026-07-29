@@ -21,14 +21,19 @@
       "requiresCap": null
     },
     "SdpData": {
-      "emits": true,
-      "parses": true,
+      "emits": false,
+      "parses": false,
       "requiresCap": null
     },
     "SdpFsm": {
       "emits": true,
       "parses": true,
       "requiresCap": "sdp-fsm"
+    },
+    "SdpFsmScreen": {
+      "emits": true,
+      "parses": true,
+      "requiresCap": "sdp-fsm-screen"
     },
     "LeaveUi": {
       "emits": true,
@@ -57,7 +62,8 @@
     }
   },
   "caps": [
-    "sdp-fsm"
+    "sdp-fsm",
+    "sdp-fsm-screen"
   ],
   "conversationPayload": {
     "writes": [
