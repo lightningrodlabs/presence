@@ -1888,6 +1888,26 @@ export class StreamsStore {
     );
 
     const store = this._screenShareStore(initiator);
+    // Supersede guard (review finding F1 of the Phase 3 branch), mirroring
+    // _handleMediaError: a stale error from a replaced FSM — the same
+    // replace-without-event route the adopt handling closes for phase
+    // events — must not clear the slot a newer connection owns, and on
+    // the incoming side must not delete `_screenShareStreams[peer]` out
+    // from under a live share's paint. Return without closing anything:
+    // the erroring FSM is already gone (replaced), and closing by peer
+    // key would tear down the live connection.
+    const currentSlot = get(store)[pubKeyB64];
+    if (currentSlot && currentSlot.connectionId !== connectionId) {
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: this.clock.now(),
+        event: 'SupersededError',
+        connectionId,
+        detail: `superseded-by=${currentSlot.connectionId}; err=${error.message || error}; path=screen`,
+      });
+      return;
+    }
+
     store.update(currentValue => {
       delete currentValue[pubKeyB64];
       return currentValue;
@@ -4666,22 +4686,17 @@ export class StreamsStore {
       });
       const conn = get(this._openConnections)[pubkey];
       if (conn) {
-        // Repair on the transport that actually owns this peer's
-        // connection. This was `this.mediaTransport` — the bare SimplePeer
-        // transport — whose `addTrack` iterates its *own* connection map.
-        // For a peer on the FSM, which is the default carrier, that map
-        // does not contain them, so the repair was a silent no-op that
-        // still consumed the cooldown and the attempt budget
-        // (MAINTAINABILITY_ASSESSMENT.md §3.12).
-        //
-        // `_activeMediaTransportFor` is the same authority Case 2
-        // (`_tryReplaceTrackRecovery`) already uses, so the two halves of
-        // this recovery family now agree. It is chosen over
-        // `_allMediaTransports()` because addressing the owning transport
-        // is strictly narrower, and over per-peer `pc.addTrack` because
-        // that would need a renegotiation contract the two carriers do not
-        // share — SimplePeer owns its own negotiation, and bypassing its
-        // `addTrack` is not equivalent. Retiring that asymmetry is Phase 4.
+        // Repair on the media transport, but only when it actually holds
+        // this peer (the hasConnection guard below). History: before
+        // Phase 3 this addressed the bare SimplePeer transport, whose
+        // addTrack iterates its own connection map — a silent no-op for
+        // FSM-carried peers that still consumed the cooldown and attempt
+        // budget (MAINTAINABILITY_ASSESSMENT.md §3.12). With one
+        // transport since Phase 3, the wrong-map failure mode is gone;
+        // the guard remains because a slot can outlive transport state.
+        // Transport-level addTrack (updateLocalStream) is chosen over
+        // per-peer pc.addTrack so the FSM's own negotiation stays in
+        // charge of the renegotiation.
         const transport = this.mediaTransport;
         if (!transport.hasConnection(pubkey)) {
           // The slot has outlived the transport's own state; there is

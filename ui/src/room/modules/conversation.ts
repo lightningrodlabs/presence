@@ -116,8 +116,7 @@ export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
  * direction is the safe one — the baseline types interoperate with every
  * released version.
  *
- * Constrains `auto-flip-policy.ts:resolveWebrtcImpl` rule 0 (via
- * `streams-store.ts:webrtcImplFor`) and
+ * Constrains `streams-store.ts:webrtcAvailableFor` / `_peerCaps` and
  * `wire-contract.ts:emittableSignalTypes`.
  */
 export function conversationPayloadCaps(
@@ -293,10 +292,12 @@ const conversationModule: ModuleDefinition = {
    * Tear down the WebRTC connection when the peer has disabled WebRTC
    * for this link — either globally (`webrtcDisabled`) or for us
    * specifically (`disableWebrtcWith` includes our pubkey). Without
-   * this, recovery would depend on simple-peer's `close` event
-   * propagating, which can lag or be missed, leaving `_openConnections`
-   * populated and `_signalsTargets` excluding the peer — so audio would
-   * not route over signals to them.
+   * this, recovery would wait on the transport's own `closed` event for
+   * a connection the peer has stopped answering, which can lag (the
+   * FSM's reconnect/grace budget) — leaving `_openConnections` populated
+   * and `_signalsTargets` excluding the peer, so audio would not route
+   * over signals to them. The payload change IS the authoritative
+   * signal; act on it directly.
    */
   onModulePayloadChange(
     agentPubKeyB64: string,
