@@ -6,10 +6,11 @@ import { filmstripController } from '../modules/video-filmstrip';
 /**
  * Small semi-transparent panel showing per-peer carrier stats.
  *
- * Reads from whichever carrier is active for this peer:
- *   - WebRTC connected → streamsStore.webrtcStats (RTT from
+ * Reads `streamsStore.statsFor(peer)` — the one carrier+stats authority
+ * (`transport/carrier-stats-policy.ts`):
+ *   - carrier 'webrtc' (ICE + DTLS up) → webrtcStats (RTT from
  *     remote-inbound-rtp, jitter + loss from inbound-rtp)
- *   - No WebRTC → streamsStore.signalsStats (RTT from ping-pong echo,
+ *   - carrier 'signals' → signalsStats (RTT from ping-pong echo,
  *     jitter from voice frame inter-arrival, loss from seq gaps)
  *
  * Polls at 1Hz via setInterval — stats update at most once a second
@@ -135,22 +136,20 @@ export class PeerStatsPanel extends LitElement {
   private _tick = () => {
     if (!this.streamsStore) return;
 
-    const isWebrtc = this.streamsStore.hasWebrtcConnection(this.agentPubKeyB64);
-    const carrier: 'webrtc' | 'signals' = isWebrtc ? 'webrtc' : 'signals';
-    const stats = isWebrtc
-      ? this.streamsStore.webrtcStats.get(this.agentPubKeyB64)
-      : this.streamsStore.signalsStats.get(this.agentPubKeyB64);
-
-    const rtt = stats?.rttMs ?? null;
-    const jitter = stats?.jitterMs ?? null;
-    const loss = stats?.lossPercent ?? null;
+    // Carrier + numbers come from the one authority (Phase 4 item 2):
+    // statsFor keys the carrier on `connected` (ICE + DTLS up, via
+    // carrierFor) — the panel used to key on "any _openConnections entry
+    // exists", which claimed webrtc for half-open negotiations while
+    // signals carried the audio.
+    const peerStats = this.streamsStore.statsFor(this.agentPubKeyB64);
+    const carrier = peerStats.carrier;
+    const rtt = peerStats.rttMs;
+    const jitter = peerStats.jitterMs;
+    const loss = peerStats.lossPercent;
 
     // Flow detection: is audio actually moving in each direction right now?
-    // The stats panel historically inferred carrier from _openConnections
-    // presence alone, which can lie — pong RTT populates signalsStats even
-    // when the local voice encoder is idle, and a lingering _openConnections
-    // entry can show "webrtc" while media has stopped flowing. The flow
-    // glyph surfaces the truth: recent frames in/out, per direction.
+    // Carrier says who OWNS the link; the flow glyph surfaces whether
+    // frames are actually moving — recent frames in/out, per direction.
     const FLOW_WINDOW_MS = 2000;
     // signalsLastRecv/-Sent are stamped from the store clock, so the
     // freshness comparison must read the same clock (PR #4 F2).

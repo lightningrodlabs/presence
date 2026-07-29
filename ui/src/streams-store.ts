@@ -22,7 +22,9 @@ import {
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { TransportEvent } from './transport';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
-import { computeSignalsTargets } from './transport/carrier-coverage';
+import { carrierFor, computeSignalsTargets } from './transport/carrier-coverage';
+import { statsForPeer } from './transport/carrier-stats-policy';
+import type { PeerStats } from './transport/carrier-stats-policy';
 import {
   decideStaleConnectionCleanup,
   staleTeardownPlan,
@@ -4149,9 +4151,19 @@ export class StreamsStore {
     return voiceController.peerLastRecvMs;
   }
 
-  /** True iff a WebRTC video connection currently exists to this peer. */
-  hasWebrtcConnection(pubKeyB64: string): boolean {
-    return !!get(this._openConnections)[pubKeyB64];
+  /**
+   * The one per-peer stats answer: which carrier owns the link right now
+   * (the `carrierFor` authority — ICE + DTLS up, never "an attempt
+   * exists") and that carrier's rtt/jitter/loss. Decision in
+   * `transport/carrier-stats-policy.ts`; the stats panel renders this
+   * instead of branching over the raw maps by hand (Phase 4 item 2).
+   */
+  statsFor(pubKeyB64: AgentPubKeyB64): PeerStats {
+    return statsForPeer({
+      slot: get(this._openConnections)[pubKeyB64],
+      webrtcStats: this.webrtcStats.get(pubKeyB64),
+      signalsStats: this.signalsStats.get(pubKeyB64),
+    });
   }
 
   /** Current OpenConnectionInfo for a peer, or undefined. */
@@ -5898,9 +5910,10 @@ export class StreamsStore {
           this.signalsStats.set(pubkeyB64, existing);
           // Only evaluate bucket on the signals path if signals is the
           // active carrier for this peer — otherwise the webrtc poll is
-          // the source of truth and will emit if bucket changes.
+          // the source of truth and will emit if bucket changes. Same
+          // authority as statsFor: carrierFor, never a hand-rolled read.
           const openConn = get(this._openConnections)[pubkeyB64];
-          if (!openConn?.connected) {
+          if (carrierFor(openConn).carrier === 'signals') {
             this._maybeEmitQualityChange(
               pubkeyB64,
               'signals',
