@@ -20,7 +20,7 @@ import {
   type PresenceSoundState,
 } from './presence-policy';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
-import type { TransportEvent, PeerTransport } from './transport';
+import type { TransportEvent } from './transport';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
 import { computeSignalsTargets } from './transport/carrier-coverage';
 import {
