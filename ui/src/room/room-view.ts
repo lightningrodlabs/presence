@@ -930,30 +930,23 @@ export class RoomView extends LitElement {
   }
 
   /**
-   * 3-way carrier selector. Collapses the previous "Disable all WebRTC" +
-   * "Use FSM transport" toggles into a single control. Symmetric union
-   * still applies on the wire — picking 'fsm' here makes any peer with us
-   * also use FSM.
+   * 2-way carrier selector. Since Phase 3 deleted SimplePeer there is one
+   * WebRTC implementation, so the choice is the honest pair: WebRTC on,
+   * or signals-only.
    */
   private _renderCarrierSelector() {
     const mode = this.streamsStore.carrierMode();
     const options: Array<{
-      value: 'simplepeer' | 'fsm' | 'signals';
+      value: 'webrtc' | 'signals';
       label: string;
       color: string;
       title: string;
     }> = [
       {
-        value: 'fsm',
-        label: 'WebRTC (FSM)',
+        value: 'webrtc',
+        label: 'WebRTC',
         color: '#7adc7a',
-        title: 'WebRTC via perfect-negotiation FSM (default)',
-      },
-      {
-        value: 'simplepeer',
-        label: 'WebRTC (SP)',
-        color: '#7adc7a',
-        title: 'WebRTC via simple-peer (fallback)',
+        title: 'WebRTC media connections (default)',
       },
       {
         value: 'signals',
@@ -2395,9 +2388,8 @@ export class RoomView extends LitElement {
 
   /**
    * Render a per-peer carrier selector. Only shown when connection
-   * details are visible. Lets the user pin this link to a specific
-   * carrier (WebRTC simple-peer / WebRTC FSM / signals) or leave it on
-   * 'inherit' to follow the global carrier and the auto-flip policy.
+   * details are visible. Lets the user force this link onto signals or
+   * leave it on 'inherit' to follow the global carrier.
    *
    * When the peer has disabled WebRTC from their side, the link is
    * forced to signals regardless of our choice — we show a static
@@ -2437,20 +2429,15 @@ export class RoomView extends LitElement {
 
     const selected = this.streamsStore.myPeerCarrier(pubkeyB64);
     const options: Array<{
-      value: 'inherit' | 'simplepeer' | 'fsm' | 'signals';
+      value: 'inherit' | 'signals';
       label: string;
     }> = [
       { value: 'inherit', label: 'Inherit global' },
-      { value: 'simplepeer', label: 'WebRTC (SP)' },
-      { value: 'fsm', label: 'WebRTC (FSM)' },
       { value: 'signals', label: 'Signals' },
     ];
     // Icon colour: amber when pinned to signals, neutral when inheriting
-    // the global carrier, green when pinned to a WebRTC impl.
-    const color =
-      selected === 'signals' ? '#e7a008'
-        : selected === 'inherit' ? '#c3c9eb'
-          : '#7adc7a';
+    // the global carrier.
+    const color = selected === 'signals' ? '#e7a008' : '#c3c9eb';
     const opacity = selected === 'inherit' ? '0.6' : '1';
 
     return html`

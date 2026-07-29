@@ -133,7 +133,11 @@ export const WIRE_CONTRACT: Record<SignalMsgType, SignalTypeContract> = {
   PongUi: { emits: true, parses: true, requiresCap: null },
   InitRequest: { emits: true, parses: true, requiresCap: null },
   InitAccept: { emits: true, parses: true, requiresCap: null },
-  SdpData: { emits: true, parses: true, requiresCap: null },
+  // RETIRED (Phase 3): SdpData carried the SimplePeer SDP exchange, and
+  // SimplePeer is deleted. The type stays in the union so the handler
+  // switch keeps an explicit drop-with-log arm (a ≤ v0.14.8 peer still
+  // emits it) instead of the anonymous unknown-type warn.
+  SdpData: { emits: false, parses: false, requiresCap: null },
   SdpFsm: { emits: true, parses: true, requiresCap: CAP_SDP_FSM },
   // Production gate: `StreamsStore._ensureOutgoingScreenShare` initiates a
   // screen-share connection only when `conversationPayloadCaps` contains

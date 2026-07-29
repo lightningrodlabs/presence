@@ -547,13 +547,7 @@ function simpleEventTypeToColor(
       return ['lightblue', undefined];
     case 'SdpData':
       return ['gray', undefined];
-    case 'SimplePeerClose':
-      return ['black', undefined];
-    case 'SimplePeerError':
-      return ['red', undefined];
-    case 'SimplePeerStream':
-      return ['darkblue', undefined];
-    case 'SimplePeerTrack':
+    case 'RemoteTrack':
       return ['cyan', undefined];
 
     // WebRTC data signals
@@ -638,13 +632,7 @@ function yEventType(event: SimpleEventType): [number, number] {
       return [0, 1.5];
     case 'SdpData':
       return [0, 1.5];
-    case 'SimplePeerClose':
-      return [0, 1.5];
-    case 'SimplePeerError':
-      return [0, 1.5];
-    case 'SimplePeerStream':
-      return [0, 1.5];
-    case 'SimplePeerTrack':
+    case 'RemoteTrack':
       return [0, 1.5];
 
     // WebRTC data signals

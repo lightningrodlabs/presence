@@ -76,13 +76,9 @@ export type SimpleEventType =
   | 'ReconcileStream'
   | 'ReconcileAudio'
   | 'ReconcileVideo'
-  | 'SimplePeerError'
-  | 'SimplePeerClose'
-  | 'SimplePeerStream'
-  | 'SimplePeerTrack'
+  | 'RemoteTrack'
   | 'FsmError'
   | 'FsmClose'
-  | 'WebrtcImplFlip'
   | 'PeerAudioOnSignal'
   | 'PeerAudioOffSignal'
   | 'PeerVideoOnSignal'
@@ -132,7 +128,7 @@ export type SimpleEventType =
   // Establishment-latency forensics, emitted once per (peer, connectionId)
   // when the transport reaches phase='connected'. The detail field carries
   // milestone latencies measured from the first signaling event:
-  //   impl=<simplepeer|fsm> ice=<ms> gather=<ms> connect=<ms> relay=<bool>
+  //   impl=fsm ice=<ms> gather=<ms> connect=<ms> relay=<bool>
   // 'ice' is time-to-first-iceConnectionState-connected (DTLS not yet up).
   // 'gather' is time-to-iceGatheringState-complete.
   // 'connect' is time-to-carrier-reported transport-connected.
@@ -177,10 +173,6 @@ export type SimpleEventType =
   // why a peer's pane appeared or disappeared.
   | 'PresenceAdd'
   | 'PresenceRemove'
-  // Carrier-switch hysteresis (§6.4) held the link on webrtc through an
-  // audibility dip because the ICE+DTLS transport was still up — i.e. we
-  // declined an auto-flip that would have abandoned a healthy transport.
-  | 'CarrierHold'
   // Read-back of the per-sender priority / networkPriority / maxBitrate after
   // `setParameters`, with a NOT-APPLIED marker when the browser didn't honor
   // the requested value — used to tell audio-starvation from bufferbloat when

@@ -21,8 +21,8 @@
       "requiresCap": null
     },
     "SdpData": {
-      "emits": true,
-      "parses": true,
+      "emits": false,
+      "parses": false,
       "requiresCap": null
     },
     "SdpFsm": {

@@ -105,7 +105,6 @@ function onSignalsNow(): boolean {
 function applyPhaseEvent(event: Extract<TransportEvent, { type: 'connection-state-change' }>): void {
   const route = routeTransportPhase({
     phase: event.phase,
-    impl: 'fsm',
     connectionId: event.connectionId,
     openConnectionId: slots[event.peer]?.connectionId,
   });

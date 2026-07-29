@@ -48,8 +48,10 @@ export type StaleConnectionInputs = {
   slotClaimsConnected: boolean;
   /**
    * Whether the carrier holding this connection runs its own transport
-   * recovery. True for the FSM, false for SimplePeer. When true this
-   * supervisor stands down entirely — see the header.
+   * recovery. True for the FSM (i.e. every live transport since Phase 3
+   * deleted SimplePeer, which is why this supervisor now always stands
+   * down in production — kept as the declared safety net for any future
+   * carrier that does not own recovery). See the header.
    */
   carrierOwnsRecovery: boolean;
   /** `pc.iceConnectionState`, or `undefined` when there is no pc to ask. */

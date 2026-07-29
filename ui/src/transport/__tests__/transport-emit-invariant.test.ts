@@ -11,20 +11,16 @@
  * would arrive *after* the slot rewrite and `routeTransportPhase` would
  * process a close against state that has already moved on.
  *
- * The invariant spans a package boundary (SimplePeerTransport wraps
- * simple-peer, FsmTransport relays ConnectionManager events from
- * packages/webrtc-peer) and was previously documented nowhere
- * (MAINTAINABILITY_ASSESSMENT.md, unscheduled-defects table). This suite
- * fails if any transport starts deferring its emit.
+ * The invariant spans a package boundary (FsmTransport relays
+ * ConnectionManager events from packages/webrtc-peer) and was previously
+ * documented nowhere (MAINTAINABILITY_ASSESSMENT.md, unscheduled-defects
+ * table). This suite fails if the transport starts deferring its emit.
  *
- * What the invariant is NOT: exactly-once. Writing this test surfaced
- * that a SimplePeerTransport teardown emits `closed` twice — once from
- * the transport's own guaranteed-synchronous emit in
- * `_closeStateInternal`, once from simple-peer's 'close' event handler
- * (kept for forensics; with the mock's synchronous `destroy` both land
- * before return, in the field the second may arrive later). The
- * duplicate is pinned below as fact, not endorsed: consumers of `closed`
- * must be idempotent.
+ * History: the suite used to assert the same invariant for
+ * SimplePeerTransport (and pinned its double-`closed` teardown quirk);
+ * that half was deleted with SimplePeer in Phase 3. Consumers of `closed`
+ * must stay idempotent regardless — duplicate closes remain possible
+ * across supersede races.
  *
  * The probe: record handler firings and the call's return into one
  * ordered list. A synchronous emit lands before 'returned'; a deferred
@@ -34,24 +30,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { SimplePeerTransport } from '../simplepeer/simple-peer-transport';
 import { FsmTransport } from '../fsm/fsm-transport';
 import type { OutgoingSignal } from '../types';
-import { createMockFactory } from './test-helpers';
 import { MockRTCPeerConnection } from '../../../../packages/webrtc-peer/src/__tests__/test-helpers';
 
 const PEER_A = 'aaaa';
 const PEER_B = 'bbbb';
-
-function setupSimplePeer() {
-  const { factory } = createMockFactory();
-  const outgoing: OutgoingSignal[] = [];
-  return new SimplePeerTransport({
-    myAgentId: PEER_A,
-    onOutgoingSignal: signal => outgoing.push(signal),
-    createPeer: factory,
-  });
-}
 
 function setupFsm() {
   const outgoing: OutgoingSignal[] = [];
@@ -66,71 +50,6 @@ function setupFsm() {
 /** Everything recorded strictly before the call returned. */
 const beforeReturn = (order: string[]): string[] =>
   order.slice(0, order.indexOf('returned'));
-
-describe('synchronous-emit invariant — SimplePeerTransport', () => {
-  it('closeConnection delivers closed before it returns', () => {
-    const transport = setupSimplePeer();
-    transport.ensureConnection(PEER_B, { initiator: true });
-
-    const order: string[] = [];
-    transport.onAny(e => {
-      if (e.type === 'connection-state-change' && e.phase === 'closed') {
-        order.push('closed-event');
-      }
-    });
-    transport.closeConnection(PEER_B, 'test');
-    order.push('returned');
-
-    expect(beforeReturn(order)).toContain('closed-event');
-  });
-
-  it('a supersede delivers the old connection close before ensureConnection returns', () => {
-    // simple-peer-transport.ts: "Emit close synchronously so listeners
-    // observe the supersede in order" — this is that claim, enforced.
-    const transport = setupSimplePeer();
-    const oldId = transport.ensureConnection(PEER_B, { connectionId: 'old' });
-
-    const order: string[] = [];
-    transport.onAny(e => {
-      if (
-        e.type === 'connection-state-change' &&
-        e.phase === 'closed' &&
-        e.connectionId === oldId
-      ) {
-        order.push('old-closed');
-      }
-    });
-    transport.ensureConnection(PEER_B, { connectionId: 'new' });
-    order.push('returned');
-
-    expect(beforeReturn(order)).toContain('old-closed');
-  });
-
-  it('a teardown emits closed TWICE today — consumers must be idempotent', () => {
-    // Pinned as fact, not endorsed. Source one: the explicit emit in
-    // _closeStateInternal (the synchronous guarantee the store relies
-    // on). Source two: simple-peer's own 'close' handler, which re-emits
-    // for forensics and only skips the slot mutation. If this ever
-    // becomes exactly-once, delete this test deliberately — do not relax
-    // the invariant tests above.
-    const transport = setupSimplePeer();
-    const id = transport.ensureConnection(PEER_B, { initiator: true });
-
-    const closes: string[] = [];
-    transport.onAny(e => {
-      if (
-        e.type === 'connection-state-change' &&
-        e.phase === 'closed' &&
-        e.connectionId === id
-      ) {
-        closes.push(e.phase);
-      }
-    });
-    transport.closeConnection(PEER_B, 'test');
-
-    expect(closes).toHaveLength(2);
-  });
-});
 
 describe('synchronous-emit invariant — FsmTransport', () => {
   it('closeConnection delivers closed exactly once, before it returns', () => {

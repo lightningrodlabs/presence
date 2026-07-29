@@ -28,8 +28,6 @@ export class PeerStatsPanel extends LitElement {
 
   /** Cached rendered state so we only requestUpdate when a number changed */
   private _lastCarrier: 'webrtc' | 'signals' | 'none' = 'none';
-  /** Variant suffix for the WebRTC carrier — distinguishes the impl. */
-  private _lastImpl: 'sp' | 'fsm' | null = null;
   private _lastRtt: number | null = null;
   private _lastJitter: number | null = null;
   private _lastLoss: number | null = null;
@@ -79,9 +77,7 @@ export class PeerStatsPanel extends LitElement {
 
   render() {
     const carrier = this._lastCarrier;
-    const carrierLabel = carrier === 'webrtc' && this._lastImpl
-      ? `webrtc ${this._lastImpl}`
-      : carrier;
+    const carrierLabel = carrier;
     const fmt = (v: number | null, unit: string) =>
       v === null ? '-' : `${v}${unit}`;
     const flowGlyph =
@@ -141,9 +137,6 @@ export class PeerStatsPanel extends LitElement {
 
     const isWebrtc = this.streamsStore.hasWebrtcConnection(this.agentPubKeyB64);
     const carrier: 'webrtc' | 'signals' = isWebrtc ? 'webrtc' : 'signals';
-    const impl: 'sp' | 'fsm' | null = isWebrtc
-      ? this.streamsStore.webrtcImplFor(this.agentPubKeyB64) === 'fsm' ? 'fsm' : 'sp'
-      : null;
     const stats = isWebrtc
       ? this.streamsStore.webrtcStats.get(this.agentPubKeyB64)
       : this.streamsStore.signalsStats.get(this.agentPubKeyB64);
@@ -200,7 +193,6 @@ export class PeerStatsPanel extends LitElement {
 
     if (
       carrier !== this._lastCarrier ||
-      impl !== this._lastImpl ||
       rtt !== this._lastRtt ||
       jitter !== this._lastJitter ||
       loss !== this._lastLoss ||
@@ -213,7 +205,6 @@ export class PeerStatsPanel extends LitElement {
       vidSkew !== this._lastVidSkew
     ) {
       this._lastCarrier = carrier;
-      this._lastImpl = impl;
       this._lastRtt = rtt;
       this._lastJitter = jitter;
       this._lastLoss = loss;

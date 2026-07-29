@@ -40,21 +40,13 @@ import { CAP_SDP_FSM, WIRE_CAPS } from '../../transport/wire-contract';
 // Payload
 // =========================================================================
 
-/** WebRTC implementation choice broadcast in the conversation payload.
- *  Symmetric union over the global `webrtcImpl` field: the effective
- *  default for a link is `'fsm'` if either side picks it, else
- *  `'simplepeer'`. Per-link overrides via `peerImpl` (below) take
- *  precedence over the global default. Default is `'fsm'` — the more
- *  capable carrier on marginal NATs; auto-flip falls back to
- *  `'simplepeer'` on failure.
- *
- *  All of that is *preference*, and preference is subordinate to
- *  capability: `resolveWebrtcImpl` pins the link to `'simplepeer'` unless
- *  `conversationPayloadSupportsFsm` says the peer's build can parse
- *  `SdpFsm` at all. A missing `webrtcImpl` field parses to `'simplepeer'`,
- *  but that alone never protected pre-FSM peers — the union resolved the
- *  link to `'fsm'` on our own global regardless, and we sent them a signal
- *  type their build has no handler for. */
+/** LEGACY wire field (Phase 3). SimplePeer is deleted, so there is no
+ *  implementation *choice* left — this build always writes `'fsm'` and no
+ *  longer reads the field for decisions. It stays on the wire because
+ *  v0.14.8 readers resolve their side of the link from it (their
+ *  symmetric union picks FSM when either side declares it), and because
+ *  its *presence* is the legacy capability probe
+ *  (`conversationPayloadSupportsFsm`) older builds are recognized by. */
 export type WebrtcImpl = 'simplepeer' | 'fsm';
 
 export interface ConversationPayload {
@@ -72,21 +64,13 @@ export interface ConversationPayload {
    * Symmetric union: if either side lists the other, WebRTC is off.
    */
   disableWebrtcWith: AgentPubKeyB64[];
-  /** Preferred WebRTC implementation for this agent's links. */
+  /** LEGACY (see `WebrtcImpl`): always written as `'fsm'`, never read for
+   *  decisions by this build. */
   webrtcImpl: WebrtcImpl;
-  /** Per-peer impl override. Each entry pins the impl for that one link
-   *  regardless of global `webrtcImpl`. Symmetric union: if both sides
-   *  set an override for the same link and the values disagree,
-   *  **`'fsm'` wins** (`auto-flip-policy.ts:resolveWebrtcImpl`, asserted by
-   *  its own tests). Note the consequence: a peer cannot unilaterally pin a
-   *  link back to simplepeer, so the automated toggle below cannot use an
-   *  override to escape a failing FSM link on its own. An override cannot
-   *  reach `'fsm'` for a peer whose build lacks the `SdpFsm` handler
-   *  either — capability is checked first.
-   *
-   *  Used both by the developer per-peer toggle and by the Phase 3
-   *  automated failure toggle, which flips a peer's override when an
-   *  `AudibilityOutage` fires on the current impl. */
+  /** LEGACY (Phase 3): the per-peer impl override lost its meaning when
+   *  SimplePeer was deleted. This build writes `{}` (clearing stale
+   *  entries opportunistically in `setPeerCarrier`) and never reads it;
+   *  parsed only so old payloads round-trip without data loss. */
   peerImpl: Record<AgentPubKeyB64, WebrtcImpl>;
   /**
    * Wire capabilities this agent's *build* declares (Phase 1.5 item 3).
@@ -336,31 +320,9 @@ const conversationModule: ModuleDefinition = {
       streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
       return;
     }
-
-    // Detect a webrtcImpl flip for this link. When the effective
-    // implementation changes (because the peer flipped its global
-    // webrtcImpl, or set/cleared a peerImpl override against us, or the
-    // Phase 3 auto-toggle ran on their side), tear down any existing
-    // connection so the next pong-driven retry establishes via the
-    // newly-selected impl.
-    const myPeerImplMap = streamsStore.myPeerImpl();
-    const prevImpl = streamsStore.webrtcImplForGiven(
-      streamsStore.myWebrtcImpl(),
-      myPeerImplMap[agentPubKeyB64],
-      prevPayload.webrtcImpl,
-      prevPayload.peerImpl?.[myPubKey],
-      conversationPayloadCaps(prev).has(CAP_SDP_FSM),
-    );
-    const nextImpl = streamsStore.webrtcImplForGiven(
-      streamsStore.myWebrtcImpl(),
-      myPeerImplMap[agentPubKeyB64],
-      nextPayload.webrtcImpl,
-      nextPayload.peerImpl?.[myPubKey],
-      conversationPayloadCaps(next).has(CAP_SDP_FSM),
-    );
-    if (prevImpl !== nextImpl) {
-      streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
-    }
+    // The webrtcImpl-flip detection that used to follow died with
+    // SimplePeer (Phase 3): with one implementation the effective impl
+    // for a link cannot change, so there is nothing to react to.
   },
 
   // No toolbar button. The conversation module auto-activates on room

@@ -1,13 +1,12 @@
 /**
  * PeerTransport — abstraction for a per-peer WebRTC transport implementation.
  *
- * Two known implementations land against this interface:
- *   - SimplePeerTransport: wraps the legacy `simple-peer` package.
- *   - FsmTransport: wraps the hand-rolled state machine from feat/webrtc-state-machine.
+ * One implementation lands against this interface since Phase 3 retired
+ * SimplePeerTransport:
+ *   - FsmTransport: wraps the hand-rolled state machine (packages/webrtc-peer).
  *
- * Goals: let streams-store consume one shape regardless of which implementation
- * is in use, so we can A/B them per peer (Phase 2/3) and slot in a third
- * carrier (QUIC/WebTransport) later (Phase 7).
+ * The shape survives the deletion so a future carrier (QUIC/WebTransport)
+ * can slot in without re-teaching streams-store.
  *
  * Scope of a transport:
  *   - per-peer connection lifecycle (idle → signaling → connected → ...)
@@ -33,11 +32,8 @@ import type { EstablishmentTimeline } from '@lightningrodlabs/webrtc-peer';
 export type ConnectionId = string;
 
 /**
- * Application-level connection phase. Mirrors feat/webrtc-state-machine's
- * ConnectionPhase. SimplePeerTransport will collapse some of these (e.g.
- * 'reconnecting' is not a state SimplePeer exposes — the wrapper either
- * stays 'connected' or transitions to 'closed'/'failed' and lets the app
- * decide to ensureConnection again).
+ * Application-level connection phase. Mirrors the FSM library's
+ * ConnectionPhase (packages/webrtc-peer).
  */
 export type ConnectionPhase =
   | 'idle'
@@ -53,10 +49,9 @@ export type ConnectionPhase =
  * Outgoing signal — produced by the transport, shipped to the remote peer
  * by the application (e.g. via `roomClient.sendMessage(..., 'SdpData', ...)`).
  *
- * `data` is opaque — for SimplePeer it's whatever SimplePeer emits on its
- * 'signal' event; for the FSM it's `{ type: 'offer'|'answer'|'candidate', sdp/candidate: ... }`.
- * The transport only requires that whatever it produces, it can also consume
- * via `processIncomingSignal`.
+ * `data` is opaque — for the FSM it's `{ type: 'offer'|'answer'|'candidate',
+ * sdp/candidate: ... }`. The transport only requires that whatever it
+ * produces, it can also consume via `processIncomingSignal`.
  */
 export type OutgoingSignal = {
   to: AgentPubKeyB64;
@@ -110,7 +105,7 @@ export type TransportEvent =
     }
   | {
       // One-shot per-connection establishment timeline (per-stage ms) from the
-      // FSM. FSM transport only; SimplePeer never emits this.
+      // FSM.
       type: 'establishment-timeline';
       peer: AgentPubKeyB64;
       connectionId: ConnectionId;
@@ -225,7 +220,7 @@ export interface PeerTransport {
 
   /** Replace a track on all active connections. No renegotiation —
    *  uses RTCRtpSender.replaceTrack(). For device switches. `stream` is
-   *  the MediaStream the tracks belong to (SimplePeer requires it; FSM
+   *  the MediaStream the tracks belong to (the FSM
    *  tolerates it but does not strictly need it). */
   replaceTrack(
     oldTrack: MediaStreamTrack | null,
@@ -279,32 +274,8 @@ export type PeerTransportOptions = {
 };
 
 /**
- * Minimal subset of SimplePeer's instance shape that the transport actually
- * uses. Exposed so tests (and alternate WebRTC stacks) can substitute their
- * own implementation via the `createPeer` option on SimplePeerTransport.
- */
-export interface SimplePeerLike {
-  signal(data: unknown): void;
-  send(data: string | ArrayBuffer | Uint8Array): void;
-  destroy(): void;
-  addTrack(track: MediaStreamTrack, stream: MediaStream): void;
-  removeTrack(track: MediaStreamTrack, stream: MediaStream): void;
-  replaceTrack(
-    oldTrack: MediaStreamTrack,
-    newTrack: MediaStreamTrack,
-    stream: MediaStream
-  ): void;
-  addStream(stream: MediaStream): void;
-  on(event: string, listener: (...args: any[]) => void): void;
-}
-
-/** Identifier for which transport implementation is in use for a peer.
- *  Matches the planned `webrtcImpl` field on the conversation module payload. */
-export type TransportImpl = 'simplepeer' | 'fsm';
-
-/**
  * Default ICE/STUN servers used by every transport implementation. Single
- * source of truth: streams-store passes this into both SimplePeerTransport and
+ * source of truth: streams-store passes this into
  * FsmTransport at construction, and FSM's DEFAULT_CONFIG falls back to it
  * when no `iceServers` getter is wired in (tests).
  */
