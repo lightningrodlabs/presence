@@ -167,12 +167,23 @@ export class MockRTCPeerConnection {
 
   getTransceivers = vi.fn((): RTCRtpTransceiver[] => []);
 
-  // Event listener interface
-  addEventListener(event: string, handler: MockEventHandler) {
+  // Event listener interface. Honors `{ signal }` like the real pc —
+  // consumers (FsmTransport's ice-diagnostic listeners) detach via
+  // AbortController, and a mock that ignored the signal could not fail
+  // the "stops emitting after close" test.
+  addEventListener(
+    event: string,
+    handler: MockEventHandler,
+    options?: { signal?: AbortSignal }
+  ) {
+    if (options?.signal?.aborted) return;
     if (!this._handlers.has(event)) {
       this._handlers.set(event, []);
     }
     this._handlers.get(event)!.push(handler);
+    options?.signal?.addEventListener('abort', () =>
+      this.removeEventListener(event, handler)
+    );
   }
 
   removeEventListener(event: string, handler: MockEventHandler) {
@@ -303,8 +314,24 @@ export class MockRTCPeerConnection {
   }
 }
 
-class MockRTCSender {
+export class MockRTCSender {
   track: MediaStreamTrack | null;
+  /**
+   * Backing store for getParameters/setParameters. Starts with one empty
+   * encoding (a post-negotiation browser shape); tests may call
+   * `setEncodings([])` to exercise the not-yet-populated skip path.
+   */
+  private _parameters: { encodings: Record<string, unknown>[] } = {
+    encodings: [{}],
+  };
+  /**
+   * Negative-control mode: when false, setParameters silently drops
+   * `networkPriority` the way browsers that don't honor it do. Exists so
+   * the read-back NOT-APPLIED detection in consumers has a test that can
+   * fail — a mock that always honors every field cannot reproduce the
+   * silent-revert bug that detection exists to catch.
+   */
+  honorNetworkPriority = true;
   constructor(track: MediaStreamTrack | null) {
     this.track = track;
   }
@@ -312,6 +339,19 @@ class MockRTCSender {
     this.track = track;
   });
   getStats = vi.fn(async () => new Map());
+  getParameters = vi.fn(
+    () => JSON.parse(JSON.stringify(this._parameters)) as RTCRtpSendParameters
+  );
+  setParameters = vi.fn(async (params: RTCRtpSendParameters) => {
+    const stored = JSON.parse(JSON.stringify(params));
+    if (!this.honorNetworkPriority) {
+      for (const enc of stored.encodings ?? []) delete enc.networkPriority;
+    }
+    this._parameters = stored;
+  });
+  setEncodings(encodings: Record<string, unknown>[]): void {
+    this._parameters = { encodings };
+  }
 }
 
 class MockRTCReceiver {

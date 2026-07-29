@@ -28,10 +28,12 @@ import type { AgentPubKeyB64 } from '@holochain/client';
 import type {
   ConnectionId,
   ConnectionPhase,
+  IceDiagnostic,
   IncomingSignal,
   OutgoingSignal,
   PeerTransport,
   PeerTransportOptions,
+  SenderPriorityOutcome,
   TransportEvent,
   TransportEventHandler,
   TransportEventType,
@@ -39,6 +41,7 @@ import type {
   Unsubscribe,
 } from '../types';
 import { ConnectionManager, DEFAULT_CONFIG } from '@lightningrodlabs/webrtc-peer';
+import type { PeerCreatedContext } from '@lightningrodlabs/webrtc-peer';
 import type {
   ConnectionConfig,
   FSMTransitionEntry,
@@ -96,6 +99,14 @@ export class FsmTransport implements PeerTransport {
   private _lastPhase = new Map<AgentPubKeyB64, ConnectionPhase>();
   private _localStream: MediaStream | null = null;
   private _destroyed = false;
+  /**
+   * Per-peer abort handles for the ICE diagnostic listeners. A new peer
+   * session (initial connect, full reconnect, or an in-place FSM
+   * replacement — which emits no close event) aborts the previous set
+   * before attaching, so an orphaned pc cannot keep leaking ICE events
+   * into the log under a stale connectionId.
+   */
+  private _iceListenerAborts = new Map<AgentPubKeyB64, AbortController>();
 
   constructor(options: FsmTransportOptions) {
     this._myAgentId = options.myAgentId;
@@ -143,6 +154,11 @@ export class FsmTransport implements PeerTransport {
       createPeerConnection: options.createPeerConnection,
       reconnectPolicy: options.reconnectPolicy,
       onTransition: options.onTransition,
+      // Fires synchronously per peer session with the fresh pc, before
+      // tracks/SDP — the attach point for ICE diagnostics. This replaces
+      // the application-side poll-until-pc-appears monitor that the
+      // deleted getRTCPeerConnection escape hatch required.
+      onPeerCreated: (ctx) => this._attachIceDiagnostics(ctx),
     });
 
     this._manager.on('connection-state-changed', (e: any) => {
@@ -218,6 +234,10 @@ export class FsmTransport implements PeerTransport {
     this._manager.on('connection-closed', (e: any) => {
       const prev = this._lastPhase.get(e.remoteAgent) ?? 'connected';
       this._lastPhase.delete(e.remoteAgent);
+      // Detach the ICE diagnostic listeners with the connection, so a pc
+      // the FSM did not synchronously destroy stops emitting.
+      this._iceListenerAborts.get(e.remoteAgent)?.abort();
+      this._iceListenerAborts.delete(e.remoteAgent);
       this._emit({
         type: 'connection-state-change',
         peer: e.remoteAgent,
@@ -226,6 +246,84 @@ export class FsmTransport implements PeerTransport {
         previous: prev,
       });
     });
+  }
+
+  /**
+   * Attach ICE-level listeners to a freshly-created pc and surface what
+   * they see as 'ice-diagnostic' events. Runs inside the transport — the
+   * pc never leaves it (Phase 4 item 3). Listener lifetime is one peer
+   * session: superseded sessions are aborted on the next attach even when
+   * the FSM replacement emitted no close event.
+   */
+  private _attachIceDiagnostics(ctx: PeerCreatedContext): void {
+    const { remoteAgent, connectionId, pc } = ctx;
+    this._iceListenerAborts.get(remoteAgent)?.abort();
+    const ac = new AbortController();
+    this._iceListenerAborts.set(remoteAgent, ac);
+    const signal = ac.signal;
+    const emitDiag = (diag: IceDiagnostic) =>
+      this._emit({ type: 'ice-diagnostic', peer: remoteAgent, connectionId, diag });
+
+    pc.addEventListener(
+      'iceconnectionstatechange',
+      () => {
+        const state = pc.iceConnectionState;
+        let selectedPair: Extract<IceDiagnostic, { kind: 'ice-state' }>['selectedPair'];
+        if (state === 'failed' || state === 'disconnected') {
+          try {
+            const transport = (pc.getSenders()[0]?.transport as any)?.iceTransport;
+            const pair = transport?.getSelectedCandidatePair?.() as
+              | { local?: RTCIceCandidate; remote?: RTCIceCandidate }
+              | undefined;
+            if (pair) {
+              selectedPair = {
+                local: {
+                  address: (pair.local as any)?.address ?? undefined,
+                  port: (pair.local as any)?.port ?? undefined,
+                  type: pair.local?.type ?? undefined,
+                },
+                remote: {
+                  address: (pair.remote as any)?.address ?? undefined,
+                  port: (pair.remote as any)?.port ?? undefined,
+                  type: pair.remote?.type ?? undefined,
+                },
+              };
+            }
+          } catch (_) {
+            // getSenders/iceTransport may not be available on all browsers
+          }
+        }
+        emitDiag({ kind: 'ice-state', state, selectedPair });
+      },
+      { signal }
+    );
+    pc.addEventListener(
+      'icegatheringstatechange',
+      () => {
+        const state = pc.iceGatheringState;
+        const localSdpHasRelay =
+          state === 'complete'
+            ? (pc.localDescription?.sdp ?? '').includes('typ relay')
+            : undefined;
+        emitDiag({ kind: 'gathering-state', state, localSdpHasRelay });
+      },
+      { signal }
+    );
+    pc.addEventListener(
+      'icecandidate',
+      (event: Event) => {
+        const c = (event as RTCPeerConnectionIceEvent).candidate;
+        if (!c) return;
+        emitDiag({
+          kind: 'candidate',
+          candidateType: c.type,
+          protocol: c.protocol,
+          address: c.address,
+          port: c.port,
+        });
+      },
+      { signal }
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -264,26 +362,6 @@ export class FsmTransport implements PeerTransport {
 
   closeConnection(peer: AgentPubKeyB64, reason?: string): void {
     this._manager.closeConnection(peer, reason ?? 'closeConnection called');
-  }
-
-  /**
-   * Recreate a peer's data channel in place — no ICE/DTLS teardown, no new peer
-   * session. Use when the data channel is stuck but the media transport is
-   * healthy. Returns true if a live connection received the call. The FSM also
-   * does this automatically via its data-channel watchdog; this is the manual
-   * escape valve.
-   */
-  recreateDataChannel(peer: AgentPubKeyB64): boolean {
-    return this._manager.recreateDataChannel(peer);
-  }
-
-  /**
-   * Trigger an ICE restart for a peer without tearing the connection down
-   * (preserves the DTLS session). Returns true if a live connection received
-   * the call.
-   */
-  restartIce(peer: AgentPubKeyB64): boolean {
-    return this._manager.restartIce(peer);
   }
 
   hasConnection(peer: AgentPubKeyB64): boolean {
@@ -387,7 +465,7 @@ export class FsmTransport implements PeerTransport {
   }
 
   async getStats(peer: AgentPubKeyB64): Promise<TransportStats | null> {
-    const pc = this.getRTCPeerConnection(peer);
+    const pc = this._pcFor(peer);
     if (!pc) return null;
     try {
       const raw = await pc.getStats();
@@ -398,14 +476,74 @@ export class FsmTransport implements PeerTransport {
     }
   }
 
-  /**
-   * Escape hatch — exposes
-   * the underlying RTCPeerConnection for ICE diagnostics, stats poll, and
-   * per-peer track recovery. This is the bridge that lets the existing
-   * streams-store diagnostic and recovery code work for FSM peers
-   * without further changes.
-   */
-  getRTCPeerConnection(peer: AgentPubKeyB64): RTCPeerConnection | undefined {
+  getIceConnectionState(peer: AgentPubKeyB64): RTCIceConnectionState | undefined {
+    return this._pcFor(peer)?.iceConnectionState;
+  }
+
+  async prioritizeAudio(
+    peer: AgentPubKeyB64,
+    opts: { videoMaxBitrateBps: number | null }
+  ): Promise<SenderPriorityOutcome[]> {
+    const pc = this._pcFor(peer);
+    if (!pc) return [];
+    const outcomes: SenderPriorityOutcome[] = [];
+    for (const sender of pc.getSenders()) {
+      const kind = sender.track?.kind;
+      if (kind !== 'audio' && kind !== 'video') continue;
+      const want = kind === 'audio' ? 'high' : 'low';
+      try {
+        const params = sender.getParameters();
+        // setParameters requires the encodings array shape returned by
+        // getParameters(); if the browser hasn't populated it yet, skip.
+        if (!params.encodings || params.encodings.length === 0) continue;
+        const enc = params.encodings[0] as RTCRtpEncodingParameters & {
+          networkPriority?: RTCPriorityType;
+        };
+        enc.priority = want;
+        enc.networkPriority = want;
+        if (kind === 'video' && opts.videoMaxBitrateBps) {
+          enc.maxBitrate = opts.videoMaxBitrateBps;
+        }
+        await sender.setParameters(params);
+        // Read back what the browser actually stored — networkPriority is
+        // not universally honored, and a silent revert must be reportable.
+        const rb = sender.getParameters().encodings?.[0] as
+          | (RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType })
+          | undefined;
+        const priority = rb?.priority ?? 'unset';
+        const networkPriority = rb?.networkPriority ?? 'unset';
+        outcomes.push({
+          kind,
+          want,
+          priority,
+          networkPriority,
+          ...(kind === 'video'
+            ? { maxBitrate: rb?.maxBitrate ?? ('unset' as const) }
+            : {}),
+          applied: priority === want && networkPriority === want,
+        });
+      } catch {
+        // Non-fatal: too-early call, unsupported field, or transient state.
+        outcomes.push({ kind, want, failed: true });
+      }
+    }
+    return outcomes;
+  }
+
+  refreshMediaForPeer(peer: AgentPubKeyB64, stream: MediaStream): boolean {
+    const fsm = this._manager.getFSM(peer);
+    if (!fsm || !this._pcFor(peer)) return false;
+    // Per-peer, kind-matched replaceTrack (forces re-encoding); tracks
+    // with no sender are added. Never touches other peers — recovery for
+    // one link must not perturb the rest (the reason the old code drove
+    // RTCRtpSender directly instead of the fan-out replaceTrack).
+    fsm.refreshMedia(stream);
+    return true;
+  }
+
+  /** The pc for a peer's current session, if one exists. Internal only —
+   *  the pc does not leave the transport (Phase 4 item 3). */
+  private _pcFor(peer: AgentPubKeyB64): RTCPeerConnection | undefined {
     return this._manager.getFSM(peer)?.peer?.pc;
   }
 
@@ -439,6 +577,8 @@ export class FsmTransport implements PeerTransport {
   destroy(): void {
     if (this._destroyed) return;
     this._destroyed = true;
+    for (const ac of this._iceListenerAborts.values()) ac.abort();
+    this._iceListenerAborts.clear();
     this._manager.destroy();
     this._typedHandlers.clear();
     this._anyHandlers.clear();

@@ -453,19 +453,7 @@ describe('FsmTransport — media event adaptation (remote-stream / remote-track 
   });
 });
 
-describe('FsmTransport — getStats / getRTCPeerConnection escape hatch', () => {
-  it('getRTCPeerConnection returns the underlying mock for an active peer', () => {
-    const { transport, pcs } = setup();
-    transport.ensureConnection(PEER_B);
-    const pc = transport.getRTCPeerConnection(PEER_B);
-    expect(pc).toBe(pcs[0]);
-  });
-
-  it('getRTCPeerConnection returns undefined for unknown peers', () => {
-    const { transport } = setup();
-    expect(transport.getRTCPeerConnection('unknown')).toBeUndefined();
-  });
-
+describe('FsmTransport — getStats / getIceConnectionState (the pc never leaves the transport)', () => {
   it('getStats resolves to a TransportStats with raw RTCStatsReport', async () => {
     const { transport } = setup();
     transport.ensureConnection(PEER_B);
@@ -479,34 +467,193 @@ describe('FsmTransport — getStats / getRTCPeerConnection escape hatch', () => 
     const stats = await transport.getStats('unknown');
     expect(stats).toBeNull();
   });
+
+  it('getIceConnectionState reflects the live pc state for an active peer', async () => {
+    const { transport, pcs } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+    expect(transport.getIceConnectionState(PEER_B)).toBe('new');
+    pcs[0].simulateIceConnectionState('checking');
+    expect(transport.getIceConnectionState(PEER_B)).toBe('checking');
+  });
+
+  it('getIceConnectionState is undefined for unknown peers', () => {
+    const { transport } = setup();
+    expect(transport.getIceConnectionState('unknown')).toBeUndefined();
+  });
 });
 
-describe('FsmTransport — on-demand data channel / ICE controls', () => {
-  it('recreateDataChannel(peer) recreates the channel in place on the live pc', async () => {
-    const { transport, pcs } = setup();
-    transport.ensureConnection(PEER_B);
-    await waitFor(() => pcs.length > 0);
-    expect(pcs[0].createDataChannel).toHaveBeenCalledTimes(1);
-
-    expect(transport.recreateDataChannel(PEER_B)).toBe(true);
-
-    expect(pcs[0].createDataChannel).toHaveBeenCalledTimes(2);
-    expect(pcs[0].close).not.toHaveBeenCalled();
-  });
-
-  it('restartIce(peer) drives an ICE restart on the live pc', async () => {
-    const { transport, pcs } = setup();
+describe('FsmTransport — ice-diagnostic events (Phase 4 item 3)', () => {
+  it('surfaces iceconnectionstatechange as an ice-state diagnostic', async () => {
+    const { transport, pcs, events } = setup();
     transport.ensureConnection(PEER_B);
     await waitFor(() => pcs.length > 0);
 
-    expect(transport.restartIce(PEER_B)).toBe(true);
-    expect(pcs[0].restartIce).toHaveBeenCalled();
+    pcs[0].simulateIceConnectionState('checking');
+
+    const diags = events.filter((e) => e.type === 'ice-diagnostic');
+    expect(diags).toContainEqual(
+      expect.objectContaining({
+        type: 'ice-diagnostic',
+        peer: PEER_B,
+        diag: expect.objectContaining({ kind: 'ice-state', state: 'checking' }),
+      }),
+    );
   });
 
-  it('both return false for unknown peers', () => {
+  it('surfaces gathering-state with the local-SDP relay probe on complete', async () => {
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    pcs[0].simulateIceGatheringState('complete');
+
+    const diag = events.find(
+      (e) => e.type === 'ice-diagnostic' && e.diag.kind === 'gathering-state',
+    );
+    expect(diag).toBeDefined();
+    expect((diag as any).diag).toMatchObject({
+      kind: 'gathering-state',
+      state: 'complete',
+      // No relay candidate in the mock offer SDP.
+      localSdpHasRelay: false,
+    });
+  });
+
+  it('surfaces gathered candidates', async () => {
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    pcs[0].simulateIceCandidate({
+      type: 'srflx',
+      protocol: 'udp',
+      address: '203.0.113.7',
+      port: 40000,
+    } as unknown as RTCIceCandidateInit);
+
+    const diag = events.find(
+      (e) => e.type === 'ice-diagnostic' && e.diag.kind === 'candidate',
+    );
+    expect((diag as any)?.diag).toMatchObject({
+      kind: 'candidate',
+      candidateType: 'srflx',
+      protocol: 'udp',
+      address: '203.0.113.7',
+      port: 40000,
+    });
+  });
+
+  it('stops emitting after closeConnection — the listener set dies with the session', async () => {
+    // The orphaned-pc leak this pins: FSM teardown does not always destroy
+    // the pc synchronously, and before Phase 4 stale listeners on orphaned
+    // pcs kept logging ICE events long after FsmClose (3-node toggle-storm
+    // capture). The transport aborts its listeners on connection-closed.
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    transport.closeConnection(PEER_B, 'test');
+    // The manager finalizes the close (and the transport aborts the
+    // listeners) one macrotask after the 'closed' state-change.
+    await waitFor(() => !transport.hasConnection(PEER_B));
+
+    const countAfterClose = events.filter((e) => e.type === 'ice-diagnostic').length;
+    pcs[0].simulateIceGatheringState('gathering');
+    pcs[0].simulateIceCandidate({
+      type: 'host',
+      protocol: 'udp',
+      address: '10.0.0.1',
+      port: 1,
+    } as unknown as RTCIceCandidateInit);
+    expect(events.filter((e) => e.type === 'ice-diagnostic')).toHaveLength(
+      countAfterClose,
+    );
+  });
+});
+
+describe('FsmTransport — per-peer control surface (replaces the escape hatch)', () => {
+  it('prioritizeAudio biases audio high / video low and caps video bitrate', async () => {
+    const { transport, pcs } = setup({ localStream: createMockStream(true, true) });
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0 && pcs[0].getSenders().length >= 2);
+
+    const outcomes = await transport.prioritizeAudio(PEER_B, {
+      videoMaxBitrateBps: 2_000_000,
+    });
+
+    const audio = outcomes.find((o) => o.kind === 'audio');
+    const video = outcomes.find((o) => o.kind === 'video');
+    expect(audio).toMatchObject({
+      want: 'high',
+      priority: 'high',
+      networkPriority: 'high',
+      applied: true,
+    });
+    expect(video).toMatchObject({
+      want: 'low',
+      priority: 'low',
+      networkPriority: 'low',
+      maxBitrate: 2_000_000,
+      applied: true,
+    });
+  });
+
+  it('negative control: a sender that silently drops networkPriority reports NOT-applied', async () => {
+    // If the mock could not reproduce the silent revert, the applied
+    // read-back check would have no test able to fail (the
+    // MockRTCPeerConnection-cannot-throw lesson).
+    const { transport, pcs } = setup({ localStream: createMockStream(true, false) });
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0 && pcs[0].getSenders().length >= 1);
+
+    (pcs[0].getSenders()[0] as any).honorNetworkPriority = false;
+    const outcomes = await transport.prioritizeAudio(PEER_B, {
+      videoMaxBitrateBps: null,
+    });
+    expect(outcomes[0]).toMatchObject({ kind: 'audio', applied: false });
+  });
+
+  it('prioritizeAudio skips senders whose encodings are not yet populated', async () => {
+    const { transport, pcs } = setup({ localStream: createMockStream(true, false) });
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0 && pcs[0].getSenders().length >= 1);
+
+    (pcs[0].getSenders()[0] as any).setEncodings([]);
+    const outcomes = await transport.prioritizeAudio(PEER_B, {
+      videoMaxBitrateBps: null,
+    });
+    expect(outcomes).toHaveLength(0);
+  });
+
+  it('prioritizeAudio returns [] for unknown peers', async () => {
     const { transport } = setup();
-    expect(transport.recreateDataChannel('unknown')).toBe(false);
-    expect(transport.restartIce('unknown')).toBe(false);
+    expect(await transport.prioritizeAudio('unknown', { videoMaxBitrateBps: null })).toEqual([]);
+  });
+
+  it('refreshMediaForPeer replaces matching-kind sender tracks on the one peer', async () => {
+    const { transport, pcs } = setup({ localStream: createMockStream(true, true) });
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0 && pcs[0].getSenders().length >= 2);
+
+    const fresh = createMockStream(true, true);
+    expect(transport.refreshMediaForPeer(PEER_B, fresh)).toBe(true);
+    await waitFor(() =>
+      pcs[0]
+        .getSenders()
+        .every((s: any) => s.replaceTrack.mock.calls.length > 0),
+    );
+    for (const sender of pcs[0].getSenders() as any[]) {
+      const replacement = sender.replaceTrack.mock.calls.at(-1)![0];
+      expect(fresh.getTracks()).toContain(replacement);
+    }
+  });
+
+  it('refreshMediaForPeer returns false when the peer has no live connection', () => {
+    const { transport } = setup();
+    expect(
+      transport.refreshMediaForPeer('unknown', createMockStream(true, true)),
+    ).toBe(false);
   });
 });
 

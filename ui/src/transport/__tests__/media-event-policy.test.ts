@@ -29,7 +29,7 @@ describe('routeTransportPhase — every ConnectionPhase is routed', () => {
     [
       'signaling',
       {
-        handler: 'start-ice-monitor',
+        handler: 'signaling',
         slot: { action: 'install' },
         reason: 'signaling-started',
       },
@@ -98,7 +98,7 @@ describe('routeTransportPhase — slot identity', () => {
 
   it('installs a slot for an FSM peer that has none (acceptor path)', () => {
     expect(signaling('new', undefined)).toEqual({
-      handler: 'start-ice-monitor',
+      handler: 'signaling',
       slot: { action: 'install' },
       reason: 'signaling-started',
     });
@@ -106,7 +106,7 @@ describe('routeTransportPhase — slot identity', () => {
 
   it('keeps a slot that already names this connection', () => {
     expect(signaling('same', 'same')).toEqual({
-      handler: 'start-ice-monitor',
+      handler: 'signaling',
       slot: { action: 'keep' },
       reason: 'signaling-started',
     });
@@ -124,7 +124,7 @@ describe('routeTransportPhase — slot identity', () => {
    */
   it('adopts the live connection when the slot names a replaced one', () => {
     expect(signaling('new', 'stale')).toEqual({
-      handler: 'start-ice-monitor',
+      handler: 'signaling',
       slot: { action: 'adopt', supersedes: 'stale' },
       reason: 'signaling-started',
     });
@@ -132,8 +132,8 @@ describe('routeTransportPhase — slot identity', () => {
 
   it('carries the superseded id so the caller can retire its per-connection state', () => {
     const route = signaling('new', 'stale');
-    expect(route.handler).toBe('start-ice-monitor');
-    if (route.handler !== 'start-ice-monitor') throw new Error('unreachable');
+    expect(route.handler).toBe('signaling');
+    if (route.handler !== 'signaling') throw new Error('unreachable');
     expect(route.slot).toEqual({ action: 'adopt', supersedes: 'stale' });
   });
 

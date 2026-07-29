@@ -72,7 +72,7 @@ export type SlotAction =
   | { action: 'keep' };
 
 export type TransportPhaseRoute =
-  | { handler: 'start-ice-monitor'; slot: SlotAction; reason: 'signaling-started' }
+  | { handler: 'signaling'; slot: SlotAction; reason: 'signaling-started' }
   | { handler: 'media-connected'; reason: 'transport-up' }
   | {
       handler: 'media-closed';
@@ -195,7 +195,7 @@ export function routeTransportPhase(
   switch (input.phase) {
     case 'signaling':
       return {
-        handler: 'start-ice-monitor',
+        handler: 'signaling',
         slot: slotActionFor(input),
         reason: 'signaling-started',
       };
