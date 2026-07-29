@@ -3123,7 +3123,7 @@ export class RoomView extends LitElement {
                     <div
                       style="color: #b9a884; font-size: 0.8em; ${conn.connected ? 'display: none' : ''}"
                     >
-                      establishing video carrier...
+                      establishing WebRTC carrier...
                     </div>
                     <div
                       style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
