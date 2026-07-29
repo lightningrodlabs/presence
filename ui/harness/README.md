@@ -19,6 +19,17 @@ reproduce. Two live here:
 - **Voice playout** (`voice-playout-harness.*`, `voice-playout.spec.ts`) —
   real-WebCodecs tier of the Symptom B investigation; see its header.
   Also in the nightly gate.
+- **Screen share** (`screen-share-harness.*`, `screen-share.spec.ts`) —
+  Phase 3.5, filing the Phase 3 review's F4 gap. Each page runs BOTH
+  production screen-share FSM transports (sharer + viewer roles) over
+  real RTCPeerConnections, signaling in the production `SdpFsmScreen`
+  envelope (dir-tagged) over a `BroadcastChannel`; the share source is a
+  real `canvas.captureStream` video track. Asserts lazy viewer-side
+  establishment (no reservation handshake), role-routing under mutual
+  share with zero drops, the malformed-`dir` drop path
+  (`decideScreenSignalRoute`, executed not mirrored), and slot +
+  `_screenShareStreams` teardown on a silent peer drop through the
+  production recovery phases. Also in the nightly gate.
 - **Layout** (below) — NOT in any gate yet: its split-mode baseline is red
   by design; it joins the nightly gate when split-mode is unified onto the
   grid model.

@@ -13,6 +13,10 @@ name: nightly-harness
 #     directions plus the declared recovery-window exception.
 #   - voice-playout.spec.ts — the real-WebCodecs playout scheduler test,
 #     with a negative control that reproduces the double-audio bug.
+#   - screen-share.spec.ts — Phase 3.5: the screen-share FSM path over
+#     real RTCPeerConnections — lazy viewer-side establishment on
+#     SdpFsmScreen, dir-routing under mutual share, malformed-dir drop,
+#     and slot/stream teardown on a silent peer drop.
 #
 # Deliberately NOT gated:
 #   - layout.spec.ts — its split-mode baseline is red by design (see
