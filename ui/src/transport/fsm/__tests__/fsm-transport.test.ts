@@ -570,6 +570,86 @@ describe('FsmTransport — ice-diagnostic events (Phase 4 item 3)', () => {
       countAfterClose,
     );
   });
+
+  it('in-place FSM replacement moves the listener set: old pc goes silent, new pc emits', async () => {
+    // The replacement route (`fsm.destroy()` on a new remote session or
+    // higher-epoch offer) emits NO close event — §3.1(c) — so the
+    // connection-closed abort never fires for the old session. The only
+    // thing detaching the old listeners is _attachIceDiagnostics aborting
+    // the previous controller before storing the new one. Both assertions
+    // are load-bearing: if the abort were deleted, the old pc would keep
+    // emitting under its stale connectionId; if the abort ran after the
+    // map write (order swapped), it would kill the NEW session's
+    // listeners instead and the new pc would go silent.
+    const { transport, pcs, outgoing, events } = setup();
+
+    transport.processIncomingSignal(
+      envelopeSignal('offer', { type: 'offer', sdp: 'remote-offer-1' }, 'remote-session-1'),
+    );
+    // Wait for the answer so the FSM has recorded remoteConnectionId —
+    // the field the new-remote-session replacement route compares.
+    await waitFor(() =>
+      outgoing.some((s) => (s.data as FsmSignalEnvelope)?.type === 'answer'),
+    );
+    const oldConnId = transport.getConnectionId(PEER_B)!;
+    expect(oldConnId).toBeTruthy();
+
+    // Same peer, different remote session (their reload): destroy-in-place.
+    transport.processIncomingSignal(
+      envelopeSignal('offer', { type: 'offer', sdp: 'remote-offer-2' }, 'remote-session-2'),
+    );
+    await waitFor(() => pcs.length >= 2);
+    await waitFor(
+      () => transport.getConnectionId(PEER_B) !== undefined
+        && transport.getConnectionId(PEER_B) !== oldConnId,
+    );
+    const newConnId = transport.getConnectionId(PEER_B)!;
+
+    const staleCount = () =>
+      events.filter(
+        (e) => e.type === 'ice-diagnostic' && e.connectionId === oldConnId,
+      ).length;
+    const before = staleCount();
+    pcs[0].simulateIceConnectionState('checking');
+    pcs[0].simulateIceCandidate({
+      type: 'host',
+      protocol: 'udp',
+      address: '10.0.0.1',
+      port: 1,
+    } as unknown as RTCIceCandidateInit);
+    // Old session's pc emits nothing under the stale connectionId.
+    expect(staleCount()).toBe(before);
+
+    // Positive control: the replacement session's listeners are live.
+    pcs[1].simulateIceConnectionState('checking');
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'ice-diagnostic',
+        peer: PEER_B,
+        connectionId: newConnId,
+        diag: expect.objectContaining({ kind: 'ice-state', state: 'checking' }),
+      }),
+    );
+  });
+
+  it('destroy() sweeps every listener set', async () => {
+    const { transport, pcs, events } = setup();
+    transport.ensureConnection(PEER_B);
+    await waitFor(() => pcs.length > 0);
+
+    transport.destroy();
+    const countAfterDestroy = events.filter((e) => e.type === 'ice-diagnostic').length;
+    pcs[0].simulateIceGatheringState('gathering');
+    pcs[0].simulateIceCandidate({
+      type: 'host',
+      protocol: 'udp',
+      address: '10.0.0.2',
+      port: 2,
+    } as unknown as RTCIceCandidateInit);
+    expect(events.filter((e) => e.type === 'ice-diagnostic')).toHaveLength(
+      countAfterDestroy,
+    );
+  });
 });
 
 describe('FsmTransport — per-peer control surface (replaces the escape hatch)', () => {
