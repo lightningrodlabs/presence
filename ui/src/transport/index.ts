@@ -1,10 +1,12 @@
 export type {
   ConnectionId,
   ConnectionPhase,
+  IceDiagnostic,
   IncomingSignal,
   OutgoingSignal,
   PeerTransport,
   PeerTransportOptions,
+  SenderPriorityOutcome,
   TransportEvent,
   TransportEventHandler,
   TransportEventType,

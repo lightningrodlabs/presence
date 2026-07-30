@@ -75,6 +75,58 @@ export type IncomingSignal = {
   epoch?: number;
 };
 
+/**
+ * ICE-level diagnostic detail carried on `ice-diagnostic` events. The
+ * transport owns the RTCPeerConnection (Phase 4 item 3 deleted the
+ * `getRTCPeerConnection` escape hatch), so ICE forensics are surfaced as
+ * events instead of the application attaching its own pc listeners.
+ * Consumers use these for logging and grace-window bookkeeping only —
+ * never to drive teardown; the transport owns recovery
+ * (`ownsTransportRecovery`).
+ */
+export type IceDiagnostic =
+  | {
+      kind: 'ice-state';
+      state: RTCIceConnectionState;
+      /** The selected candidate pair at a failed/disconnected transition,
+       *  when the browser exposes it (Chromium only). */
+      selectedPair?: {
+        local?: { address?: string; port?: number; type?: string };
+        remote?: { address?: string; port?: number; type?: string };
+      };
+    }
+  | {
+      kind: 'gathering-state';
+      state: RTCIceGatheringState;
+      /** On 'complete': whether the local SDP contains a relay candidate. */
+      localSdpHasRelay?: boolean;
+    }
+  | {
+      kind: 'candidate';
+      candidateType?: string | null;
+      protocol?: string | null;
+      address?: string | null;
+      port?: number | null;
+    };
+
+/**
+ * Per-sender outcome of `prioritizeAudio`. `applied` is the read-back
+ * check: `networkPriority` is not universally honored, and a silent
+ * revert (video allowed to starve audio on a constrained uplink) must be
+ * visible in diagnostics rather than inferred.
+ */
+export type SenderPriorityOutcome =
+  | {
+      kind: 'audio' | 'video';
+      want: 'high' | 'low';
+      priority: string;
+      networkPriority: string;
+      /** Video only: the read-back bitrate cap. */
+      maxBitrate?: number | 'unset';
+      applied: boolean;
+    }
+  | { kind: 'audio' | 'video'; want: 'high' | 'low'; failed: true };
+
 /** Events emitted by the transport. All carry peer + connectionId for supersede-guards. */
 export type TransportEvent =
   | {
@@ -110,6 +162,15 @@ export type TransportEvent =
       peer: AgentPubKeyB64;
       connectionId: ConnectionId;
       timeline: EstablishmentTimeline;
+    }
+  | {
+      // ICE-level forensics from inside the transport (state changes,
+      // gathering, candidates). Replaces the application attaching its
+      // own pc listeners via the deleted escape hatch.
+      type: 'ice-diagnostic';
+      peer: AgentPubKeyB64;
+      connectionId: ConnectionId;
+      diag: IceDiagnostic;
     }
   | {
       type: 'error';
@@ -233,6 +294,39 @@ export interface PeerTransport {
 
   /** Get WebRTC stats. Returns null if connection is not in a state that has stats. */
   getStats(peer: AgentPubKeyB64): Promise<TransportStats | null>;
+
+  /**
+   * Live `iceConnectionState` for the peer's current connection, or
+   * `undefined` when there is no pc to ask. Diagnostic input to the
+   * stale-connection net (`stale-connection-policy.ts`, which stands down
+   * while `ownsTransportRecovery` is true) — never a teardown trigger on
+   * its own. This is the read-only remnant of the deleted
+   * `getRTCPeerConnection` escape hatch.
+   */
+  getIceConnectionState(peer: AgentPubKeyB64): RTCIceConnectionState | undefined;
+
+  /**
+   * Bias the peer's encoders toward audio: audio senders get high
+   * priority/networkPriority, video senders low, plus an optional video
+   * bitrate cap. On a saturated uplink the congestion controller then
+   * starves video before audio. Best-effort: senders whose encodings are
+   * not yet populated are skipped; per-sender failures are reported, not
+   * thrown. Call after `connected` (senders exist post-addTrack).
+   */
+  prioritizeAudio(
+    peer: AgentPubKeyB64,
+    opts: { videoMaxBitrateBps: number | null }
+  ): Promise<SenderPriorityOutcome[]>;
+
+  /**
+   * Per-peer track refresh against the current stream: replaces each
+   * sender's track with the matching-kind track (forcing re-encoding),
+   * adds tracks that have no sender yet. Single-peer counterpart to the
+   * fan-out `replaceTrack` — recovery for one peer must not perturb the
+   * others. Returns false when the peer has no live connection (caller
+   * decides the heavier fallback).
+   */
+  refreshMediaForPeer(peer: AgentPubKeyB64, stream: MediaStream): boolean;
 
   /** Process an incoming signal received via the application's signaling channel. */
   processIncomingSignal(signal: IncomingSignal): void;

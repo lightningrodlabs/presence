@@ -110,7 +110,7 @@ function applyPhaseEvent(event: Extract<TransportEvent, { type: 'connection-stat
   });
 
   const slotEvent: SlotEvent | null =
-    route.handler === 'start-ice-monitor'
+    route.handler === 'signaling'
       ? { kind: 'signaling', slot: route.slot }
       : route.handler === 'media-connected'
         ? { kind: 'connected' }

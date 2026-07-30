@@ -2481,18 +2481,19 @@ export class RoomView extends LitElement {
       pk => pk,
       pk => {
         const seeing = this.streamsStore.observersSeeing(pk);
-        const connected = this.streamsStore.observersConnectedTo(pk);
-        // Prefer the "connected via" framing when any observer has a
-        // working link; fall back to "last seen by" when presence is
-        // only ping-level (impolite close in progress, link broken
-        // everywhere).
-        const label = connected.length > 0 ? 'connected via' : 'last seen by';
+        const hearing = this.streamsStore.observersHearing(pk);
+        // Prefer the "heard by" framing when any observer reports live
+        // audio; fall back to "last seen by" when presence is only
+        // ping-level (impolite close in progress, link broken
+        // everywhere). "connected" is reserved for ICE + DTLS up and is
+        // not a claim this tile can make (Phase 4 item 4).
+        const label = hearing.length > 0 ? 'heard by' : 'last seen by';
         const observers = seeing;
         return html`
           <div
             class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
             style="opacity: 0.7;"
-            title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not connected to you"
+            title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not reachable by you"
           >
             <avatar-with-nickname
               .hideNickname=${true}
@@ -2503,7 +2504,7 @@ export class RoomView extends LitElement {
               class="secondary-font"
               style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
             >
-              reported in room — not connected to you
+              reported in room — not reachable by you
             </div>
             ${observers.length > 0
               ? html`<div

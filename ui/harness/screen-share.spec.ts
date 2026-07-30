@@ -117,7 +117,7 @@ test.describe('screen share across real WebRTC links', () => {
     // stops being `install`.
     const firstIn = bAfterEstablish.timeline.find(e => e.role === 'in');
     expect(firstIn).toBeDefined();
-    expect(firstIn!.route).toBe('start-ice-monitor/signaling-started');
+    expect(firstIn!.route).toBe('signaling/signaling-started');
     expect(firstIn!.write).toBe('install');
     // A real video track arrived and the paint mirror is wired.
     expect(bAfterEstablish.streams['agent-A'].video).toBeGreaterThan(0);

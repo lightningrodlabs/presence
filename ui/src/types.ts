@@ -112,6 +112,12 @@ export type AudioLinkState =
  * Discrete freshness bucket for "last time I heard from this peer via
  * signals." Broadcast instead of an absolute timestamp so clock skew
  * between observers does not flip the color.
+ *
+ * This is the **signals-reachable** predicate — evidence about the
+ * Holochain signal path only. Never compare it with, or substitute it
+ * for, WebRTC `connected` (ICE + DTLS up): the two carriers fail
+ * independently, and `decideAudioLink` (`peer-link-policy.ts`) is where
+ * their precedence is decided — observed media flow beats this bucket.
  */
 export type LastSeenBucket = 'fresh' | 'stale' | 'gone' | 'unknown';
 

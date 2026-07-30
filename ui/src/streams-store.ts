@@ -19,10 +19,13 @@ import {
   PRESENT_STALENESS_MS,
   type PresenceSoundState,
 } from './presence-policy';
+import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
-import type { TransportEvent } from './transport';
+import type { PeerTransport, TransportEvent } from './transport';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
-import { computeSignalsTargets } from './transport/carrier-coverage';
+import { carrierFor, computeSignalsTargets } from './transport/carrier-coverage';
+import { statsForPeer } from './transport/carrier-stats-policy';
+import type { PeerStats } from './transport/carrier-stats-policy';
 import {
   decideStaleConnectionCleanup,
   staleTeardownPlan,
@@ -96,35 +99,23 @@ declare const __APP_VERSION__: string;
 const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
- * How often the ICE monitors poll for a connection's `RTCPeerConnection`
- * to appear, and how many times before giving up. The budget
- * (100ms * 150 = 15s) is `SDP_EXCHANGE_TIMEOUT`: past that the connection
- * this monitor exists to observe has itself been given up on, so an
- * unbounded poll is observing nothing. Serves the connection-establishment
- * predicate; reuses that predicate's clock rather than introducing a
- * threshold of its own.
- */
-const ICE_MONITOR_ATTACH_POLL_MS = 100;
-const ICE_MONITOR_ATTACH_MAX_ATTEMPTS =
-  SDP_EXCHANGE_TIMEOUT / ICE_MONITOR_ATTACH_POLL_MS;
-
-/**
  * How long an established peer may sit in iceConnectionState 'disconnected'
- * before stale-cleanup tears it down. WebRTC treats 'disconnected' as
- * recoverable: it keeps probing the active candidate pair and may transition
- * back to 'connected' if the path heals (e.g. brief packet loss, NAT mapping
- * that resettles). Tearing down at the first 'disconnected' aborts that
- * recovery and forces a full InitRequest/SDP/ICE cycle on both sides; with
- * no relay candidate available, the new attempt frequently lands on the same
- * broken path and fails the same way. We give ICE this window to recover
- * before giving up. 'failed' and 'closed' are still acted on immediately.
+ * before the stale-connection net would tear it down. WebRTC treats
+ * 'disconnected' as recoverable: it keeps probing the active candidate pair
+ * and may transition back to 'connected' if the path heals (e.g. brief
+ * packet loss, NAT mapping that resettles). Tearing down at the first
+ * 'disconnected' aborts that recovery and forces a full re-establishment on
+ * both sides; with no relay candidate available, the new attempt frequently
+ * lands on the same broken path and fails the same way.
  *
- * Note: when a peer is using the FSM transport, the FSM itself runs an
- * internal grace of the same duration (configurable via
- * ConnectionConfig.iceDisconnectedGraceMs, default 15s). The two graces are
- * independent — both delay teardown — so the streams-store grace is also
- * needed to prevent stale-cleanup from destroying an FSM-managed peer
- * mid-recovery.
+ * Input to `decideStaleConnectionCleanup` only. Since Phase 3 every live
+ * transport owns its recovery (the FSM runs its own grace of the same
+ * duration, ConnectionConfig.iceDisconnectedGraceMs), so the net always
+ * stands down before this grace is consulted — it is the declared safety
+ * net for a future carrier that does not own recovery, not a second live
+ * controller. (This comment previously claimed both graces were needed
+ * concurrently; that stopped being true when Phase 1 item 4 made the
+ * supervisor stand down for recovery-owning transports.)
  */
 const ICE_DISCONNECTED_GRACE_MS = 15000;
 
@@ -329,9 +320,14 @@ export class StreamsStore {
    * routed by the sender's declared role (`dir: 'sharer' | 'viewer'`),
    * not by connectionId — see `handleSdpFsmScreen`.
    */
-  mediaTransport!: FsmTransport;
-  screenShareOutTransport!: FsmTransport;
-  screenShareInTransport!: FsmTransport;
+  // Typed as the interface, not the implementation (Phase 4 item 3 made
+  // `PeerTransport` a real annotation): the store can only use the
+  // declared transport surface, so an impl-specific reach-in — the
+  // escape hatch this codebase spent three phases removing — is a
+  // compile error here, not a code-review catch.
+  mediaTransport!: PeerTransport;
+  screenShareOutTransport!: PeerTransport;
+  screenShareInTransport!: PeerTransport;
 
   constructor(
     roomStore: RoomStore,
@@ -609,7 +605,7 @@ export class StreamsStore {
           openConnectionId: get(this._openConnections)[event.peer]?.connectionId,
         });
         switch (route.handler) {
-          case 'start-ice-monitor':
+          case 'signaling':
             if (route.slot.action === 'adopt') {
               // The FSM behind the slot's connectionId was replaced in place
               // by ConnectionManager (higher-epoch offer, or a new remote
@@ -627,11 +623,12 @@ export class StreamsStore {
                 connectionId: route.slot.supersedes,
                 detail: `superseded-by=${event.connectionId}; path=transport-replace`,
               });
-              this._stopMediaIceMonitor(event.peer, route.slot.supersedes);
-              // Keyed to the old connection; the new monitor sets its own.
+              this._clearIceTiming(event.peer, route.slot.supersedes);
+              // Keyed to the old connection; the new connection's
+              // ice-diagnostic events set their own.
               delete this._iceDisconnectedAt[event.peer];
             }
-            this._startMediaIceMonitor(event.peer, event.connectionId);
+            this._stakeIceTiming(event.peer, event.connectionId);
             {
               // `install`: FSM acceptor path — an incoming offer creates an
               // FSM without streams-store knowing in advance, so the slot
@@ -691,6 +688,9 @@ export class StreamsStore {
       case 'establishment-timeline':
         this._handleEstablishmentTimeline(event.peer, event.connectionId, event.timeline);
         break;
+      case 'ice-diagnostic':
+        this._handleMediaIceDiagnostic(event.peer, event.connectionId, event.diag);
+        break;
       case 'error':
         this._handleMediaError(event.peer, event.connectionId, event.error);
         break;
@@ -739,12 +739,12 @@ export class StreamsStore {
 
   /** The one media transport (fan-out helper retained where operations
    *  are broadcast-shaped: setLocalStream, add/remove/replaceTrack). */
-  private _allMediaTransports(): Array<FsmTransport> {
+  private _allMediaTransports(): Array<PeerTransport> {
     return [this.mediaTransport];
   }
 
   private _subscribeScreenShareTransport(
-    transport: FsmTransport,
+    transport: PeerTransport,
     initiator: boolean,
   ): void {
     transport.onAny((event: TransportEvent) => {
@@ -761,14 +761,7 @@ export class StreamsStore {
               get(this._screenShareStore(initiator))[event.peer]?.connectionId,
           });
           switch (route.handler) {
-            case 'start-ice-monitor': {
-              if (initiator) {
-                // Watch the outgoing-screen-share peer's ICE state for the
-                // stale-cleanup grace bookkeeping (the supervisor itself
-                // stands down while the FSM owns recovery, but the
-                // timestamps keep the forensic story readable).
-                this._startScreenShareIceMonitor(event.peer, transport);
-              }
+            case 'signaling': {
               const slotWrite = decideSlotWrite(
                 { kind: 'signaling', slot: route.slot },
                 event.connectionId,
@@ -820,6 +813,15 @@ export class StreamsStore {
         case 'remote-track':
           this._handleScreenShareRemoteTrack(event.peer, event.connectionId, event.track);
           break;
+        case 'ice-diagnostic':
+          // Outgoing side only: the stale-cleanup grace bookkeeping (the
+          // net itself stands down while the FSM owns recovery, but the
+          // timestamps keep the forensic story readable). The viewer side
+          // has no stale supervisor and needs nothing here.
+          if (initiator) {
+            this._handleScreenShareIceDiagnostic(event.peer, event.diag);
+          }
+          break;
         case 'error':
           this._handleScreenShareError(event.peer, event.connectionId, event.error, initiator);
           break;
@@ -830,54 +832,46 @@ export class StreamsStore {
   // --- media transport event handlers ---
 
   /**
-   * Watch RTCPeerConnection ICE state for forensic logging. The transport
-   * does not surface ICE-level events on its interface; we reach in via
-   * the per-impl escape hatch and attach listeners.
+   * Stake t0 for the (peer, connectionId) establishment-latency record on
+   * the first `signaling` transition. The ICE-level milestones that fill
+   * the rest of the record arrive as `ice-diagnostic` transport events
+   * (`_handleMediaIceDiagnostic`) — the transport owns the pc and its
+   * listeners since Phase 4 item 3; the store only keeps the forensic
+   * bookkeeping.
    */
-  private _startMediaIceMonitor(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-  ): void {
+  private _stakeIceTiming(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
     const key = `${pubKeyB64}:${connectionId}`;
-    // Stake t0 on the first signaling transition for this (peer, connId).
-    // Done before the attach-gate so re-entries during a pc-not-ready
-    // retry race still anchor t0 at the actual signaling boundary rather
-    // than at the moment pc finally appears.
     if (!this._iceTimings[key]) {
       this._iceTimings[key] = { t0: this.clock.now(), impl: 'fsm' };
     }
-    const transport = this.mediaTransport;
-    let attempts = 0;
-    const attach = () => {
-      // Gate inside attach (not at function entry) so a re-entry from a
-      // second `signaling` transition keeps polling for pc when the first
-      // call is still retrying. Claiming the key before pc is ready
-      // would let later transitions short-circuit, and on LAN ICE
-      // completes faster than the 100ms retry interval — the listener
-      // would attach after every relevant state change had already fired.
-      if (this._iceMonitorsAttached.has(key)) return;
-      const pc = transport.getRTCPeerConnection(pubKeyB64);
-      if (!pc) {
-        // Bounded: a connection torn down before its pc materialises used
-        // to poll forever (PR #4 F3). The budget is the SDP-exchange
-        // timeout — past it the connection this monitor exists for has
-        // itself been given up on, so there is nothing left to observe.
-        attempts += 1;
-        if (attempts > ICE_MONITOR_ATTACH_MAX_ATTEMPTS) {
-          this.logger.logCustomMessage(
-            `ICE monitor [${pubKeyB64.slice(0, 8)}]: gave up waiting for pc after ${attempts} attempts connId=${connectionId.slice(0, 8)}`
-          );
-          return;
-        }
-        this.clock.setTimeout(attach, ICE_MONITOR_ATTACH_POLL_MS);
-        return;
-      }
-      this._iceMonitorsAttached.add(key);
-      const ac = new AbortController();
-      this._iceMonitorAbortControllers.set(key, ac);
-      const signal = ac.signal;
-      pc.addEventListener('iceconnectionstatechange', () => {
-        const state = pc.iceConnectionState;
+  }
+
+  /**
+   * Drop the establishment-timing record for a (peer, connectionId) pair.
+   * Called from the close/error paths so a future reconnect with a fresh
+   * connectionId starts a clean record. Listener detachment is the
+   * transport's job now (one listener set per peer session, aborted on
+   * close/replace inside `FsmTransport`).
+   */
+  private _clearIceTiming(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
+    delete this._iceTimings[`${pubKeyB64}:${connectionId}`];
+  }
+
+  /**
+   * Route an `ice-diagnostic` event from the media transport: forensic log
+   * lines (same formats the in-store pc listeners produced before Phase 4,
+   * so log analysis stays stable), establishment-latency milestones, and
+   * the `_iceDisconnectedAt` grace bookkeeping.
+   */
+  private _handleMediaIceDiagnostic(
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    diag: import('./transport').IceDiagnostic,
+  ): void {
+    const key = `${pubKeyB64}:${connectionId}`;
+    switch (diag.kind) {
+      case 'ice-state': {
+        const state = diag.state;
         this.logger.logCustomMessage(
           `ICE [${pubKeyB64.slice(0, 8)}]: ${state} connId=${connectionId.slice(0, 8)}`
         );
@@ -890,34 +884,27 @@ export class StreamsStore {
         }
         if (t) t.finalIceState = state;
         // Maintain the invariant: an entry exists iff iceState is
-        // currently 'disconnected'. The cleanup paths use a grace
+        // currently 'disconnected'. The stale-connection net uses a grace
         // period before treating 'disconnected' as terminal.
         if (state === 'disconnected') {
           this._iceDisconnectedAt[pubKeyB64] = this.clock.now();
         } else {
           delete this._iceDisconnectedAt[pubKeyB64];
         }
-        if (state === 'failed' || state === 'disconnected') {
-          try {
-            const transport = (pc.getSenders()[0]?.transport as any)?.iceTransport;
-            const pair = transport?.getSelectedCandidatePair?.() as { local?: RTCIceCandidate; remote?: RTCIceCandidate } | undefined;
-            if (pair) {
-              this.logger.logCustomMessage(
-                `ICE failed pair [${pubKeyB64.slice(0, 8)}]: local=${(pair.local as any)?.address}:${(pair.local as any)?.port} (${pair.local?.type}) remote=${(pair.remote as any)?.address}:${(pair.remote as any)?.port} (${pair.remote?.type})`
-              );
-            }
-          } catch (_) {
-            // getSenders/iceTransport may not be available on all browsers
-          }
+        if (diag.selectedPair) {
+          const { local, remote } = diag.selectedPair;
+          this.logger.logCustomMessage(
+            `ICE failed pair [${pubKeyB64.slice(0, 8)}]: local=${local?.address}:${local?.port} (${local?.type}) remote=${remote?.address}:${remote?.port} (${remote?.type})`
+          );
         }
-      }, { signal });
-      pc.addEventListener('icegatheringstatechange', () => {
+        break;
+      }
+      case 'gathering-state': {
         this.logger.logCustomMessage(
-          `ICE gathering [${pubKeyB64.slice(0, 8)}]: ${pc.iceGatheringState}`
+          `ICE gathering [${pubKeyB64.slice(0, 8)}]: ${diag.state}`
         );
-        if (pc.iceGatheringState === 'complete') {
-          const stats = (pc as any).localDescription?.sdp;
-          const hasRelay = stats ? stats.includes('typ relay') : false;
+        if (diag.state === 'complete') {
+          const hasRelay = diag.localSdpHasRelay ?? false;
           this.logger.logCustomMessage(
             `ICE candidates summary [${pubKeyB64.slice(0, 8)}]: relay=${hasRelay}`
           );
@@ -930,35 +917,18 @@ export class StreamsStore {
             t.relay = hasRelay;
           }
         }
-      }, { signal });
-      pc.addEventListener('icecandidate', (event: RTCPeerConnectionIceEvent) => {
-        if (event.candidate) {
-          const c = event.candidate;
-          this.logger.logCustomMessage(
-            `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${c.type} ${c.protocol} ${c.address}:${c.port}`
-          );
-        }
-      }, { signal });
-    };
-    attach();
-  }
-
-  /**
-   * Release the attach-once bookkeeping for a (peer, connectionId) pair
-   * AND actively detach the listeners by aborting their AbortController.
-   * Called from the close/error paths so a future reconnect with a fresh
-   * connectionId re-attaches a clean set, and orphaned pcs (where the
-   * FSM teardown didn't synchronously destroy the underlying pc) stop
-   * leaking ICE-state events into the log.
-   */
-  private _stopMediaIceMonitor(pubKeyB64: AgentPubKeyB64, connectionId: string): void {
-    const key = `${pubKeyB64}:${connectionId}`;
-    this._iceMonitorsAttached.delete(key);
-    delete this._iceTimings[key];
-    const ac = this._iceMonitorAbortControllers.get(key);
-    if (ac) {
-      ac.abort();
-      this._iceMonitorAbortControllers.delete(key);
+        break;
+      }
+      case 'candidate': {
+        this.logger.logCustomMessage(
+          `ICE candidate [${pubKeyB64.slice(0, 8)}]: ${diag.candidateType} ${diag.protocol} ${diag.address}:${diag.port}`
+        );
+        break;
+      }
+      default: {
+        const exhaustive: never = diag;
+        void exhaustive;
+      }
     }
   }
 
@@ -1032,40 +1002,23 @@ export class StreamsStore {
   }
 
   /**
-   * Watch the underlying RTCPeerConnection of an outgoing screen-share
-   * peer so the stale-cleanup paths can apply the grace period.
-   * Maintains the invariant on `_screenShareIceDisconnectedAt`: an entry
-   * exists iff iceState is currently 'disconnected'.
+   * `ice-diagnostic` bookkeeping for the outgoing screen-share transport:
+   * maintains the invariant on `_screenShareIceDisconnectedAt` — an entry
+   * exists iff the share's iceState is currently 'disconnected' — which
+   * the stale-connection net reads for its grace window. No log lines:
+   * the media transport is the forensic subject; the share only needs
+   * the timestamps.
    */
-  private _startScreenShareIceMonitor(
+  private _handleScreenShareIceDiagnostic(
     pubKeyB64: AgentPubKeyB64,
-    transport: FsmTransport,
+    diag: import('./transport').IceDiagnostic,
   ): void {
-    let attempts = 0;
-    const attach = () => {
-      const pc = transport.getRTCPeerConnection(pubKeyB64);
-      if (!pc) {
-        // Bounded for the same reason as the media monitor (PR #4 F3).
-        attempts += 1;
-        if (attempts > ICE_MONITOR_ATTACH_MAX_ATTEMPTS) {
-          this.logger.logCustomMessage(
-            `Screen-share ICE monitor [${pubKeyB64.slice(0, 8)}]: gave up waiting for pc after ${attempts} attempts`
-          );
-          return;
-        }
-        this.clock.setTimeout(attach, ICE_MONITOR_ATTACH_POLL_MS);
-        return;
-      }
-      pc.addEventListener('iceconnectionstatechange', () => {
-        const state = pc.iceConnectionState;
-        if (state === 'disconnected') {
-          this._screenShareIceDisconnectedAt[pubKeyB64] = this.clock.now();
-        } else {
-          delete this._screenShareIceDisconnectedAt[pubKeyB64];
-        }
-      });
-    };
-    attach();
+    if (diag.kind !== 'ice-state') return;
+    if (diag.state === 'disconnected') {
+      this._screenShareIceDisconnectedAt[pubKeyB64] = this.clock.now();
+    } else {
+      delete this._screenShareIceDisconnectedAt[pubKeyB64];
+    }
   }
 
   /** DTLS-stall watchdog timeout (ms) for the FSM transport. Defaults to a
@@ -1124,68 +1077,33 @@ export class StreamsStore {
   }
 
   /**
-   * Bias the encoder toward audio on a constrained uplink: mark the audio
-   * sender high network priority and the video sender low, and cap video
-   * bitrate. On a saturated upload the congestion controller then starves
-   * video before audio, so voice survives loss/contention that would
-   * otherwise hit both equally. Best-effort: setParameters can reject if
-   * called before encodings exist or on browsers that don't support a
-   * field; failures are non-fatal and logged at debug only.
+   * Bias the encoder toward audio on a constrained uplink: audio senders
+   * high network priority, video low + capped bitrate, so a saturated
+   * upload starves video before voice. The mechanism lives in the
+   * transport (`prioritizeAudio` — the pc no longer leaves it, Phase 4
+   * item 3); the store keeps the policy inputs (the bitrate-cap setting)
+   * and the forensic record. `networkPriority` is not universally
+   * honored; the outcome's `applied` flag surfaces a silent revert —
+   * exactly the periodic-dropout symptom we chase — as NOT-APPLIED in
+   * capture rather than leaving it inferred.
    */
-  private async _applySenderParams(
-    pc: RTCPeerConnection | undefined,
-    peerB64?: AgentPubKeyB64,
-  ): Promise<void> {
-    if (!pc) return;
-    const report: string[] = [];
-    for (const sender of pc.getSenders()) {
-      const kind = sender.track?.kind;
-      if (kind !== 'audio' && kind !== 'video') continue;
-      try {
-        const params = sender.getParameters();
-        // setParameters requires the encodings array shape returned by
-        // getParameters(); if the browser hasn't populated it yet, skip.
-        if (!params.encodings || params.encodings.length === 0) continue;
-        const enc = params.encodings[0] as RTCRtpEncodingParameters & {
-          networkPriority?: RTCPriorityType;
-        };
-        const want = kind === 'audio' ? 'high' : 'low';
-        if (kind === 'audio') {
-          enc.priority = 'high';
-          enc.networkPriority = 'high';
-        } else {
-          enc.priority = 'low';
-          enc.networkPriority = 'low';
-          const cap = this._videoMaxBitrate();
-          if (cap) enc.maxBitrate = cap;
-        }
-        await sender.setParameters(params);
-        // Read back what the browser actually stored. `networkPriority` is not
-        // universally honored; if it silently reverts, video can starve audio
-        // on a constrained uplink — exactly the periodic-dropout symptom we are
-        // chasing. Logging applied-vs-requested makes that visible in capture.
-        const rb = sender.getParameters().encodings?.[0] as
-          | (RTCRtpEncodingParameters & { networkPriority?: RTCPriorityType })
-          | undefined;
-        const gotPrio = rb?.priority ?? 'unset';
-        const gotNet = rb?.networkPriority ?? 'unset';
-        const applied = gotPrio === want && gotNet === want;
-        let s = `${kind}:want=${want} priority=${gotPrio} netPriority=${gotNet}${applied ? '' : ' NOT-APPLIED'}`;
-        if (kind === 'video') s += ` maxBitrate=${rb?.maxBitrate ?? 'unset'}`;
-        report.push(s);
-      } catch {
-        // Non-fatal: too-early call, unsupported field, or transient state.
-        report.push(`${kind}:setParameters-failed`);
-      }
-    }
-    if (peerB64 && report.length > 0) {
-      this.logger.logAgentEvent({
-        agent: peerB64,
-        timestamp: this.clock.now(),
-        event: 'SenderParams',
-        detail: report.join(' | '),
-      });
-    }
+  private async _applySenderPriorities(peerB64: AgentPubKeyB64): Promise<void> {
+    const outcomes = await this.mediaTransport.prioritizeAudio(peerB64, {
+      videoMaxBitrateBps: this._videoMaxBitrate(),
+    });
+    if (outcomes.length === 0) return;
+    const report = outcomes.map(o => {
+      if ('failed' in o) return `${o.kind}:setParameters-failed`;
+      let s = `${o.kind}:want=${o.want} priority=${o.priority} netPriority=${o.networkPriority}${o.applied ? '' : ' NOT-APPLIED'}`;
+      if (o.kind === 'video') s += ` maxBitrate=${o.maxBitrate ?? 'unset'}`;
+      return s;
+    });
+    this.logger.logAgentEvent({
+      agent: peerB64,
+      timestamp: this.clock.now(),
+      event: 'SenderParams',
+      detail: report.join(' | '),
+    });
   }
 
   private _handleMediaConnected(
@@ -1265,7 +1183,7 @@ export class StreamsStore {
 
     // Prioritise audio over video on the now-live sender (protects voice on
     // constrained uplinks). Fire-and-forget; senders exist post-addTrack.
-    void this._applySenderParams(transport.getRTCPeerConnection(pubKeyB64), pubKeyB64);
+    void this._applySenderPriorities(pubKeyB64);
 
     this.updateConnectionStatus(pubKeyB64, { type: 'Connected' });
     this.eventCallback({
@@ -1278,12 +1196,11 @@ export class StreamsStore {
     // relay (TURN) usage so the UI can flag it.
     this.clock.setTimeout(async () => {
       try {
-        const pc = transport.getRTCPeerConnection(pubKeyB64);
-        if (!pc) return;
-        const stats = await pc.getStats();
+        const stats = await transport.getStats(pubKeyB64);
+        if (!stats) return;
         let isRelayed = false;
         const reportsById: Record<string, any> = {};
-        stats.forEach((report: any) => {
+        stats.raw.forEach((report: any) => {
           reportsById[report.id] = report;
         });
         Object.values(reportsById).forEach((report: any) => {
@@ -1359,7 +1276,7 @@ export class StreamsStore {
           detail: `superseded-by=${slotWrite.supersededBy}`,
         });
       } else {
-        this._stopMediaIceMonitor(pubKeyB64, connectionId);
+        this._clearIceTiming(pubKeyB64, connectionId);
       }
       return;
     }
@@ -1423,12 +1340,12 @@ export class StreamsStore {
     delete this._staleCycles[pubKeyB64];
     delete this._reconcileAttemptCount[pubKeyB64];
     delete this._iceDisconnectedAt[pubKeyB64];
-    // Capture failure-side latency before _stopMediaIceMonitor wipes
+    // Capture failure-side latency before _clearIceTiming wipes
     // the timing entry. _emitIceNeverConnected no-ops if the
     // establishment event already fired (i.e. this is a normal close
     // after a successful connect).
     this._emitIceNeverConnected(pubKeyB64, connectionId);
-    this._stopMediaIceMonitor(pubKeyB64, connectionId);
+    this._clearIceTiming(pubKeyB64, connectionId);
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
 
@@ -1655,7 +1572,7 @@ export class StreamsStore {
     // down. Subsequent error events for the same connectionId would
     // re-emit the same structured event and re-fire peer-disconnected.
     if (!currentOnError) {
-      this._stopMediaIceMonitor(pubKeyB64, connectionId);
+      this._clearIceTiming(pubKeyB64, connectionId);
       return;
     }
 
@@ -1696,10 +1613,10 @@ export class StreamsStore {
     }
     this.removePeerAudioAnalyser(pubKeyB64);
     this.webrtcStats.delete(pubKeyB64);
-    // Capture failure-side latency before _stopMediaIceMonitor wipes
+    // Capture failure-side latency before _clearIceTiming wipes
     // the timing entry. Mirrors the _handleMediaClosed path.
     this._emitIceNeverConnected(pubKeyB64, connectionId);
-    this._stopMediaIceMonitor(pubKeyB64, connectionId);
+    this._clearIceTiming(pubKeyB64, connectionId);
 
     // Drive transport close so the underlying peer is fully torn down.
     // The resulting close event hits _handleMediaClosed and our
@@ -3220,9 +3137,10 @@ export class StreamsStore {
   /**
    * Tracks the timestamp at which a video peer's iceConnectionState most
    * recently entered 'disconnected', for the grace-period recovery window
-   * in stale cleanup. Set in the iceconnectionstatechange listener attached
-   * by `_startMediaIceMonitor`; the invariant is that an entry exists iff
-   * the underlying RTCPeerConnection's iceConnectionState is currently
+   * in stale cleanup. Maintained by `_handleMediaIceDiagnostic` from the
+   * transport's `ice-diagnostic` events (the transport owns the pc and
+   * its listeners since Phase 4 item 3); the invariant is that an entry
+   * exists iff the connection's iceConnectionState is currently
    * 'disconnected'. Cleared on entry to any other ICE state, on close-
    * cleanup, and on the supersede paths (where the close handler is
    * short-circuited by the supersede guard).
@@ -3230,36 +3148,14 @@ export class StreamsStore {
   _iceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
 
   /**
-   * (peer, connectionId) pairs that already have ICE listeners attached.
-   * The FSM transitions through `signaling` more than once during
-   * renegotiation, and `_dispatchMediaEvent` re-enters
-   * `_startMediaIceMonitor` each time — without this guard, every
-   * iceconnectionstatechange/icegatheringstatechange/icecandidate event
-   * is logged N times for N signaling transitions on the same pc.
-   */
-  _iceMonitorsAttached = new Set<string>();
-
-  /**
-   * AbortController per (peer, connectionId) carrying the
-   * `iceconnectionstatechange` / `icegatheringstatechange` / `icecandidate`
-   * listeners attached by `_startMediaIceMonitor`. Calling `.abort()` on
-   * stop actively removes the listeners regardless of whether the
-   * underlying RTCPeerConnection is still alive — necessary because the
-   * FSM-side teardown does not always destroy the pc synchronously, so
-   * stale listeners on orphaned pcs would otherwise keep emitting
-   * `ICE [...]: checking` events long after FsmClose (witnessed in the
-   * 3-node toggle-storm capture, ~3 concurrent pcs per peer until
-   * SDP timeout cleaned them up).
-   */
-  _iceMonitorAbortControllers = new Map<string, AbortController>();
-
-  /**
    * Per-(peer, connectionId) establishment timings, captured for forensic
-   * A/B-ing of the two WebRTC carriers on marginal links. Emitted as a
-   * single `IceEstablishment` SimpleEvent on phase='connected', or as
+   * A/B-ing of establishment latency on marginal links. t0 is staked on
+   * the `signaling` transition (`_stakeIceTiming`); the ICE milestones
+   * arrive as `ice-diagnostic` transport events. Emitted as a single
+   * `IceEstablishment` SimpleEvent on phase='connected', or as
    * `IceNeverConnected` if the connection closes first. See
    * WEBRTC_CARRIER_ANALYSIS.md for the analysis goal. Key format
-   * `<peerB64>:<connectionId>`, matching `_iceMonitorsAttached`.
+   * `<peerB64>:<connectionId>`.
    */
   _iceTimings: Record<string, {
     t0: number;
@@ -3633,57 +3529,25 @@ export class StreamsStore {
    * this peer right now, and via what carrier?"
    */
   audioLinkFor(peerB64: AgentPubKeyB64): AudioLinkState {
-    if (get(this.blockedAgents).includes(peerB64)) return 'blocked';
-
-    const bucket = this.lastSeenBucket(peerB64);
-    if (bucket === 'gone' || bucket === 'unknown') return 'absent';
-
-    const conn = get(this._openConnections)[peerB64];
-    const status = get(this._connectionStatuses)[peerB64];
-
-    // Active flow takes precedence over everything else: if audio is
-    // actually arriving, the link is working regardless of any stale
-    // intent or status flags.
-    const webrtcAudioLive =
-      !!conn?.connected &&
-      !!conn?.audio &&
-      (this._staleCycles[peerB64]?.audio ?? 0) < 2;
-    if (webrtcAudioLive) return 'webrtc';
-
-    // Same media-flowing window as isMediaLive / computePresentPeers —
-    // one window per predicate. (Was a bespoke 2000ms literal.)
-    const lastRecv = voiceController.peerLastRecvMs.get(peerB64);
-    const signalsLive =
-      lastRecv !== undefined &&
-      this.clock.now() - lastRecv < MEDIA_LIVE_WINDOW_MS;
-    if (signalsLive) return 'signals';
-
-    // No flow. Peer intent comes BEFORE the negotiation check: a stale
-    // ConnectionStatus stuck in InitSent/AcceptSent (e.g. left over from
-    // before webrtc was globally disabled) would otherwise mask the fact
-    // that the peer is intentionally muted. Muted is the more accurate
-    // answer when both could apply.
+    // The decision — including the contract that observed media flow
+    // beats the signals-reachability veto — lives in
+    // `peer-link-policy.ts:decideAudioLink`. This method only gathers
+    // the snapshot.
     const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
-    if (peerConv) {
-      const payload = parseConversationPayload(peerConv);
-      if (payload?.micMuted) return 'muted';
-    }
-
-    // Genuine in-progress negotiation (no flow, peer not muted).
-    if (status) {
-      switch (status.type) {
-        case 'AwaitingInit':
-        case 'InitSent':
-        case 'AcceptSent':
-        case 'SdpExchange':
-          return 'negotiating';
-        default:
-          break;
-      }
-    }
-
-    // Reachable, not muted, no flow and not negotiating — broken.
-    return 'down';
+    const payload = peerConv ? parseConversationPayload(peerConv) : null;
+    return decideAudioLink({
+      blocked: get(this.blockedAgents).includes(peerB64),
+      reachableBucket: this.lastSeenBucket(peerB64),
+      slot: get(this._openConnections)[peerB64],
+      audioStaleCycles: this._staleCycles[peerB64]?.audio ?? 0,
+      lastVoiceMs: voiceController.peerLastRecvMs.get(peerB64),
+      now: this.clock.now(),
+      // Same media-flowing window as isMediaLive / computePresentPeers —
+      // one window per predicate. (Was a bespoke 2000ms literal.)
+      mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+      peerMicMuted: !!payload?.micMuted,
+      statusType: get(this._connectionStatuses)[peerB64]?.type,
+    });
   }
 
   /**
@@ -3691,42 +3555,18 @@ export class StreamsStore {
    * can render "how I see each other agent."
    */
   peerLinkFor(peerB64: AgentPubKeyB64): PeerLinkSnapshot {
-    const conn = get(this._openConnections)[peerB64];
-    const audioLink = this.audioLinkFor(peerB64);
-
-    let carrier: PeerLinkSnapshot['carrier'];
-    if (audioLink === 'webrtc') carrier = 'webrtc';
-    else if (audioLink === 'signals') carrier = 'signals';
-    else if (conn?.connected) carrier = 'webrtc';
-    else carrier = 'none';
-
-    let audio: PeerLinkSnapshot['audio'];
-    if (audioLink === 'webrtc' || audioLink === 'signals') audio = 'live';
-    else if (audioLink === 'muted') audio = 'muted';
-    else if (conn?.connected && conn.audio) audio = 'stale';
-    else audio = 'off';
-
-    // Video is 'live' if WebRTC has an active video track OR we've
-    // received a filmstrip clip from this peer within the media-flowing
-    // window (signals carrier carrying low-bandwidth video).
+    // Field semantics (carrier vs the carrierFor authority, the 'stale'
+    // audio arm) are documented on `buildPeerLinkSnapshot`
+    // (`peer-link-policy.ts`); this method only gathers the snapshot.
     const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
-    const filmstripLive =
-      lastFilmstripMs !== undefined &&
-      this.clock.now() - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS;
-    const video: PeerLinkSnapshot['video'] =
-      conn?.video || filmstripLive
-        ? 'live'
-        : conn?.videoMuted
-          ? 'muted'
-          : 'off';
-
-    return {
-      audioLink,
-      carrier,
-      audio,
-      video,
+    return buildPeerLinkSnapshot({
+      audioLink: this.audioLinkFor(peerB64),
+      slot: get(this._openConnections)[peerB64],
+      filmstripLive:
+        lastFilmstripMs !== undefined &&
+        this.clock.now() - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS,
       lastSeen: this.lastSeenBucket(peerB64),
-    };
+    });
   }
 
   /**
@@ -3818,7 +3658,7 @@ export class StreamsStore {
    * vanishing in lockstep with everyone else's link failure.
    *
    * Whether anyone has a *working* link is exposed separately via
-   * `observersConnectedTo()` so the placeholder can label the observer
+   * `observersHearing()` so the placeholder can label the observer
    * list accurately.
    */
   phantomAgents(): AgentPubKeyB64[] {
@@ -3875,12 +3715,19 @@ export class StreamsStore {
   }
 
   /**
-   * Subset of `observersSeeing` who additionally have a working or
-   * in-progress audio link to the phantom. Used to pick the observer-list
-   * label: "connected via" when this is non-empty, "last seen by"
-   * otherwise.
+   * Subset of `observersSeeing` who report actually hearing the phantom
+   * (audioLink 'webrtc' or 'signals'). Used to pick the observer-list
+   * label: "heard by" when this is non-empty, "last seen by" otherwise.
+   *
+   * Was `observersConnectedTo`, which also counted 'negotiating' links
+   * and labeled the result "connected via" — presenting an in-flight
+   * handshake, or signals reachability, as "connected". Phase 4 item 4:
+   * that word is reserved for ICE + DTLS up; what this list can honestly
+   * claim about a phantom is audibility. Declared behavior change: an
+   * observer whose only link to the phantom is a pending negotiation now
+   * falls back to the "last seen by" framing.
    */
-  observersConnectedTo(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
+  observersHearing(peerB64: AgentPubKeyB64): AgentPubKeyB64[] {
     const out: AgentPubKeyB64[] = [];
     const now = this.clock.now();
     const observerStaleness = OBSERVER_FRESHNESS_MS;
@@ -3891,11 +3738,7 @@ export class StreamsStore {
       if (now - obs.lastUpdated > observerStaleness) continue;
       const snap = obs.peerLinks[peerB64];
       if (!snap) continue;
-      if (
-        snap.audioLink === 'webrtc' ||
-        snap.audioLink === 'signals' ||
-        snap.audioLink === 'negotiating'
-      ) {
+      if (snap.audioLink === 'webrtc' || snap.audioLink === 'signals') {
         out.push(observerKey);
       }
     }
@@ -4149,9 +3992,19 @@ export class StreamsStore {
     return voiceController.peerLastRecvMs;
   }
 
-  /** True iff a WebRTC video connection currently exists to this peer. */
-  hasWebrtcConnection(pubKeyB64: string): boolean {
-    return !!get(this._openConnections)[pubKeyB64];
+  /**
+   * The one per-peer stats answer: which carrier owns the link right now
+   * (the `carrierFor` authority — ICE + DTLS up, never "an attempt
+   * exists") and that carrier's rtt/jitter/loss. Decision in
+   * `transport/carrier-stats-policy.ts`; the stats panel renders this
+   * instead of branching over the raw maps by hand (Phase 4 item 2).
+   */
+  statsFor(pubKeyB64: AgentPubKeyB64): PeerStats {
+    return statsForPeer({
+      slot: get(this._openConnections)[pubKeyB64],
+      webrtcStats: this.webrtcStats.get(pubKeyB64),
+      signalsStats: this.signalsStats.get(pubKeyB64),
+    });
   }
 
   /** Current OpenConnectionInfo for a peer, or undefined. */
@@ -4768,47 +4621,31 @@ export class StreamsStore {
   }
 
   /**
-   * Attempt lightweight track recovery using replaceTrack on the RTCRtpSender.
-   * This avoids renegotiation and stream cloning.
-   * Returns true if replaceTrack was possible, false if fallback is needed.
+   * Attempt lightweight track recovery: the transport's per-peer
+   * `refreshMediaForPeer` replaces each sender's track with the matching
+   * mainStream track (forcing re-encoding) without perturbing other
+   * peers, and adds a track that has no sender yet. Returns true if the
+   * peer had a live connection to refresh, false if the heavier
+   * reconnect fallback is needed.
+   *
+   * Declared behavior change (Phase 4 item 3): a missing sender for one
+   * kind no longer fails the whole recovery into a full reconnect — the
+   * transport adds the track in place (one renegotiation instead of a
+   * teardown + InitRequest cycle).
    */
   private _tryReplaceTrackRecovery(
     pubkey: AgentPubKeyB64,
     _connInfo: OpenConnectionInfo,
-    audioTrack: MediaStreamTrack | undefined,
-    videoTrack: MediaStreamTrack | undefined
+    _audioTrack: MediaStreamTrack | undefined,
+    _videoTrack: MediaStreamTrack | undefined
   ): boolean {
+    if (!this.mainStream) return false;
     try {
-      const pc = this.mediaTransport.getRTCPeerConnection(pubkey);
-      if (!pc) return false;
-
-      const senders = pc.getSenders();
-      let success = true;
-
-      // Single-peer recovery: drive replaceTrack directly on the
-      // RTCRtpSender so we don't perturb other peers via the
-      // transport-wide replaceTrack fan-out.
-      if (audioTrack) {
-        const audioSender = senders.find(s => s.track?.kind === 'audio');
-        if (audioSender) {
-          audioSender.replaceTrack(audioTrack);
-          this.logger.logCustomMessage(`replaceTrack audio [${pubkey.slice(0, 8)}]: success`);
-        } else {
-          success = false;
-        }
-      }
-
-      if (videoTrack) {
-        const videoSender = senders.find(s => s.track?.kind === 'video');
-        if (videoSender) {
-          videoSender.replaceTrack(videoTrack);
-          this.logger.logCustomMessage(`replaceTrack video [${pubkey.slice(0, 8)}]: success`);
-        } else {
-          success = false;
-        }
-      }
-
-      return success;
+      const ok = this.mediaTransport.refreshMediaForPeer(pubkey, this.mainStream);
+      this.logger.logCustomMessage(
+        `replaceTrack [${pubkey.slice(0, 8)}]: ${ok ? 'refreshed via transport' : 'no live connection'}`
+      );
+      return ok;
     } catch (e: any) {
       console.warn(`replaceTrack recovery failed for ${pubkey.slice(0, 8)}:`, e.message);
       this.logger.logCustomMessage(`replaceTrack [${pubkey.slice(0, 8)}]: failed -- ${e.message}`);
@@ -5432,13 +5269,11 @@ export class StreamsStore {
       // when bytesReceived is 0, so removing the outer gate doesn't
       // perturb that path.
 
-      const pc = this.mediaTransport.getRTCPeerConnection(pubKeyB64);
-      if (!pc) continue;
-
       try {
-        const stats = await pc.getStats();
+        const stats = await this.mediaTransport.getStats(pubKeyB64);
+        if (!stats) continue;
         const reports: RtcStatsReportLike[] = [];
-        stats.forEach((report: RtcStatsReportLike) => reports.push(report));
+        stats.raw.forEach((report: RtcStatsReportLike) => reports.push(report));
         const summary = summarizeRtcStats(reports);
 
         this.webrtcStats.set(pubKeyB64, {
@@ -5747,8 +5582,8 @@ export class StreamsStore {
         // route is what clears a wedged slot.
         const outgoing = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
         if (outgoing) {
-          const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
-          const iceState = pc?.iceConnectionState;
+          const iceState =
+            this.screenShareOutTransport.getIceConnectionState(pubkeyB64);
           const decision = decideStaleConnectionCleanup({
             hasExistingConn: true,
             slotClaimsConnected: !!outgoing.connected,
@@ -5898,9 +5733,10 @@ export class StreamsStore {
           this.signalsStats.set(pubkeyB64, existing);
           // Only evaluate bucket on the signals path if signals is the
           // active carrier for this peer — otherwise the webrtc poll is
-          // the source of truth and will emit if bucket changes.
+          // the source of truth and will emit if bucket changes. Same
+          // authority as statsFor: carrierFor, never a hand-rolled read.
           const openConn = get(this._openConnections)[pubkeyB64];
-          if (!openConn?.connected) {
+          if (carrierFor(openConn).carrier === 'signals') {
             this._maybeEmitQualityChange(
               pubkeyB64,
               'signals',
@@ -6042,10 +5878,9 @@ export class StreamsStore {
     const existingConn = get(this._openConnections)[pubkeyB64];
     {
       const activeTransport = this.mediaTransport;
-      const pc = existingConn
-        ? activeTransport.getRTCPeerConnection(pubkeyB64)
+      const iceState = existingConn
+        ? activeTransport.getIceConnectionState(pubkeyB64)
         : undefined;
-      const iceState = pc?.iceConnectionState;
       const decision = decideStaleConnectionCleanup({
         hasExistingConn: !!existingConn,
         slotClaimsConnected: !!existingConn?.connected,
@@ -6178,8 +6013,8 @@ export class StreamsStore {
      */
     const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
     if (outgoingScreenShare) {
-      const pc = this.screenShareOutTransport.getRTCPeerConnection(pubkeyB64);
-      const iceState = pc?.iceConnectionState;
+      const iceState =
+        this.screenShareOutTransport.getIceConnectionState(pubkeyB64);
       // Same predicate as the video path — see `stale-connection-policy.ts`.
       const decision = decideStaleConnectionCleanup({
         hasExistingConn: true,
