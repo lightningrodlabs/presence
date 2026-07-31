@@ -69,6 +69,11 @@ export type CustomLog = {
 
 export type SimpleEventType =
   | 'Pong' // Retained for backward compat with old logs; no longer emitted (pong timing is in agentPongMetadataLogs)
+  // Log-timeline aggregation of FSM SDP traffic (offer/answer/candidate
+  // bursts). The name predates Phase 3: the `SdpData` WIRE type is
+  // retired (emits:false/parses:false in the wire contract) — this
+  // logging event is alive and unrelated to the wire surface, kept
+  // under its old name for capture continuity.
   | 'SdpData'
   | 'InitAccept'
   | 'InitRequest'
@@ -94,10 +99,8 @@ export type SimpleEventType =
   | 'TrackArrivedMuted'
   | 'TrackUnmuted'
   | 'TrackUnmuteTimeout'
-  | 'AddStream'
   | 'StreamReceived'
   | 'StaleCleanup'
-  | 'SdpTimeout'
   | 'PeerLeave'
   // Carrier (WebRTC ↔ signals) transition for a given peer's audio.
   | 'CarrierSwitch'
@@ -178,6 +181,85 @@ export type SimpleEventType =
   // the requested value — used to tell audio-starvation from bufferbloat when
   // voice chops on an otherwise-healthy webrtc path.
   | 'SenderParams';
+
+/**
+ * Whether a declared event type is produced by the current build.
+ *
+ * - `emitted` — a source construction site exists: some line in
+ *   `ui/src` constructs a `SimpleEvent` with this type. Reachability is
+ *   NOT proven — the grep in `__tests__/event-taxonomy.test.ts` finds
+ *   the site, it cannot show the path to it is live.
+ * - `historical` — no longer emitted, retained in the union because old
+ *   captures (localStorage sessions, exported JSON, gathered
+ *   `DiagnosticSnapshot`s) still contain it and log-reading tooling must
+ *   keep parsing it. Capture continuity outranks renaming — the same
+ *   decision that kept `FsmTransition` et al. under their old names in
+ *   Phase 3. The taxonomy test asserts the *absence* of emission sites
+ *   for these, so a type cannot silently come back to life unreviewed.
+ *
+ * Every member of `SimpleEventType` must appear here — `satisfies`
+ * makes a new union member without a taxonomy row (or a row without a
+ * member) a compile error. The full table is snapshot-pinned by the
+ * taxonomy test, so any change to it is a reviewed diff.
+ *
+ * The primary consumer of these events is an LLM reading gathered JSON
+ * (`exportLogs()` / the DiagnosticRequest wire flow) — see
+ * MAINTAINABILITY_ASSESSMENT.md Phase 5. What matters is that the
+ * stream is trustworthy as evidence: declared here, honest about
+ * completeness (`DiagnosticSnapshot.truncated`), correlatable
+ * timestamps (`DiagnosticSnapshot.generatedAt`).
+ */
+export type SimpleEventStatus = 'emitted' | 'historical';
+
+export const SIMPLE_EVENT_TAXONOMY = {
+  Pong: 'historical',
+  SdpData: 'emitted',
+  InitAccept: 'emitted',
+  InitRequest: 'emitted',
+  Connected: 'emitted',
+  ReconcileStream: 'emitted',
+  ReconcileAudio: 'emitted',
+  ReconcileVideo: 'emitted',
+  RemoteTrack: 'emitted',
+  FsmError: 'emitted',
+  FsmClose: 'emitted',
+  PeerAudioOnSignal: 'emitted',
+  PeerAudioOffSignal: 'emitted',
+  PeerVideoOnSignal: 'emitted',
+  PeerVideoOffSignal: 'emitted',
+  PeerChangeAudioInput: 'emitted',
+  PeerChangeVideoInput: 'emitted',
+  MyAudioOn: 'emitted',
+  MyAudioOff: 'emitted',
+  MyVideoOn: 'emitted',
+  MyVideoOff: 'emitted',
+  ChangeMyAudioInput: 'emitted',
+  ChangeMyVideoInput: 'emitted',
+  TrackArrivedMuted: 'emitted',
+  TrackUnmuted: 'emitted',
+  TrackUnmuteTimeout: 'emitted',
+  StreamReceived: 'emitted',
+  StaleCleanup: 'emitted',
+  PeerLeave: 'emitted',
+  CarrierSwitch: 'emitted',
+  QualityBucketChange: 'emitted',
+  MyWebrtcDisable: 'emitted',
+  MyWebrtcEnable: 'emitted',
+  AudibilityOutageStart: 'emitted',
+  AudibilityOutageEnd: 'emitted',
+  Superseded: 'emitted',
+  SupersededClose: 'emitted',
+  SupersededError: 'emitted',
+  SupersededConnect: 'emitted',
+  IceEstablishment: 'emitted',
+  IceNeverConnected: 'emitted',
+  ConnectionAborted: 'emitted',
+  FsmEstablishmentTimeline: 'emitted',
+  FsmTransition: 'emitted',
+  PresenceAdd: 'emitted',
+  PresenceRemove: 'emitted',
+  SenderParams: 'emitted',
+} as const satisfies Record<SimpleEventType, SimpleEventStatus>;
 
 export type SimpleEvent = {
   agent: AgentPubKeyB64;

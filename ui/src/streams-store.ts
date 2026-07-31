@@ -1576,12 +1576,11 @@ export class StreamsStore {
       return;
     }
 
-    const errLabel = 'FsmError';
     this._flushSdpAggregatesForConnection(connectionId);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: this.clock.now(),
-      event: errLabel,
+      event: 'FsmError',
       connectionId,
       detail: error.message || String(error),
     });
