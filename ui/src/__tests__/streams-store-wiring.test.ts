@@ -300,6 +300,102 @@ describe('slot lifecycle applied from transport events (the exit criterion)', ()
     ).toHaveLength(2);
   });
 
+  it('screen-share (sharer side): install → connected → adopt-on-replacement → stale events guarded → failed clears (review F1)', () => {
+    const { store, transports, logger } = makeStarted();
+    const out = transports['screen-share-out']!;
+
+    // signaling installs the outgoing slot, not yet connected.
+    out.emitPhase(peerA, 'ss-1', 'signaling');
+    let slot = get(store._screenShareConnectionsOutgoing)[peerA];
+    expect(slot).toMatchObject({
+      connectionId: 'ss-1',
+      connected: false,
+      direction: 'outgoing',
+      video: true,
+    });
+
+    // connected flips the flag through _handleScreenShareConnected.
+    out.emitPhase(peerA, 'ss-1', 'connected', 'connecting');
+    expect(get(store._screenShareConnectionsOutgoing)[peerA].connected).toBe(true);
+
+    // In-place FSM replacement (sharer re-initiated at a higher epoch —
+    // the Phase 3.5 field-real route): signaling under a NEW id, no
+    // close for the old one. The slot must adopt.
+    out.emitPhase(peerA, 'ss-2', 'signaling');
+    slot = get(store._screenShareConnectionsOutgoing)[peerA];
+    expect(slot.connectionId).toBe('ss-2');
+    expect(slot.connected).toBe(false);
+    const superseded = logger.eventsNamed('Superseded');
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0].detail).toContain('screen-transport-replace');
+    // Negative control: no closed/failed ever fired for ss-1.
+    expect(
+      out.emitted.filter(
+        e =>
+          e.type === 'connection-state-change' &&
+          e.connectionId === 'ss-1' &&
+          (e.phase === 'closed' || e.phase === 'failed')
+      )
+    ).toHaveLength(0);
+
+    // Stale events from the replaced connection must not mutate the new
+    // slot: a late connected may not flip the flag, a late closed may
+    // not clear it (both supersede guards in the screen apply half).
+    out.emitPhase(peerA, 'ss-1', 'connected', 'connecting');
+    slot = get(store._screenShareConnectionsOutgoing)[peerA];
+    expect(slot.connectionId).toBe('ss-2');
+    expect(slot.connected).toBe(false);
+    out.emitPhase(peerA, 'ss-1', 'closed', 'connected');
+    expect(get(store._screenShareConnectionsOutgoing)[peerA]).toBeDefined();
+
+    // failed clears the live slot; the trailing duplicate closed is a
+    // no-op (same idempotency contract as the media path).
+    out.emitPhase(peerA, 'ss-2', 'failed', 'signaling');
+    expect(get(store._screenShareConnectionsOutgoing)[peerA]).toBeUndefined();
+    out.emitPhase(peerA, 'ss-2', 'closed', 'failed');
+    expect(get(store._screenShareConnectionsOutgoing)[peerA]).toBeUndefined();
+  });
+
+  it('screen-share (viewer side): install → connected fires the event → remote stream wires _screenShareStreams → failed clears both (review F1)', () => {
+    const { store, transports, events } = makeStarted();
+    const inc = transports['screen-share-in']!;
+
+    inc.emitPhase(peerA, 'sv-1', 'signaling');
+    expect(get(store._screenShareConnectionsIncoming)[peerA]).toMatchObject({
+      connectionId: 'sv-1',
+      connected: false,
+      direction: 'incoming',
+      video: false,
+    });
+
+    inc.emitPhase(peerA, 'sv-1', 'connected', 'connecting');
+    expect(get(store._screenShareConnectionsIncoming)[peerA].connected).toBe(true);
+    expect(events.some(e => e.type === 'peer-screen-share-connected')).toBe(true);
+
+    // The viewer's stream mirror (`_screenShareStreams`, the unscheduled
+    // -table row Phase 3 wired) is set on remote-stream…
+    const fakeStream = {
+      getTracks: () => [],
+      getAudioTracks: () => [],
+      getVideoTracks: () => [{}],
+    } as unknown as MediaStream;
+    inc.emit({
+      type: 'remote-stream',
+      peer: peerA,
+      connectionId: 'sv-1',
+      stream: fakeStream,
+    });
+    expect(store._screenShareStreams[peerA]).toBe(fakeStream);
+    expect(get(store._screenShareConnectionsIncoming)[peerA].video).toBe(true);
+
+    // …and dies with the connection, so paint-restore cannot resurrect
+    // a dead share.
+    inc.emitPhase(peerA, 'sv-1', 'failed', 'connected');
+    expect(get(store._screenShareConnectionsIncoming)[peerA]).toBeUndefined();
+    expect(store._screenShareStreams[peerA]).toBeUndefined();
+    expect(events.some(e => e.type === 'peer-screen-share-disconnected')).toBe(true);
+  });
+
   it('a vanished connection (no event at all) keeps its slot — never assume you will be told', () => {
     const { store, clock, transports } = makeStarted();
     const media = transports.media!;
