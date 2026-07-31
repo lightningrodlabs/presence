@@ -35,6 +35,23 @@ import { StreamsStore } from '../streams-store';
 import { SimpleEventType, StreamInfoLog } from '../logging';
 import './elements/avatar-with-nickname';
 
+/**
+ * DEMOTED to a best-effort courtesy view (Phase 5 item 4,
+ * MAINTAINABILITY_ASSESSMENT.md). The diagnostic pipeline's product is
+ * the gathered JSON (`exportLogs()` / the DiagnosticRequest wire flow,
+ * read by an LLM); this graph is a human convenience on top of it.
+ *
+ * Consequences:
+ * - New event types get NO render arms here. They render through the
+ *   `default` arms of `simpleEventTypeToColor`/`yEventType` (pink,
+ *   short line), which is the intended behavior, not an omission.
+ * - Types the taxonomy declares 'historical' (`SIMPLE_EVENT_TAXONOMY`,
+ *   `logging.ts`) get no arms either — this view renders the live
+ *   logger, which cannot contain them.
+ * - If maintaining this file ever costs more than trivial upkeep,
+ *   deleting it outright is the sanctioned move. The JSON path is the
+ *   one that must not break.
+ */
 @localized()
 @customElement('logs-graph')
 export class LogsGraph extends LitElement {
@@ -150,43 +167,8 @@ export class LogsGraph extends LitElement {
     const myEvents =
       allAgentEvents[encodeHashToBase64(this.client.myPubKey)] || [];
     const agentEvents = allAgentEvents[this.agent] || [];
-    const pongEvents = agentEvents.filter(event => event.event === 'Pong');
 
-    // Create rectangles for Pongs
-    let tempRect: (Partial<Shape> & { x1: number }) | undefined;
-    pongEvents
-      .sort((a, b) => a.timestamp - b.timestamp)
-      .forEach(event => {
-        if (tempRect && event.timestamp - tempRect.x1 < 3_500) {
-          tempRect.x1 = event.timestamp; // Update the right end of the rectangle
-        } else if (!tempRect) {
-          // start a new rectangle
-          tempRect = {
-            type: 'rect',
-            name: 'Pong',
-            x0: event.timestamp,
-            x1: event.timestamp,
-            y0: -0.5,
-            y1: 0.5,
-            line: {
-              color: 'f2da0080',
-            },
-            fillcolor: 'f2da0080',
-          };
-        } else {
-          // finish the rectangle and add it to the shapes array
-          shapes.push(tempRect);
-          tempRect = undefined;
-        }
-      });
-
-    // And push the last one too
-    if (tempRect) shapes.push(tempRect);
-
-    [
-      ...myEvents,
-      ...agentEvents.filter(event => event.event !== 'Pong'), // Filter out Pong events
-    ].forEach(payload => {
+    [...myEvents, ...agentEvents].forEach(payload => {
       const [color, dash] = simpleEventTypeToColor(payload.event);
       const [y0, y1] = yEventType(payload.event);
       shapes.push({
@@ -246,50 +228,16 @@ export class LogsGraph extends LitElement {
             return;
         } else if (payload.agent !== this.agent) return;
 
-        // If it's a Pong event, we want to use a rectanlge instead of lines in order
-        // not to overload the computational load of rendering as this otherwise
-        // freezes up Presence as a whole
-        if (payload.event === 'Pong') {
-          // Search all shapes for Pong rectangles with a timestamp less than 4.5 seconds ago
-          // which would correspond to < 2x ping frequency and indicate that no Pong had been
-          // lost. Otherwise we create a separate triangle to visualize gaps in Pongs.
-          const matchingRectIdx = this.shapes.findIndex(
-            shape =>
-              shape.type === 'rect' &&
-              shape.name === 'Pong' &&
-              typeof shape.x1 === 'number' &&
-              payload.timestamp - shape.x1 < 3_500
-          );
-          if (matchingRectIdx !== -1) {
-            const matchingRect = this.shapes[matchingRectIdx];
-            matchingRect.x1 = payload.timestamp;
-            this.shapes[matchingRectIdx] = matchingRect;
-          } else {
-            this.shapes.push({
-              type: 'rect',
-              name: 'Pong',
-              x0: payload.timestamp,
-              x1: payload.timestamp,
-              y0: -0.5,
-              y1: 0.5,
-              line: {
-                color: 'f2da0080',
-              },
-              fillcolor: 'f2da0080',
-            });
-          }
-        } else {
-          const [color, dash] = simpleEventTypeToColor(payload.event);
-          const [y0, y1] = yEventType(payload.event);
-          this.addVerticalLine(
-            payload.timestamp,
-            payload.event,
-            color,
-            dash,
-            y0,
-            y1
-          );
-        }
+        const [color, dash] = simpleEventTypeToColor(payload.event);
+        const [y0, y1] = yEventType(payload.event);
+        this.addVerticalLine(
+          payload.timestamp,
+          payload.event,
+          color,
+          dash,
+          y0,
+          y1
+        );
 
         Plotly.relayout(this.graph, {
           shapes: this.shapes,
@@ -535,9 +483,6 @@ function simpleEventTypeToColor(
   event: SimpleEventType
 ): [string, Dash | undefined] {
   switch (event) {
-    case 'Pong':
-      return ['#f2da0080', undefined]; // darker yellow
-
     // WebRTC Connection Events
     case 'Connected':
       return ['green', undefined];
@@ -620,9 +565,6 @@ function simpleEventTypeToColor(
 
 function yEventType(event: SimpleEventType): [number, number] {
   switch (event) {
-    case 'Pong':
-      return [-0.5, 0.5];
-
     // WebRTC Connection Events
     case 'Connected':
       return [0, 1.5];
