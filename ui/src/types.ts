@@ -463,10 +463,38 @@ export type RoomSignal =
 
 export type EntryTypes = {};
 
+/**
+ * One node's recent logs, gathered over the DiagnosticRequest/
+ * DiagnosticResponse wire flow so every node's evidence lands in one
+ * place. Primary consumer: an LLM reconstructing a field incident from
+ * the gathered JSON (MAINTAINABILITY_ASSESSMENT.md Phase 5) — the
+ * fields below state what that reader needs to trust the evidence.
+ *
+ * Clocks: every timestamp inside `agentEvents` and `customLogs` is the
+ * REPORTING node's wall clock (`Date.now()` at that node), not the
+ * requester's. `generatedAt` is the same clock sampled at gather time,
+ * so it is the cross-node alignment anchor: the requester can estimate
+ * per-node skew by comparing `generatedAt` against its own receive
+ * time, but timestamps from different snapshots must never be compared
+ * raw.
+ *
+ * Window: contents are bounded by `DIAGNOSTIC_WINDOW_MS`
+ * (`logging.ts`) and then by the signal-size budget in
+ * `diagnostic-snapshot-policy.ts`.
+ */
 export type DiagnosticSnapshot = {
   fromAgent: AgentPubKeyB64;
   sessionId: string;
   agentEvents: import('./logging').SimpleEvent[];
   customLogs: import('./logging').CustomLog[];
+  /** Reporting node's wall clock at gather time; see the clock note above. */
   generatedAt: number;
+  /**
+   * Present iff the snapshot was cut down to fit the signal-size
+   * budget: per-collection counts of DROPPED entries (oldest first).
+   * Absent means complete within the diagnostic window. Additive field
+   * — old parsers ignore it (Phase 5 item 2: evidence must declare its
+   * own holes).
+   */
+  truncated?: { events: number; customLogs: number };
 };

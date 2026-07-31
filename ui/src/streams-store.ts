@@ -38,6 +38,7 @@ import {
 } from './transport/track-health-policy';
 import type { RtcStatsReportLike } from './transport/track-health-policy';
 import { decideInitRetry } from './transport/init-retry-policy';
+import { buildDiagnosticSnapshot } from './diagnostic-snapshot-policy';
 import { decideScreenSignalRoute } from './transport/screen-signal-policy';
 import {
   derived,
@@ -6413,34 +6414,20 @@ export class StreamsStore {
     const flatEvents = Object.values(allRecentEvents).flat();
     const recentCustomLogs = this.logger.getRecentCustomLogs();
 
-    const snapshot: DiagnosticSnapshot = {
+    // The size guard and its self-declaring truncation live in
+    // diagnostic-snapshot-policy.ts (Phase 5 item 2).
+    const { payload } = buildDiagnosticSnapshot({
       fromAgent: this.myPubKeyB64,
       sessionId: this.logger.sessionId,
       agentEvents: flatEvents,
       customLogs: recentCustomLogs,
       generatedAt: this.clock.now(),
-    };
-
-    const payload = JSON.stringify(snapshot);
-    // Guard against signal size limits — truncate if too large
-    if (payload.length > 60_000) {
-      const truncated: DiagnosticSnapshot = {
-        ...snapshot,
-        agentEvents: flatEvents.slice(-200),
-        customLogs: recentCustomLogs.slice(-100),
-      };
-      await this.roomClient.sendMessage(
-        [signal.from_agent],
-        'DiagnosticResponse',
-        JSON.stringify(truncated),
-      );
-    } else {
-      await this.roomClient.sendMessage(
-        [signal.from_agent],
-        'DiagnosticResponse',
-        payload,
-      );
-    }
+    });
+    await this.roomClient.sendMessage(
+      [signal.from_agent],
+      'DiagnosticResponse',
+      payload,
+    );
   }
 
   /**
@@ -6471,8 +6458,11 @@ export class StreamsStore {
         delete next[pubkeyB64];
         return next;
       });
+      const truncationNote = snapshot.truncated
+        ? ` (TRUNCATED: ${snapshot.truncated.events} events, ${snapshot.truncated.customLogs} custom logs dropped at sender)`
+        : '';
       this.logger.logCustomMessage(
-        `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs`
+        `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs${truncationNote}`
       );
     } catch (e) {
       console.warn('Failed to parse DiagnosticResponse:', e);
