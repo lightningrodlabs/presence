@@ -63,6 +63,13 @@ export class ManualClock implements Clock {
     this.clearTimeout(id);
   }
 
+  /** Number of currently armed timers. The wiring tests use this to
+   *  assert start()/disconnect() symmetry — a disconnect() that leaves a
+   *  timer armed is a leak, visible here without waiting for it to fire. */
+  get pendingTimerCount(): number {
+    return this._timers.length;
+  }
+
   /** Advance time by `ms`, running every timer that comes due, in order. */
   advance(ms: number): void {
     const target = this._now + ms;
