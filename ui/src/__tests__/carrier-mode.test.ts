@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeHashToBase64 } from '@holochain/client';
 import { StreamsStore } from '../streams-store';
-import { ManualClock } from '../clock.testing';
-import type { RoomStore } from '../room/room-store';
+import { makeFakeDeps } from '../store-deps.testing';
 import type { PresenceLogger } from '../logging';
 
 /**
@@ -20,15 +19,8 @@ const myPubKey = new Uint8Array(39).fill(1);
 const peerA = encodeHashToBase64(new Uint8Array(39).fill(2));
 
 function makeUnstartedStore(): StreamsStore {
-  const roomStore = {
-    client: { client: { myPubKey } },
-  } as unknown as RoomStore;
-  return new StreamsStore(
-    roomStore,
-    async () => '',
-    {} as PresenceLogger,
-    new ManualClock()
-  );
+  const { deps } = makeFakeDeps({ myPubKey });
+  return new StreamsStore(deps, async () => '', {} as PresenceLogger);
 }
 
 describe('carrierMode — the one carrier axis', () => {

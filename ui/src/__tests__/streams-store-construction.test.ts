@@ -3,19 +3,21 @@ import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import { StreamsStore } from '../streams-store';
 import { ManualClock } from '../clock.testing';
+import { makeFakeDeps } from '../store-deps.testing';
 import { MEDIA_LIVE_WINDOW_MS, PRESENT_STALENESS_MS } from '../presence-policy';
 import { voiceController } from '../room/modules/voice';
-import type { RoomStore } from '../room/room-store';
 import type { PresenceLogger } from '../logging';
 
 /**
  * Phase 2 item 2: the constructor assigns fields and defines derived
- * stores, and does nothing else. Everything ambient (window, navigator,
- * the signal bus, transports, module singletons) lives in start().
+ * stores, and does nothing else. Everything ambient (the deps record's
+ * world — bus, storage, transports, media devices — plus the module
+ * singletons) lives in start().
  *
  * These tests run in the plain node environment — no jsdom, no stubs.
  * Constructing a StreamsStore here failing would mean the constructor
  * regressed into touching the ambient world again (§3.6 / Phase 6).
+ * The started store's wiring is covered by streams-store-wiring.test.ts.
  */
 
 const myPubKey = new Uint8Array(39).fill(1);
@@ -24,15 +26,8 @@ const peerA = encodeHashToBase64(new Uint8Array(39).fill(2));
 const peerB = encodeHashToBase64(new Uint8Array(39).fill(3));
 
 function makeUnstartedStore(clock: ManualClock): StreamsStore {
-  const roomStore = {
-    client: { client: { myPubKey } },
-  } as unknown as RoomStore;
-  return new StreamsStore(
-    roomStore,
-    async () => '',
-    {} as PresenceLogger,
-    clock
-  );
+  const { deps } = makeFakeDeps({ clock, myPubKey });
+  return new StreamsStore(deps, async () => '', {} as PresenceLogger);
 }
 
 describe('StreamsStore construction/activation split', () => {
