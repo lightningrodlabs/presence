@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **BREAKING: `TransitionRecorder` removed** (with `TransitionRecorderOptions`).
+  Exported since 0.1.0, never constructed by any consumer outside its own test.
+  Capture `onTransition` entries yourself if you need a portable record.
+- **BREAKING: `ConnectionConfig.diagnostics` removed**, along with the `DIAG:`
+  entries it gated on the `onTransition` stream. The flag was never set by any
+  consumer and the one consuming app dropped `DIAG:` entries unconditionally.
+  Real connection events (ICE state, dropped stale signals, new peer sessions,
+  establishment timeline) are unaffected.
+
+(Note: the workspace version string predates these changes and the epoch work;
+see the consuming repo's MAINTAINABILITY_ASSESSMENT.md Phase 0 addendum on
+package-version hygiene.)
+
 ## 0.3.0
 
 Connection-lifecycle work (see the consuming app's `WEBRTC_CONNECTION_PLAN.md`).

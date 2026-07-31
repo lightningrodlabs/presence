@@ -5106,12 +5106,6 @@ export class StreamsStore {
    * very events we need to see when diagnosing storm-like behaviour.
    */
   private _logFsmTransition(entry: import('@lightningrodlabs/webrtc-peer').FSMTransitionEntry): void {
-    // Drop internal DTLS-watchdog bookkeeping. These are self-transitions
-    // within `connecting`, fire 3-4 times per successful FSM connection,
-    // and duplicate the information already carried by the surrounding
-    // ICE state events. Keep them out of the timeline unless we're
-    // specifically debugging DTLS / data-channel readiness.
-    if (entry.trigger.startsWith('DIAG:')) return;
     // Capture the reason a peer leaves a live webrtc call so the downgrade to
     // signals can name it (§6.6). The FSM logs the transition (onTransition)
     // before the corresponding state-change event reaches `_handleMediaClosed`,

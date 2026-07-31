@@ -378,15 +378,6 @@ export type ConnectionConfig = {
    */
   iceDisconnectedGraceMs: number;
   role: ConnectionRole;
-  /**
-   * Emit verbose, library-internal `DIAG:` instrumentation on the `onTransition`
-   * stream (DTLS-watchdog arming/skipping bookkeeping, timer cancellation, etc.).
-   * These are for debugging the library itself; most consumers filter them out.
-   * Default `false` — leave off in production to avoid building entries no one
-   * reads. Turn on when diagnosing connection-establishment / DTLS-stall issues.
-   * Optional; defaults to `false` (see `DEFAULT_CONFIG`).
-   */
-  diagnostics?: boolean;
 };
 
 export const DEFAULT_CONFIG: ConnectionConfig = {
@@ -403,7 +394,6 @@ export const DEFAULT_CONFIG: ConnectionConfig = {
   maxDataChannelRecreateAttempts: 3,
   iceDisconnectedGraceMs: 15_000,
   role: 'mesh',
-  diagnostics: false,
 };
 
 // ---------------------------------------------------------------------------

@@ -961,10 +961,7 @@ export class PeerConnectionFSM {
         this._clearTimer('ice-disconnected-grace');
         // ICE connected — DTLS watchdog takes over from the flat connection-timeout
         if (this._state === 'connecting') {
-          const timerCount = this._timers.filter(t => t.name === 'connection-timeout').length;
           this._clearTimer('connection-timeout');
-          const afterCount = this._timers.filter(t => t.name === 'connection-timeout').length;
-          this._logDiag(`cancelled connection-timeout (had=${timerCount}, after=${afterCount}), starting DTLS watchdog (dtlsConnected=${this._dtlsConnected}, dcOpen=${this._dataChannelOpen}, timeoutMs=${this._config.dtlsStallTimeoutMs})`);
         }
         this._startDtlsWatchdog();
         this._checkCompositeReadiness();
@@ -1268,25 +1265,20 @@ export class PeerConnectionFSM {
   private _startDtlsWatchdog(): void {
     // Only watch during connecting/reconnecting phases
     if (this._state !== 'connecting' && this._state !== 'reconnecting') {
-      this._logDiag(`watchdog skipped (state=${this._state}, expected connecting|reconnecting)`);
       return;
     }
     // Already connected — no need to watch
     if (this._dtlsConnected && this._dataChannelOpen) {
-      this._logDiag(`watchdog skipped (already connected: dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`);
       return;
     }
     // Cancel any existing watchdog
     this._cancelDtlsWatchdog();
-
-    this._logDiag(`watchdog armed (${this._config.dtlsStallTimeoutMs}ms, ice=${this._iceConnected}, dtls=${this._dtlsConnected}, dc=${this._dataChannelOpen})`);
 
     this._dtlsWatchdogId = setTimeout(() => {
       this._dtlsWatchdogId = null;
       if (this._destroyed) return;
       // Only fire if ICE is still connected but DTLS hasn't completed
       if (!this._iceConnected || this._dtlsConnected) {
-        this._logDiag(`watchdog fired but conditions not met (ice=${this._iceConnected}, dtls=${this._dtlsConnected}, state=${this._state})`);
         return;
       }
 
@@ -1334,11 +1326,6 @@ export class PeerConnectionFSM {
     if (this._state !== 'connecting' && this._state !== 'connected') return;
     if (this._dataChannelOpen) return;
     this._cancelDataChannelWatchdog();
-
-    this._logDiag(
-      `data-channel watchdog armed (${this._config.dataChannelStallTimeoutMs}ms, ` +
-      `attempts=${this._dataChannelRecreateAttempts}/${this._config.maxDataChannelRecreateAttempts})`
-    );
 
     this._dataChannelWatchdogId = setTimeout(() => {
       this._dataChannelWatchdogId = null;
@@ -1601,16 +1588,6 @@ export class PeerConnectionFSM {
       trigger,
       peerSessionId: this._session.local,
     });
-  }
-
-  /**
-   * Verbose library-internal instrumentation, gated behind `config.diagnostics`
-   * (default off). For debugging the library itself; most consumers filter
-   * `DIAG:` entries out, so building them by default is wasted work.
-   */
-  private _logDiag(trigger: string): void {
-    if (!this._config.diagnostics) return;
-    this._logTransition(`DIAG: ${trigger}`);
   }
 
   // ---------------------------------------------------------------------------

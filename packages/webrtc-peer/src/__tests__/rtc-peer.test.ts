@@ -18,7 +18,6 @@ const DEFAULT_CONFIG: ConnectionConfig = {
   maxDataChannelRecreateAttempts: 3,
   iceDisconnectedGraceMs: 15000,
   role: 'mesh',
-  diagnostics: false,
 };
 
 function createPeer(options: {
