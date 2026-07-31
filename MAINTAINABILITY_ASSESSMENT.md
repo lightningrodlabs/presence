@@ -474,7 +474,7 @@ Original item list, kept for the record:
 
 **Explicitly out of scope: shrinking the event stream to save lines.** The 12.5% of `streams-store.ts` this surface occupies is the price of the field-diagnosis loop, and Phase 3.5's harness run demonstrated the pattern again — the timeline recording is what turned a real-browser run into assertable evidence. Volume is not the enemy; undeclared meaning is.
 
-### Phase 6 — Inject the ambient world; test the wiring (reframed 2026-07-31) — **IMPLEMENTED 2026-07-31** on `feat/phase-6-inject-ambient-world` (one commit per item; awaiting adversarial review per working agreement 9)
+### Phase 6 — Inject the ambient world; test the wiring (reframed 2026-07-31) — **LANDED 2026-07-31** (adversarially reviewed per working agreement 9: review F1 — the screen-share slot-apply glue was mutation-invisible to the suite — fixed in `6320701` and re-verified by the reviewer, who reproduced all six mutation reds and ran verify 614 + harness 5/5 at the fixup tip and verify at the merge commit; merged `--no-ff` as `fb4c776`)
 
 Branch `feat/phase-6-inject-ambient-world`. The suites went 598 → 614 (211 package + 403 ui — 16 new wiring tests); harness 5/5 at the tip. Review round 1 (2026-07-31) found one blocking gap, F1 — the screen-share slot-apply glue had zero executable coverage (the reviewer's mutation neutralized the screen signaling arm and all 401 then-current ui tests stayed green) while the docs claimed the wiring validated — fixed on the branch with two screen-share lifecycle tests, plus prose scoping F2. Per-item outcomes, against the list below:
 
