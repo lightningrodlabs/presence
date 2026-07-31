@@ -4,8 +4,6 @@
  * Two-layer state model:
  * - Layer 1 (ConnectionPhase): Application-level states for UI and ConnectionManager
  * - Layer 2 (TransportState): Mirrors browser's native WebRTC state machines
- *
- * See docs/webrtc-state-machine-plan.md and docs/webrtc-state-machine-research.md
  */
 
 /**

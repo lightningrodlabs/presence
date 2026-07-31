@@ -4,7 +4,8 @@
  * Dispatches signals to the correct FSM, manages media stream propagation,
  * and exposes an aggregate ConnectionManagerViewModel for room-level UI.
  *
- * See docs/webrtc-state-machine-plan.md
+ * See README.md ("Reconnection" / "Ownership: who drives recovery") for the
+ * recovery-ownership contract this class implements.
  */
 
 import { PeerConnectionFSM } from './peer-connection-fsm.js';

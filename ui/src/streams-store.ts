@@ -79,8 +79,8 @@ import {
   CAP_SDP_FSM_SCREEN,
   isSignalMsgType,
 } from './transport/wire-contract';
-import { RoomClient } from './room/room-client';
 import { RoomStore } from './room/room-store';
+import type { StreamsStoreDeps } from './store-deps';
 import { PresenceLogger } from './logging';
 import { MicSource, MicAcquireResult } from './mic-source';
 import { CameraSource, CameraAcquireResult } from './camera-source';
@@ -163,13 +163,22 @@ export function pruneExpiredPending<T>(
  * holochain peers
  */
 export class StreamsStore {
-  private roomClient: RoomClient;
+  /**
+   * The ambient world, injected (Phase 6 item 1): clock, storage, the
+   * signal bus, the transport factory, media devices. `static connect`
+   * builds the production record; the wiring tests build fakes. Every
+   * ambient read in this class goes through it — a new `window.` /
+   * `navigator.` / direct-RoomClient touch outside the declared
+   * out-of-scope media paths is a regression against the Phase 6 seam.
+   */
+  private readonly deps: StreamsStoreDeps;
 
   /**
    * The single time authority (Phase 2 item 1). Every timing read and
    * timer in this class — and in the controllers bound to it — goes
    * through this clock so tests can drive staleness windows and retry
-   * cycles deterministically with a ManualClock.
+   * cycles deterministically with a ManualClock. Alias of `deps.clock`
+   * (kept as a field because controllers and tests read `store.clock`).
    */
   readonly clock: Clock;
 
@@ -178,8 +187,6 @@ export class StreamsStore {
   private signalUnsubscribe: (() => void) | null = null;
 
   private pingInterval: number | undefined;
-
-  private roomStore: RoomStore;
 
   private allAgents: AgentPubKey[] = [];
 
@@ -191,25 +198,26 @@ export class StreamsStore {
 
   _pageLifecycleUnsub: (() => void) | null = null;
 
-  // ICE/TURN settings live in localStorage and are edited from the Settings
-  // panel. Read them live (not snapshotted at construction) so edits take
-  // effect on the next connection without a reload. iceConfig / the transport
-  // trickle getters consult these on every ensureConnection.
+  // ICE/TURN settings live in storage.local (window.localStorage in
+  // production) and are edited from the Settings panel. Read them live (not
+  // snapshotted at construction) so edits take effect on the next connection
+  // without a reload. iceConfig / the transport trickle getters consult
+  // these on every ensureConnection.
   get trickleICE(): boolean {
     // Stored as 'true'/'false'; default ON when unset.
-    return window.localStorage.getItem('trickleICE') !== 'false';
+    return this.deps.storage.local.getItem('trickleICE') !== 'false';
   }
 
   get turnUrl(): string {
-    return window.localStorage.getItem('turnUrl') || '';
+    return this.deps.storage.local.getItem('turnUrl') || '';
   }
 
   get turnUsername(): string {
-    return window.localStorage.getItem('turnUsername') || '';
+    return this.deps.storage.local.getItem('turnUsername') || '';
   }
 
   get turnCredential(): string {
-    return window.localStorage.getItem('turnCredential') || '';
+    return this.deps.storage.local.getItem('turnCredential') || '';
   }
 
   // Cloudflare-provisioned TURN. Stored under separate keys from the manual
@@ -217,15 +225,15 @@ export class StreamsStore {
   // ICE agent gathers relay candidates from every configured server). Written
   // by the Settings panel's auto-provisioning; read live here.
   get cfTurnUrl(): string {
-    return window.localStorage.getItem('cfTurnUrl') || '';
+    return this.deps.storage.local.getItem('cfTurnUrl') || '';
   }
 
   get cfTurnUsername(): string {
-    return window.localStorage.getItem('cfTurnUsername') || '';
+    return this.deps.storage.local.getItem('cfTurnUsername') || '';
   }
 
   get cfTurnCredential(): string {
-    return window.localStorage.getItem('cfTurnCredential') || '';
+    return this.deps.storage.local.getItem('cfTurnCredential') || '';
   }
 
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
@@ -331,18 +339,15 @@ export class StreamsStore {
   screenShareInTransport!: PeerTransport;
 
   constructor(
-    roomStore: RoomStore,
+    deps: StreamsStoreDeps,
     screenSourceSelection: () => Promise<string>,
-    logger: PresenceLogger,
-    clock: Clock = systemClock
+    logger: PresenceLogger
   ) {
-    this.roomStore = roomStore;
+    this.deps = deps;
     this.screenSourceSelection = screenSourceSelection;
     this.logger = logger;
-    this.clock = clock;
-    const roomClient = roomStore.client;
-    this.roomClient = roomClient;
-    this.myPubKeyB64 = encodeHashToBase64(roomClient.client.myPubKey);
+    this.clock = deps.clock;
+    this.myPubKeyB64 = encodeHashToBase64(deps.bus.myPubKey);
 
     this._activeAgents = derived(
       [this._knownAgents, this.blockedAgents, this._presenceTick] as [
@@ -427,7 +432,7 @@ export class StreamsStore {
    * call exactly once, then disconnect() to tear down.
    */
   start(): void {
-    this.signalUnsubscribe = this.roomClient.onSignal(async signal =>
+    this.signalUnsubscribe = this.deps.bus.onSignal(async signal =>
       this.handleSignal(signal)
     );
 
@@ -439,14 +444,14 @@ export class StreamsStore {
       PING_INTERVAL
     );
 
-    const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
+    const blockedAgentsJson = this.deps.storage.session.getItem('blockedAgents');
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
     );
     // trickleICE / turnUrl / turnUsername / turnCredential are read live from
-    // localStorage via getters, so there is nothing to snapshot here.
-    this.webrtcGloballyDisabled = window.localStorage.getItem('disableAllWebrtc') === 'true';
-    const signalDelay = window.localStorage.getItem('signalDelayMs');
+    // storage.local via getters, so there is nothing to snapshot here.
+    this.webrtcGloballyDisabled = this.deps.storage.local.getItem('disableAllWebrtc') === 'true';
+    const signalDelay = this.deps.storage.local.getItem('signalDelayMs');
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
@@ -462,37 +467,40 @@ export class StreamsStore {
     // route to the complementary transport — connectionId cannot do that
     // job here because each side's FSM allocates its own id.
     const screenShareTransport = (dir: 'sharer' | 'viewer') =>
-      new FsmTransport({
-        myAgentId: this.myPubKeyB64,
-        iceServers: () => this.iceConfig,
-        trickleICE: () => this.trickleICE,
-        iceTransportPolicy: () => this._readIceTransportPolicy(),
-        configOverrides: {
-          dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs(),
+      this.deps.transportFactory(
+        dir === 'sharer' ? 'screen-share-out' : 'screen-share-in',
+        {
+          myAgentId: this.myPubKeyB64,
+          iceServers: () => this.iceConfig,
+          trickleICE: () => this.trickleICE,
+          iceTransportPolicy: () => this._readIceTransportPolicy(),
+          configOverrides: {
+            dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs(),
+          },
+          onOutgoingSignal: (signal) => {
+            const toAgent = decodeHashFromBase64(signal.to);
+            this.deps.bus.sendMessage(
+              [toAgent],
+              'SdpFsmScreen',
+              JSON.stringify({
+                connection_id: signal.connectionId,
+                peer_session_id: signal.peerSessionId,
+                epoch: signal.epoch,
+                dir,
+                data: signal.data,
+              }),
+            );
+          },
+          onTransition: (entry) => this._logFsmTransition(entry),
         },
-        onOutgoingSignal: (signal) => {
-          const toAgent = decodeHashFromBase64(signal.to);
-          this.roomClient.sendMessage(
-            [toAgent],
-            'SdpFsmScreen',
-            JSON.stringify({
-              connection_id: signal.connectionId,
-              peer_session_id: signal.peerSessionId,
-              epoch: signal.epoch,
-              dir,
-              data: signal.data,
-            }),
-          );
-        },
-        onTransition: (entry) => this._logFsmTransition(entry),
-      });
+      );
     this.screenShareOutTransport = screenShareTransport('sharer');
     this.screenShareInTransport = screenShareTransport('viewer');
 
     // Media FSM transport. Outgoing signals carry an FSM-shaped envelope
     // (type/payload) wrapped on the wire as 'SdpFsm'; incoming 'SdpFsm'
     // signals route here via handleSdpFsm.
-    this.mediaTransport = new FsmTransport({
+    this.mediaTransport = this.deps.transportFactory('media', {
       myAgentId: this.myPubKeyB64,
       iceServers: () => this.iceConfig,
       trickleICE: () => this.trickleICE,
@@ -501,13 +509,16 @@ export class StreamsStore {
       // last-mile uplinks (a handshake there can need several seconds of
       // retransmits); a single stall tore the connection down to the lossy
       // signals carrier and churned reconnects. Raise to a viable default,
-      // user-overridable via localStorage('dtlsStallTimeoutMs').
+      // user-overridable via storage.local('dtlsStallTimeoutMs'). NOTE:
+      // snapshotted here at transport construction, unlike the live
+      // iceServers/trickleICE closures — the wiring tests pin this
+      // distinction.
       configOverrides: {
         dtlsStallTimeoutMs: this._readDtlsStallTimeoutMs(),
       },
       onOutgoingSignal: (signal) => {
         const toAgent = decodeHashFromBase64(signal.to);
-        this.roomClient.sendMessage(
+        this.deps.bus.sendMessage(
           [toAgent],
           'SdpFsm',
           JSON.stringify({
@@ -526,7 +537,7 @@ export class StreamsStore {
     this._subscribeScreenShareTransport(this.screenShareOutTransport, true);
     this._subscribeScreenShareTransport(this.screenShareInTransport, false);
 
-    navigator.mediaDevices.ondevicechange = e => {
+    this.deps.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
 
@@ -1028,7 +1039,7 @@ export class StreamsStore {
   private _readDtlsStallTimeoutMs(): number {
     const DEFAULT_MS = 12_000;
     try {
-      const raw = window.localStorage.getItem('dtlsStallTimeoutMs');
+      const raw = this.deps.storage.local.getItem('dtlsStallTimeoutMs');
       if (!raw) return DEFAULT_MS;
       const n = parseInt(raw, 10);
       return Number.isFinite(n) && n >= 1_000 ? n : DEFAULT_MS;
@@ -1045,7 +1056,7 @@ export class StreamsStore {
    */
   private _readIceTransportPolicy(): RTCIceTransportPolicy | undefined {
     try {
-      const raw = window.localStorage.getItem('iceTransportPolicy');
+      const raw = this.deps.storage.local.getItem('iceTransportPolicy');
       if (raw === 'relay') {
         // Force-TURN is only meaningful — and only safe — when a TURN server is
         // actually configured. With 'relay' and no TURN, ICE gathers zero
@@ -1068,7 +1079,7 @@ export class StreamsStore {
   private _videoMaxBitrate(): number | null {
     const DEFAULT_KBPS = 2_000;
     try {
-      const raw = window.localStorage.getItem('videoMaxBitrateKbps');
+      const raw = this.deps.storage.local.getItem('videoMaxBitrateKbps');
       const kbps = raw != null ? parseInt(raw, 10) : DEFAULT_KBPS;
       if (!Number.isFinite(kbps) || kbps <= 0) return raw === '0' ? null : DEFAULT_KBPS * 1_000;
       return kbps * 1_000;
@@ -2053,8 +2064,29 @@ export class StreamsStore {
     screenSourceSelection: () => Promise<string>,
     logger: PresenceLogger
   ): Promise<StreamsStore> {
+    // The production deps record — the ONE place the ambient world is
+    // bound to the store. It reproduces the pre-Phase-6 ambient reads
+    // exactly: storage getters stay live reads (the record holds the
+    // Storage objects, not snapshots), the bus adapts RoomClient, and
+    // the factory yields FsmTransport for all three purposes.
+    const roomClient = roomStore.client;
+    const deps: StreamsStoreDeps = {
+      clock: systemClock,
+      storage: {
+        local: window.localStorage,
+        session: window.sessionStorage,
+      },
+      bus: {
+        myPubKey: roomClient.client.myPubKey,
+        onSignal: handler => roomClient.onSignal(handler),
+        sendMessage: (toAgents, msgType, payload) =>
+          roomClient.sendMessage(toAgents, msgType, payload),
+      },
+      transportFactory: (_purpose, options) => new FsmTransport(options),
+      mediaDevices: navigator.mediaDevices,
+    };
     const streamsStore = new StreamsStore(
-      roomStore,
+      deps,
       screenSourceSelection,
       logger
     );
@@ -2111,7 +2143,7 @@ export class StreamsStore {
     };
 
     streamsStore.clock.setTimeout(async () => {
-      const mediaDevices = await navigator.mediaDevices.enumerateDevices();
+      const mediaDevices = await deps.mediaDevices.enumerateDevices();
       streamsStore.mediaDevices.set(mediaDevices);
     }, 0);
     return streamsStore;
@@ -2122,8 +2154,12 @@ export class StreamsStore {
     // unmount) so we can tell user-initiated leaves from DOM-remount leaves.
     // Stack is best-effort — useful when reason='unknown' to find a new caller.
     const stack = new Error().stack?.split('\n').slice(1, 4).join(' | ') ?? '';
+    // `document` is guarded so disconnect() stays executable in node —
+    // the wiring tests exercise start()/disconnect() symmetry there.
+    const visibility =
+      typeof document !== 'undefined' ? document.visibilityState : 'no-dom';
     this.logger.logCustomMessage(
-      `Disconnect reason=${reason} visibility=${document.visibilityState} ${stack}`
+      `Disconnect reason=${reason} visibility=${visibility} ${stack}`
     );
 
     // Notify peers immediately before tearing down
@@ -2131,7 +2167,7 @@ export class StreamsStore {
       .filter(a => a !== this.myPubKeyB64)
       .map(b64 => decodeHashFromBase64(b64));
     if (agentsToNotify.length > 0) {
-      this.roomClient.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
+      this.deps.bus.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
     }
 
     if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
@@ -2144,8 +2180,10 @@ export class StreamsStore {
       this._pageLifecycleUnsub();
       this._pageLifecycleUnsub = null;
     }
-    // Close all connections and stop all streams
-    this.mediaTransport.destroy();
+    // Close all connections and stop all streams. (A duplicated
+    // `mediaTransport.destroy()` line lived here until Phase 6's
+    // symmetry test asserted destroy-exactly-once per transport;
+    // destroy() is idempotent, so the duplicate was harmless noise.)
     this.mediaTransport.destroy();
     this.screenShareInTransport.destroy();
     this.screenShareOutTransport.destroy();
@@ -2197,11 +2235,11 @@ export class StreamsStore {
   }
 
   enableTrickleICE() {
-    window.localStorage.setItem('trickleICE', 'true');
+    this.deps.storage.local.setItem('trickleICE', 'true');
   }
 
   disableTrickleICE() {
-    window.localStorage.setItem('trickleICE', 'false');
+    this.deps.storage.local.setItem('trickleICE', 'false');
   }
 
   get iceConfig(): RTCIceServer[] {
@@ -2233,20 +2271,20 @@ export class StreamsStore {
   }
 
   setTurnUrl(url: string) {
-    window.localStorage.setItem('turnUrl', url);
+    this.deps.storage.local.setItem('turnUrl', url);
   }
 
   setTurnUsername(username: string) {
-    window.localStorage.setItem('turnUsername', username);
+    this.deps.storage.local.setItem('turnUsername', username);
   }
 
   setTurnCredential(credential: string) {
-    window.localStorage.setItem('turnCredential', credential);
+    this.deps.storage.local.setItem('turnCredential', credential);
   }
 
   setSignalDelay(ms: number) {
     this.signalDelayMs = ms;
-    window.localStorage.setItem('signalDelayMs', String(ms));
+    this.deps.storage.local.setItem('signalDelayMs', String(ms));
   }
 
   onEvent(cb: (ev: StoreEventPayload) => any) {
@@ -2357,7 +2395,7 @@ export class StreamsStore {
     // Include a send-side timestamp so peers can echo it back in their
     // pong, letting us compute signals-carrier RTT on receipt without
     // adding new messages. See handlePingUi / handlePongUi.
-    await this.roomStore.client.sendMessage(
+    await this.deps.bus.sendMessage(
       agentsToPing,
       'PingUi',
       JSON.stringify({ t0: this.clock.now() }),
@@ -2480,7 +2518,7 @@ export class StreamsStore {
 
   async changeVideoInput(deviceId: string) {
     this.logger.logAgentEvent({
-      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
       event: 'ChangeMyVideoInput',
     });
@@ -2547,7 +2585,7 @@ export class StreamsStore {
     this._reconcileSignalsVideo();
 
     this.logger.logAgentEvent({
-      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
       event: 'MyVideoOn',
     });
@@ -2679,7 +2717,7 @@ export class StreamsStore {
     });
 
     this.logger.logAgentEvent({
-      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
       event: 'MyVideoOff',
     });
@@ -2690,7 +2728,7 @@ export class StreamsStore {
 
   async changeAudioInput(deviceId: string) {
     this.logger.logAgentEvent({
-      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
       event: 'ChangeMyAudioInput',
     });
@@ -2719,7 +2757,7 @@ export class StreamsStore {
 
   async audioOn(enabled: boolean) {
     this.logger.logAgentEvent({
-      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
       event: 'MyAudioOn',
     });
@@ -2799,7 +2837,7 @@ export class StreamsStore {
   async audioOff() {
     console.log('### AUDIO OFF');
     this.logger.logAgentEvent({
-      agent: encodeHashToBase64(this.roomClient.client.myPubKey),
+      agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
       event: 'MyAudioOff',
     });
@@ -2981,12 +3019,12 @@ export class StreamsStore {
     if (!currentlyBlockedAgents.includes(pubKey64)) {
       this.blockedAgents.set([...currentlyBlockedAgents, pubKey64]);
     }
-    const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
+    const blockedAgentsJson = this.deps.storage.session.getItem('blockedAgents');
     const blockedAgents: AgentPubKeyB64[] = blockedAgentsJson
       ? JSON.parse(blockedAgentsJson)
       : [];
     if (!blockedAgents.includes(pubKey64))
-      window.sessionStorage.setItem(
+      this.deps.storage.session.setItem(
         'blockedAgents',
         JSON.stringify([...blockedAgents, pubKey64])
       );
@@ -3008,11 +3046,11 @@ export class StreamsStore {
     this.blockedAgents.set(
       currentlyBlockedAgents.filter(pubkey => pubkey !== pubKey64)
     );
-    const blockedAgentsJson = window.sessionStorage.getItem('blockedAgents');
+    const blockedAgentsJson = this.deps.storage.session.getItem('blockedAgents');
     const blockedAgents: AgentPubKeyB64[] = blockedAgentsJson
       ? JSON.parse(blockedAgentsJson)
       : [];
-    window.sessionStorage.setItem(
+    this.deps.storage.session.setItem(
       'blockedAgents',
       JSON.stringify(blockedAgents.filter(pubkey => pubkey !== pubKey64))
     );
@@ -3029,7 +3067,7 @@ export class StreamsStore {
   mediaDevices: Writable<MediaDeviceInfo[]> = writable([]);
 
   async updateMediaDevices() {
-    const mediaDevices = await navigator.mediaDevices.enumerateDevices();
+    const mediaDevices = await this.deps.mediaDevices.enumerateDevices();
     this.mediaDevices.set(mediaDevices);
   }
 
@@ -3469,7 +3507,7 @@ export class StreamsStore {
           .map(a => decodeHashFromBase64(a));
     if (agentsToNotify.length > 0) {
       try {
-        await this.roomClient.sendMessage(
+        await this.deps.bus.sendMessage(
           agentsToNotify,
           'ModuleData',
           JSON.stringify({ moduleId, chunk })
@@ -3831,7 +3869,7 @@ export class StreamsStore {
 
     if (mode === 'signals') {
       this.webrtcGloballyDisabled = true;
-      window.localStorage.setItem('disableAllWebrtc', 'true');
+      this.deps.storage.local.setItem('disableAllWebrtc', 'true');
       this.logger.logAgentEvent({
         agent: this.myPubKeyB64,
         timestamp: this.clock.now(),
@@ -3854,7 +3892,7 @@ export class StreamsStore {
 
     // mode === 'webrtc'
     this.webrtcGloballyDisabled = false;
-    window.localStorage.removeItem('disableAllWebrtc');
+    this.deps.storage.local.removeItem('disableAllWebrtc');
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
@@ -4287,7 +4325,7 @@ export class StreamsStore {
       .map(a => decodeHashFromBase64(a));
     if (agentsToNotify.length > 0) {
       try {
-        await this.roomClient.sendMessage(
+        await this.deps.bus.sendMessage(
           agentsToNotify,
           'ModuleState',
           JSON.stringify(envelope)
@@ -4448,7 +4486,7 @@ export class StreamsStore {
         },
       };
       try {
-        await this.roomClient.sendMessage(
+        await this.deps.bus.sendMessage(
           [decodeHashFromBase64(agentB64)],
           'PongUi',
           JSON.stringify(metaData),
@@ -4761,7 +4799,7 @@ export class StreamsStore {
     }));
 
     const peerHash = decodeHashFromBase64(peerB64);
-    this.roomClient.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
+    this.deps.bus.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
       this.logger.logCustomMessage(
         `DiagnosticRequest send failed [${peerB64.slice(0, 8)}] attempt ${attempt}: ${e?.message ?? e}`
       );
@@ -5554,7 +5592,7 @@ export class StreamsStore {
             : undefined,
         },
       };
-      await this.roomClient.sendMessage(
+      await this.deps.bus.sendMessage(
         [signal.from_agent],
         'PongUi',
         JSON.stringify(metaData),
@@ -5942,7 +5980,7 @@ export class StreamsStore {
             ...(pendingInits ?? []),
             { connectionId: newConnectionId, t0: now },
           ];
-          await this.roomClient.sendMessage(
+          await this.deps.bus.sendMessage(
             [signal.from_agent],
             'InitRequest',
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
@@ -6097,7 +6135,7 @@ export class StreamsStore {
       // per-peer state lazily from the incoming offer (SdpFsm), so the
       // InitAccept is purely the initiator's go-signal. `_pendingAccepts`
       // died with the SimplePeer SdpData path that consumed it.
-      await this.roomClient.sendMessage(
+      await this.deps.bus.sendMessage(
         [signal.from_agent],
         'InitAccept',
         JSON.stringify({ connection_id, connection_type }),
@@ -6417,7 +6455,7 @@ export class StreamsStore {
       customLogs: recentCustomLogs,
       generatedAt: this.clock.now(),
     });
-    await this.roomClient.sendMessage(
+    await this.deps.bus.sendMessage(
       [signal.from_agent],
       'DiagnosticResponse',
       payload,
