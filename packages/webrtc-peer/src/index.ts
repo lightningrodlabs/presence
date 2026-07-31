@@ -22,9 +22,6 @@ export type { ConnectionManagerOptions } from './connection-manager.js';
 export { DefaultReconnectPolicy, DEFAULT_RECONNECT_OPTIONS } from './reconnect-policy.js';
 export type { DefaultReconnectPolicyOptions } from './reconnect-policy.js';
 
-export { TransitionRecorder } from './transition-recorder.js';
-export type { TransitionRecorderOptions } from './transition-recorder.js';
-
 export type {
   // Identity
   PeerId,

@@ -62,7 +62,6 @@ your transport to deliver SDP and ICE messages between two known peers.
   `healthy` flag.
 - **Structured forensics** — every transition emits an `FSMTransitionEntry` with
   a full `TransportSnapshot` (ICE / DTLS / signaling / gathering / data-channel).
-  `TransitionRecorder` captures a ring buffer you can dump on failure.
 - **`onPeerCreated` hook** — get the bare `RTCPeerConnection` before any tracks
   are attached, to install simulcast transceivers, codec preferences, etc.
 - **Zero runtime dependencies.** Browser WebRTC APIs only. Fully typed. Testable —
@@ -269,16 +268,8 @@ const manager = new ConnectionManager({
 `onTransition` is the firehose: one structured `FSMTransitionEntry` per
 transition, each carrying timestamp, connection id, from/to phase, trigger
 string, peer-session id, and a `TransportSnapshot` of all underlying browser
-states. `TransitionRecorder` keeps the last N entries; `dump()` / `toJSON()`
-produce a portable record for bug reports. The library never writes to
-`console` — pass a `logger` (`Logger`) if you want recovered errors and
-warnings surfaced.
-
-Verbose library-internal instrumentation (DTLS-watchdog bookkeeping, timer
-cancellation) is **off by default** and emitted as `DIAG:`-prefixed entries only
-when you set `config.diagnostics = true`. Leave it off in production; turn it on
-when diagnosing connection-establishment or DTLS-stall issues. Real connection
-events (ICE state, dropped stale signals, new peer sessions) are always emitted.
+states. The library never writes to `console` — pass a `logger` (`Logger`) if
+you want recovered errors and warnings surfaced.
 
 The `establishment-timeline` event (on the FSM and `ConnectionManager`) emits one
 structured `EstablishmentTimeline` record per connect, with per-stage durations
@@ -286,16 +277,11 @@ structured `EstablishmentTimeline` record per connect, with per-stage durations
 `peerSessionId` — a compact way to track establishment latency without parsing
 the transition firehose.
 
-```ts
-const recorder = new TransitionRecorder({ capacity: 500 });
-const manager = new ConnectionManager({
-  myAgentId,
-  signaling: send,
-  onTransition: (entry) => recorder.record(entry),
-});
-
-window.onerror = () => navigator.clipboard.writeText(recorder.toJSON());
-```
+(Removed here: `TransitionRecorder` — an exported ring buffer no consumer ever
+constructed — and the `config.diagnostics` gate with its `DIAG:` entries, which
+the one consuming app filtered out unconditionally. Both deleted in the
+consuming repo's Phase 5; capture your own `onTransition` entries if you need a
+portable record.)
 
 ## Lower-level API
 
