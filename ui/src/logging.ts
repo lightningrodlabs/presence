@@ -70,12 +70,16 @@ export type CustomLog = {
 /**
  * How far back a gathered diagnostic snapshot reaches (15 minutes).
  *
- * Serves exactly one consumer: the DiagnosticRequest/DiagnosticResponse
- * wire snapshot (`getRecentAgentEvents`/`getRecentCustomLogs`, gathered
- * by `StreamsStore.handleDiagnosticRequest` and bounded above by the
- * signal-size guard in `diagnostic-snapshot-policy.ts`). 15 minutes is
- * long enough to capture a session of trial-and-error configuration
- * changes when diagnosing marginal STUN/ICE conditions.
+ * Serves two consumer families, both via the
+ * `getRecentAgentEvents`/`getRecentCustomLogs` defaults (review F2):
+ * the DiagnosticRequest/DiagnosticResponse wire snapshot
+ * (`StreamsStore.handleDiagnosticRequest`, bounded above by the
+ * signal-size guard in `diagnostic-snapshot-policy.ts`) and the
+ * merged-export paths (`StreamsStore.exportMergedLogs`/
+ * `exportMergedLogsAll`), which combine the same local window with
+ * received remote snapshots for download. 15 minutes is long enough to
+ * capture a session of trial-and-error configuration changes when
+ * diagnosing marginal STUN/ICE conditions.
  *
  * This is a reporting window, not a liveness threshold — it serves none
  * of the four liveness predicates and must not be reused as one

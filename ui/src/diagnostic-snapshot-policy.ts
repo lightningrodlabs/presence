@@ -33,8 +33,16 @@ export const DIAGNOSTIC_TRUNCATED_CUSTOM_LOGS_KEPT = 100;
 export type DiagnosticSnapshotInput = {
   fromAgent: string;
   sessionId: string;
-  /** Flattened recent events, oldest first (truncation keeps the tail). */
+  /**
+   * Flattened recent events, in ANY order — the policy sorts by
+   * timestamp itself before applying the size guard, so "truncation
+   * drops the oldest" is enforced here rather than trusted to the
+   * caller. The real caller flattens a per-agent grouping
+   * (agent-insertion order, not chronological); slicing that raw would
+   * drop whole agents while declaring an oldest-first drop (review F1).
+   */
   agentEvents: SimpleEvent[];
+  /** Also accepted in any order; `logCustomMessage` allows backdated timestamps. */
   customLogs: CustomLog[];
   /** This node's wall clock at gather time (`DiagnosticSnapshot.generatedAt`). */
   generatedAt: number;
@@ -53,11 +61,22 @@ export function buildDiagnosticSnapshot(input: DiagnosticSnapshotInput): {
   snapshot: DiagnosticSnapshot;
   payload: string;
 } {
+  // Chronological order is this policy's own precondition — establish
+  // it, don't assume it (sort is stable, so same-timestamp entries keep
+  // their relative order). The complete snapshot is sorted too: the
+  // reader gets one timeline either way.
+  const agentEvents = [...input.agentEvents].sort(
+    (a, b) => a.timestamp - b.timestamp,
+  );
+  const customLogs = [...input.customLogs].sort(
+    (a, b) => a.timestamp - b.timestamp,
+  );
+
   const complete: DiagnosticSnapshot = {
     fromAgent: input.fromAgent,
     sessionId: input.sessionId,
-    agentEvents: input.agentEvents,
-    customLogs: input.customLogs,
+    agentEvents,
+    customLogs,
     generatedAt: input.generatedAt,
   };
   const completePayload = JSON.stringify(complete);
@@ -65,8 +84,8 @@ export function buildDiagnosticSnapshot(input: DiagnosticSnapshotInput): {
     return { snapshot: complete, payload: completePayload };
   }
 
-  const keptEvents = input.agentEvents.slice(-DIAGNOSTIC_TRUNCATED_EVENTS_KEPT);
-  const keptCustomLogs = input.customLogs.slice(
+  const keptEvents = agentEvents.slice(-DIAGNOSTIC_TRUNCATED_EVENTS_KEPT);
+  const keptCustomLogs = customLogs.slice(
     -DIAGNOSTIC_TRUNCATED_CUSTOM_LOGS_KEPT,
   );
   const truncated: DiagnosticSnapshot = {
@@ -74,8 +93,8 @@ export function buildDiagnosticSnapshot(input: DiagnosticSnapshotInput): {
     agentEvents: keptEvents,
     customLogs: keptCustomLogs,
     truncated: {
-      events: input.agentEvents.length - keptEvents.length,
-      customLogs: input.customLogs.length - keptCustomLogs.length,
+      events: agentEvents.length - keptEvents.length,
+      customLogs: customLogs.length - keptCustomLogs.length,
     },
   };
   return { snapshot: truncated, payload: JSON.stringify(truncated) };
