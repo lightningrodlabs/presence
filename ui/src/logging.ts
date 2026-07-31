@@ -67,6 +67,23 @@ export type CustomLog = {
   log: string;
 };
 
+/**
+ * How far back a gathered diagnostic snapshot reaches (15 minutes).
+ *
+ * Serves exactly one consumer: the DiagnosticRequest/DiagnosticResponse
+ * wire snapshot (`getRecentAgentEvents`/`getRecentCustomLogs`, gathered
+ * by `StreamsStore.handleDiagnosticRequest` and bounded above by the
+ * signal-size guard in `diagnostic-snapshot-policy.ts`). 15 minutes is
+ * long enough to capture a session of trial-and-error configuration
+ * changes when diagnosing marginal STUN/ICE conditions.
+ *
+ * This is a reporting window, not a liveness threshold — it serves none
+ * of the four liveness predicates and must not be reused as one
+ * (working agreement 2 runs the other way: liveness code must not
+ * borrow this constant).
+ */
+export const DIAGNOSTIC_WINDOW_MS = 900_000;
+
 export type SimpleEventType =
   | 'Pong' // Retained for backward compat with old logs; no longer emitted (pong timing is in agentPongMetadataLogs)
   // Log-timeline aggregation of FSM SDP traffic (offer/answer/candidate
@@ -697,12 +714,11 @@ export class PresenceLogger {
   }
 
   /**
-   * Get all agent events from the current session newer than `sinceMs` milliseconds ago.
-   * Default window is 15 minutes — long enough to capture a session of
-   * trial-and-error configuration changes when diagnosing marginal
-   * STUN/ICE conditions.
+   * Get all agent events from the current session newer than `sinceMs`
+   * milliseconds ago. Default is `DIAGNOSTIC_WINDOW_MS` — see its
+   * docblock for the consumer this serves.
    */
-  getRecentAgentEvents(sinceMs: number = 900_000): Record<AgentPubKeyB64, SimpleEvent[]> {
+  getRecentAgentEvents(sinceMs: number = DIAGNOSTIC_WINDOW_MS): Record<AgentPubKeyB64, SimpleEvent[]> {
     const cutoff = Date.now() - sinceMs;
     const result: Record<AgentPubKeyB64, SimpleEvent[]> = {};
     Object.entries(this.agentEvents).forEach(([agent, events]) => {
@@ -715,10 +731,11 @@ export class PresenceLogger {
   }
 
   /**
-   * Get all custom logs from the current session newer than `sinceMs` milliseconds ago.
-   * Default window matches getRecentAgentEvents (15 minutes).
+   * Get all custom logs from the current session newer than `sinceMs`
+   * milliseconds ago. Default is `DIAGNOSTIC_WINDOW_MS`, matching
+   * getRecentAgentEvents.
    */
-  getRecentCustomLogs(sinceMs: number = 900_000): CustomLog[] {
+  getRecentCustomLogs(sinceMs: number = DIAGNOSTIC_WINDOW_MS): CustomLog[] {
     const cutoff = Date.now() - sinceMs;
     return this.customLogs.filter(log => log.timestamp >= cutoff);
   }
