@@ -156,6 +156,14 @@ describe('room DNA on holochain 0.7', () => {
       );
       expect(revisions.length).toBe(2);
 
+      // The original is still readable as-authored after the update.
+      const original = await call<HolochainRecord | null>(alice, 'get_original_attachment', {
+        input: createdHash,
+        local: true,
+      });
+      assert(original);
+      assert.deepEqual(new EntryRecord<any>(original).entry, attachment);
+
       // Delete
       await call(alice, 'delete_attachment', { input: createdHash, local: true });
       await dhtSync([alice, bob], roomCell(alice).cell_id[0]);
@@ -165,6 +173,14 @@ describe('room DNA on holochain 0.7', () => {
         local: true,
       });
       expect(bobAllAfter.length).toBe(0);
+
+      const deletes = await call<unknown[] | null>(
+        bob,
+        'get_all_deletes_for_attachment',
+        { input: createdHash, local: true },
+      );
+      assert(deletes);
+      expect(deletes.length).toBe(1);
 
       const oldestDelete = await call<unknown | null>(
         bob,
