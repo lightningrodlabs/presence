@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { Scenario, runScenario } from '@holochain/tryorama';
+import { Scenario, runScenario } from '@holochain-open-dev/tryorama';
 import { CellType, encodeHashToBase64 } from '@holochain/client';
 import path from 'path';
 import { fileURLToPath } from 'url';
