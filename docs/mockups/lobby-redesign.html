@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<!-- HISTORICAL design mockup (2026-03): lobby before/after comparison. Preserved by the 2026-08 retro sweep (assessment §7.5 item 4); a design artifact, not a spec. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Presence Lobby — Before / After</title>
+<link href="https://fonts.googleapis.com/css2?family=Pacifico&family=Baloo+2:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Baloo 2', sans-serif;
+    background: #111;
+    color: #e1e5fc;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+    gap: 60px;
+  }
+  h1 { font-size: 28px; color: #8890c0; font-weight: 400; }
+  .label {
+    font-size: 22px;
+    color: #6a72a0;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-weight: 600;
+  }
+  .mockup {
+    width: 100%;
+    max-width: 760px;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 0 40px rgba(0,0,0,0.5);
+  }
+
+  /* ===== BEFORE ===== */
+  .before .top-panel {
+    background: linear-gradient(#a1aad9, #7780af);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 280px;
+    justify-content: center;
+    padding: 40px 20px;
+    box-shadow: 0 0 60px 10px #1e2137;
+    position: relative;
+  }
+  .before .enter-btn {
+    background: linear-gradient(#102a4d, #071931);
+    border-radius: 40px;
+    color: #fff0f0;
+    border: none;
+    padding: 12px 25px;
+    font-family: 'Pacifico', sans-serif;
+    font-size: 32px;
+    box-shadow: 1px 1px 4px 2px #03162f;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .before .empty-msg {
+    color: #0a1c35;
+    font-style: italic;
+    font-family: 'Pacifico', sans-serif;
+    font-size: 22px;
+    margin-top: 15px;
+  }
+  .before .bottom-panel {
+    background: #1a1d30;
+    padding: 40px 20px 60px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 30px;
+  }
+  .tab {
+    background: linear-gradient(#1b1f35, #282b42 30%, #282b42);
+    color: #e1e5fc;
+    height: 54px;
+    padding: 2px 18px;
+    box-shadow: 0 0 4px 2px black inset;
+    cursor: pointer;
+    font-family: 'Baloo 2', sans-serif;
+    font-weight: 600;
+    font-size: 22px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+  }
+  .tab:first-child { border-radius: 25px 3px 3px 25px; }
+  .tab:last-child { border-radius: 3px 25px 25px 3px; }
+  .tab.active { background: linear-gradient(#3a3f5e, #4a4f72 30%, #4a4f72); }
+  .create-section {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .create-label {
+    font-size: 20px;
+    color: #e1e5fc;
+  }
+  .create-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .create-row input {
+    padding: 10px 14px;
+    border-radius: 6px;
+    border: none;
+    font-size: 16px;
+    width: 240px;
+  }
+  .create-row button {
+    padding: 10px 20px;
+    border-radius: 6px;
+    border: none;
+    background: #5a6199;
+    color: white;
+    font-size: 16px;
+    cursor: pointer;
+    font-family: 'Baloo 2', sans-serif;
+  }
+
+  /* ===== AFTER ===== */
+  .after .top-panel {
+    background: linear-gradient(#a1aad9, #7780af);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 280px;
+    justify-content: center;
+    padding: 40px 20px;
+    box-shadow: 0 0 60px 10px #1e2137;
+    position: relative;
+  }
+  .after .enter-btn {
+    background: linear-gradient(#2a4a8f, #1a3060);
+    border-radius: 40px;
+    color: #ffffff;
+    border: none;
+    padding: 16px 35px;
+    font-family: 'Pacifico', sans-serif;
+    font-size: 34px;
+    box-shadow: 0 0 25px 6px rgba(100, 140, 255, 0.35), 1px 1px 4px 2px #03162f;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    animation: pulse-glow 2.5s ease-in-out infinite;
+  }
+  @keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 25px 6px rgba(100, 140, 255, 0.3), 1px 1px 4px 2px #03162f; }
+    50% { box-shadow: 0 0 35px 10px rgba(100, 140, 255, 0.5), 1px 1px 4px 2px #03162f; }
+  }
+  .after .invite-msg {
+    color: #1a2d50;
+    font-size: 18px;
+    margin-top: 18px;
+    font-weight: 500;
+    opacity: 0.85;
+  }
+  .after .bottom-panel {
+    background: #1a1d30;
+    padding: 40px 20px 60px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .after .create-toggle {
+    background: none;
+    border: 1px solid #5a6199;
+    border-radius: 20px;
+    color: #9da3d0;
+    padding: 8px 20px;
+    font-size: 17px;
+    cursor: pointer;
+    font-family: 'Baloo 2', sans-serif;
+    transition: all 0.2s;
+  }
+  .after .create-toggle:hover {
+    background: #5a619930;
+    color: #c0c5ee;
+  }
+  .after .create-form-collapsed {
+    display: none;
+  }
+
+  .divider {
+    width: 100%;
+    max-width: 760px;
+    border: none;
+    border-top: 1px solid #333;
+  }
+
+  /* Arrow annotation */
+  .annotation {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    max-width: 760px;
+    width: 100%;
+    background: #1e2040;
+    border-radius: 10px;
+    padding: 16px 20px;
+    font-size: 15px;
+    line-height: 1.5;
+    color: #b0b6d8;
+  }
+  .annotation .marker {
+    color: #7b85cc;
+    font-size: 24px;
+    font-weight: bold;
+    flex-shrink: 0;
+  }
+  .annotation strong { color: #d0d5f0; }
+</style>
+</head>
+<body>
+
+<h1>Presence Lobby Redesign — Before / After</h1>
+
+<!-- ==================== BEFORE ==================== -->
+<div class="label">Before (current)</div>
+<div class="mockup before">
+  <div class="top-panel">
+    <button class="enter-btn">
+      🚪 <span>Enter Main Room</span>
+    </button>
+    <div class="empty-msg">The main room is empty.</div>
+  </div>
+  <div class="bottom-panel">
+    <div class="tabs">
+      <button class="tab active">👥 Shared Rooms</button>
+      <button class="tab">🔒 Private Rooms</button>
+    </div>
+    <div class="create-section">
+      <div class="create-label">+ Create New Shared Room</div>
+      <div class="create-row">
+        <input placeholder="room name" type="text" />
+        <button>Create</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="annotation">
+  <span class="marker">△</span>
+  <div>
+    <strong>"The main room is empty"</strong> discourages entry. The always-visible
+    <strong>white input field</strong> is the highest-contrast element on the page and
+    pulls attention to "Create" instead of "Enter."
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ==================== AFTER ==================== -->
+<div class="label">After (proposed)</div>
+<div class="mockup after">
+  <div class="top-panel">
+    <button class="enter-btn">
+      🚪 <span>Enter Main Room</span>
+    </button>
+    <div class="invite-msg">Be the first one here — others will see you when they arrive.</div>
+  </div>
+  <div class="bottom-panel">
+    <div class="tabs">
+      <button class="tab active">👥 Shared Rooms</button>
+      <button class="tab">🔒 Private Rooms</button>
+    </div>
+    <button class="create-toggle">+ Create New Shared Room</button>
+  </div>
+</div>
+
+<div class="annotation">
+  <span class="marker">▽</span>
+  <div>
+    <strong>Three changes:</strong><br>
+    1. Button has a <strong>brighter gradient + subtle glow pulse</strong> — it's now the dominant visual element.<br>
+    2. Empty-room copy replaced with an <strong>invitation</strong> ("Be the first one here").<br>
+    3. Create form <strong>collapsed behind a text button</strong> — the white input field no longer competes for attention. Clicking expands it.
+  </div>
+</div>
+
+</body>
+</html>
