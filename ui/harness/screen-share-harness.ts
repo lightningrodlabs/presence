@@ -1,278 +1,295 @@
 /**
- * Screen-share field harness — page side (Phase 3.5).
+ * Screen-share field harness — page side (Phase 3.5; rebuilt by Phase 6.5
+ * to run the REAL StreamsStore).
  *
- * One page = one agent running BOTH production screen-share transports —
- * `screenShareOutTransport` (sharer role) and `screenShareInTransport`
- * (viewer role), each a real `FsmTransport`/`ConnectionManager` over a
- * real `RTCPeerConnection` (loopback ICE + DTLS) — with signaling relayed
- * over a `BroadcastChannel` carrying the production `SdpFsmScreen`
- * envelope shape (`connection_id`/`peer_session_id`/`epoch`/`dir`/`data`),
- * fire-and-forget like Holochain remote signals.
+ * One page = one agent running the production orchestrator: a real
+ * `StreamsStore` (Phase 6 deps record) whose two screen-share transports
+ * are real `FsmTransport`s over real `RTCPeerConnection`s (loopback ICE +
+ * DTLS). Signaling rides a `BroadcastChannel` bus with Holochain's
+ * fire-and-forget semantics, in the production `SdpFsmScreen` wire
+ * envelope — produced and parsed by the store's own glue
+ * (`start()`'s onOutgoingSignal wrap / `handleSdpFsmScreen`), not by this
+ * file. Slot writes, role routing, the `_screenShareStreams` mirror, and
+ * outgoing-share initiation (`_ensureOutgoingScreenShare` off the real
+ * ping/pong cycle) are all store code. The Phase 3.5 mirror of that glue
+ * is DELETED per one-authority (working agreement 1).
  *
- * This exists because the Phase 3 screen-share port shipped with no field
- * validation at all (the Phase 3 review's F4; the assessment's
- * unscheduled-defects row). The three things only a real browser can
- * falsify:
+ * What the harness still supplies (declared, not mirrored logic):
+ *   - the deps binding and dwell compression, identical in role to
+ *     carrier-handover-harness.ts (see its header);
+ *   - the ping-loop arming, peer seeding, and conversation-module
+ *     activation (`_syncConversationPayload` — the real path) that give
+ *     both builds their wire caps, since `CAP_SDP_FSM_SCREEN` gates every
+ *     screen link;
+ *   - `share()` = ACQUISITION INJECTION ONLY: it assigns a
+ *     `canvas.captureStream` track to `store.screenShareStream`, standing
+ *     exactly where `screenShareOn`'s `getUserMedia` stands — that call
+ *     needs Electron's `chromeMediaSource: 'desktop'` and cannot run in
+ *     plain Chromium (the declared out-of-scope media-acquisition area).
+ *     Everything downstream — per-peer initiation, setLocalStream, slot
+ *     install — is the store's pong-driven path;
+ *   - the `epoch0` seam: production's per-peer epoch counter is
+ *     session-scoped, so a re-initiating SHARER allocates a later
+ *     generation than the attempt the viewer still holds. A fresh page
+ *     starts at 0; `?epoch0=N` pre-seeds the store's private counter to
+ *     stand in for the same-session re-initiation the supersede route
+ *     needs. (A plain reload is the equal-epoch case — absorbed inside
+ *     the FSM, no slot events; the spec documents that separately.)
  *
- *   1. Establishment: a sharer-side offer builds the viewer's FSM lazily
- *      (no reservation handshake exists anymore) and real ICE/DTLS comes
- *      up carrying a real captured video track.
- *   2. Role-routing under MUTUAL share: A→B and B→A are two independent
- *      connections on two transport pairs; the `dir` tag — not
- *      connectionId — is what keeps their signals apart. A mis-route here
- *      creates a phantom FSM on the wrong transport.
- *   3. Teardown on a silent peer drop: real ICE consent loss walks the
- *      production phases and the terminal `failed`/`closed` clears the
- *      slot and the `_screenShareStreams` mirror.
- *
- * Fidelity statement, same shape as carrier-handover-harness.ts:
- *
- *   REAL:    RTCPeerConnection, ICE/DTLS, ConnectionManager, FsmTransport,
- *            canvas.captureStream video track, decideScreenSignalRoute
- *            (the production routing decision, executed), routeTransportPhase,
- *            decideSlotWrite (the slot rules the store executes).
- *   MODELED: only the glue — the `_subscribeScreenShareTransport` /
- *            `handleSdpFsmScreen` / `_ensureOutgoingScreenShare` wiring is
- *            mirrored here because `StreamsStore` cannot run without
- *            Holochain (§3.6; Phase 6 retires this gap).
+ * Timeline `write` labels are DERIVED from the real slot state observed
+ * after the store applied each event (prev/next comparison) — a readable
+ * projection of what the store did, never a second decision path.
  *
  * Exposes `window.screenHarness`.
  */
 
-import { FsmTransport } from '../src/transport/fsm/fsm-transport';
-import {
-  routeTransportPhase,
-  decideSlotWrite,
-  type SlotEvent,
-} from '../src/transport/media-event-policy';
-import { decideScreenSignalRoute } from '../src/transport/screen-signal-policy';
-import type { OutgoingSignal, TransportEvent, ConnectionPhase } from '../src/transport/types';
+import { encodeHashToBase64, decodeHashFromBase64 } from '@holochain/client';
+import type { AgentPubKey } from '@holochain/client';
+import { get } from '@holochain-open-dev/stores';
 import { DefaultReconnectPolicy } from '@lightningrodlabs/webrtc-peer';
+import { StreamsStore } from '../src/streams-store';
+import { PresenceLogger } from '../src/logging';
+import { systemClock } from '../src/clock';
+import { FsmTransport } from '../src/transport/fsm/fsm-transport';
+import { PING_INTERVAL } from '../src/presence-policy';
+import type { StreamsStoreDeps } from '../src/store-deps';
+import type { RoomSignal } from '../src/types';
+import type { ConnectionPhase, PeerTransport } from '../src/transport/types';
 
 type Role = 'out' | 'in';
+
+type Slot = { connectionId: string; connected: boolean };
 
 type TimelineEntry = {
   /** ms since harness start */
   t: number;
-  /** Which local transport the event came from. */
   role: Role;
   phase: ConnectionPhase;
   connectionId: string;
-  route: string;
-  /** The executed SlotWrite: install/replace/set-connected/clear, or
-   *  none/<reason> (kept, superseded, no-slot), or '-' for ignore routes.
-   *  `replace` is the adopt path — the FSM was replaced in place with no
-   *  close event (§3.1(c)); `none/superseded` is the guard dropping a
-   *  stale event from the replaced connection (the Phase 3 review's F1
-   *  semantics, field-asserted by the spec). */
+  /** Derived from the REAL slot state around this event:
+   *  install / replace / set-connected / clear / none. `replace` is the
+   *  adopt path — the FSM was replaced in place with no close event
+   *  (§3.1(c)); `none` covers guarded/no-op events (stale connectionIds,
+   *  duplicate closes, recovery phases). */
   write: string;
   outSlotConnected: boolean | null;
   inSlotConnected: boolean | null;
 };
-
-type Slot = { connectionId: string; connected: boolean };
 
 type HarnessState = {
   me: string;
   peer: string;
   started: boolean;
   sharing: boolean;
+  peerPresent: boolean;
   out: { phase: ConnectionPhase | 'none'; slot: Slot | null };
   in: { phase: ConnectionPhase | 'none'; slot: Slot | null };
-  /** Mirror of `_screenShareStreams[peer]`: video-track count of the
-   *  received share, present iff a stream arrived and its slot survives. */
+  /** The store's real `_screenShareStreams` mirror, video-track counts. */
   streams: Record<string, { video: number }>;
-  /** Signal-routing tallies. `dropped` counts decideScreenSignalRoute
-   *  drop verdicts — malformed/unknown dir. */
+  /** Observe-only tallies. toIn/toOut count arriving envelopes by their
+   *  raw `dir` tag (the store does the actual routing); `dropped` counts
+   *  the store's own drop verdicts, read from its forensic log. */
   routed: { toIn: number; toOut: number; dropped: number };
+  /** Store-logged 'Superseded' adopt events for the peer (screen path). */
+  supersededCount: number;
   timeline: TimelineEntry[];
 };
 
 const params = new URLSearchParams(location.search);
 const ME = params.get('me') ?? 'A';
 const PEER = params.get('peer') ?? (ME === 'A' ? 'B' : 'A');
-/** Starting connection epoch (`?epoch0=N`). Production's per-peer epoch
- *  counter is session-scoped; a page that re-initiates WITHIN a session
- *  allocates a higher epoch than the attempt the viewer still holds —
- *  the manager's documented supersede route. This seam lets the spec
- *  drive that route deterministically. (A plain reload resets epochs to
- *  1 — the equal-epoch case — which the FSM absorbs internally with a
- *  fresh RtcPeer, same connectionId, no slot events at all; the spec
- *  documents that too.) */
 const EPOCH0 = parseInt(params.get('epoch0') ?? '0', 10) || 0;
 const T0 = performance.now();
 
-// Fire-and-forget signaling relay; a closed page is silence, not an error.
-const bus = new BroadcastChannel('screen-share-signaling');
-
-// One slot table per direction — the shape of
-// `_screenShareConnectionsOutgoing` / `_screenShareConnectionsIncoming`,
-// one peer wide.
-const outSlots: Record<string, Slot> = {};
-const inSlots: Record<string, Slot> = {};
-// Mirror of `_screenShareStreams` (incoming shares only).
-const streams: Record<string, { video: number }> = {};
-const routed = { toIn: 0, toOut: 0, dropped: 0 };
-const timeline: TimelineEntry[] = [];
-
-let outTransport: FsmTransport | null = null;
-let inTransport: FsmTransport | null = null;
-let shareStream: MediaStream | null = null;
-let epochCounter = EPOCH0;
-
-function makeTransport(dir: 'sharer' | 'viewer'): FsmTransport {
-  return new FsmTransport({
-    myAgentId: ME,
-    onOutgoingSignal: (signal: OutgoingSignal) => {
-      // The production wire payload for 'SdpFsmScreen' (streams-store
-      // start()), plus from/to for the bus. JSON round-trip as production
-      // does — also load-bearing: an offer's payload is an
-      // RTCSessionDescription platform object that structured clone
-      // rejects; toJSON flattens it.
-      bus.postMessage(
-        JSON.parse(
-          JSON.stringify({
-            from: ME,
-            to: signal.to,
-            connection_id: signal.connectionId,
-            peer_session_id: signal.peerSessionId,
-            epoch: signal.epoch,
-            dir,
-            data: signal.data,
-          }),
-        ),
-      );
-    },
-    // Loopback host candidates only — no external STUN in CI.
-    iceServers: [],
-    trickleICE: true,
-    // Compress the dwell in each phase, not the phases themselves.
-    configOverrides: {
-      connectionTimeoutMs: 5_000,
-      sdpExchangeTimeoutMs: 4_000,
-      dtlsStallTimeoutMs: 3_000,
-      iceDisconnectedGraceMs: 1_500,
-    },
-    reconnectPolicy: new DefaultReconnectPolicy({
-      maxAttempts: 2,
-      iceRestartMaxAttempts: 1,
-      baseDelayMs: 250,
-      maxDelayMs: 1_000,
-      jitterMs: 100,
-    }),
-  });
+function agentKey(name: string): AgentPubKey {
+  const bytes = new Uint8Array(39);
+  for (let i = 0; i < name.length && i < 39; i += 1) {
+    bytes[i] = name.charCodeAt(i);
+  }
+  return bytes as AgentPubKey;
 }
 
-/**
- * `_subscribeScreenShareTransport`'s connection-state-change arm: route via
- * the production policy, then execute the production slot decision against
- * the role's slot table. The `_screenShareStreams` mirror dies with the
- * incoming slot on a `clear` write, exactly as `_handleScreenShareClosed`
- * deletes it.
- */
-function applyPhaseEvent(
-  role: Role,
-  event: Extract<TransportEvent, { type: 'connection-state-change' }>,
-): void {
-  const slots = role === 'out' ? outSlots : inSlots;
-  const route = routeTransportPhase({
-    phase: event.phase,
-    connectionId: event.connectionId,
-    openConnectionId: slots[event.peer]?.connectionId,
-  });
+const MY_KEY = agentKey(ME);
+const MY_B64 = encodeHashToBase64(MY_KEY);
+const PEER_B64 = encodeHashToBase64(agentKey(PEER));
 
-  const slotEvent: SlotEvent | null =
-    route.handler === 'signaling'
-      ? { kind: 'signaling', slot: route.slot }
-      : route.handler === 'media-connected'
-        ? { kind: 'connected' }
-        : route.handler === 'media-closed'
-          ? { kind: 'closed' }
-          : null;
+// --- the bus (see carrier-handover-harness.ts) ---
+const channel = new BroadcastChannel('screen-share-signaling');
+const busHandlers = new Set<(signal: RoomSignal) => void | Promise<void>>();
+const routed = { toIn: 0, toOut: 0 };
 
-  let writeLabel = '-';
-  if (slotEvent) {
-    const write = decideSlotWrite(slotEvent, event.connectionId, slots[event.peer]);
-    writeLabel = write.write === 'none' ? `none/${write.reason}` : write.write;
-    switch (write.write) {
-      case 'install':
-      case 'replace':
-      case 'set-connected':
-        slots[event.peer] = write.slot;
-        break;
-      case 'clear':
-        delete slots[event.peer];
-        if (role === 'in') delete streams[event.peer];
-        break;
-      case 'none':
-        break;
+function deliver(from: string, msgType: string, payload: string): void {
+  // Observe-only tally of arriving screen envelopes by their raw dir tag;
+  // the store's handleSdpFsmScreen does the actual routing (and the
+  // dropping — see `droppedCount`).
+  if (msgType === 'SdpFsmScreen') {
+    try {
+      const dir = JSON.parse(payload)?.dir;
+      if (dir === 'sharer') routed.toIn += 1;
+      else if (dir === 'viewer') routed.toOut += 1;
+    } catch {
+      // unparseable payloads are the store's problem, deliberately
     }
   }
-
-  timeline.push({
-    t: Math.round(performance.now() - T0),
-    role,
-    phase: event.phase,
-    connectionId: event.connectionId,
-    route: `${route.handler}/${route.reason}`,
-    write: writeLabel,
-    outSlotConnected: outSlots[event.peer]?.connected ?? null,
-    inSlotConnected: inSlots[event.peer]?.connected ?? null,
-  });
-  render();
+  const signal: RoomSignal = {
+    type: 'Message',
+    from_agent: decodeHashFromBase64(from),
+    msg_type: msgType,
+    payload,
+  };
+  busHandlers.forEach(handler => handler(signal));
 }
 
-/** `handleSdpFsmScreen`: route by the SENDER's declared role, executing
- *  the production decision — drop-not-guess on anything malformed. */
-function handleIncoming(envelope: {
-  from: string;
-  connection_id: string;
-  peer_session_id?: number;
-  epoch?: number;
-  dir?: unknown;
-  data: unknown;
-}): void {
-  const verdict = decideScreenSignalRoute(envelope.dir);
-  if (verdict.route === 'drop') {
-    routed.dropped += 1;
+channel.onmessage = (msg: MessageEvent) => {
+  const { from, to, msgType, payload } = msg.data ?? {};
+  if (to !== MY_B64) return;
+  deliver(from, msgType, payload ?? '');
+};
+
+const logger = new PresenceLogger();
+
+const deps: StreamsStoreDeps = {
+  clock: systemClock,
+  storage: {
+    local: window.localStorage,
+    session: window.sessionStorage,
+  },
+  bus: {
+    myPubKey: MY_KEY,
+    onSignal: handler => {
+      busHandlers.add(handler);
+      return () => busHandlers.delete(handler);
+    },
+    sendMessage: async (toAgents, msgType, payload = '') => {
+      for (const agent of toAgents) {
+        channel.postMessage({
+          from: MY_B64,
+          to: encodeHashToBase64(agent),
+          msgType,
+          payload,
+        });
+      }
+    },
+  },
+  transportFactory: (_purpose, options) =>
+    new FsmTransport({
+      ...options,
+      iceServers: [],
+      configOverrides: {
+        ...options.configOverrides,
+        connectionTimeoutMs: 5_000,
+        sdpExchangeTimeoutMs: 4_000,
+        dtlsStallTimeoutMs: 3_000,
+        iceDisconnectedGraceMs: 1_500,
+      },
+      reconnectPolicy: new DefaultReconnectPolicy({
+        maxAttempts: 2,
+        iceRestartMaxAttempts: 1,
+        baseDelayMs: 250,
+        maxDelayMs: 1_000,
+        jitterMs: 100,
+      }),
+    }),
+  mediaDevices: navigator.mediaDevices,
+};
+
+const timeline: TimelineEntry[] = [];
+let store: StreamsStore | null = null;
+let shareStream: MediaStream | null = null;
+
+function slotOf(role: Role): Slot | null {
+  if (!store) return null;
+  const table =
+    role === 'out'
+      ? get(store._screenShareConnectionsOutgoing)
+      : get(store._screenShareConnectionsIncoming);
+  const slot = table[PEER_B64];
+  return slot
+    ? { connectionId: slot.connectionId, connected: !!slot.connected }
+    : null;
+}
+
+/** Derive the write label from the real slot before/after the event. */
+function deriveWrite(prev: Slot | null, next: Slot | null): string {
+  if (!prev && next) return 'install';
+  if (prev && !next) return 'clear';
+  if (prev && next && prev.connectionId !== next.connectionId) return 'replace';
+  if (prev && next && !prev.connected && next.connected) return 'set-connected';
+  return 'none';
+}
+
+function droppedCount(): number {
+  return logger
+    .getRecentCustomLogs()
+    .filter(l => l.log.startsWith('Dropped SdpFsmScreen')).length;
+}
+
+function supersededCount(): number {
+  const events = logger.getRecentAgentEvents()[PEER_B64] ?? [];
+  return events.filter(
+    e => e.event === 'Superseded' && e.detail?.includes('screen-transport-replace')
+  ).length;
+}
+
+function observe(role: Role, transport: PeerTransport): void {
+  let prevSlot = slotOf(role);
+  transport.onAny(event => {
+    if (event.type !== 'connection-state-change') return;
+    const nextSlot = slotOf(role);
+    timeline.push({
+      t: Math.round(performance.now() - T0),
+      role,
+      phase: event.phase,
+      connectionId: event.connectionId,
+      write: deriveWrite(prevSlot, nextSlot),
+      outSlotConnected: slotOf('out')?.connected ?? null,
+      inSlotConnected: slotOf('in')?.connected ?? null,
+    });
+    prevSlot = nextSlot;
     render();
-    return;
-  }
-  const transport = verdict.route === 'incoming-share' ? inTransport : outTransport;
-  if (verdict.route === 'incoming-share') routed.toIn += 1;
-  else routed.toOut += 1;
-  transport?.processIncomingSignal({
-    from: envelope.from,
-    connectionId: envelope.connection_id,
-    peerSessionId: envelope.peer_session_id,
-    epoch: envelope.epoch,
-    data: envelope.data,
   });
-  render();
 }
 
 function start(): void {
-  if (outTransport) return;
-  outTransport = makeTransport('sharer');
-  inTransport = makeTransport('viewer');
+  if (store) return;
+  store = new StreamsStore(deps, async () => '', logger);
+  store.start();
 
-  outTransport.onAny((event: TransportEvent) => {
-    if (event.type === 'connection-state-change') applyPhaseEvent('out', event);
-  });
-  inTransport.onAny((event: TransportEvent) => {
-    if (event.type === 'connection-state-change') applyPhaseEvent('in', event);
-    if (event.type === 'remote-stream') {
-      // `_handleScreenShareRemoteStream`: record the share for paint.
-      streams[event.peer] = { video: event.stream.getVideoTracks().length };
-      render();
-    }
-  });
+  // Observe (never apply) both real screen transports, after the store's
+  // own subscriptions so every entry reflects applied state.
+  observe('out', store.screenShareOutTransport);
+  observe('in', store.screenShareInTransport);
 
-  bus.onmessage = (msg: MessageEvent) => {
-    const envelope = msg.data ?? {};
-    if (envelope.to !== ME) return;
-    handleIncoming(envelope);
-  };
+  // The epoch0 seam: pre-seed the store's session-scoped per-peer epoch
+  // counter so this page's first share allocates generation EPOCH0+1 —
+  // standing in for a sharer that re-initiates WITHIN a session, which is
+  // what drives the manager's supersede route on the viewer.
+  if (EPOCH0 > 0) {
+    (store as unknown as { _connectionEpoch: Record<string, number> })._connectionEpoch[
+      PEER_B64
+    ] = EPOCH0;
+  }
+
+  // static connect's glue, reproduced: roster + ping cadence. The
+  // conversation module is activated through the real path so this
+  // build's wire caps (including sdp-fsm-screen) travel in pong metadata
+  // — without them the peer's capability gate keeps every screen link
+  // closed.
+  store._knownAgents.update(agents => {
+    agents[PEER_B64] = {
+      pubkey: PEER_B64,
+      type: 'known',
+      lastSeen: undefined,
+      appVersion: undefined,
+    };
+    return agents;
+  });
+  store._syncConversationPayload({}).catch(() => {});
+  store.pingAgents().catch(() => {});
+  window.setInterval(() => {
+    store?.pingAgents().catch(() => {});
+    render();
+  }, PING_INTERVAL);
 
   render();
 }
@@ -297,41 +314,53 @@ function makeShareStream(): MediaStream {
   return canvas.captureStream(10);
 }
 
-/** `_ensureOutgoingScreenShare`: idempotent; installs the outgoing slot
- *  with the FSM-allocated connectionId. (The production capability gate
- *  is omitted — both pages are this build.) */
+/**
+ * Acquisition injection — the ONLY stand-in for `screenShareOn`, whose
+ * `getUserMedia({chromeMediaSource:'desktop'})` needs Electron. Assigning
+ * the stream is all it takes: the store's own pong cycle notices
+ * (`handlePingUi`/`handlePongUi` → `_ensureOutgoingScreenShare`), sets the
+ * transport's local stream, allocates the epoch, and installs the slot.
+ */
 function share(): void {
-  if (!outTransport) return;
-  if (outSlots[PEER]) return;
+  if (!store || store.screenShareStream) return;
   if (!shareStream) shareStream = makeShareStream();
-  outTransport.setLocalStream(shareStream);
-  epochCounter += 1;
-  const connectionId = outTransport.ensureConnection(PEER, { epoch: epochCounter });
-  outSlots[PEER] = { connectionId, connected: false };
+  store.screenShareStream = shareStream;
   render();
 }
 
-/** Test seam: feed a raw envelope from the peer through the production
- *  routing decision (e.g. a malformed `dir`) without bus plumbing. */
+/** Test seam: feed a raw envelope from the peer through the store's real
+ *  handleSignal → handleSdpFsmScreen path (e.g. a malformed `dir`). */
 function injectIncoming(dir: unknown): void {
-  handleIncoming({
-    from: PEER,
-    connection_id: 'bogus-conn',
-    dir,
-    data: { type: 'offer', payload: { type: 'offer', sdp: 'v=0' } },
-  });
+  deliver(
+    PEER_B64,
+    'SdpFsmScreen',
+    JSON.stringify({
+      connection_id: 'bogus-conn',
+      dir,
+      data: { type: 'offer', payload: { type: 'offer', sdp: 'v=0' } },
+    }),
+  );
 }
 
 function state(): HarnessState {
+  const stream = store?._screenShareStreams[PEER_B64];
   return {
     me: ME,
     peer: PEER,
-    started: outTransport !== null,
-    sharing: shareStream !== null,
-    out: { phase: outTransport?.getPhase(PEER) ?? 'none', slot: outSlots[PEER] ?? null },
-    in: { phase: inTransport?.getPhase(PEER) ?? 'none', slot: inSlots[PEER] ?? null },
-    streams,
-    routed,
+    started: store !== null,
+    sharing: !!store?.screenShareStream,
+    peerPresent: store ? get(store._presentPeers).includes(PEER_B64) : false,
+    out: {
+      phase: store?.screenShareOutTransport.getPhase(PEER_B64) ?? 'none',
+      slot: slotOf('out'),
+    },
+    in: {
+      phase: store?.screenShareInTransport.getPhase(PEER_B64) ?? 'none',
+      slot: slotOf('in'),
+    },
+    streams: stream ? { [PEER]: { video: stream.getVideoTracks().length } } : {},
+    routed: { ...routed, dropped: droppedCount() },
+    supersededCount: supersededCount(),
     timeline,
   };
 }
