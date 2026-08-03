@@ -25,6 +25,20 @@ export const PING_INTERVAL = 2000;
 export const PRESENT_STALENESS_MS = 3 * PING_INTERVAL;
 
 /**
+ * The **passively-observed present** predicate's staleness window: an agent
+ * whose PingUi arrived within this window is shown as "in the room" by
+ * observers who have NOT joined the call (lobby room cards, the home
+ * screen's main-room list — both via `passive-presence.ts`, the one
+ * implementation). Wider than PRESENT_STALENESS_MS because a passive
+ * observer has only ping evidence — no pongs, no media flow — so a longer
+ * window buys flap resistance at the cost of a slower observed leave. Also
+ * the sweep cadence: the pruner runs once per window, so worst-case
+ * eviction latency is 2x the window (unchanged from the two inline models
+ * this replaced, which used a bare 10000 for both roles).
+ */
+export const PASSIVE_PRESENT_STALENESS_MS = 5 * PING_INTERVAL;
+
+/**
  * Freshness window for **observer testimony** (another peer's broadcast
  * peerLinks / connection statuses): testimony older than this is ignored
  * so a departed observer cannot keep ghost peers alive. Slightly under

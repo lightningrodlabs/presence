@@ -1,6 +1,7 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import type { StreamsStore } from '../../streams-store';
+import { MEDIA_LIVE_WINDOW_MS } from '../../presence-policy';
 import { filmstripController } from '../modules/video-filmstrip';
 
 /**
@@ -150,7 +151,10 @@ export class PeerStatsPanel extends LitElement {
     // Flow detection: is audio actually moving in each direction right now?
     // Carrier says who OWNS the link; the flow glyph surfaces whether
     // frames are actually moving — recent frames in/out, per direction.
-    const FLOW_WINDOW_MS = 2000;
+    // Same question as the media-flowing predicate, so it reads that
+    // predicate's window (a local 2000ms literal silently disagreed with
+    // it until the 2026-08 retro — working agreement 2).
+    const FLOW_WINDOW_MS = MEDIA_LIVE_WINDOW_MS;
     // signalsLastRecv/-Sent are stamped from the store clock, so the
     // freshness comparison must read the same clock (PR #4 F2).
     const now = this.streamsStore.clock.now();

@@ -1,11 +1,15 @@
 import { LitElement, PropertyValues, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { AgentPubKey, AppClient, RoleName } from '@holochain/client';
+import { AppClient, RoleName } from '@holochain/client';
 import { consume } from '@lit/context';
 import { localized, msg } from '@lit/localize';
 
 import { clientContext } from '../contexts';
 import { RoomClient } from '../room/room-client';
+import {
+  PassiveParticipant,
+  PassivePresenceTracker,
+} from '../passive-presence';
 import { sharedStyles } from '../sharedStyles';
 import './list-online-agents';
 
@@ -38,11 +42,13 @@ export class RoomOnlineAgents extends LitElement {
   label: string | undefined;
 
   @state()
-  _participants: { pubkey: AgentPubKey; lastSeen: number }[] = [];
+  _participants: PassiveParticipant[] = [];
 
   private _unsubscribe: (() => void) | undefined;
 
-  private _gcInterval: number | undefined;
+  private _tracker = new PassivePresenceTracker(list => {
+    this._participants = list;
+  });
 
   willUpdate(changed: PropertyValues<this>) {
     // Reset the list when the watched room changes. Done in willUpdate (part of
@@ -66,27 +72,10 @@ export class RoomOnlineAgents extends LitElement {
     this._teardown();
     if (!this.roleName || !this.client) return;
     const roomClient = new RoomClient(this.client, this.roleName);
-    // Expire agents that haven't pinged in the last 10 seconds.
-    this._gcInterval = window.setInterval(() => {
-      const now = Date.now();
-      this._participants = this._participants.filter(
-        info => now - info.lastSeen < 10000
-      );
-    }, 10000);
-    this._unsubscribe = roomClient.onSignal(signal => {
-      if (signal.type === 'Message' && signal.msg_type === 'PingUi') {
-        const next = this._participants.filter(
-          info => info.pubkey.toString() !== signal.from_agent.toString()
-        );
-        next.push({ pubkey: signal.from_agent, lastSeen: Date.now() });
-        this._participants = next;
-      }
-      if (signal.type === 'Message' && signal.msg_type === 'LeaveUi') {
-        this._participants = this._participants.filter(
-          info => info.pubkey.toString() !== signal.from_agent.toString()
-        );
-      }
-    });
+    this._tracker.start();
+    this._unsubscribe = roomClient.onSignal(signal =>
+      this._tracker.handleSignal(signal)
+    );
   }
 
   private _teardown() {
@@ -94,10 +83,7 @@ export class RoomOnlineAgents extends LitElement {
       this._unsubscribe();
       this._unsubscribe = undefined;
     }
-    if (this._gcInterval) {
-      window.clearInterval(this._gcInterval);
-      this._gcInterval = undefined;
-    }
+    this._tracker.stop();
   }
 
   disconnectedCallback(): void {

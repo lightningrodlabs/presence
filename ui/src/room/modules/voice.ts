@@ -9,6 +9,20 @@ import type { MicAcquireResult } from '../../mic-source';
 import { Clock, systemClock } from '../../clock';
 
 /**
+ * How long a playout anchor stays projectable after it was set. NOT a
+ * liveness window — it serves A/V-sync projection validity, not any of the
+ * four liveness predicates (a stale anchor would drift open-loop; the
+ * jitter buffer + drift cap horizon is ~0.5s, so 3s is comfortably past
+ * any legitimate scheduling gap). Coincidentally equal to
+ * MEDIA_LIVE_WINDOW_MS; the values are unrelated and may diverge. Both
+ * sides of the comparison (`setAtMs`, the read in
+ * `getPlayoutSenderTimeMs`) are local wall-clock stamps, per this file's
+ * clock rule: presence-relevant stamps ride the store clock, local
+ * scheduling arithmetic stays on wall clock.
+ */
+const PLAYOUT_ANCHOR_MAX_AGE_MS = 3000;
+
+/**
  * Voice module — sends audio to all peers in the room over Holochain remote
  * signals (the same channel `screen-share` uses for SDP). No WebRTC. No new
  * zome calls. The signal envelope reuses `ModuleData` so the existing
@@ -446,10 +460,7 @@ class VoiceController {
     const state = this.peers.get(agentPubKeyB64);
     const anchor = state?.playoutAnchor;
     if (!state || !anchor) return null;
-    // Stale anchor — audio stopped flowing; projecting forward from it
-    // would drift open-loop. 3s is well past any scheduling horizon
-    // (jitter buffer + drift cap is ~0.5s).
-    if (Date.now() - anchor.setAtMs > 3000) return null;
+    if (Date.now() - anchor.setAtMs > PLAYOUT_ANCHOR_MAX_AGE_MS) return null;
     const ctx = this.audioContext;
     if (!ctx) return null;
     return estimatePlayoutSenderTimeMs(anchor, ctx.currentTime);

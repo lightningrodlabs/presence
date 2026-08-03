@@ -72,6 +72,11 @@ import { exportLogs, clearAllLogs } from './logging';
 import { downloadJson, formattedDate } from './utils';
 import { fetchCloudflareTurnCredentials } from './cloudflare-turn';
 import { DescendentRoom, weaveClientContext } from './types';
+import { systemClock } from './clock';
+import {
+  PassiveParticipant,
+  PassivePresenceTracker,
+} from './passive-presence';
 import { RoomStore } from './room/room-store';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
 
@@ -156,13 +161,11 @@ export class PresenceApp extends LitElement {
   _myAccountabilities: MossAccountability[] | undefined;
 
   @state()
-  _activeMainRoomParticipants: {
-    pubkey: AgentPubKey;
-    lastSeen: number;
-  }[] = [];
+  _activeMainRoomParticipants: PassiveParticipant[] = [];
 
-  @state()
-  _clearActiveParticipantsInterval: number | undefined;
+  private _mainRoomPresence = new PassivePresenceTracker(list => {
+    this._activeMainRoomParticipants = list;
+  });
 
   @state()
   _refreshing = false;
@@ -242,8 +245,7 @@ export class PresenceApp extends LitElement {
   _unsubscribe: (() => void) | undefined;
 
   disconnectedCallback(): void {
-    if (this._clearActiveParticipantsInterval)
-      window.clearInterval(this._clearActiveParticipantsInterval);
+    this._mainRoomPresence.stop();
     if (this._unsubscribe) this._unsubscribe();
     if (this._cfTurnRefreshTimer) window.clearTimeout(this._cfTurnRefreshTimer);
     // The super call is what runs hostDisconnected on the reactive
@@ -271,7 +273,7 @@ export class PresenceApp extends LitElement {
   get _cfTurnValid(): boolean {
     return (
       !!window.localStorage.getItem('cfTurnUrl') &&
-      this._cfTurnExpiry > Date.now()
+      this._cfTurnExpiry > systemClock.now()
     );
   }
 
@@ -304,7 +306,7 @@ export class PresenceApp extends LitElement {
       window.localStorage.setItem('cfTurnUsername', creds.username);
       window.localStorage.setItem('cfTurnCredential', creds.credential);
 
-      const expiry = Date.now() + creds.ttl * 1000;
+      const expiry = systemClock.now() + creds.ttl * 1000;
       window.localStorage.setItem('cfTurnExpiry', String(expiry));
       this._cfTurnExpiry = expiry;
       this._cfTurnStatus = {
@@ -351,7 +353,7 @@ export class PresenceApp extends LitElement {
     if (!this._cfTurnConfigured || !this._cfTurnExpiry) return;
     const delay = Math.max(
       10_000,
-      this._cfTurnExpiry - Date.now() - PresenceApp.CF_TURN_REFRESH_BUFFER_MS
+      this._cfTurnExpiry - systemClock.now() - PresenceApp.CF_TURN_REFRESH_BUFFER_MS
     );
     this._cfTurnRefreshTimer = window.setTimeout(
       () => this._refreshCloudflareTurn(),
@@ -390,7 +392,7 @@ export class PresenceApp extends LitElement {
     if (
       !hasStoredUrl ||
       !this._cfTurnExpiry ||
-      this._cfTurnExpiry - Date.now() <= PresenceApp.CF_TURN_REFRESH_BUFFER_MS
+      this._cfTurnExpiry - systemClock.now() <= PresenceApp.CF_TURN_REFRESH_BUFFER_MS
     ) {
       void this._refreshCloudflareTurn();
     } else {
@@ -399,7 +401,7 @@ export class PresenceApp extends LitElement {
   }
 
   async firstUpdated() {
-    const start = Date.now();
+    const start = systemClock.now();
     // Provision/refresh Cloudflare TURN credentials on load if configured.
     this._ensureCloudflareTurn();
     if ((import.meta as any).env.DEV) {
@@ -534,44 +536,22 @@ export class PresenceApp extends LitElement {
 
     this._provisionedCell = cellTypes.provisioned;
 
-    const loadFinished = Date.now();
+    const loadFinished = systemClock.now();
     const timeElapsed = loadFinished - start;
     if (timeElapsed > 3000) {
       this._pageView = PageView.Home;
     } else {
-      setTimeout(() => {
+      systemClock.setTimeout(() => {
         this._pageView = PageView.Home;
       }, 3000 - timeElapsed);
     }
 
-    this._clearActiveParticipantsInterval = window.setInterval(() => {
-      const now = Date.now();
-      // If an agent hasn't sent a ping for more than 10 seconds, assume that they are no longer in the room
-      this._activeMainRoomParticipants =
-        this._activeMainRoomParticipants.filter(
-          info => now - info.lastSeen < 10000
-        );
-    }, 10000);
-
-    this._unsubscribe = this._mainRoomStore.client.onSignal(async signal => {
-      if (signal.type === 'Message' && signal.msg_type === 'PingUi') {
-        // This is the case if the other agent is in the main room
-        const newOnlineAgentsList = this._activeMainRoomParticipants.filter(
-          info => info.pubkey.toString() !== signal.from_agent.toString()
-        );
-        newOnlineAgentsList.push({
-          pubkey: signal.from_agent,
-          lastSeen: Date.now(),
-        });
-        this._activeMainRoomParticipants = newOnlineAgentsList;
-      }
-      if (signal.type === 'Message' && signal.msg_type === 'LeaveUi') {
-        this._activeMainRoomParticipants =
-          this._activeMainRoomParticipants.filter(
-            info => info.pubkey.toString() !== signal.from_agent.toString()
-          );
-      }
-    });
+    // A PingUi from an agent means they are in the main room; the tracker
+    // is the shared passive-presence authority (see passive-presence.ts).
+    this._mainRoomPresence.start();
+    this._unsubscribe = this._mainRoomStore.client.onSignal(signal =>
+      this._mainRoomPresence.handleSignal(signal)
+    );
   }
 
   /**
@@ -713,7 +693,7 @@ export class PresenceApp extends LitElement {
 
   notifyError(msg: string) {
     this._displayError = msg;
-    setTimeout(() => {
+    systemClock.setTimeout(() => {
       this._displayError = undefined;
     }, 4000);
   }
@@ -1378,7 +1358,7 @@ export class PresenceApp extends LitElement {
             @click=${() => {
               clearAllLogs();
               this._logCleared = true;
-              setTimeout(() => { this._logCleared = false; }, 2000);
+              systemClock.setTimeout(() => { this._logCleared = false; }, 2000);
             }}
           >
             ${this._logCleared ? 'Cleared' : 'Clear Logs'}
@@ -1474,7 +1454,7 @@ export class PresenceApp extends LitElement {
                 @click=${async () => {
                   this._refreshing = true;
                   await this.updateRoomLists();
-                  setTimeout(() => {
+                  systemClock.setTimeout(() => {
                     this._refreshing = false;
                   }, 200);
                 }}
