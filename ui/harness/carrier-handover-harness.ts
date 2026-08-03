@@ -1,60 +1,78 @@
 /**
- * Carrier-handover field harness — page side (Phase 1.5 item 4).
+ * Carrier-handover field harness — page side (Phase 1.5 item 4; rebuilt by
+ * Phase 6.5 to run the REAL StreamsStore).
  *
- * One page = one agent. It runs the PRODUCTION transport stack over a REAL
- * `RTCPeerConnection` — `FsmTransport` wrapping `ConnectionManager`, real
- * ICE, real DTLS, real data channel on the loopback interface — with
- * signaling relayed over a `BroadcastChannel` standing in for Holochain
- * remote signals (same fire-and-forget, no delivery guarantee semantics:
- * a closed page simply stops answering, exactly like a vanished peer).
+ * One page = one agent running the PRODUCTION orchestrator: a real
+ * `StreamsStore`, constructed with the Phase 6 deps record and started, so
+ * every piece of glue between the wire and the slot table is the store's
+ * own — `handleSignal` → ping/pong presence → the InitRequest/InitAccept
+ * handshake → `_dispatchMediaEvent` → `routeTransportPhase` →
+ * `decideSlotWrite` → the actual `_openConnections` mutation →
+ * `computeSignalsTargets` over the real present set. The transports are
+ * real `FsmTransport`s over real `RTCPeerConnection`s (loopback ICE +
+ * DTLS); signaling rides a `BroadcastChannel` bus with Holochain's
+ * fire-and-forget semantics (a closed page is silence, not an error).
  *
- * On every `connection-state-change` it applies the PRODUCTION decision
- * functions — `routeTransportPhase` for the slot, `computeSignalsTargets`
- * for the carrier set — to a slot table shaped like
- * `_openConnections[peer]`. So the fidelity statement is:
+ * The Phase 1.5 mirror this file replaced applied `routeTransportPhase` /
+ * `decideSlotWrite` to its own slot table and hardcoded the present set —
+ * the "MODELED: only the glue" caveat. That mirror is DELETED per
+ * one-authority (working agreement 1): the store executes its own glue
+ * here, and a divergence in that glue is now a failing harness run, not an
+ * invisible gap.
  *
- *   REAL:    RTCPeerConnection, ICE/DTLS state machine, ConnectionManager,
- *            FsmTransport, routeTransportPhase, decideSlotWrite (the slot
- *            rules the store itself executes), carrierFor,
- *            computeSignalsTargets, reconnect/backoff behavior.
- *   MODELED: only the glue — route.handler → SlotEvent, and applying the
- *            returned SlotWrite to a plain table (`StreamsStore` itself
- *            cannot run without Holochain — MAINTAINABILITY_ASSESSMENT.md
- *            §3.6).
+ * What the harness still supplies (declared, not mirrored logic):
+ *   - the deps record's production binding (`static connect` needs a
+ *     RoomStore/Holochain; this page IS the binder, standing where
+ *     `connect` stands): real clock, real page storage, the
+ *     BroadcastChannel bus, `navigator.mediaDevices`;
+ *   - the transport factory, which passes the store's own options through
+ *     to a real `FsmTransport` but compresses the DWELL (timeouts,
+ *     reconnect budget) via the transport's test seams and pins
+ *     `iceServers: []` so CI never leaves loopback. The PHASES traversed
+ *     are the production ones;
+ *   - the ping-loop arming and peer seeding that `static connect` does
+ *     from `roomStore.allAgents` in production;
+ *   - `connect()` = activating the conversation module through the real
+ *     `_syncConversationPayload` path — production's "join the call",
+ *     which is what arms WebRTC initiation in `handlePongUi`. Capability
+ *     declarations then propagate peer-to-peer inside real pong metadata.
  *
- * A divergence in that glue is the kind of bug the harness cannot catch —
- * Phase 6 (constructible orchestrator) retires the gap entirely; until then
- * this is the highest-fidelity check the carrier logic gets against a real
- * network stack. (The slot rules themselves stopped being glue when they
- * moved into `decideSlotWrite`: the store executes the same function.)
- *
- * Timeouts and the reconnect budget are shortened via the transport's test
- * seams so a silent peer drop reaches `failed` in tens of seconds, not
- * minutes. The PHASES traversed are the production ones; only the dwell in
- * each is compressed.
+ * Consequence of real presence (a deliberate fidelity gain over the
+ * mirror): `onSignals` requires the peer to be PRESENT — pong-fresh or
+ * media-live — so a silently-dropped peer leaves the signals send set when
+ * their pongs go stale, independent of the WebRTC give-up. The spec's
+ * carrier assertions therefore key on `carrier` (the slot's claim, the
+ * carrier-coverage authority) and use `onSignals` only where presence is
+ * guaranteed by flowing pongs.
  *
  * Exposes `window.carrierHarness`.
  */
 
-import { FsmTransport } from '../src/transport/fsm/fsm-transport';
-import {
-  routeTransportPhase,
-  decideSlotWrite,
-  type SlotEvent,
-} from '../src/transport/media-event-policy';
-import { computeSignalsTargets, carrierFor } from '../src/transport/carrier-coverage';
-import type { OutgoingSignal, TransportEvent, ConnectionPhase } from '../src/transport/types';
+import { encodeHashToBase64, decodeHashFromBase64 } from '@holochain/client';
+import type { AgentPubKey } from '@holochain/client';
+import { get } from '@holochain-open-dev/stores';
 import { DefaultReconnectPolicy } from '@lightningrodlabs/webrtc-peer';
+import { StreamsStore } from '../src/streams-store';
+import { PresenceLogger } from '../src/logging';
+import { systemClock } from '../src/clock';
+import { FsmTransport } from '../src/transport/fsm/fsm-transport';
+import { carrierFor } from '../src/transport/carrier-coverage';
+import { PING_INTERVAL } from '../src/presence-policy';
+import type { StreamsStoreDeps } from '../src/store-deps';
+import type { RoomSignal } from '../src/types';
+import type { ConnectionPhase } from '../src/transport/types';
 
 type TimelineEntry = {
   /** ms since harness start */
   t: number;
   phase: ConnectionPhase;
   connectionId: string;
-  route: string;
-  /** Whether the peer is a signals target AFTER applying this event. */
+  /** Carrier AFTER the store applied this event (carrierFor over the real
+   *  `_openConnections` slot — the same authority production reads). */
+  carrier: 'webrtc' | 'signals';
+  /** Whether the peer is in the real `_signalsTargets` AFTER this event. */
   onSignals: boolean;
-  /** Slot's `connected` claim AFTER applying this event. */
+  /** The real slot's `connected` claim AFTER this event; null = no slot. */
   slotConnected: boolean | null;
 };
 
@@ -62,9 +80,11 @@ type HarnessState = {
   me: string;
   peer: string;
   started: boolean;
+  connected: boolean;
   phase: ConnectionPhase | 'none';
   carrier: 'webrtc' | 'signals';
   onSignals: boolean;
+  peerPresent: boolean;
   slot: { connectionId: string; connected: boolean } | null;
   timeline: TimelineEntry[];
 };
@@ -74,135 +94,175 @@ const ME = params.get('me') ?? 'A';
 const PEER = params.get('peer') ?? (ME === 'A' ? 'B' : 'A');
 const T0 = performance.now();
 
-// Signaling relay. Fire-and-forget like Holochain remote signals: no acks,
-// no queue for absent listeners — a closed page is silence, not an error.
-const bus = new BroadcastChannel('carrier-handover-signaling');
+/** Deterministic 39-byte agent key from a name — enough for
+ *  encode/decodeHashFromBase64 round-trips; no conductor exists to care. */
+function agentKey(name: string): AgentPubKey {
+  const bytes = new Uint8Array(39);
+  for (let i = 0; i < name.length && i < 39; i += 1) {
+    bytes[i] = name.charCodeAt(i);
+  }
+  return bytes as AgentPubKey;
+}
 
-// The slot table this page's carrier decision reads — the shape of
-// `_openConnections`, one peer wide.
-const slots: Record<string, { connectionId: string; connected: boolean }> = {};
+const MY_KEY = agentKey(ME);
+const MY_B64 = encodeHashToBase64(MY_KEY);
+const PEER_B64 = encodeHashToBase64(agentKey(PEER));
+
+// --- the bus: BroadcastChannel with Holochain remote-signal semantics ---
+// Fire-and-forget: no acks, no queue for absent listeners. Payloads are
+// the store's own JSON strings (the SDP flattening already happened in
+// the store's onOutgoingSignal), so structured clone never sees a
+// platform object.
+const channel = new BroadcastChannel('carrier-handover-signaling');
+const busHandlers = new Set<(signal: RoomSignal) => void | Promise<void>>();
+channel.onmessage = (msg: MessageEvent) => {
+  const { from, to, msgType, payload } = msg.data ?? {};
+  if (to !== MY_B64) return;
+  const signal: RoomSignal = {
+    type: 'Message',
+    from_agent: decodeHashFromBase64(from),
+    msg_type: msgType,
+    payload: payload ?? '',
+  };
+  busHandlers.forEach(handler => handler(signal));
+};
+
+const deps: StreamsStoreDeps = {
+  clock: systemClock,
+  storage: {
+    local: window.localStorage,
+    session: window.sessionStorage,
+  },
+  bus: {
+    myPubKey: MY_KEY,
+    onSignal: handler => {
+      busHandlers.add(handler);
+      return () => busHandlers.delete(handler);
+    },
+    sendMessage: async (toAgents, msgType, payload = '') => {
+      for (const agent of toAgents) {
+        channel.postMessage({
+          from: MY_B64,
+          to: encodeHashToBase64(agent),
+          msgType,
+          payload,
+        });
+      }
+    },
+  },
+  // Real FsmTransport with the store's own options (onOutgoingSignal,
+  // onTransition — the production glue), dwell compressed via the
+  // transport's test seams. iceServers pinned to [] : loopback host
+  // candidates only, no external STUN in CI.
+  transportFactory: (_purpose, options) =>
+    new FsmTransport({
+      ...options,
+      iceServers: [],
+      configOverrides: {
+        ...options.configOverrides,
+        connectionTimeoutMs: 5_000,
+        sdpExchangeTimeoutMs: 4_000,
+        dtlsStallTimeoutMs: 3_000,
+        iceDisconnectedGraceMs: 1_500,
+      },
+      reconnectPolicy: new DefaultReconnectPolicy({
+        maxAttempts: 2,
+        iceRestartMaxAttempts: 1,
+        baseDelayMs: 250,
+        maxDelayMs: 1_000,
+        jitterMs: 100,
+      }),
+    }),
+  mediaDevices: navigator.mediaDevices,
+};
+
 const timeline: TimelineEntry[] = [];
+let store: StreamsStore | null = null;
+let pingLoop: number | undefined;
 
-let transport: FsmTransport | null = null;
+function carrierNow(): 'webrtc' | 'signals' {
+  const slot = store ? get(store._openConnections)[PEER_B64] : undefined;
+  return carrierFor(slot).carrier;
+}
 
 function onSignalsNow(): boolean {
-  return computeSignalsTargets({
-    presentPeers: [PEER],
-    openConnections: slots,
-  }).has(PEER);
+  return store ? get(store._signalsTargets).has(PEER_B64) : false;
 }
 
 /**
- * `StreamsStore._dispatchMediaEvent`'s connection-state-change arm: route
- * via the production policy, then EXECUTE the production slot decision —
- * `decideSlotWrite` is the same function the store runs, so the slot rules
- * here cannot drift from the app's (PR #3 review finding F1: the previous
- * hand-written mirror had already diverged on the adopt and
- * connected-supersede paths before it merged). What remains modeled is
- * only this glue: route.handler → SlotEvent, and applying the returned
- * write to a plain table.
+ * Construct and start the real store, then stand where `static connect`
+ * stands: seed the peer (production seeds `_knownAgents` from
+ * `roomStore.allAgents` inside `pingAgents`) and arm the ping loop on the
+ * same cadence. Establishment is NOT armed here — that is `connect()`.
  */
-function applyPhaseEvent(event: Extract<TransportEvent, { type: 'connection-state-change' }>): void {
-  const route = routeTransportPhase({
-    phase: event.phase,
-    connectionId: event.connectionId,
-    openConnectionId: slots[event.peer]?.connectionId,
-  });
-
-  const slotEvent: SlotEvent | null =
-    route.handler === 'signaling'
-      ? { kind: 'signaling', slot: route.slot }
-      : route.handler === 'media-connected'
-        ? { kind: 'connected' }
-        : route.handler === 'media-closed'
-          ? { kind: 'closed' }
-          : null;
-
-  if (slotEvent) {
-    const write = decideSlotWrite(slotEvent, event.connectionId, slots[event.peer]);
-    switch (write.write) {
-      case 'install':
-      case 'replace':
-      case 'set-connected':
-        slots[event.peer] = write.slot;
-        break;
-      case 'clear':
-        delete slots[event.peer];
-        break;
-      case 'none':
-        break;
-    }
-  }
-
-  timeline.push({
-    t: Math.round(performance.now() - T0),
-    phase: event.phase,
-    connectionId: event.connectionId,
-    route: `${route.handler}/${route.reason}`,
-    onSignals: onSignalsNow(),
-    slotConnected: slots[event.peer]?.connected ?? null,
-  });
-  render();
-}
-
 function start(): void {
-  if (transport) return;
-  transport = new FsmTransport({
-    myAgentId: ME,
-    onOutgoingSignal: (signal: OutgoingSignal) => {
-      // JSON round-trip, as production does over the Holochain wire
-      // (streams-store wraps the envelope in JSON.stringify). Also
-      // load-bearing here: an offer's payload is an RTCSessionDescription
-      // platform object, which structured clone rejects (DataCloneError);
-      // toJSON flattens it to { type, sdp }.
-      bus.postMessage(JSON.parse(JSON.stringify({ from: ME, ...signal })));
-    },
-    // Loopback host candidates only — no external STUN in CI.
-    iceServers: [],
-    trickleICE: true,
-    // Compress the dwell in each phase, not the phases themselves.
-    configOverrides: {
-      connectionTimeoutMs: 5_000,
-      sdpExchangeTimeoutMs: 4_000,
-      dtlsStallTimeoutMs: 3_000,
-      iceDisconnectedGraceMs: 1_500,
-    },
-    reconnectPolicy: new DefaultReconnectPolicy({
-      maxAttempts: 2,
-      iceRestartMaxAttempts: 1,
-      baseDelayMs: 250,
-      maxDelayMs: 1_000,
-      jitterMs: 100,
-    }),
+  if (store) return;
+  store = new StreamsStore(deps, async () => '', new PresenceLogger());
+  store.start();
+
+  // Observe (never apply): record the timeline AFTER the store's own
+  // subscription — registered in start(), so it runs first — has applied
+  // each event. What lands in `slotConnected`/`carrier` is the store's
+  // real state, not a recomputation.
+  store.mediaTransport.onAny(event => {
+    if (event.type !== 'connection-state-change') return;
+    timeline.push({
+      t: Math.round(performance.now() - T0),
+      phase: event.phase,
+      connectionId: event.connectionId,
+      carrier: carrierNow(),
+      onSignals: onSignalsNow(),
+      slotConnected: get(store!._openConnections)[PEER_B64]?.connected ?? null,
+    });
+    render();
   });
 
-  transport.onAny((event: TransportEvent) => {
-    if (event.type === 'connection-state-change') applyPhaseEvent(event);
+  // static connect's glue, reproduced: peer roster + ping cadence.
+  store._knownAgents.update(agents => {
+    agents[PEER_B64] = {
+      pubkey: PEER_B64,
+      type: 'known',
+      lastSeen: undefined,
+      appVersion: undefined,
+    };
+    return agents;
   });
-
-  bus.onmessage = (msg: MessageEvent) => {
-    const { from, to, connectionId, peerSessionId, epoch, data } = msg.data ?? {};
-    if (to !== ME || !transport) return;
-    transport.processIncomingSignal({ from, connectionId, peerSessionId, epoch, data });
-  };
+  store.pingAgents().catch(() => {});
+  pingLoop = window.setInterval(() => {
+    store?.pingAgents().catch(() => {});
+    render();
+  }, PING_INTERVAL);
 
   render();
 }
 
+/**
+ * Production's "join the call": activate the conversation module through
+ * the real `_syncConversationPayload` path. This is what makes
+ * `handlePongUi` start initiating (conversationActive) and what declares
+ * this build's wire caps to the peer (inside real pong metadata) so the
+ * peer's capability gate opens. WebRTC establishment then happens by
+ * itself on the next pong cycles — initiator tie-break, InitRequest,
+ * InitAccept, SDP over the bus — all store code.
+ */
 function connect(): void {
-  transport?.ensureConnection(PEER, {});
+  store?._syncConversationPayload({}).catch(() => {});
 }
 
 function state(): HarnessState {
-  const slot = slots[PEER] ?? null;
+  const slot = store ? (get(store._openConnections)[PEER_B64] ?? null) : null;
   return {
     me: ME,
     peer: PEER,
-    started: transport !== null,
-    phase: transport?.getPhase(PEER) ?? 'none',
-    carrier: carrierFor(slot ?? undefined).carrier,
+    started: store !== null,
+    connected: !!slot?.connected,
+    phase: store?.mediaTransport.getPhase(PEER_B64) ?? 'none',
+    carrier: carrierNow(),
     onSignals: onSignalsNow(),
-    slot,
+    peerPresent: store ? get(store._presentPeers).includes(PEER_B64) : false,
+    slot: slot
+      ? { connectionId: slot.connectionId, connected: !!slot.connected }
+      : null,
     timeline,
   };
 }
@@ -213,4 +273,5 @@ function render(): void {
 }
 
 (globalThis as any).carrierHarness = { start, connect, state };
+void pingLoop;
 render();
