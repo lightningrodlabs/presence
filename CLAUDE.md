@@ -4,7 +4,7 @@
 
 ## Which branch is real
 
-`main-0.6` is the line that ships. v0.14.8 was built from it. **`main` is a dead end** — two commits since the split at `c589a6b`, both substantively present on `main-0.6`, one ui version behind, no `packages/` directory, no `test` script, no FSM work. The `v0.14.8` tag points at `main`, which is wrong; nothing tagged corresponds to what shipped.
+`main-0.6` is the line that ships. v0.14.8 was built from it. **`main` is a dead end** — two commits since the split at `c589a6b`, both substantively present on `main-0.6`, one ui version behind, no `packages/` directory, no `test` script, no FSM work. The `v0.14.8` tag was repointed 2026-07-27 at the verified build source (`7b86951`, on the `fix/flash` lineage) — the tag itself is now correct, but it is not an ancestor of `main-0.6`, so `git describe` on the trunk still answers nothing; `origin/HEAD` also still points at dead `main`, so a fresh clone lands on the wrong lineage.
 
 Check your branch before reading source. Reading `ui/src/` from a `main` checkout gives answers that do not describe the shipped app.
 

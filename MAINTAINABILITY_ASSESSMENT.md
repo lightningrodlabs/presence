@@ -579,3 +579,69 @@ Three anti-patterns, each evidenced in §3. **Unenforced abstractions are worse 
 7. **A conclusion may not dismiss field evidence on the strength of passing tests.** `12cb027` closed a duplicate-connection investigation as "structurally impossible … all covered by passing tests" and explicitly reinterpreted a field log as something else; six weeks later the same problem was rediscovered in the field and fixed for real (§3.11). When a log and a test suite disagree, the test suite is the thing that is wrong about reality — especially here, where the mocks cannot throw and therefore cannot reproduce the failure modes that actually occur (§3.6).
 8. **A fix names the symptom's previous fixes.** The same pane-survival symptom was fixed three times in three layers over 71 days, with no commit citing its predecessor, and the third broke an invariant the first had documented. A one-line "supersedes `<hash>`" in the commit message would have surfaced each of those collisions at the time.
 9. **Every phase PR gets an adversarial review by a session that did not write it**, reading only the diff and the code. The second, independent cause of §3.1(c) — the silent in-place FSM replacement — was found exactly this way, before the field found it. That is the norm this rule institutionalizes, not luck to be hoped for; it matters doubly here because the human reviewer is working at the edge of the WebRTC domain and the authoring session's self-review converges to agreement with itself.
+
+---
+
+## 7. Retrospective — 2026-08-03
+
+Written after the Phase 6.5 merge, against the question the plan existed to answer: did it fix the drift and the unmaintainability, and what would a fresh assessment find now? Method: the §3 measurements re-run against the working tree (four independent re-audits — liveness constants, orchestrator shape, prose drift, and a fresh-eyes scan deliberately blind to this document), every enforcement gate executed rather than read, and the spot findings verified by hand before being acted on. `nix develop -c npm run verify` was green (614 tests + both typechecks) at every measurement.
+
+### 7.1 The mechanism diagnosis held
+
+§2's claim — drift is additive change without retirement, in the absence of enforcement, not model degradation — is now testable against six phases of history, and it held on both sides:
+
+- **Every gate installed by the phases is real and runs.** Wire-contract snapshot, event taxonomy (with negative controls), no-ambient-clock pin, compat corpus, CI verify, nightly harness: all executed, all pass, no `.notinuse` files remain. These fail builds; they are not recorded intentions.
+- **The character of change flipped.** The 17 fix-commits in the 90 days before this assessment were field firefighting (grace periods, keepalives, the third fix for one pane-survival symptom). The 18 since are almost entirely adversarial-review findings applied inside phases before merge. The fixed-three-times-in-three-layers pattern has not recurred.
+- **Gated surfaces stayed true while ungated ones rotted, in the same weeks.** Of 99 invariant-shaped comments in `ui/src`, zero fail the cites-its-constraint check; `packages/webrtc-peer/README.md` verified 6/6 on spot-check. Meanwhile the ungated prose decayed exactly as §6 predicted — see 7.3. Same repo, same period, opposite outcomes: as clean a confirmation of the types > tests > CLAUDE.md > prose ranking as we will get.
+
+### 7.2 The measurements
+
+| Metric | 2026-07 (§3) | 2026-08-03 |
+|---|---|---|
+| Independent liveness sources | 21 | 16 (5 declared authorities + 11 residual independents) |
+| Bare liveness threshold literals | 13 across 5 files | 11 across 6 files, none duplicated more than twice |
+| The 5600ms hand-copies | 5 sites | 0 (all read `OBSERVER_FRESHNESS_MS`) |
+| `streams-store.ts` | 6,600 lines / 965 `this.` | 6,504 lines / 1,020 `this.` |
+| `handlePongUi` | 352 lines, 8 nesting levels | 340 lines, 8 nesting levels |
+| `_openConnections` write sites | 18 across 13 methods | 14 across 12, mostly clustered in the `_handleMedia*` block |
+| `room-view.ts` reads of store internals | 65 | 18, nearly all store subscriptions for paint |
+| Tests guarding the trunk | 315, run by nothing | 614 in CI + 3 nightly harness specs against real ICE/DTLS |
+| Direct `StreamsStore` tests | 0 (unconstructible) | construction + 16 wiring tests in node |
+| Pure policy modules | 1 template (`auto-flip-policy.ts`) | 14 modules, 2,239 lines, 12 with table tests, test:source > 1.0 for seven |
+
+The pattern in the numbers: **the decisions left the god file; the orchestration stayed.** Extraction added marshalling and commentary at nearly the rate it deleted logic — the §5 Phase 6 correction predicted exactly this (the 3,500-line trigger was unreachable). The refactor made the orchestrator *verifiable* without making it *small*. That was the right trade, and it should be stated plainly: anyone expecting a shorter `streams-store.ts` from these phases will not find one. `handlePongUi` remains the concentrate — nine sequential decisions, most of which now have a policy module sitting next to them ready to receive the work. Fossils persist: the `S I M P L E   P E E R   H A N D L I N G` banner still heads code whose carrier Phase 3 deleted, and four observer-testimony loops share `OBSERVER_FRESHNESS_MS` but not a body.
+
+### 7.3 Where the drift went
+
+Drift was not eliminated; it was displaced into the surfaces no gate reads — the plan documents and this repo's own bootstrap prose. Found false or contradictory on 2026-08-03:
+
+- **`CLAUDE.md` carried a false claim about the v0.14.8 tag** ("points at `main`") for a week after Phase 0 repointed it at the verified build source. Corrected in the change that adds this section. The same falsehood is embedded in `fixtures/compat/0.14.8.json`'s provenance note — the fixture is immutable by design, so the correction lives here: **the wire data in that fixture is sound; its provenance sentence is not.**
+- **`docs/WEBRTC_CONNECTION_PLAN.md`** describes the deleted auto-flip machinery as live, poses an open question both sides of which were deleted in Phase 3, and says the store cannot be instantiated under vitest (false since Phase 2). It was corrected once, in Phase 0, and drifted again — a document that requires re-correction every few phases is a document arguing for its own demotion.
+- **`docs/CONNECTION_LIFECYCLE_PLAN.md`** lists two defects as "Still outstanding … confirmed 2026-07-27" that Phases 1–2 fixed (`_pendingInits` now has the TTL sweep; the manager prunes on `failed`). Maximum-confidence framing on fixed defects: a reader would go re-fix them.
+- **`MODULAR_AGENT_PANE.md`** still asserts `_screenShareStreams` is written nowhere; Phase 3 wired it.
+- **Working agreement 3's status-header rule is a dead letter, and the contradiction is recorded inside this repo:** CLAUDE.md commands `Status:` headers on every document, Phase 0 item 6 records the mechanism as *rejected*, and 4 of 21 documents carry one. Worse, CLAUDE.md tells readers headerless docs are unreliable — which deauthorizes the corrected docs too. This needs one decision, either direction, and the loser deleted.
+
+The general finding: claims about *repository state* (tags, branch heads, workspace contents, "no test files exist") are the class no vitest grep can catch, and that is exactly where the surviving falsehoods concentrate. The `tests/` workspace is the specimen: `TRANSPORT_REFACTOR_PLAN.md` asserts the tryorama fixtures "were never written" while a real 429-line tryorama suite has sat **untracked** in `tests/src/signal-latency/` since April, invisible to every audit that trusted `git ls-files`. It needs a commit-or-delete decision.
+
+### 7.4 What a fresh assessment finds now
+
+A fresh-eyes scan (blind to this document) returned: *not a mess, but not safe — a well-tended engine bolted to an untended cockpit.* The residue is no longer diffuse; it is four named areas:
+
+1. **The view layer is where §3 used to be.** `room-view.ts` (4,541 lines) + `presence-app.ts` (2,024) are 24% of the UI, zero tests, every dead-code lint rule disabled, 179 stray `console.*` calls surviving in production paths. The scan found four live teardown defects the way §3.0 was found — by looking where nothing was looking: a `keydown` listener on `document` leaked per room join; the asset-store subscription never released (its unsubscriber field was declared, cleared, and never assigned); a doubled `allAgents` subscription in `static connect`, neither released, keeping the room store's lazy polling alive past the room; and — largest — `RoomView.disconnectedCallback` never called `super.disconnectedCallback()`, so Lit never ran `hostDisconnected` on its 22 StoreSubscribers (`presence-app.ts` had the same omission). All four fixed in the change that adds this section. The structural items remain: two render methods over 550 lines, a 46-line block copy-pasted verbatim inside `render()`, 1,434 lines of CSS extractable from the two class files at near-zero risk.
+2. **Parallel models persist outside the store's axis — including one on no list until now.** The lobby presence model (`lobby/room-online-agents.ts`, bare 10000ms, ambient `Date.now()`) was declared-deferred; **`presence-app.ts` holds a second verbatim copy of the same model** (`_activeMainRoomParticipants`) that no document mentioned before this section. `peer-stats-panel.ts` hand-rolls a 2000ms flow window that silently disagrees with `MEDIA_LIVE_WINDOW_MS` (3000) for the same question. And two unnamed thresholds were introduced *by the consolidation phases themselves* (`voice.ts` playout-anchor 3000ms; `peer-link-policy.ts` bare `< 2` cycles duplicating `STALE_CYCLES_REFRESH_THRESHOLD`) — working agreement 2 violated by its own authors, which is the measure of a rule that has no gate. The no-ambient-clock pin covers one file of the ~15 that read time; the three files above are precisely the ones it cannot see.
+3. **The Rust side and the release path stand where §3.12 and §3.7 left them.** Zero tests on 588 lines of integrity validation (deferred to 0.7 by decision — the decision does not reduce the exposure); root `npm test` still runs an empty workspace; `origin/HEAD` still points at dead `main`, so a fresh clone still lands on the wrong lineage — the trap Phase 0 called "worth removing before anything else" is intact after seven phases; `packages/webrtc-peer` is still 0.3.0 with two unreleased BREAKING changelog entries.
+4. **Dependency and lint hygiene.** Two dead dependencies (`@lit/task`, `@theweave/elements`), two ID libraries for three call sites, `ui` and `tests` workspaces on incompatibly split holochain-client majors (likely *why* the tryorama harness went unused), TS 4.5 / vite 4 / eslint 8 all EOL, and 19 disabled lint rules including every dead-code detector — the root cause of most of the above going unnoticed.
+
+Counterweight, so the list is not misread: TODO/FIXME density is 3 in ~27k lines; the Rust has zero `unwrap`/`panic`; object-URL and timer hygiene are correct everywhere checked outside the four fixed defects; no dead files; the CI workflow comments explain their own exclusions. The cockpit is untended, not reckless.
+
+### 7.5 What the next round should be
+
+Not more phases like 1–6 — the extraction queue is exhausted. The regime that worked (gate first, then rely on the gate) applied to where the exposure now sits:
+
+1. **Widen the two cheapest gates instead of writing rules.** Extend the no-ambient-clock pin to `lobby/room-online-agents.ts`, `presence-app.ts`, and `peer-stats-panel.ts`; re-enable `no-unused-vars`. Most of 7.4 item 4 becomes visible the day that lands.
+2. **One lobby-presence authority** (the scheduled branch), explicitly covering **both** copies — fixing `room-online-agents.ts` alone leaves `presence-app.ts`'s.
+3. **Decide the status-header contradiction** one way and delete the losing text from CLAUDE.md or from Phase 0 item 6.
+4. **Commit or delete `tests/src/signal-latency/`**, delete the empty `unzoom` scaffold, and either align the `tests` workspace versions or delete the workspace — a harness that cannot build is a recorded intention (working agreement 5 applied to a directory).
+5. **The view layer needs a declared decision, not an accident.** It is now, measurably, the least-verified place a production bug can live — the property the store had in July. Either it gets the store's treatment (extract paint decisions, wire a component test), or its untested status is declared with the same honesty as the harness stand-ins. What it must not get is what it has: silence.
+
+The one-line summary of six phases: **the reform held exactly where it was mechanized and decayed exactly where it relied on discipline** — which is §2's thesis, confirmed a second time, this time by the reform itself.
