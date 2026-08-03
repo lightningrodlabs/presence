@@ -59,7 +59,7 @@ Each phase ships something usable on its own. Earlier phases deliberately don't 
 - [x] voice-over-signals merged to `main` (commit `3b219e7`); branch rebased onto `origin/main` (`c589a6b`).
 - [x] `npm install` complete (872 packages, 56s).
 - [x] Build baseline captured: zomes compile, happ packs, vitest infra runs.
-- [x] Test baseline finding: **no test files in the `tests/` workspace** — it holds only `unzoom/unzoom/common.ts`, so vitest reports "No test files found, exiting with code 1" and root `npm test` runs zero tests. **Still true.** The unit suite that does exist lives in `ui/` and `packages/webrtc-peer/` and is run by `npm run verify` (315 tests + typecheck, in CI). The tryorama integration fixtures this phase envisaged under `tests/src/transport/` were never written.
+- [x] Test baseline finding, updated 2026-08-03: the `tests/` workspace holds one committed tryorama suite (`tests/src/signal-latency/` — a latency/throughput measurement rig, untracked from 2026-04 until the retro sweep; see `tests/README.md` for why it cannot currently run) and no regression tests, so root `npm test` still verifies nothing. The unit suite lives in `ui/` and `packages/webrtc-peer/` and is run by `npm run verify` (614 tests + typecheck, in CI — the count in this line goes stale; `CLAUDE.md` tracks it). The tryorama integration fixtures this phase envisaged under `tests/src/transport/` were never written.
 - [x] Reconciliation strategy with `feat/webrtc-state-machine`: cherry-pick the new files (`ui/src/connection/*` plus its 4 test files in `__tests__/` and `ui/vitest.config.ts`) rather than merge — the streams-store changes there will conflict heavily with main. The FSM lands as new files in Phase 2 and gets adapted to the Phase-1 interface.
 
 ---

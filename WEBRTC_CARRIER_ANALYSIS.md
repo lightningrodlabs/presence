@@ -1,5 +1,7 @@
 # WebRTC Carrier Analysis — Best Practices vs Our Two Carriers
 
+**Status: HISTORICAL (2026-08-03).** One of the two carriers this document compares no longer exists: `SimplePeerTransport` was deleted in Phase 3 (`MAINTAINABILITY_ASSESSMENT.md`), and the FSM is the only WebRTC carrier. The analysis was verified sound by the 2026-07 assessment and is kept for its best-practices evidence and the signals-vs-WebRTC framing; every SimplePeer-side observation is now archaeology.
+
 Written 2026-05-11. Comparison of `SimplePeerTransport` and `FsmTransport` against
 industry-recommended WebRTC patterns, framed by the project goal: **non-TURN
 P2P connectivity in marginal NAT conditions on Electron**.
