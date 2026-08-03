@@ -81,6 +81,88 @@ export function carrierFor(slot: WebrtcSlot | undefined): CarrierCoverage {
   return { carrier: 'signals', reason: 'webrtc-not-yet-connected' };
 }
 
+// ---------------------------------------------------------------------------
+// WebRTC eligibility (Round 3 item 2)
+// ---------------------------------------------------------------------------
+
+export type WebrtcEligibilityInputs = {
+  /**
+   * Which end of the video handshake is asking. The answer is the SAME
+   * for both roles — that symmetry is the decision this type surfaces
+   * (see `decideWebrtcEligibility`) — but the axis is kept in the
+   * signature so a future asymmetry has to be written as a visible
+   * branch on `role` with its reason, not as a second call site quietly
+   * omitting a conjunct.
+   */
+  role: 'initiator' | 'acceptor';
+  /** Is our own conversation module active (`_myModuleStates['conversation']`)? */
+  conversationActive: boolean;
+  /** Has either side disabled WebRTC for this link (`webrtcDisabled(peer)`)? */
+  peerWebrtcDisabled: boolean;
+  /** The `disableAllWebrtc` kill switch. */
+  webrtcGloballyDisabled: boolean;
+  /** Does the peer hold the `sdp-fsm` capability (`webrtcAvailableFor(peer)`)? */
+  peerHasSdpFsmCap: boolean;
+};
+
+export type WebrtcEligibility =
+  | { eligible: true; reason: 'all-conjuncts-hold' }
+  | {
+      eligible: false;
+      reason:
+        | 'conversation-inactive'
+        | 'webrtc-globally-disabled'
+        | 'peer-webrtc-disabled'
+        | 'peer-lacks-sdp-fsm-cap';
+    };
+
+/**
+ * May we stand up (or agree to stand up) a WebRTC video connection with
+ * this peer? ONE predicate for both ends of the handshake.
+ *
+ * Before this existed the initiator (`handlePongUi`) required
+ * `conversationActive && !peerWebrtcDisabled && !webrtcGloballyDisabled
+ * && webrtcAvailableFor(peer)` while the acceptor (`handleInitRequest`),
+ * 170 lines away, checked only the last three — with the conversation
+ * module inactive locally we refused to initiate but would answer an
+ * inbound InitRequest and stand up a full connection, with no comment
+ * declaring whether that was intended.
+ *
+ * **Decision (2026-08-03, §8 item 2): the predicate is symmetric — the
+ * acceptor requires `conversationActive` too.** Reason: the conversation
+ * module being inactive means this node does not want conversation
+ * media; answering an InitRequest anyway stands up exactly the
+ * connection the module toggle exists to prevent, and no rationale for
+ * the asymmetry was found in code, prose, or history. This is a declared
+ * behavior change: a node with the conversation module inactive now
+ * ignores inbound video InitRequests instead of answering them.
+ *
+ * Conjunct order fixes which reason wins when several fail; it mirrors
+ * the old initiator order (conversation, kill switch, per-peer, then
+ * capability).
+ *
+ * Constrains `streams-store.ts:handlePongUi` (initiator arm) and
+ * `streams-store.ts:handleInitRequest` (acceptor arm) — grep for these
+ * conjuncts should find no third composition site.
+ */
+export function decideWebrtcEligibility(
+  input: WebrtcEligibilityInputs,
+): WebrtcEligibility {
+  if (!input.conversationActive) {
+    return { eligible: false, reason: 'conversation-inactive' };
+  }
+  if (input.webrtcGloballyDisabled) {
+    return { eligible: false, reason: 'webrtc-globally-disabled' };
+  }
+  if (input.peerWebrtcDisabled) {
+    return { eligible: false, reason: 'peer-webrtc-disabled' };
+  }
+  if (!input.peerHasSdpFsmCap) {
+    return { eligible: false, reason: 'peer-lacks-sdp-fsm-cap' };
+  }
+  return { eligible: true, reason: 'all-conjuncts-hold' };
+}
+
 export type SignalsTargetsInputs = {
   /**
    * The **present** set — `StreamsStore._presentPeers`, i.e. ping-fresh

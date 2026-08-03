@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { carrierFor, computeSignalsTargets } from '../carrier-coverage';
-import type { WebrtcSlot } from '../carrier-coverage';
+import {
+  carrierFor,
+  computeSignalsTargets,
+  decideWebrtcEligibility,
+} from '../carrier-coverage';
+import type {
+  WebrtcEligibilityInputs,
+  WebrtcSlot,
+} from '../carrier-coverage';
 
 describe('carrierFor — one carrier owns each present peer', () => {
   const table: Array<[string, WebrtcSlot | undefined, ReturnType<typeof carrierFor>]> = [
@@ -114,5 +121,101 @@ describe('computeSignalsTargets — the carrier-coverage invariant', () => {
     });
 
     expect(targets.size).toBe(0);
+  });
+});
+
+describe('decideWebrtcEligibility — one predicate for both handshake ends (Round 3 item 2)', () => {
+  const ROLES = ['initiator', 'acceptor'] as const;
+
+  const eligibleBase = (role: (typeof ROLES)[number]): WebrtcEligibilityInputs => ({
+    role,
+    conversationActive: true,
+    peerWebrtcDisabled: false,
+    webrtcGloballyDisabled: false,
+    peerHasSdpFsmCap: true,
+  });
+
+  // role × conjunct: flipping any single conjunct makes the peer
+  // ineligible with that conjunct's reason, identically for both roles.
+  // Inverting a conjunct inside the policy fails the corresponding row —
+  // the reviewer's mutation check.
+  const conjunctRows: Array<
+    [Partial<WebrtcEligibilityInputs>, string]
+  > = [
+    [{ conversationActive: false }, 'conversation-inactive'],
+    [{ webrtcGloballyDisabled: true }, 'webrtc-globally-disabled'],
+    [{ peerWebrtcDisabled: true }, 'peer-webrtc-disabled'],
+    [{ peerHasSdpFsmCap: false }, 'peer-lacks-sdp-fsm-cap'],
+  ];
+
+  for (const role of ROLES) {
+    it(`${role}: all conjuncts holding is eligible`, () => {
+      expect(decideWebrtcEligibility(eligibleBase(role))).toEqual({
+        eligible: true,
+        reason: 'all-conjuncts-hold',
+      });
+    });
+
+    it.each(conjunctRows)(
+      `${role}: %o → ineligible (%s)`,
+      (flip, reason) => {
+        expect(decideWebrtcEligibility({ ...eligibleBase(role), ...flip })).toEqual({
+          eligible: false,
+          reason,
+        });
+      },
+    );
+  }
+
+  it('is symmetric by decision: the acceptor requires conversationActive too (the declared behavior change)', () => {
+    // Before the predicate, the acceptor omitted this conjunct — an
+    // inactive-conversation node would answer an InitRequest and stand
+    // up the very connection the module toggle exists to prevent.
+    expect(
+      decideWebrtcEligibility({
+        ...eligibleBase('acceptor'),
+        conversationActive: false,
+      }).eligible,
+    ).toBe(false);
+  });
+
+  it('answers identically for both roles on every single-conjunct flip', () => {
+    for (const [flip] of conjunctRows) {
+      expect(
+        decideWebrtcEligibility({ ...eligibleBase('initiator'), ...flip }),
+      ).toEqual(
+        decideWebrtcEligibility({ ...eligibleBase('acceptor'), ...flip }),
+      );
+    }
+  });
+
+  it('reason precedence: conversation, then kill switch, then per-peer, then capability', () => {
+    expect(
+      decideWebrtcEligibility({
+        role: 'initiator',
+        conversationActive: false,
+        webrtcGloballyDisabled: true,
+        peerWebrtcDisabled: true,
+        peerHasSdpFsmCap: false,
+      }).reason,
+    ).toBe('conversation-inactive');
+    expect(
+      decideWebrtcEligibility({
+        role: 'initiator',
+        conversationActive: true,
+        webrtcGloballyDisabled: true,
+        peerWebrtcDisabled: true,
+        peerHasSdpFsmCap: false,
+      }).reason,
+    ).toBe('webrtc-globally-disabled');
+    expect(
+      decideWebrtcEligibility({
+        role: 'initiator',
+        conversationActive: true,
+        webrtcGloballyDisabled: false,
+        peerWebrtcDisabled: true,
+        peerHasSdpFsmCap: false,
+      }).reason,
+    ).toBe('peer-webrtc-disabled');
   });
 });

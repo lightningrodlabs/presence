@@ -23,7 +23,11 @@ import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
-import { carrierFor, computeSignalsTargets } from './transport/carrier-coverage';
+import {
+  carrierFor,
+  computeSignalsTargets,
+  decideWebrtcEligibility,
+} from './transport/carrier-coverage';
 import { statsForPeer } from './transport/carrier-stats-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
@@ -5983,16 +5987,19 @@ export class StreamsStore {
     // but no actual connection has happened yet
     const alreadyOpen = get(this._openConnections)[pubkeyB64];
 
-    // Only initiate/manage WebRTC video connections when conversation
-    // module is active AND WebRTC is not disabled for this peer.
+    // Only initiate/manage WebRTC video connections when eligible. The
+    // predicate (conversation module active, kill switch, per-peer
+    // disable, sdp-fsm capability) is `decideWebrtcEligibility` — the
+    // ONE composition of these conjuncts, shared with the acceptor arm
+    // in `handleInitRequest` (Round 3 item 2).
     if (
-      conversationActive &&
-      !peerWebrtcDisabled &&
-      !this.webrtcGloballyDisabled &&
-      // Capability gate (wire-contract emission rule): a peer that cannot
-      // parse SdpFsm has no WebRTC path since Phase 3 — don't start a
-      // handshake whose SDP leg we could never send them.
-      this.webrtcAvailableFor(pubkeyB64)
+      decideWebrtcEligibility({
+        role: 'initiator',
+        conversationActive,
+        peerWebrtcDisabled,
+        webrtcGloballyDisabled: this.webrtcGloballyDisabled,
+        peerHasSdpFsmCap: this.webrtcAvailableFor(pubkeyB64),
+      }).eligible
     ) {
       const pendingInits = this._pendingInits[pubkeyB64];
       const decision = decideInitRetry({
@@ -6155,18 +6162,46 @@ export class StreamsStore {
      * Only accept init requests from agents who's pubkey is alphabetically  "higher" than ours
      */
     if (connection_type === 'video' && pubKey64 > this.myPubKeyB64) {
-      // Reject if WebRTC is globally disabled or disabled for this peer.
-      if (this.webrtcGloballyDisabled || this.webrtcDisabled(pubKey64)) {
-        console.log(`#### IGNORING INIT REQUEST from ${pubKey64.slice(0, 8)}: WebRTC disabled`);
-        return;
-      }
-      // A peer whose build cannot parse SdpFsm has no WebRTC path to us
-      // at all since Phase 3 deleted SimplePeer; answering their
-      // InitRequest would lure them into an SDP exchange we drop.
-      if (!this.webrtcAvailableFor(pubKey64)) {
-        this.logger.logCustomMessage(
-          `Dropped video InitRequest from ${pubKey64.slice(0, 8)}: peer lacks sdp-fsm capability`
-        );
+      // One eligibility predicate, shared with the initiator arm in
+      // `handlePongUi` (Round 3 item 2). Declared behavior change: the
+      // acceptor now requires `conversationActive` too — before this,
+      // a node with the conversation module inactive refused to initiate
+      // but would answer an inbound InitRequest and stand up a full
+      // connection. The decision and its reason live in the predicate's
+      // docblock (`decideWebrtcEligibility`, carrier-coverage.ts).
+      const eligibility = decideWebrtcEligibility({
+        role: 'acceptor',
+        conversationActive: !!get(this._myModuleStates)['conversation'],
+        peerWebrtcDisabled: this.webrtcDisabled(pubKey64),
+        webrtcGloballyDisabled: this.webrtcGloballyDisabled,
+        peerHasSdpFsmCap: this.webrtcAvailableFor(pubKey64),
+      });
+      if (!eligibility.eligible) {
+        const reason = eligibility.reason;
+        switch (reason) {
+          case 'conversation-inactive':
+            this.logger.logCustomMessage(
+              `Ignored video InitRequest from ${pubKey64.slice(0, 8)}: conversation module inactive (symmetric eligibility, §8 item 2)`
+            );
+            break;
+          case 'webrtc-globally-disabled':
+          case 'peer-webrtc-disabled':
+            console.log(`#### IGNORING INIT REQUEST from ${pubKey64.slice(0, 8)}: WebRTC disabled`);
+            break;
+          case 'peer-lacks-sdp-fsm-cap':
+            // A peer whose build cannot parse SdpFsm has no WebRTC path
+            // to us at all since Phase 3 deleted SimplePeer; answering
+            // their InitRequest would lure them into an SDP exchange we
+            // drop.
+            this.logger.logCustomMessage(
+              `Dropped video InitRequest from ${pubKey64.slice(0, 8)}: peer lacks sdp-fsm capability`
+            );
+            break;
+          default: {
+            const exhaustive: never = reason;
+            void exhaustive;
+          }
+        }
         return;
       }
       console.log(

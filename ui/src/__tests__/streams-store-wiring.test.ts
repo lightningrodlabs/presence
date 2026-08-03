@@ -540,6 +540,77 @@ describe('the error path through the started store (Round 3 item 1)', () => {
   });
 });
 
+describe('acceptor eligibility through the started store (Round 3 item 2)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  it('an inactive conversation module ignores inbound video InitRequests; activating it answers (the declared symmetry change)', async () => {
+    const { store, clock, bus, logger } = makeStarted();
+    // The peer (alphabetically higher than us — the acceptor arm's
+    // ordering condition) declares the sdp-fsm capability.
+    store._peerModuleStates.set({
+      [peerA]: {
+        conversation: conversationEnvelope(clock, { caps: ['sdp-fsm'] }),
+      },
+    });
+
+    // Our conversation module is inactive: the acceptor now refuses,
+    // where the pre-predicate code would have sent InitAccept.
+    await bus.deliver(
+      message(
+        peerAKey,
+        'InitRequest',
+        JSON.stringify({ connection_id: 'ir-1', connection_type: 'video' })
+      )
+    );
+    expect(bus.sentOfType('InitAccept')).toHaveLength(0);
+    expect(
+      logger.customMessages.some(m => m.includes('conversation module inactive'))
+    ).toBe(true);
+
+    // Activate the module: the same request is now answered.
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    await bus.deliver(
+      message(
+        peerAKey,
+        'InitRequest',
+        JSON.stringify({ connection_id: 'ir-2', connection_type: 'video' })
+      )
+    );
+    const accepts = bus.sentOfType('InitAccept');
+    expect(accepts).toHaveLength(1);
+    expect(accepts[0].to).toEqual([peerA]);
+  });
+
+  it('a peer without the sdp-fsm capability is refused even with the conversation module active', async () => {
+    const { store, clock, bus, logger } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // Declared empty caps — "baseline only", which excludes sdp-fsm.
+    store._peerModuleStates.set({
+      [peerA]: { conversation: conversationEnvelope(clock, { caps: [] }) },
+    });
+    await bus.deliver(
+      message(
+        peerAKey,
+        'InitRequest',
+        JSON.stringify({ connection_id: 'ir-3', connection_type: 'video' })
+      )
+    );
+    expect(bus.sentOfType('InitAccept')).toHaveLength(0);
+    expect(
+      logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
+    ).toBe(true);
+  });
+});
+
 describe('the manual clock drives the ambient cadences through start()', () => {
   it('the presence tick armed by start() evicts a stale peer with no store write', () => {
     const { store, clock } = makeStarted();
