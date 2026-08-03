@@ -391,7 +391,7 @@ export class RoomView extends LitElement {
     this._logTimestampCheckbox.checked = false;
   }
 
-  sideClickListener = (e: MouseEvent) => {
+  sideClickListener = () => {
     this.closeClosables();
   };
 
@@ -1501,7 +1501,7 @@ export class RoomView extends LitElement {
                     this.openCustomEventLogDialog();
                     e.stopPropagation();
                   }}
-                  @keypress=${(e: KeyboardEvent) => {
+                  @keypress=${() => {
                     this.openCustomEventLogDialog();
                   }}
                 >
@@ -1609,7 +1609,7 @@ export class RoomView extends LitElement {
                         <div
                           class="audio-source column"
                           tabindex="0"
-                          @click=${async (e: any) => {
+                          @click=${async () => {
                             this.closeClosables();
                             await this.streamsStore.changeAudioInput(
                               device.deviceId
@@ -1733,7 +1733,7 @@ export class RoomView extends LitElement {
                         <div
                           class="audio-source column"
                           tabindex="0"
-                          @click=${async (e: any) => {
+                          @click=${async () => {
                             this.closeClosables();
                             await this.streamsStore.changeVideoInput(
                               device.deviceId

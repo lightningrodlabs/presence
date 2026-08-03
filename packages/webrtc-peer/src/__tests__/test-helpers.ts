@@ -52,8 +52,6 @@ export class MockRTCPeerConnection {
   // Track management
   private _senders: MockRTCSender[] = [];
   private _receivers: MockRTCReceiver[] = [];
-  private _localStreams: MediaStream[] = [];
-  private _remoteStreams: MediaStream[] = [];
   private _dataChannels: MockRTCDataChannel[] = [];
   private _pendingCandidates: RTCIceCandidateInit[] = [];
 
@@ -107,10 +105,8 @@ export class MockRTCPeerConnection {
     } else if (desc.type === 'answer') {
       this._setSignalingState('stable');
     }
-    // Apply any pending ICE candidates
-    for (const candidate of this._pendingCandidates) {
-      // In real impl, these would be applied
-    }
+    // Pending ICE candidates would be applied here in a real impl; the
+    // mock just drops them.
     this._pendingCandidates = [];
   });
 
@@ -122,7 +118,7 @@ export class MockRTCPeerConnection {
     // In real impl, candidate would be applied to ICE agent
   });
 
-  addTrack = vi.fn((track: MediaStreamTrack, ...streams: MediaStream[]): RTCRtpSender => {
+  addTrack = vi.fn((track: MediaStreamTrack, ..._streams: MediaStream[]): RTCRtpSender => {
     const sender = new MockRTCSender(track);
     this._senders.push(sender);
     this._fireEvent('negotiationneeded');
@@ -146,7 +142,7 @@ export class MockRTCPeerConnection {
     return new Map() as unknown as RTCStatsReport;
   });
 
-  createDataChannel = vi.fn((label: string, options?: RTCDataChannelInit): RTCDataChannel => {
+  createDataChannel = vi.fn((label: string, _options?: RTCDataChannelInit): RTCDataChannel => {
     const dc = new MockRTCDataChannel(label);
     this._dataChannels.push(dc);
     // In real browsers, creating a data channel triggers negotiationneeded

@@ -2647,8 +2647,19 @@ export class StreamsStore {
   }
 
   private _releaseVideoKeepalive(): void {
+    // Stop every track the retained stream produced (today just the one;
+    // stop() is idempotent), then free the canvas bitmap by zeroing its
+    // dimensions. The two retention fields exist as GC anchors while the
+    // captureStream track is live — this is their one read.
+    this._videoKeepaliveStream?.getTracks().forEach(t => {
+      try { t.stop(); } catch {}
+    });
     if (this._videoKeepaliveTrack) {
       try { this._videoKeepaliveTrack.stop(); } catch {}
+    }
+    if (this._videoKeepaliveCanvas) {
+      this._videoKeepaliveCanvas.width = 0;
+      this._videoKeepaliveCanvas.height = 0;
     }
     this._videoKeepaliveTrack = null;
     this._videoKeepaliveStream = null;
