@@ -1,13 +1,13 @@
 use hdi::prelude::*;
 
 pub fn validate_create_link_all_agents(
-    action: CreateLink,
+    action: Action,
     _base_address: AnyLinkableHash,
-    _target_address: AnyLinkableHash,
+    target_address: AnyLinkableHash,
     _tag: LinkTag,
 ) -> ExternResult<ValidateCallbackResult> {
     // Validate that the link target is a punlic key
-    let target_pubkey = match AgentPubKey::try_from(action.target_address.clone()) {
+    let target_pubkey = match AgentPubKey::try_from(target_address) {
         Ok(pubkey) => pubkey,
         Err(_) => {
             return Ok(ValidateCallbackResult::Invalid(
@@ -20,7 +20,7 @@ pub fn validate_create_link_all_agents(
     //     action.author, target_pubkey, action.target_address, target_address, base_address
     // );
     // Validate that the author of the Create action matches the link target
-    if action.author != target_pubkey {
+    if action.author() != &target_pubkey {
         return Ok(ValidateCallbackResult::Invalid(
             "Links from the ALL_AGENTS anchor can only be created for oneself.".into(),
         ));
@@ -28,8 +28,8 @@ pub fn validate_create_link_all_agents(
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_delete_link_all_agents(
-    _action: DeleteLink,
-    _original_action: CreateLink,
+    _action: Action,
+    _original_action: Action,
     _base: AnyLinkableHash,
     _target: AnyLinkableHash,
     _tag: LinkTag,
@@ -39,7 +39,7 @@ pub fn validate_delete_link_all_agents(
     )))
 }
 pub fn validate_create_link_all_descendent_rooms(
-    _action: CreateLink,
+    _action: Action,
     _base_address: AnyLinkableHash,
     _target_address: AnyLinkableHash,
     _tag: LinkTag,
@@ -48,8 +48,8 @@ pub fn validate_create_link_all_descendent_rooms(
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_delete_link_all_descendent_rooms(
-    _action: DeleteLink,
-    _original_action: CreateLink,
+    _action: Action,
+    _original_action: Action,
     _base: AnyLinkableHash,
     _target: AnyLinkableHash,
     _tag: LinkTag,

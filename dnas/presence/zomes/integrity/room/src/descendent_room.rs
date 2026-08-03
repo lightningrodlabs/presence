@@ -10,15 +10,15 @@ pub struct DescendentRoom {
     pub meta_data: Option<String>,
 }
 pub fn validate_create_descendent_room(
-    _action: EntryCreationAction,
+    _action: Action,
     _descendent_room: DescendentRoom,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_update_descendent_room(
-    _action: Update,
+    _action: Action,
     _descendent_room: DescendentRoom,
-    _original_action: EntryCreationAction,
+    _original_action: Action,
     _original_descendent_room: DescendentRoom,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Invalid(
@@ -26,8 +26,8 @@ pub fn validate_update_descendent_room(
     ))
 }
 pub fn validate_delete_descendent_room(
-    _action: Delete,
-    _original_action: EntryCreationAction,
+    _action: Action,
+    _original_action: Action,
     _original_descendent_room: DescendentRoom,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Invalid(String::from(

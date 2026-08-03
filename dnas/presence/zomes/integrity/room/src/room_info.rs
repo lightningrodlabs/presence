@@ -10,15 +10,15 @@ pub struct RoomInfo {
     pub meta_data: Option<String>,
 }
 pub fn validate_create_room_info(
-    _action: EntryCreationAction,
+    _action: Action,
     _room_info: RoomInfo,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_update_room_info(
-    _action: Update,
+    _action: Action,
     _room_info: RoomInfo,
-    _original_action: EntryCreationAction,
+    _original_action: Action,
     _original_room_info: RoomInfo,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Invalid(
@@ -26,8 +26,8 @@ pub fn validate_update_room_info(
     ))
 }
 pub fn validate_delete_room_info(
-    _action: Delete,
-    _original_action: EntryCreationAction,
+    _action: Action,
+    _original_action: Action,
     _original_room_info: RoomInfo,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Invalid(String::from(
@@ -35,7 +35,7 @@ pub fn validate_delete_room_info(
     )))
 }
 pub fn validate_create_link_room_info_updates(
-    _action: CreateLink,
+    _action: Action,
     base_address: AnyLinkableHash,
     target_address: AnyLinkableHash,
     _tag: LinkTag,
@@ -73,8 +73,8 @@ pub fn validate_create_link_room_info_updates(
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_delete_link_room_info_updates(
-    _action: DeleteLink,
-    _original_action: CreateLink,
+    _action: Action,
+    _original_action: Action,
     _base: AnyLinkableHash,
     _target: AnyLinkableHash,
     _tag: LinkTag,

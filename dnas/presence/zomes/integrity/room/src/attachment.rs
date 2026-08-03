@@ -5,28 +5,28 @@ pub struct Attachment {
     pub wal: String,
 }
 pub fn validate_create_attachment(
-    _action: EntryCreationAction,
+    _action: Action,
     _attachment: Attachment,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_update_attachment(
-    _action: Update,
+    _action: Action,
     _attachment: Attachment,
-    _original_action: EntryCreationAction,
+    _original_action: Action,
     _original_attachment: Attachment,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_delete_attachment(
-    _action: Delete,
-    _original_action: EntryCreationAction,
+    _action: Action,
+    _original_action: Action,
     _original_attachment: Attachment,
 ) -> ExternResult<ValidateCallbackResult> {
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_create_link_attachment_updates(
-    _action: CreateLink,
+    _action: Action,
     base_address: AnyLinkableHash,
     target_address: AnyLinkableHash,
     _tag: LinkTag,
@@ -61,8 +61,8 @@ pub fn validate_create_link_attachment_updates(
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_delete_link_attachment_updates(
-    _action: DeleteLink,
-    _original_action: CreateLink,
+    _action: Action,
+    _original_action: Action,
     _base: AnyLinkableHash,
     _target: AnyLinkableHash,
     _tag: LinkTag,
@@ -72,7 +72,7 @@ pub fn validate_delete_link_attachment_updates(
     )))
 }
 pub fn validate_create_link_all_attachments(
-    _action: CreateLink,
+    _action: Action,
     _base_address: AnyLinkableHash,
     target_address: AnyLinkableHash,
     _tag: LinkTag,
@@ -96,8 +96,8 @@ pub fn validate_create_link_all_attachments(
     Ok(ValidateCallbackResult::Valid)
 }
 pub fn validate_delete_link_all_attachments(
-    _action: DeleteLink,
-    _original_action: CreateLink,
+    _action: Action,
+    _original_action: Action,
     _base: AnyLinkableHash,
     _target: AnyLinkableHash,
     _tag: LinkTag,
