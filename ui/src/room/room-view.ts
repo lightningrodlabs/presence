@@ -549,11 +549,16 @@ export class RoomView extends LitElement {
 
     this._roomInfo = await this.roomStore.client.getRoomInfo();
 
-    this._weaveClient.assets.assetStore(this.wal).subscribe(status => {
-      console.log('Got asset store update: ', status);
-      this.assetStoreContent = status;
-      this.requestUpdate();
-    });
+    // _unsubscribe is cleared in disconnectedCallback; without retaining
+    // it here the callback keeps firing requestUpdate() on the detached
+    // element for the life of the asset store.
+    this._unsubscribe = this._weaveClient.assets
+      .assetStore(this.wal)
+      .subscribe(status => {
+        console.log('Got asset store update: ', status);
+        this.assetStoreContent = status;
+        this.requestUpdate();
+      });
 
     // Auto-activate receiver-controlled modules that advertise state (e.g. clock timezone)
     for (const mod of getAllModules()) {
@@ -822,9 +827,14 @@ export class RoomView extends LitElement {
     // below); room-view's own never-assigned handle and its no-op
     // clearInterval are gone (PR #4 F7).
     window.removeEventListener('resize', this._onWindowResize);
+    document.removeEventListener('keydown', this.keyDownListener);
     if (this._unsubscribe) this._unsubscribe();
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect('room-view-disconnectedCallback');
+    // The super call is what runs hostDisconnected on the reactive
+    // controllers — without it every StoreSubscriber on this element
+    // outlives the element.
+    super.disconnectedCallback();
   }
 
   idToLayout(id: string, isShared: boolean = false) {

@@ -198,6 +198,10 @@ export class StreamsStore {
 
   _pageLifecycleUnsub: (() => void) | null = null;
 
+  // Set by static connect; releasing it is what lets the room store's
+  // lazy allAgents polling deactivate after the room is left.
+  _allAgentsUnsub: (() => void) | null = null;
+
   // ICE/TURN settings live in storage.local (window.localStorage in
   // production) and are edited from the Settings panel. Read them live (not
   // snapshotted at construction) so edits take effect on the next connection
@@ -2092,25 +2096,25 @@ export class StreamsStore {
     );
     streamsStore.start();
 
-    // Wait for allAgents to load before first ping so we actually have peers to contact
-    await new Promise<void>((resolve) => {
-      roomStore.allAgents.subscribe(val => {
-        if (val.status === 'complete') {
-          streamsStore.allAgents = val.value;
-          resolve();
-        } else if (val.status === 'error') {
-          console.error('Failed to get all agents: ', val.error);
-          resolve(); // Don't block forever on error
-        }
-      });
+    // One subscription serves both jobs: gate the first ping on the initial
+    // load, then keep feeding updates. (Two parallel subscriptions lived here
+    // once — the load-gate one was never released, so both wrote allAgents
+    // for the life of the store and the lazy store could never deactivate.)
+    let resolveInitialLoad: (() => void) | undefined;
+    const initialLoad = new Promise<void>(resolve => {
+      resolveInitialLoad = resolve;
     });
-
-    // Keep subscribing for ongoing updates
-    roomStore.allAgents.subscribe(val => {
+    streamsStore._allAgentsUnsub = roomStore.allAgents.subscribe(val => {
       if (val.status === 'complete') {
         streamsStore.allAgents = val.value;
+        resolveInitialLoad?.();
+      } else if (val.status === 'error') {
+        console.error('Failed to get all agents: ', val.error);
+        resolveInitialLoad?.(); // Don't block forever on error
       }
     });
+    // Wait for allAgents to load before first ping so we actually have peers to contact
+    await initialLoad;
 
     // ping all agents that are not already connected to you every PING_INTERVAL milliseconds
     await streamsStore.pingAgents();
@@ -2179,6 +2183,10 @@ export class StreamsStore {
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
       this._pageLifecycleUnsub = null;
+    }
+    if (this._allAgentsUnsub) {
+      this._allAgentsUnsub();
+      this._allAgentsUnsub = null;
     }
     // Close all connections and stop all streams. (A duplicated
     // `mediaTransport.destroy()` line lived here until Phase 6's

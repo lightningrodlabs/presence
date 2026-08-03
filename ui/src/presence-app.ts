@@ -246,6 +246,9 @@ export class PresenceApp extends LitElement {
       window.clearInterval(this._clearActiveParticipantsInterval);
     if (this._unsubscribe) this._unsubscribe();
     if (this._cfTurnRefreshTimer) window.clearTimeout(this._cfTurnRefreshTimer);
+    // The super call is what runs hostDisconnected on the reactive
+    // controllers (profile/lobby StoreSubscribers).
+    super.disconnectedCallback();
   }
 
   // Refresh interval bookkeeping: refresh this many ms before the TTL lapses so
