@@ -174,7 +174,7 @@ Panes render from `_activeAgents` (derived from `_knownAgents`, filtered by pong
 
 ### Pre-existing Bug: Video Toggle Freeze on Remote Peers
 
-`videoOff()` calls `track.stop()` + `removeTrack()`, then `videoOn()` calls `getUserMedia()` + `addTrack()` with a new track. Remote peers see frozen/distorted frames because SimplePeer doesn't handle this add-after-remove cleanly. This bug exists on `main` (pre-module-system) and is not caused by the module changes. Options:
+`videoOff()` calls `track.stop()` + `removeTrack()`, then `videoOn()` calls `getUserMedia()` + `addTrack()` with a new track. Remote peers saw frozen/distorted frames, diagnosed at the time as SimplePeer not handling this add-after-remove cleanly. **That diagnosis is archaeology** (correction 2026-08-03): SimplePeer was deleted in Phase 3 (2026-07-29) — the FSM transport is the only carrier. The symptom may or may not persist on the FSM path; if it recurs, re-diagnose against the current transport rather than trusting this paragraph. The options below are kept as the original option space. This bug predates the module system and is not caused by the module changes. Options:
 - Change `videoOff()` to `track.enabled = false` (like audio does) -- avoids `getUserMedia` re-prompt and track replacement issues, but keeps camera LED on
 - Fix the track replacement to use `replaceTrack()` instead of remove+add
 - Investigate the runtime permission persistence (browser vs Moss/Weave container)

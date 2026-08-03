@@ -1,7 +1,7 @@
 # Harnesses
 
 Browser-real test rigs for the parts of the app the vitest mocks cannot
-reproduce. Two live here:
+reproduce. The rigs living here:
 
 - **Carrier handover** (`carrier-handover-harness.*`, `carrier-handover.spec.ts`)
   — Phase 1.5's field harness. Two pages, each an agent running the
