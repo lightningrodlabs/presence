@@ -1,14 +1,15 @@
 name: test
 
-# main-0.6 only. `main` is a dead lineage with no `packages/` workspace and no
+# main-0.6 (the shipped line) and main-0.7 (the Holochain 0.7 upgrade line).
+# `main` is a dead lineage with no `packages/` workspace and no
 # verify/test:unit scripts, so this job would go red on every push to it — a
 # permanently failing gate teaches people to ignore gates. Add `main` back only
 # if it is ever revived with the scripts this workflow calls.
 on:
   push:
-    branches: [main-0.6]
+    branches: [main-0.6, main-0.7]
   pull_request:
-    branches: [main-0.6]
+    branches: [main-0.6, main-0.7]
 
 jobs:
   verify:
@@ -22,15 +23,15 @@ jobs:
       # this job touches, and pulling it in would make the one gate that must
       # always run the slowest and most fragile part of CI.
       #
-      # Pinned exactly, not '20': flake.nix provides nodejs_20 (v20.20.0), and a
-      # floating '20' here would let CI and the devshell drift onto different
+      # Pinned exactly, not '22': flake.nix provides nodejs_22 (v22.23.1), and a
+      # floating '22' here would let CI and the devshell drift onto different
       # minors. The lockfile makes dependency *resolution* identical, but the
       # closure contains node-gyp modules (bufferutil, utf-8-validate) that build
       # against the running node's ABI — so the node version is a real input, not
       # a cosmetic one. Keep this in step with flake.nix.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20.20.0'
+          node-version: '22.23.1'
           cache: npm
 
       # Two Electron binaries (29.4.6, 32.3.3) are in the closure via @theweave/cli
@@ -45,3 +46,30 @@ jobs:
       # ui tests and ui typecheck resolve @lightningrodlabs/webrtc-peer through
       # its dist/), runs the ui tests, then typechecks both workspaces.
       - run: npm run verify
+
+  # Conductor-level DNA tests (tests/src/room over tryorama). Unlike `verify`,
+  # this needs the holochain toolchain: build:zomes (Rust/wasm), `hc app pack`,
+  # and a real conductor binary — all supplied by the nix devshell. The
+  # holochain-ci cachix cache turns the closure download into minutes, not a
+  # from-source build. Kept as a separate job so a toolchain outage cannot
+  # block the pure-Node `verify` gate.
+  dna-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: holochain-ci
+
+      - run: nix develop -c npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+      # Root `test` = build:zomes + `hc app pack` + `npm t -w tests`
+      # (the src/room suite; the signal-latency rig is excluded by design —
+      # see tests/README.md).
+      - run: nix develop -c npm test
