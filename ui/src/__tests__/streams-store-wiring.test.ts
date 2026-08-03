@@ -433,6 +433,113 @@ describe('slot lifecycle applied from transport events (the exit criterion)', ()
   });
 });
 
+describe('the error path through the started store (Round 3 item 1)', () => {
+  it('a live media error performs the full close-path cleanup, and the duplicate is inert', () => {
+    const { store, clock, transports, logger, events } = makeStarted();
+    const media = transports.media!;
+
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    // Per-peer bookkeeping the pre-table error path leaked (§8 item 1's
+    // seven-entry skip list — the publicly reachable members stand in
+    // for the set; the table test pins every field).
+    store._pendingInits[peerA] = [{ connectionId: 'conn-1', t0: clock.now() }];
+    store._iceDisconnectedAt[peerA] = clock.now() - 1000;
+
+    media.emit({
+      type: 'error',
+      peer: peerA,
+      connectionId: 'conn-1',
+      error: new Error('boom'),
+    });
+
+    // Slot cleared, transport close driven with the error-path reason.
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(media.closeCalls.some(c => c.reason === 'error event')).toBe(true);
+    // The full cleanup set ran — including entries the old inline error
+    // path skipped…
+    expect(store._pendingInits[peerA]).toBeUndefined();
+    expect(store._iceDisconnectedAt[peerA]).toBeUndefined();
+    expect(store._lastDisconnectTime[peerA]).toBe(clock.now());
+    // …and the CarrierSwitch downgrade forensic event (declared change
+    // b; the earlier signals->webrtc entry is the connect-time upgrade).
+    const downgrades = () =>
+      logger
+        .eventsNamed('CarrierSwitch')
+        .filter(e => e.detail?.startsWith('webrtc->signals'));
+    expect(logger.eventsNamed('FsmError')).toHaveLength(1);
+    expect(downgrades()).toHaveLength(1);
+    const disconnects = events.filter(e => e.type === 'peer-disconnected');
+    expect(disconnects).toHaveLength(1);
+
+    // Duplicate error (the transport close already happened): no second
+    // FsmError, no second CarrierSwitch, no re-fired peer-disconnected.
+    media.emit({
+      type: 'error',
+      peer: peerA,
+      connectionId: 'conn-1',
+      error: new Error('boom again'),
+    });
+    expect(logger.eventsNamed('FsmError')).toHaveLength(1);
+    expect(downgrades()).toHaveLength(1);
+    expect(events.filter(e => e.type === 'peer-disconnected')).toHaveLength(1);
+  });
+
+  it('a stale error from a replaced FSM must not tear down the adopted connection', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    // In-place replacement: signaling under a new id, no close for conn-1.
+    media.emitPhase(peerA, 'conn-2', 'signaling');
+
+    media.emit({
+      type: 'error',
+      peer: peerA,
+      connectionId: 'conn-1',
+      error: new Error('stale'),
+    });
+
+    // The adopted slot survives untouched; the stale error is a log line.
+    expect(get(store._openConnections)[peerA]).toMatchObject({
+      connectionId: 'conn-2',
+    });
+    expect(logger.eventsNamed('SupersededError')).toHaveLength(1);
+    expect(media.closeCalls).toHaveLength(0);
+  });
+
+  it('screen-share error with no slot does not re-fire peer-screen-share-disconnected (declared change a)', () => {
+    const { store, transports, events } = makeStarted();
+    const inc = transports['screen-share-in']!;
+
+    inc.emitPhase(peerA, 'sv-1', 'signaling');
+    inc.emitPhase(peerA, 'sv-1', 'connected', 'connecting');
+    inc.emit({
+      type: 'error',
+      peer: peerA,
+      connectionId: 'sv-1',
+      error: new Error('first'),
+    });
+    expect(get(store._screenShareConnectionsIncoming)[peerA]).toBeUndefined();
+    expect(
+      events.filter(e => e.type === 'peer-screen-share-disconnected'),
+    ).toHaveLength(1);
+
+    // The duplicate error — no slot left — must stay silent toward the
+    // view. Before the table, this re-fired on every duplicate.
+    inc.emit({
+      type: 'error',
+      peer: peerA,
+      connectionId: 'sv-1',
+      error: new Error('second'),
+    });
+    expect(
+      events.filter(e => e.type === 'peer-screen-share-disconnected'),
+    ).toHaveLength(1);
+  });
+});
+
 describe('the manual clock drives the ambient cadences through start()', () => {
   it('the presence tick armed by start() evicts a stale peer with no store write', () => {
     const { store, clock } = makeStarted();

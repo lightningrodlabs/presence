@@ -90,12 +90,16 @@ function slotActionFor(input: TransportPhaseInputs): SlotAction {
  *  Deliberately narrow: `OpenConnectionInfo` satisfies it structurally. */
 export type SlotState = { connectionId: string; connected: boolean };
 
-/** The three route outcomes that touch the slot, as a discriminated input.
- *  `ignore` routes never reach this decision. */
+/** The route outcomes that touch the slot, as a discriminated input.
+ *  `ignore` routes never reach this decision. `error` (Round 3 item 1) is
+ *  the transport's error event: same guard structure as `closed` — before
+ *  it existed, both error handlers hand-rolled the supersede/no-slot
+ *  guards and had diverged. */
 export type SlotEvent =
   | { kind: 'signaling'; slot: SlotAction }
   | { kind: 'connected' }
-  | { kind: 'closed' };
+  | { kind: 'closed' }
+  | { kind: 'error' };
 
 export type SlotWrite =
   /** Create the slot fresh. Both `install` and `replace` start from
@@ -173,7 +177,14 @@ export function decideSlotWrite(
         slot: { connectionId: current.connectionId, connected: true },
       };
     }
-    case 'closed': {
+    case 'closed':
+    case 'error': {
+      // Same cell structure for both: an error for the live connection
+      // clears the slot (the error path's cleanup plan then drives the
+      // transport close); a superseded or duplicate error must not touch
+      // a slot a newer connection owns. What differs between close and
+      // error is the *cleanup set*, and that lives in
+      // `closeCleanupPlan` (close-cleanup-policy.ts), not here.
       if (!current) return { write: 'none', reason: 'no-slot' };
       if (current.connectionId !== eventConnectionId) {
         return {

@@ -215,4 +215,26 @@ describe('decideSlotWrite — the slot transition, shared by store and harness',
       reason: 'no-slot',
     });
   });
+
+  // Round 3 item 1: the `error` kind shares the closed guard structure.
+  // Before it existed both error handlers hand-rolled these guards and
+  // had diverged (the screen path re-fired a view event on no-slot).
+  it('error with the matching id clears the slot', () => {
+    expect(decideSlotWrite({ kind: 'error' }, 'live-1', live)).toEqual({ write: 'clear' });
+  });
+
+  it('error with a mismatched id is superseded — a stale error must not touch the new slot', () => {
+    expect(decideSlotWrite({ kind: 'error' }, 'old-0', live)).toEqual({
+      write: 'none',
+      reason: 'superseded',
+      supersededBy: 'live-1',
+    });
+  });
+
+  it('error with no slot is a duplicate error — nothing to write', () => {
+    expect(decideSlotWrite({ kind: 'error' }, 'live-1', undefined)).toEqual({
+      write: 'none',
+      reason: 'no-slot',
+    });
+  });
 });

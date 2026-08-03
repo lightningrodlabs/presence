@@ -26,11 +26,13 @@ import { routeTransportPhase, decideSlotWrite } from './transport/media-event-po
 import { carrierFor, computeSignalsTargets } from './transport/carrier-coverage';
 import { statsForPeer } from './transport/carrier-stats-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
-import {
-  decideStaleConnectionCleanup,
-  staleTeardownPlan,
-} from './transport/stale-connection-policy';
-import type { StaleTeardownTarget } from './transport/stale-connection-policy';
+import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
+import { closeCleanupPlan } from './transport/close-cleanup-policy';
+import type {
+  CloseCleanupContext,
+  CloseCleanupOutcome,
+  CloseCleanupPlan,
+} from './transport/close-cleanup-policy';
 import {
   summarizeRtcStats,
   decideTrackRefresh,
@@ -139,6 +141,20 @@ const INIT_RETRY_THRESHOLD = 5000;
  * `_pendingInits` grew unboundedly against an unresponsive peer.)
  */
 const PENDING_HANDSHAKE_TTL_MS = 20000;
+
+/**
+ * Map a close/error `decideSlotWrite` result onto the cleanup table's
+ * outcome axis. Only the guard outcomes a `closed`/`error` event can
+ * produce appear here; `install`/`replace`/`set-connected` belong to
+ * other event kinds and reaching this with one is a programming error.
+ */
+function closeGuardOutcome(
+  write: ReturnType<typeof decideSlotWrite>,
+): CloseCleanupOutcome {
+  if (write.write === 'clear') return 'live';
+  if (write.write === 'none' && write.reason === 'superseded') return 'superseded';
+  return 'no-slot';
+}
 
 /**
  * Drop entries older than `ttlMs` from a pending-handshake map,
@@ -1258,6 +1274,156 @@ export class StreamsStore {
     }, 2000);
   }
 
+  /**
+   * The single executor of `closeCleanupPlan` rows
+   * (transport/close-cleanup-policy.ts) — every connection-teardown path
+   * (close event, error event, stale teardown, peer leave; media and both
+   * screen-share directions) applies its cleanup through here. The
+   * step ORDER below is part of the contract: CarrierSwitch reads the
+   * slot's `connected` before the clear; `_emitIceNeverConnected` runs
+   * before `_clearIceTiming` wipes the record; an `after-slot-clear`
+   * transport close happens once the slot is gone so the synchronously
+   * emitted nested `closed` hits the no-slot guard, while a
+   * `before-slot-clear` close deliberately lets that nested event run the
+   * full close row first (see the policy header).
+   */
+  private _applyCloseCleanup(
+    ctx: CloseCleanupContext,
+    plan: CloseCleanupPlan,
+    pubKeyB64: AgentPubKeyB64,
+    connectionId: string,
+    closeReason: string,
+  ): void {
+    const slotStore =
+      ctx.target === 'media'
+        ? this._openConnections
+        : ctx.target === 'screen-share-outgoing'
+          ? this._screenShareConnectionsOutgoing
+          : this._screenShareConnectionsIncoming;
+    const transport =
+      ctx.target === 'media'
+        ? this.mediaTransport
+        : ctx.target === 'screen-share-outgoing'
+          ? this.screenShareOutTransport
+          : this.screenShareInTransport;
+
+    const wasWebrtcCarrier = !!get(slotStore)[pubKeyB64]?.connected;
+
+    if (plan.closeTransport === 'before-slot-clear') {
+      transport.closeConnection(pubKeyB64, closeReason);
+    }
+
+    if (plan.emitCarrierSwitch && wasWebrtcCarrier) {
+      // Annotate the downgrade with *why* we left webrtc (§6.6) — the
+      // reason the FSM took this peer out of `connected`, captured in
+      // `_logFsmTransition`. Falls back to 'unknown' if the root reason
+      // wasn't seen.
+      const reason = this._lastWebrtcExitReason.get(pubKeyB64) ?? 'unknown';
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: this.clock.now(),
+        event: 'CarrierSwitch',
+        connectionId,
+        detail: `webrtc->signals reason="${reason}"`,
+      });
+    }
+    if (plan.clearWebrtcExitReason) this._lastWebrtcExitReason.delete(pubKeyB64);
+    if (plan.clearQualityBucket) this._lastQualityBucket.delete(pubKeyB64);
+    if (plan.recordLastDisconnect) {
+      this._lastDisconnectTime[pubKeyB64] = this.clock.now();
+    }
+    if (plan.clearVideoStreamSlot) delete this._videoStreams[pubKeyB64];
+    // A closed connection's pending InitRequests are dead reservations:
+    // clearing them lets the next pong cycle re-initiate immediately
+    // instead of waiting out INIT_RETRY_THRESHOLD against a stale t0
+    // (Phase 2 item 7 — inits get close-path cleanup like accepts).
+    if (plan.clearPendingInits) delete this._pendingInits[pubKeyB64];
+
+    if (plan.clearSlot) {
+      slotStore.update(currentValue => {
+        delete currentValue[pubKeyB64];
+        return currentValue;
+      });
+    }
+    if (plan.closeTransport === 'after-slot-clear') {
+      transport.closeConnection(pubKeyB64, closeReason);
+    }
+
+    if (plan.clearPerceivedStreamInfo) {
+      // Clear stale perceivedStreamInfo so icons don't show stale state
+      // during reconnection.
+      this._othersConnectionStatuses.update(statuses => {
+        if (statuses[pubKeyB64]) {
+          statuses[pubKeyB64] = {
+            ...statuses[pubKeyB64],
+            perceivedStreamInfo: undefined,
+          };
+        }
+        return statuses;
+      });
+    }
+
+    if (plan.clearLastBytesReceived) delete this._lastBytesReceived[pubKeyB64];
+    if (plan.clearStaleCycles) delete this._staleCycles[pubKeyB64];
+    if (plan.clearReconcileAttemptCount) delete this._reconcileAttemptCount[pubKeyB64];
+    if (plan.clearIceDisconnectedAt) delete this._iceDisconnectedAt[pubKeyB64];
+    if (plan.clearScreenShareIceDisconnectedAt) {
+      delete this._screenShareIceDisconnectedAt[pubKeyB64];
+    }
+    if (plan.clearScreenShareStream) {
+      // The incoming share's stream slot dies with its connection —
+      // room-view's paint-restore path reads this map and must not
+      // resurrect a dead share.
+      delete this._screenShareStreams[pubKeyB64];
+    }
+
+    // Capture failure-side latency before _clearIceTiming wipes the
+    // timing entry. _emitIceNeverConnected no-ops if the establishment
+    // event already fired (i.e. this is a normal close after a
+    // successful connect).
+    if (plan.emitIceNeverConnected) this._emitIceNeverConnected(pubKeyB64, connectionId);
+    if (plan.clearIceTiming) this._clearIceTiming(pubKeyB64, connectionId);
+    if (plan.removeAudioAnalyser) this.removePeerAudioAnalyser(pubKeyB64);
+    if (plan.clearWebrtcStats) this.webrtcStats.delete(pubKeyB64);
+
+    if (plan.teardownOutgoingScreenShare) {
+      // Tear down any outgoing screen share to this peer since they
+      // have disconnected. Without this, a stale connection may linger
+      // and block re-initiation when the peer rejoins.
+      const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
+      if (outgoingScreenShare) {
+        console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
+        this.screenShareOutTransport.closeConnection(
+          pubKeyB64,
+          ctx.via === 'error-event' ? 'media peer error' : 'media peer closed',
+        );
+        this._screenShareConnectionsOutgoing.update(currentValue => {
+          delete currentValue[pubKeyB64];
+          return currentValue;
+        });
+      }
+    }
+
+    if (plan.setDisconnectedStatus === 'media') {
+      this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
+    } else if (plan.setDisconnectedStatus === 'screen-share') {
+      this.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Disconnected' });
+    }
+    if (plan.fireEvent === 'peer-disconnected') {
+      this.eventCallback({
+        type: 'peer-disconnected',
+        pubKeyB64,
+        connectionId,
+      });
+    } else if (plan.fireEvent === 'peer-screen-share-disconnected') {
+      this.eventCallback({
+        type: 'peer-screen-share-disconnected',
+        pubKeyB64,
+        connectionId,
+      });
+    }
+  }
+
   private _handleMediaClosed(
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
@@ -1276,114 +1442,42 @@ export class StreamsStore {
     // _openConnections[peer], cleared analyser/stats, and fired
     // peer-disconnected; a second would emit a redundant
     // FsmClose and re-fire peer-disconnected on consumers.
-    const currentOnClose = get(this._openConnections)[pubKeyB64];
     const slotWrite = decideSlotWrite(
       { kind: 'closed' },
       connectionId,
-      currentOnClose,
+      get(this._openConnections)[pubKeyB64],
     );
-    if (slotWrite.write !== 'clear') {
-      if (slotWrite.write === 'none' && slotWrite.reason === 'superseded') {
-        this.logger.logAgentEvent({
-          agent: pubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'SupersededClose',
-          connectionId,
-          detail: `superseded-by=${slotWrite.supersededBy}`,
-        });
-      } else {
-        this._clearIceTiming(pubKeyB64, connectionId);
-      }
-      return;
-    }
+    const ctx: CloseCleanupContext = {
+      target: 'media',
+      via: 'close-event',
+      outcome: closeGuardOutcome(slotWrite),
+    };
+    const plan = closeCleanupPlan(ctx);
 
-    const closingConn = currentOnClose!;
-    const wasWebrtcCarrier = !!closingConn?.connected;
-
-    // Flush any in-flight SdpData bursts for this connection so the
-    // summary lands before the close event in the timeline.
-    this._flushSdpAggregatesForConnection(connectionId);
-
-    this.logger.logAgentEvent({
-      agent: pubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'FsmClose',
-      connectionId,
-      detail: `cause=${cause}`,
-    });
-    if (wasWebrtcCarrier) {
-      // Annotate the downgrade with *why* we left webrtc (§6.6) — the reason
-      // the FSM took this peer out of `connected`, captured in
-      // `_logFsmTransition`. Falls back to the impl-specific FSM close if the
-      // root reason wasn't seen (e.g. close arrived without a connected->X log).
-      const reason = this._lastWebrtcExitReason.get(pubKeyB64) ?? 'unknown';
+    if (plan.logSuperseded && slotWrite.write === 'none') {
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
-        event: 'CarrierSwitch',
+        event: 'SupersededClose',
         connectionId,
-        detail: `webrtc->signals reason="${reason}"`,
-      });
-    }
-    this._lastWebrtcExitReason.delete(pubKeyB64);
-    this._lastQualityBucket.delete(pubKeyB64);
-    this._lastDisconnectTime[pubKeyB64] = this.clock.now();
-
-    delete this._videoStreams[pubKeyB64];
-    // A closed connection's pending InitRequests are dead reservations:
-    // clearing them lets the next pong cycle re-initiate immediately
-    // instead of waiting out INIT_RETRY_THRESHOLD against a stale t0
-    // (Phase 2 item 7 — inits get close-path cleanup like accepts).
-    delete this._pendingInits[pubKeyB64];
-
-    this._openConnections.update(currentValue => {
-      delete currentValue[pubKeyB64];
-      return currentValue;
-    });
-
-    // Clear stale perceivedStreamInfo so icons don't show stale state during reconnection
-    this._othersConnectionStatuses.update(statuses => {
-      if (statuses[pubKeyB64]) {
-        statuses[pubKeyB64] = {
-          ...statuses[pubKeyB64],
-          perceivedStreamInfo: undefined,
-        };
-      }
-      return statuses;
-    });
-
-    delete this._lastBytesReceived[pubKeyB64];
-    delete this._staleCycles[pubKeyB64];
-    delete this._reconcileAttemptCount[pubKeyB64];
-    delete this._iceDisconnectedAt[pubKeyB64];
-    // Capture failure-side latency before _clearIceTiming wipes
-    // the timing entry. _emitIceNeverConnected no-ops if the
-    // establishment event already fired (i.e. this is a normal close
-    // after a successful connect).
-    this._emitIceNeverConnected(pubKeyB64, connectionId);
-    this._clearIceTiming(pubKeyB64, connectionId);
-    this.removePeerAudioAnalyser(pubKeyB64);
-    this.webrtcStats.delete(pubKeyB64);
-
-    // Tear down any outgoing screen share to this peer since they
-    // have disconnected. Without this, a stale connection may linger
-    // and block re-initiation when the peer rejoins.
-    const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-    if (outgoingScreenShare) {
-      console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
-      this.screenShareOutTransport.closeConnection(pubKeyB64, 'media peer closed');
-      this._screenShareConnectionsOutgoing.update(currentValue => {
-        delete currentValue[pubKeyB64];
-        return currentValue;
+        detail: `superseded-by=${slotWrite.supersededBy}`,
       });
     }
 
-    this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
-    this.eventCallback({
-      type: 'peer-disconnected',
-      pubKeyB64,
-      connectionId,
-    });
+    if (ctx.outcome === 'live') {
+      // Flush any in-flight SdpData bursts for this connection so the
+      // summary lands before the close event in the timeline.
+      this._flushSdpAggregatesForConnection(connectionId);
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: this.clock.now(),
+        event: 'FsmClose',
+        connectionId,
+        detail: `cause=${cause}`,
+      });
+    }
+
+    this._applyCloseCleanup(ctx, plan, pubKeyB64, connectionId, 'close event');
   }
 
   private _handleMediaRemoteStream(
@@ -1568,82 +1662,52 @@ export class StreamsStore {
     connectionId: string,
     error: Error,
   ): void {
-    const transport = this.mediaTransport;
     console.log('#### GOT ERROR EVENT ####: ', error);
 
-    // Supersede guard (see _handleMediaClosed for the full rationale).
-    const currentOnError = get(this._openConnections)[pubKeyB64];
-    if (currentOnError && currentOnError.connectionId !== connectionId) {
+    // Guards live in `decideSlotWrite` (the `error` kind, Round 3 item 1
+    // — this handler used to hand-roll them and had diverged from the
+    // close path). Superseded: a stale error from a replaced FSM must not
+    // touch the slot a newer connection owns. No-slot: duplicate error —
+    // the first one already tore the connection down.
+    const slotWrite = decideSlotWrite(
+      { kind: 'error' },
+      connectionId,
+      get(this._openConnections)[pubKeyB64],
+    );
+    const ctx: CloseCleanupContext = {
+      target: 'media',
+      via: 'error-event',
+      outcome: closeGuardOutcome(slotWrite),
+    };
+    const plan = closeCleanupPlan(ctx);
+
+    if (plan.logSuperseded && slotWrite.write === 'none') {
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
         event: 'SupersededError',
         connectionId,
-        detail: `superseded-by=${currentOnError.connectionId}; err=${error.message || error}`,
-      });
-      return;
-    }
-
-    // Duplicate-error guard: first error already tore the connection
-    // down. Subsequent error events for the same connectionId would
-    // re-emit the same structured event and re-fire peer-disconnected.
-    if (!currentOnError) {
-      this._clearIceTiming(pubKeyB64, connectionId);
-      return;
-    }
-
-    this._flushSdpAggregatesForConnection(connectionId);
-    this.logger.logAgentEvent({
-      agent: pubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'FsmError',
-      connectionId,
-      detail: error.message || String(error),
-    });
-
-    delete this._videoStreams[pubKeyB64];
-
-    this._openConnections.update(currentValue => {
-      delete currentValue[pubKeyB64];
-      return currentValue;
-    });
-
-    this._othersConnectionStatuses.update(statuses => {
-      if (statuses[pubKeyB64]) {
-        statuses[pubKeyB64] = {
-          ...statuses[pubKeyB64],
-          perceivedStreamInfo: undefined,
-        };
-      }
-      return statuses;
-    });
-
-    const outgoingScreenShare2 = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-    if (outgoingScreenShare2) {
-      this.screenShareOutTransport.closeConnection(pubKeyB64, 'media peer error');
-      this._screenShareConnectionsOutgoing.update(currentValue => {
-        delete currentValue[pubKeyB64];
-        return currentValue;
+        detail: `superseded-by=${slotWrite.supersededBy}; err=${error.message || error}`,
       });
     }
-    this.removePeerAudioAnalyser(pubKeyB64);
-    this.webrtcStats.delete(pubKeyB64);
-    // Capture failure-side latency before _clearIceTiming wipes
-    // the timing entry. Mirrors the _handleMediaClosed path.
-    this._emitIceNeverConnected(pubKeyB64, connectionId);
-    this._clearIceTiming(pubKeyB64, connectionId);
 
-    // Drive transport close so the underlying peer is fully torn down.
-    // The resulting close event hits _handleMediaClosed and our
-    // duplicate-close guard short-circuits it (entry is already removed).
-    transport.closeConnection(pubKeyB64, 'error event');
+    if (ctx.outcome === 'live') {
+      this._flushSdpAggregatesForConnection(connectionId);
+      this.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: this.clock.now(),
+        event: 'FsmError',
+        connectionId,
+        detail: error.message || String(error),
+      });
+    }
 
-    this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
-    this.eventCallback({
-      type: 'peer-disconnected',
-      pubKeyB64,
-      connectionId,
-    });
+    // The plan carries the full close-path cleanup set (declared change:
+    // the error path used to skip seven of the close path's cleanups and
+    // the CarrierSwitch forensic event) and drives the transport close
+    // after the slot clear, so the nested close event hits the no-slot
+    // guard.
+    this._applyCloseCleanup(ctx, plan, pubKeyB64, connectionId, 'error event');
   }
 
   // --- screen-share transport event handlers ---
@@ -1713,40 +1777,25 @@ export class StreamsStore {
   ): void {
     console.log('#### GOT SCREEN SHARE CLOSE EVENT ####');
 
-    const store = this._screenShareStore(initiator);
     // Supersede guard: a stale close from a replaced FSM must not clear
     // the slot a newer connection owns (decideSlotWrite drops it).
     const write = decideSlotWrite(
       { kind: 'closed' },
       connectionId,
-      get(store)[pubKeyB64],
+      get(this._screenShareStore(initiator))[pubKeyB64],
     );
-    if (write.write !== 'clear') return;
-    store.update(currentValue => {
-      delete currentValue[pubKeyB64];
-      return currentValue;
-    });
-
-    if (initiator) {
-      delete this._screenShareIceDisconnectedAt[pubKeyB64];
-    } else {
-      // The incoming share's stream slot dies with its connection —
-      // room-view's paint-restore path reads this map and must not
-      // resurrect a dead share.
-      delete this._screenShareStreams[pubKeyB64];
-    }
-
-    if (!initiator) {
-      this.eventCallback({
-        type: 'peer-screen-share-disconnected',
-        pubKeyB64,
-        connectionId,
-      });
-    }
-
-    this.updateScreenShareConnectionStatus(pubKeyB64, {
-      type: 'Disconnected',
-    });
+    const ctx: CloseCleanupContext = {
+      target: initiator ? 'screen-share-outgoing' : 'screen-share-incoming',
+      via: 'close-event',
+      outcome: closeGuardOutcome(write),
+    };
+    this._applyCloseCleanup(
+      ctx,
+      closeCleanupPlan(ctx),
+      pubKeyB64,
+      connectionId,
+      'close event',
+    );
   }
 
   private _handleScreenShareRemoteStream(
@@ -1819,48 +1868,44 @@ export class StreamsStore {
       `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
     );
 
-    const store = this._screenShareStore(initiator);
-    // Supersede guard (review finding F1 of the Phase 3 branch), mirroring
-    // _handleMediaError: a stale error from a replaced FSM — the same
-    // replace-without-event route the adopt handling closes for phase
-    // events — must not clear the slot a newer connection owns, and on
-    // the incoming side must not delete `_screenShareStreams[peer]` out
-    // from under a live share's paint. Return without closing anything:
-    // the erroring FSM is already gone (replaced), and closing by peer
-    // key would tear down the live connection.
-    const currentSlot = get(store)[pubKeyB64];
-    if (currentSlot && currentSlot.connectionId !== connectionId) {
+    // Supersede guard (review finding F1 of the Phase 3 branch), now the
+    // shared `decideSlotWrite` error kind: a stale error from a replaced
+    // FSM — the same replace-without-event route the adopt handling
+    // closes for phase events — must not clear the slot a newer
+    // connection owns, and on the incoming side must not delete
+    // `_screenShareStreams[peer]` out from under a live share's paint.
+    // The no-slot (duplicate-error) row no longer re-fires
+    // `peer-screen-share-disconnected` into the view (§8 item 1 declared
+    // change a).
+    const write = decideSlotWrite(
+      { kind: 'error' },
+      connectionId,
+      get(this._screenShareStore(initiator))[pubKeyB64],
+    );
+    const ctx: CloseCleanupContext = {
+      target: initiator ? 'screen-share-outgoing' : 'screen-share-incoming',
+      via: 'error-event',
+      outcome: closeGuardOutcome(write),
+    };
+    const plan = closeCleanupPlan(ctx);
+
+    if (plan.logSuperseded && write.write === 'none') {
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
         event: 'SupersededError',
         connectionId,
-        detail: `superseded-by=${currentSlot.connectionId}; err=${error.message || error}; path=screen`,
-      });
-      return;
-    }
-
-    store.update(currentValue => {
-      delete currentValue[pubKeyB64];
-      return currentValue;
-    });
-
-    if (!initiator) {
-      delete this._screenShareStreams[pubKeyB64];
-      this.eventCallback({
-        type: 'peer-screen-share-disconnected',
-        pubKeyB64,
-        connectionId,
+        detail: `superseded-by=${write.supersededBy}; err=${error.message || error}; path=screen`,
       });
     }
 
-    // Drive teardown via the transport so the FSM is fully closed.
-    const transport = initiator ? this.screenShareOutTransport : this.screenShareInTransport;
-    transport.closeConnection(pubKeyB64, 'screen-share error event');
-
-    this.updateScreenShareConnectionStatus(pubKeyB64, {
-      type: 'Disconnected',
-    });
+    this._applyCloseCleanup(
+      ctx,
+      plan,
+      pubKeyB64,
+      connectionId,
+      'screen-share error event',
+    );
   }
 
   /**
@@ -5385,63 +5430,38 @@ export class StreamsStore {
 
   /**
    * The one executor for a stale-connection teardown. The predicate that
-   * decides *whether* to tear down is `decideStaleConnectionCleanup`; the
-   * cleanup set — what gets cleared per target — is `staleTeardownPlan`
-   * (both in `transport/stale-connection-policy.ts`). All three supervisor
-   * sites call this: the screen-share check in `handlePingUi`, and the
-   * video and screen-share checks in `handlePongUi`. Site-specific
-   * forensics (console/custom/agent-event logging) stay at the sites.
+   * decides *whether* to tear down is `decideStaleConnectionCleanup`
+   * (`transport/stale-connection-policy.ts`); the cleanup set is the
+   * `stale-teardown` rows of `closeCleanupPlan`
+   * (`transport/close-cleanup-policy.ts`). All three supervisor sites
+   * call this: the screen-share check in `handlePingUi`, and the video
+   * and screen-share checks in `handlePongUi`. Site-specific forensics
+   * (console/custom/agent-event logging) stay at the sites.
    */
   private _applyStaleTeardown(
-    target: StaleTeardownTarget,
+    target: 'media' | 'screen-share-outgoing',
     pubkeyB64: AgentPubKeyB64,
     iceState: RTCIceConnectionState | undefined,
   ): void {
-    const plan = staleTeardownPlan(target);
-    switch (plan.slot) {
-      case 'open-connections': {
-        this.mediaTransport.closeConnection(
-          pubkeyB64,
-          `stale ICE=${iceState}`,
-        );
-        this._openConnections.update(v => {
-          delete v[pubkeyB64];
-          return v;
-        });
-        break;
-      }
-      case 'screen-share-connections-outgoing': {
-        this.screenShareOutTransport.closeConnection(
-          pubkeyB64,
-          `stale ICE=${iceState}`,
-        );
-        this._screenShareConnectionsOutgoing.update(v => {
-          delete v[pubkeyB64];
-          return v;
-        });
-        break;
-      }
-      default: {
-        const exhaustive: never = plan.slot;
-        void exhaustive;
-      }
-    }
-    switch (plan.pendingInits) {
-      case 'video':
-        delete this._pendingInits[pubkeyB64];
-        break;
-      case 'none':
-        // Screen share has no pending-init map since Phase 3 retired its
-        // handshake; the FSM owns retry, so there is nothing to clear.
-        break;
-      default: {
-        const exhaustive: never = plan.pendingInits;
-        void exhaustive;
-      }
-    }
-    if (plan.clearVideoStreamSlot) {
-      delete this._videoStreams[pubkeyB64];
-    }
+    // The supervisor only fires against an existing slot
+    // (`hasExistingConn` is the first input to the predicate), so the
+    // outcome axis is 'live' by construction here.
+    const ctx: CloseCleanupContext = {
+      target,
+      via: 'stale-teardown',
+      outcome: 'live',
+    };
+    const slot =
+      target === 'media'
+        ? get(this._openConnections)[pubkeyB64]
+        : get(this._screenShareConnectionsOutgoing)[pubkeyB64];
+    this._applyCloseCleanup(
+      ctx,
+      closeCleanupPlan(ctx),
+      pubkeyB64,
+      slot?.connectionId ?? '',
+      `stale ICE=${iceState}`,
+    );
   }
 
   // ********************************************************************************************
@@ -5668,7 +5688,6 @@ export class StreamsStore {
       timestamp: this.clock.now(),
       event: 'PeerLeave',
     });
-    this._lastQualityBucket.delete(pubkeyB64);
     // If we were mid-outage for this peer, close it out — the peer is
     // gone, not silently unreachable. Wouldn't fire via _checkAudibilityOutages
     // because peer drops from the presence set on next tick.
@@ -5694,32 +5713,36 @@ export class StreamsStore {
       return agents;
     });
 
-    // Destroy video connection
-    if (get(this._openConnections)[pubkeyB64]) {
-      this.mediaTransport.closeConnection(pubkeyB64, 'peer left');
-      this._openConnections.update(v => { delete v[pubkeyB64]; return v; });
+    // Destroy the peer's connections (media, then both screen-share
+    // directions) and clear the per-peer maps — the `peer-leave` rows of
+    // `closeCleanupPlan`. The map clears run whether or not a slot
+    // exists (they always did on this path); the transport close runs
+    // first when a slot exists, so a live connection gets the full
+    // close-event cleanup via the synchronously emitted nested `closed`.
+    for (const target of [
+      'media',
+      'screen-share-incoming',
+      'screen-share-outgoing',
+    ] as const) {
+      const slot =
+        target === 'media'
+          ? get(this._openConnections)[pubkeyB64]
+          : target === 'screen-share-incoming'
+            ? get(this._screenShareConnectionsIncoming)[pubkeyB64]
+            : get(this._screenShareConnectionsOutgoing)[pubkeyB64];
+      const ctx: CloseCleanupContext = {
+        target,
+        via: 'peer-leave',
+        outcome: slot ? 'live' : 'no-slot',
+      };
+      this._applyCloseCleanup(
+        ctx,
+        closeCleanupPlan(ctx),
+        pubkeyB64,
+        slot?.connectionId ?? '',
+        'peer left',
+      );
     }
-
-    // Destroy incoming screen share
-    if (get(this._screenShareConnectionsIncoming)[pubkeyB64]) {
-      this.screenShareInTransport.closeConnection(pubkeyB64, 'peer left');
-      this._screenShareConnectionsIncoming.update(v => { delete v[pubkeyB64]; return v; });
-    }
-
-    // Destroy outgoing screen share
-    if (get(this._screenShareConnectionsOutgoing)[pubkeyB64]) {
-      this.screenShareOutTransport.closeConnection(pubkeyB64, 'peer left');
-      this._screenShareConnectionsOutgoing.update(v => { delete v[pubkeyB64]; return v; });
-    }
-
-    // Clean up video/screen streams and pending state
-    delete this._videoStreams[pubkeyB64];
-    delete this._screenShareStreams[pubkeyB64];
-    delete this._pendingInits[pubkeyB64];
-
-    // Mark as disconnected
-    this.updateConnectionStatus(pubkeyB64, { type: 'Disconnected' });
-    this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'Disconnected' });
 
     // Clean up module states for this peer (capture pre-image for transition dispatch)
     const peerModulesAtLeave = get(this._peerModuleStates)[pubkeyB64] || {};
@@ -5952,7 +5975,7 @@ export class StreamsStore {
           event: 'StaleCleanup',
           connectionId: existingConn.connectionId,
         });
-        this._applyStaleTeardown('video', pubkeyB64, iceState);
+        this._applyStaleTeardown('media', pubkeyB64, iceState);
       }
     }
 
