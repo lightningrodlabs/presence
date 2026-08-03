@@ -5,7 +5,6 @@ import {
   mdiPhoneRefresh,
   mdiVideo,
 } from '@mdi/js';
-import { wrapPathInSvg } from '@holochain-open-dev/elements';
 import type { AgentPubKeyB64 } from '@holochain/client';
 import { registerModule } from './registry';
 import type {

@@ -32,7 +32,7 @@ import type {
   TransportSnapshot,
   Unsubscribe,
 } from './types.js';
-import { VALID_TRANSITIONS, createIdleViewModel, DEFAULT_CONFIG, NOOP_LOGGER } from './types.js';
+import { VALID_TRANSITIONS, DEFAULT_CONFIG, NOOP_LOGGER } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -197,7 +197,6 @@ export class PeerConnectionFSM {
 
   // View model — reactive store (simple callback-based for now, will be wrapped in Writable by ConnectionManager)
   private _viewModelListeners: Set<(vm: ConnectionViewModel) => void> = new Set();
-  private _currentViewModel: ConnectionViewModel;
 
   constructor(options: PeerConnectionFSMOptions) {
     this.remoteAgent = options.remoteAgent;
@@ -213,7 +212,6 @@ export class PeerConnectionFSM {
     this._createPeerConnection = options.createPeerConnection;
     this._onPeerCreated = options.onPeerCreated;
     this._logger = options.logger ?? NOOP_LOGGER;
-    this._currentViewModel = createIdleViewModel();
   }
 
   // ---------------------------------------------------------------------------
@@ -399,7 +397,7 @@ export class PeerConnectionFSM {
   }
 
   /** Remove a local media stream */
-  removeLocalStream(stream: MediaStream): void {
+  removeLocalStream(_stream: MediaStream): void {
     this._localStream = null;
     if (this._destroyed || !this._peer) return;
     for (const sender of this._peer.getSenders()) {
@@ -1498,7 +1496,6 @@ export class PeerConnectionFSM {
       healthy: this._state === 'connected' && this._iceConnected && this._dtlsConnected,
       dataChannelReady: this._state === 'connected' && this._dataChannelOpen,
     };
-    this._currentViewModel = vm;
     return vm;
   }
 

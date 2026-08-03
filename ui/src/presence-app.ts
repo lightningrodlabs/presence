@@ -967,7 +967,7 @@ export class PresenceApp extends LitElement {
           clonedCell => html`
             <private-room-card
               .clonedCell=${clonedCell}
-              @request-open-room=${async (e: CustomEvent) => {
+              @request-open-room=${async () => {
                 try {
                   await (this._weaveClient as any).openAsset(
                     {

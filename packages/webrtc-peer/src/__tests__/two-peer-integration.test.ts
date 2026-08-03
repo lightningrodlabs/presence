@@ -13,12 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ConnectionManager } from '../connection-manager';
 import type { FSMTransitionEntry } from '../types';
-import { DefaultReconnectPolicy } from '../reconnect-policy';
-import {
-  MockRTCPeerConnection,
-  FakeSignalingChannel,
-  createMockStream,
-} from './test-helpers';
+import { MockRTCPeerConnection, FakeSignalingChannel } from './test-helpers';
 
 type PeerContext = {
   manager: ConnectionManager;
@@ -100,7 +95,7 @@ describe('Two-Peer Integration', () => {
     });
 
     it('3. view models reflect connection state', () => {
-      const { peerA, peerB } = createTestPair();
+      const { peerA } = createTestPair();
 
       peerA.manager.ensureConnection('agent-bbb');
 
@@ -129,7 +124,7 @@ describe('Two-Peer Integration', () => {
     });
 
     it('5. polite peer (lower pubkey) has role correctly assigned', () => {
-      const { peerA, peerB } = createTestPair();
+      const { peerA } = createTestPair();
 
       // agent-aaa < agent-bbb, so A is polite
       peerA.manager.ensureConnection('agent-bbb');
@@ -272,7 +267,7 @@ describe('Two-Peer Integration', () => {
     it('28. peer joins while others have existing connections', async () => {
       const channel = new FakeSignalingChannel();
       const peerA = createPeer('agent-aaa', channel);
-      const peerB = createPeer('agent-bbb', channel);
+      createPeer('agent-bbb', channel);
 
       // A and B connect
       peerA.manager.ensureConnection('agent-bbb');

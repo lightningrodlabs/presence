@@ -4,7 +4,7 @@ import type { PeerConnectionFSMOptions } from '../peer-connection-fsm';
 import { DefaultReconnectPolicy } from '../reconnect-policy';
 import { DEFAULT_CONFIG } from '../types';
 import type { ConnectionPhase, EstablishmentTimeline, FSMTransitionEntry } from '../types';
-import { MockRTCPeerConnection, createMockStream, createMockTrack } from './test-helpers';
+import { MockRTCPeerConnection, createMockStream } from './test-helpers';
 
 function createFSM(overrides: Partial<PeerConnectionFSMOptions> = {}) {
   const transitionLog: FSMTransitionEntry[] = [];

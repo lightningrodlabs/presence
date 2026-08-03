@@ -8,7 +8,7 @@ import {
   writeLocalStorage,
   writeSessionStorage,
 } from './utils';
-import { PongMetaData, PongMetaDataV1, StreamAndTrackInfo } from './types';
+import { PongMetaDataV1, StreamAndTrackInfo } from './types';
 
 declare global {
   interface Window {
