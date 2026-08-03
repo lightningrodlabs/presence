@@ -72,6 +72,7 @@ import { exportLogs, clearAllLogs } from './logging';
 import { downloadJson, formattedDate } from './utils';
 import { fetchCloudflareTurnCredentials } from './cloudflare-turn';
 import { DescendentRoom, weaveClientContext } from './types';
+import { systemClock } from './clock';
 import {
   PassiveParticipant,
   PassivePresenceTracker,
@@ -272,7 +273,7 @@ export class PresenceApp extends LitElement {
   get _cfTurnValid(): boolean {
     return (
       !!window.localStorage.getItem('cfTurnUrl') &&
-      this._cfTurnExpiry > Date.now()
+      this._cfTurnExpiry > systemClock.now()
     );
   }
 
@@ -305,7 +306,7 @@ export class PresenceApp extends LitElement {
       window.localStorage.setItem('cfTurnUsername', creds.username);
       window.localStorage.setItem('cfTurnCredential', creds.credential);
 
-      const expiry = Date.now() + creds.ttl * 1000;
+      const expiry = systemClock.now() + creds.ttl * 1000;
       window.localStorage.setItem('cfTurnExpiry', String(expiry));
       this._cfTurnExpiry = expiry;
       this._cfTurnStatus = {
@@ -352,7 +353,7 @@ export class PresenceApp extends LitElement {
     if (!this._cfTurnConfigured || !this._cfTurnExpiry) return;
     const delay = Math.max(
       10_000,
-      this._cfTurnExpiry - Date.now() - PresenceApp.CF_TURN_REFRESH_BUFFER_MS
+      this._cfTurnExpiry - systemClock.now() - PresenceApp.CF_TURN_REFRESH_BUFFER_MS
     );
     this._cfTurnRefreshTimer = window.setTimeout(
       () => this._refreshCloudflareTurn(),
@@ -391,7 +392,7 @@ export class PresenceApp extends LitElement {
     if (
       !hasStoredUrl ||
       !this._cfTurnExpiry ||
-      this._cfTurnExpiry - Date.now() <= PresenceApp.CF_TURN_REFRESH_BUFFER_MS
+      this._cfTurnExpiry - systemClock.now() <= PresenceApp.CF_TURN_REFRESH_BUFFER_MS
     ) {
       void this._refreshCloudflareTurn();
     } else {
@@ -400,7 +401,7 @@ export class PresenceApp extends LitElement {
   }
 
   async firstUpdated() {
-    const start = Date.now();
+    const start = systemClock.now();
     // Provision/refresh Cloudflare TURN credentials on load if configured.
     this._ensureCloudflareTurn();
     if ((import.meta as any).env.DEV) {
@@ -535,12 +536,12 @@ export class PresenceApp extends LitElement {
 
     this._provisionedCell = cellTypes.provisioned;
 
-    const loadFinished = Date.now();
+    const loadFinished = systemClock.now();
     const timeElapsed = loadFinished - start;
     if (timeElapsed > 3000) {
       this._pageView = PageView.Home;
     } else {
-      setTimeout(() => {
+      systemClock.setTimeout(() => {
         this._pageView = PageView.Home;
       }, 3000 - timeElapsed);
     }
@@ -692,7 +693,7 @@ export class PresenceApp extends LitElement {
 
   notifyError(msg: string) {
     this._displayError = msg;
-    setTimeout(() => {
+    systemClock.setTimeout(() => {
       this._displayError = undefined;
     }, 4000);
   }
@@ -1357,7 +1358,7 @@ export class PresenceApp extends LitElement {
             @click=${() => {
               clearAllLogs();
               this._logCleared = true;
-              setTimeout(() => { this._logCleared = false; }, 2000);
+              systemClock.setTimeout(() => { this._logCleared = false; }, 2000);
             }}
           >
             ${this._logCleared ? 'Cleared' : 'Clear Logs'}
@@ -1453,7 +1454,7 @@ export class PresenceApp extends LitElement {
                 @click=${async () => {
                   this._refreshing = true;
                   await this.updateRoomLists();
-                  setTimeout(() => {
+                  systemClock.setTimeout(() => {
                     this._refreshing = false;
                   }, 200);
                 }}

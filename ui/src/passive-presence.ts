@@ -4,7 +4,7 @@
  *
  * Consumers: the lobby room cards (`lobby/room-online-agents.ts`) and the
  * home screen's main-room list (`presence-app.ts`). Replaces the two
- * hand-rolled copies of this model (each with its own `Date.now()` and bare
+ * hand-rolled copies of this model (each on ambient clock reads with bare
  * `10000` literals) found by the 2026-08 retro — `MAINTAINABILITY_ASSESSMENT.md`
  * §7.4 item 2. A third copy is the parallel-path move working agreement 1
  * forbids: extend this one.

@@ -33,6 +33,7 @@ import type {
   LastSeenBucket,
   PeerLinkSnapshot,
 } from './types';
+import { STALE_CYCLES_REFRESH_THRESHOLD } from './transport/track-health-policy';
 
 /** The `_openConnections` fields these decisions read. Deliberately narrow. */
 export type LinkSlot = {
@@ -80,8 +81,13 @@ export function decideAudioLink(s: AudioLinkInputs): AudioLinkState {
   // Active flow takes precedence over everything else — including the
   // reachability veto below. If audio is actually arriving, the link is
   // working regardless of any stale intent, status flag, or pong outage.
+  // The cycle bound is track-health's: one threshold for "inbound audio is
+  // cycle-stale", shared with decideTrackRefresh (a bare `2` here silently
+  // duplicated it until the 2026-08 retro — working agreement 2).
   const webrtcAudioLive =
-    !!s.slot?.connected && !!s.slot?.audio && s.audioStaleCycles < 2;
+    !!s.slot?.connected &&
+    !!s.slot?.audio &&
+    s.audioStaleCycles < STALE_CYCLES_REFRESH_THRESHOLD;
   if (webrtcAudioLive) return 'webrtc';
 
   const signalsLive =
