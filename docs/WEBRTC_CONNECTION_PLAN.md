@@ -1,5 +1,7 @@
 # WebRTC connection lifecycle: situations, measured data, code gaps, and plan
 
+**Status: HISTORICAL (2026-08-03).** This document drifted false twice — corrected against code in Phase 0, found wrong again by the retro (`MAINTAINABILITY_ASSESSMENT.md` §7.3): it describes the deleted auto-flip machinery as live, poses an open question both sides of which were deleted in Phase 3, and says `StreamsStore` cannot be instantiated under vitest (false since Phase 2). A document that needs re-correction every few phases argues for its own demotion, so it is demoted rather than corrected a third time. Current authorities: the code, `CLAUDE.md` "True today", and `MAINTAINABILITY_ASSESSMENT.md`. Read what follows as a snapshot of the 2026-07 stack, useful for its measured data and rationale, unreliable on current mechanism.
+
 Scope: the WebRTC media transport for Presence — the
 `@lightningrodlabs/webrtc-peer` FSM package, its `FsmTransport` adapter, and the
 `StreamsStore` carrier orchestration. Audio/video correctness on lossy and

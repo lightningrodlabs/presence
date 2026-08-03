@@ -4,7 +4,7 @@ The module system is built and shipping. Panes are decoupled from WebRTC (driven
 
 The "Share-type Module Abstraction" section below is the design that produced them, kept for its rationale; its four implementation phases all landed. The genuinely open items are the two at the end of this document, plus one defect worth knowing about before you touch the share path:
 
-> **`_screenShareStreams` is permanently empty.** It is declared at `ui/src/streams-store.ts:3002` and read at `ui/src/room/room-view.ts:782`, but **nothing ever writes to it**. The design below has screen share's `renderShare` resolving its stream from that record at render time — that resolution cannot work. Whatever currently puts a screen share on screen is doing it by another route; find that route before extending this one.
+> **`_screenShareStreams` is wired since Phase 3** (correction 2026-08-03 — the retro found this note still asserting the pre-Phase-3 defect). It is written in `StreamsStore._handleScreenShareRemoteStream`, cleared on close/error/leave/disconnect, and read by room-view's share pane; the render-time resolution the design below relies on works. The original defect (declared, read, written nowhere — permanently `{}`) is recorded in `MAINTAINABILITY_ASSESSMENT.md` §3.9 and its unscheduled table.
 
 ## What's Built
 

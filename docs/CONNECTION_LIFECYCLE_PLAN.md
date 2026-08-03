@@ -1,5 +1,7 @@
 # Connection lifecycle & diagnostics
 
+**Status: HISTORICAL (2026-08-03).** The retro (`MAINTAINABILITY_ASSESSMENT.md` §7.3) found this document asserting two fixed defects as "Still outstanding … confirmed 2026-07-27": `_pendingInits` HAS a TTL sweep (`pruneExpiredPending` / `PENDING_HANDSHAKE_TTL_MS` in `ui/src/streams-store.ts`, Phase 2 item 7 — and `_pendingAccepts` no longer exists at all, deleted in Phase 3), and `ConnectionManager` DOES prune on `failed` (`packages/webrtc-peer/src/connection-manager.ts`, Phase 1 item 2, covered by `connection-manager.test.ts`). Do not re-fix anything this document claims is open. Kept for its forensic record and the Phase-4B warning block, which remains the repo's best specimen of a test-suite conclusion that dismissed field evidence and was wrong.
+
 Started 2026-05-15 from forensic analysis of the merged logs
 `Presence_merged_0.14.7_2026-5-13` and `2026-5-15`, plus a reported "peer dropped
 from my screen mid-call" incident. Most of it shipped; this records what it
