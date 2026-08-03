@@ -54,3 +54,96 @@ export function statsForPeer(snap: PeerStatsSnapshot): PeerStats {
     lossPercent: stats?.lossPercent ?? null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Flow glyph (Round 3 item 5)
+// ---------------------------------------------------------------------------
+
+export type FlowGlyph = 'both' | 'tx' | 'rx' | 'idle' | 'muted';
+
+export type FlowGlyphInputs = {
+  /** The active carrier, from `statsForPeer` — never re-derived. */
+  carrier: 'webrtc' | 'signals';
+  now: number;
+  /**
+   * The media-flowing predicate's window (`MEDIA_LIVE_WINDOW_MS`) — the
+   * same window `isMediaLive` applies to signals frames. One window per
+   * predicate (working agreement 2).
+   */
+  windowMs: number;
+  /** Signals arm: is the local voice encoder running (tx gate)? */
+  encoderRunning: boolean;
+  /** Signals arm: last frame sent/received stamps, on the store clock. */
+  lastSentMs: number | undefined;
+  lastRecvMs: number | undefined;
+  /**
+   * WebRTC arm: the slot's `connected` claim (ICE + DTLS up) — the
+   * WebRTC half of the media-flowing predicate (`isMediaLive` treats
+   * `webrtcConnected` as flow; there are no per-frame stamps on this
+   * carrier).
+   */
+  webrtcConnected: boolean;
+  /** WebRTC arm: a remote audio track has arrived on the connection. */
+  webrtcAudioIn: boolean;
+  /** The audio-link roll-up says the peer is muted (`decideAudioLink`). */
+  linkMuted: boolean;
+};
+
+export type FlowGlyphDecision = {
+  flow: FlowGlyph;
+  reason:
+    | 'signals-frames'
+    | 'signals-window-empty'
+    | 'webrtc-flowing'
+    | 'webrtc-not-flowing'
+    | 'muted-overrides-idle';
+};
+
+/**
+ * The tx/rx flow glyph for the stats panel — extracted from
+ * `peer-stats-panel._tick`, where the two carrier arms answered
+ * different questions under a comment claiming they were the same
+ * predicate: the signals arm windowed frame stamps on
+ * `MEDIA_LIVE_WINDOW_MS` while the WebRTC arm read raw slot fields with
+ * no window and no `connected` requirement on rx.
+ *
+ * Both arms now answer via the media-flowing predicate's rules
+ * (`isMediaLive`): signals flow is frame stamps inside `windowMs`;
+ * WebRTC flow is keyed on `connected` — declared change: with
+ * `connected` false, a leftover `audio` flag on the slot can no longer
+ * paint an rx glyph.
+ *
+ * The muted glyph wins over idle but never over actual flow.
+ *
+ * Constrains `peer-stats-panel.ts:_tick`.
+ */
+export function decideFlowGlyph(input: FlowGlyphInputs): FlowGlyphDecision {
+  let tx: boolean;
+  let rx: boolean;
+  if (input.carrier === 'signals') {
+    tx =
+      input.encoderRunning &&
+      input.lastSentMs !== undefined &&
+      input.now - input.lastSentMs < input.windowMs;
+    rx =
+      input.lastRecvMs !== undefined &&
+      input.now - input.lastRecvMs < input.windowMs;
+  } else {
+    tx = input.webrtcConnected;
+    rx = input.webrtcConnected && input.webrtcAudioIn;
+  }
+  const flow: FlowGlyph = tx && rx ? 'both' : tx ? 'tx' : rx ? 'rx' : 'idle';
+  if (flow === 'idle' && input.linkMuted) {
+    return { flow: 'muted', reason: 'muted-overrides-idle' };
+  }
+  if (input.carrier === 'signals') {
+    return {
+      flow,
+      reason: flow === 'idle' ? 'signals-window-empty' : 'signals-frames',
+    };
+  }
+  return {
+    flow,
+    reason: flow === 'idle' ? 'webrtc-not-flowing' : 'webrtc-flowing',
+  };
+}
