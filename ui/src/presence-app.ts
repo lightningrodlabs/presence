@@ -1338,6 +1338,12 @@ export class PresenceApp extends LitElement {
               }}
               style="width: 100%; box-sizing: border-box; padding: 6px 10px; background: #2a2f4e; color: #c3c9eb; border: 1px solid #444a6e; border-radius: 4px; font-size: 14px;"
             />
+            <span
+              class="secondary-font"
+              style="color: #888ea8; font-size: 12px; margin-top: 4px; display: block;"
+              >Applies to connections established after the change; existing
+              connections keep their current servers.</span
+            >
           </div>
         </div>
         ${this.renderCloudflareTurnSection()}
@@ -1402,7 +1408,8 @@ export class PresenceApp extends LitElement {
                 <span
                   class="secondary-font"
                   style="color: #888ea8; font-size: 12px; margin-top: 4px; display: block;"
-                  >Random 0-N ms delay per signal. For testing only.</span
+                  >Random 0-N ms delay per signal. For testing only.
+                  Takes effect on the next room join.</span
                 >
               </div>
             </div>
