@@ -72,6 +72,10 @@ import { exportLogs, clearAllLogs } from './logging';
 import { downloadJson, formattedDate } from './utils';
 import { fetchCloudflareTurnCredentials } from './cloudflare-turn';
 import { DescendentRoom, weaveClientContext } from './types';
+import {
+  PassiveParticipant,
+  PassivePresenceTracker,
+} from './passive-presence';
 import { RoomStore } from './room/room-store';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
 
@@ -156,13 +160,11 @@ export class PresenceApp extends LitElement {
   _myAccountabilities: MossAccountability[] | undefined;
 
   @state()
-  _activeMainRoomParticipants: {
-    pubkey: AgentPubKey;
-    lastSeen: number;
-  }[] = [];
+  _activeMainRoomParticipants: PassiveParticipant[] = [];
 
-  @state()
-  _clearActiveParticipantsInterval: number | undefined;
+  private _mainRoomPresence = new PassivePresenceTracker(list => {
+    this._activeMainRoomParticipants = list;
+  });
 
   @state()
   _refreshing = false;
@@ -242,8 +244,7 @@ export class PresenceApp extends LitElement {
   _unsubscribe: (() => void) | undefined;
 
   disconnectedCallback(): void {
-    if (this._clearActiveParticipantsInterval)
-      window.clearInterval(this._clearActiveParticipantsInterval);
+    this._mainRoomPresence.stop();
     if (this._unsubscribe) this._unsubscribe();
     if (this._cfTurnRefreshTimer) window.clearTimeout(this._cfTurnRefreshTimer);
     // The super call is what runs hostDisconnected on the reactive
@@ -544,34 +545,12 @@ export class PresenceApp extends LitElement {
       }, 3000 - timeElapsed);
     }
 
-    this._clearActiveParticipantsInterval = window.setInterval(() => {
-      const now = Date.now();
-      // If an agent hasn't sent a ping for more than 10 seconds, assume that they are no longer in the room
-      this._activeMainRoomParticipants =
-        this._activeMainRoomParticipants.filter(
-          info => now - info.lastSeen < 10000
-        );
-    }, 10000);
-
-    this._unsubscribe = this._mainRoomStore.client.onSignal(async signal => {
-      if (signal.type === 'Message' && signal.msg_type === 'PingUi') {
-        // This is the case if the other agent is in the main room
-        const newOnlineAgentsList = this._activeMainRoomParticipants.filter(
-          info => info.pubkey.toString() !== signal.from_agent.toString()
-        );
-        newOnlineAgentsList.push({
-          pubkey: signal.from_agent,
-          lastSeen: Date.now(),
-        });
-        this._activeMainRoomParticipants = newOnlineAgentsList;
-      }
-      if (signal.type === 'Message' && signal.msg_type === 'LeaveUi') {
-        this._activeMainRoomParticipants =
-          this._activeMainRoomParticipants.filter(
-            info => info.pubkey.toString() !== signal.from_agent.toString()
-          );
-      }
-    });
+    // A PingUi from an agent means they are in the main room; the tracker
+    // is the shared passive-presence authority (see passive-presence.ts).
+    this._mainRoomPresence.start();
+    this._unsubscribe = this._mainRoomStore.client.onSignal(signal =>
+      this._mainRoomPresence.handleSignal(signal)
+    );
   }
 
   /**
