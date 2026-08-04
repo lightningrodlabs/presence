@@ -118,6 +118,31 @@ describe('RoomView split-drag listeners (Round 3 item 4b(2))', () => {
     expect(el._isResizing).toBe(false);
     expect(el._releaseResizeListeners).toBeUndefined();
   });
+
+  it('re-entry (a second start mid-drag) releases the first set — add/remove counts balance (review F3)', () => {
+    const el = makeRoomView();
+    const added = vi.spyOn(document, 'addEventListener');
+    const removed = vi.spyOn(document, 'removeEventListener');
+    const dragTypes = new Set(['mousemove', 'mouseup', 'touchmove', 'touchend']);
+    const countDrag = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.filter(c => dragTypes.has(c[0] as string)).length;
+
+    try {
+      // Two starts (second finger's touchstart mid-drag), then teardown.
+      el._onResizeStart(new MouseEvent('mousedown'));
+      el._onResizeStart(new MouseEvent('mousedown'));
+      el.disconnectedCallback();
+      // 8 adds (2 starts × 4 listeners) must be matched by 8 removes
+      // (4 on re-entry + 4 on disconnect). Pre-fix the re-entry
+      // overwrote the release closure and only 4 were ever removed —
+      // the first drag's listeners were orphaned permanently.
+      expect(countDrag(added)).toBe(8);
+      expect(countDrag(removed)).toBe(countDrag(added));
+    } finally {
+      added.mockRestore();
+      removed.mockRestore();
+    }
+  });
 });
 
 describe('PresenceApp room lock (Round 3 item 4b(3))', () => {
