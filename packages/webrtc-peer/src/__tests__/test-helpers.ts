@@ -409,6 +409,12 @@ export class MockRTCDataChannel {
     this._fireEvent('message', { data });
   }
 
+  /** Test helper: simulate a channel error (shape matches the browser's
+   *  RTCErrorEvent enough for RTCPeer's `event.error || event` read). */
+  simulateError(error: Error) {
+    this._fireEvent('error', { error });
+  }
+
   private _fireEvent(event: string, detail?: any) {
     const eventObj = detail ? { ...detail, type: event } : { type: event };
     const propHandler = this._propHandlers.get(event);

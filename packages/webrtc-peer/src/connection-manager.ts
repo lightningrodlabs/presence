@@ -587,6 +587,22 @@ export class ConnectionManager {
       });
     });
 
+    // Forward FSM error events. These died here silently before —
+    // negotiation exceptions (setLocalDescription/setRemoteDescription
+    // throwing mid-handshake) and data-channel errors were emitted by
+    // RTCPeer, re-emitted by the FSM, and dropped, so the root-cause
+    // text never reached any log. Forwarded verbatim as forensics: the
+    // FSM owns recovery, and terminality is still communicated by
+    // phase (`failed`), never by this event.
+    fsm.on('error', (event) => {
+      this._emitManagerEvent({
+        type: 'error',
+        remoteAgent,
+        connectionId,
+        data: event.data,
+      });
+    });
+
     return fsm;
   }
 

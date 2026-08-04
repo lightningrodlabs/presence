@@ -3,56 +3,58 @@
  * connection-teardown cleanup table.
  *
  * Before this file, the close-path cleanup set was stated five times and
- * had diverged: `_handleMediaError` skipped seven of `_handleMediaClosed`'s
- * cleanups (`_lastQualityBucket`, `_lastWebrtcExitReason`, `_pendingInits`,
- * `_lastBytesReceived`, `_staleCycles`, `_reconcileAttemptCount`,
- * `_iceDisconnectedAt`), never recorded `_lastDisconnectTime`, and never
- * emitted the `CarrierSwitch` forensic event; `_handleScreenShareError`
- * fell through its no-slot guard and re-fired
- * `peer-screen-share-disconnected` into the view on every duplicate error;
- * and the superseded-close arm leaked `_iceTimings` per superseded
- * attempt. `closeCleanupPlan` states the set once, per
+ * had diverged (the superseded-close arm leaked `_iceTimings` per
+ * superseded attempt; the two error handlers hand-rolled divergent
+ * guards). `closeCleanupPlan` states the set once, per
  * (target × via × outcome) cell; `StreamsStore._applyCloseCleanup` is the
- * single executor.
+ * single executor. This file also absorbs Phase 2b's `staleTeardownPlan`
+ * (deleted — one authority per concept): its two rows are the
+ * `stale-teardown` cells below.
  *
- * This file also absorbs Phase 2b's `staleTeardownPlan` (deleted — one
- * authority per concept): its two rows are the `stale-teardown` cells
- * below.
+ * ## Errors are NOT a teardown path (amended 2026-08-04, review F2)
+ *
+ * The first cut of this table carried `error-event` rows performing the
+ * full close set. Review F2 established that transport `error` events
+ * had NO production producer — `ConnectionManager` had dropped FSM error
+ * events since the FSM carrier landed (SimplePeer's `peer.on('error')`,
+ * for which the store's error-teardown was written, was the last real
+ * producer, deleted in Phase 3). Under the FSM the contract is
+ * different: errors are SYMPTOMS (a negotiation exception the FSM will
+ * retry, a data-channel error its watchdog recovers) and the give-up
+ * VERDICT arrives as the `failed` phase. Wiring errors to teardown would
+ * have re-created the dual-recovery-controller race (§3.4). So the
+ * error path is forensic-only — the manager now forwards FSM errors, the
+ * transport emits them (minus blocked-transition records, declared in
+ * `fsm-transport.ts`), and the store handlers log `FsmError` /
+ * `SupersededError` and touch NOTHING else. The error rows were deleted
+ * from this table; the log-only invariant is pinned in
+ * `streams-store-wiring.test.ts`.
  *
  * ## The transport-close ordering field
  *
  * Every transport's `closeConnection` synchronously emits a final
  * `closed` event (the Phase 2b emit-invariant, pinned in
  * `transport-emit-invariant.test.ts`). That makes ordering part of the
- * cleanup semantics, so the table declares it instead of leaving it to
- * call-site accident:
+ * cleanup semantics, so the table declares it: `'before-slot-clear'`
+ * (stale-teardown and peer-leave) closes the transport FIRST, so when a
+ * live connection object exists the nested `closed` event runs the full
+ * `close-event/live` row synchronously — that is where the
+ * FsmClose/CarrierSwitch forensics and `peer-disconnected` come from on
+ * these paths. The row's own clears are the residue that must ALSO hold
+ * when there is no connection object behind the slot (the vanished-pc
+ * case, where `closeConnection` emits nothing). `close-event` rows never
+ * close the transport (it just closed).
  *
- * - `'after-slot-clear'` (error paths): the slot is cleared FIRST, so the
- *   nested `closed` event hits the no-slot guard and the error row's own
- *   cleanup set is the complete story.
- * - `'before-slot-clear'` (stale-teardown and peer-leave): the transport
- *   is closed FIRST, so when a live connection object exists the nested
- *   `closed` event runs the full `close-event/live` row synchronously —
- *   that is where the FsmClose/CarrierSwitch forensics and
- *   `peer-disconnected` come from on these paths. The row's own clears
- *   are the residue that must ALSO hold when there is no connection
- *   object behind the slot (the vanished-pc case, where `closeConnection`
- *   emits nothing).
- *
- * Declared behavior changes carried by this table (§8 item 1):
- *  (a) a screen-share error with no matching slot no longer fires
- *      `peer-screen-share-disconnected` (the duplicate-error re-fire was
- *      the divergence, not the spec);
- *  (b) the media error path performs the full close-path cleanup set,
- *      including the `CarrierSwitch webrtc->signals` forensic event;
- *  (c) same-family leak fixes: superseded close/error arms clear the
- *      event connection's `_iceTimings` entry, and the outgoing
- *      screen-share error path clears `_screenShareIceDisconnectedAt`
- *      like its close path does.
+ * Declared behavior changes carried by this table (§8 item 1 as
+ * amended): the superseded-close arm now clears the event connection's
+ * `_iceTimings` entry (the leak dies as a table row). The original
+ * item's error-path behavior claims were retracted as field claims —
+ * they described a path with no producer (see the amendment in §8
+ * item 1).
  *
  * Constrains `streams-store.ts:_applyCloseCleanup` and its callers
- * (`_handleMediaClosed`, `_handleMediaError`, `_handleScreenShareClosed`,
- * `_handleScreenShareError`, `_applyStaleTeardown`, `handleLeaveUi`).
+ * (`_handleMediaClosed`, `_handleScreenShareClosed`,
+ * `_applyStaleTeardown`, `handleLeaveUi`).
  */
 
 /** Which connection family is being torn down. */
@@ -61,10 +63,10 @@ export type CloseCleanupTarget =
   | 'screen-share-outgoing'
   | 'screen-share-incoming';
 
-/** Which path is tearing it down. */
+/** Which path is tearing it down. (No `error-event`: errors are
+ *  forensic-only since the F2 amendment — see the header.) */
 export type CloseCleanupVia =
   | 'close-event'
-  | 'error-event'
   | 'stale-teardown'
   | 'peer-leave';
 
@@ -90,12 +92,13 @@ export type CloseCleanupContext = {
 export type CloseCleanupPlan = {
   /** Row tag, for logs and table-test readability. */
   reason: string;
-  /** Log the Superseded{Close,Error} forensic event (handler-side — the
-   *  event name and detail differ per caller). */
+  /** Log the SupersededClose forensic event (handler-side). The log-only
+   *  error handlers log SupersededError themselves — they never consult
+   *  this table. */
   logSuperseded: boolean;
   /** `transport.closeConnection` and when, relative to the slot clear.
    *  See the header for why the ordering is semantics, not style. */
-  closeTransport: 'none' | 'before-slot-clear' | 'after-slot-clear';
+  closeTransport: 'none' | 'before-slot-clear';
   /** Delete the target's connection slot
    *  (`_openConnections` / `_screenShareConnections{Outgoing,Incoming}`). */
   clearSlot: boolean;
@@ -159,8 +162,7 @@ const NONE: Omit<CloseCleanupPlan, 'reason'> = {
 };
 
 /** The full media close set — the one authority for "what a media
- *  connection's death must clean up". Close and error rows share it;
- *  error additionally drives the transport close. */
+ *  connection's death must clean up". */
 const MEDIA_FULL: Omit<CloseCleanupPlan, 'reason' | 'closeTransport'> = {
   ...NONE,
   clearSlot: true,
@@ -198,19 +200,6 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
               return { reason: 'media-close-superseded', ...NONE, logSuperseded: true, clearIceTiming: true };
             case 'no-slot':
               return { reason: 'media-close-duplicate', ...NONE, clearIceTiming: true };
-          }
-          break;
-        case 'error-event':
-          switch (ctx.outcome) {
-            case 'live':
-              // Declared change (b): the error path performs the full
-              // close set. It closes the transport AFTER the slot clear
-              // so the nested `closed` hits the no-slot guard.
-              return { reason: 'media-error', ...MEDIA_FULL, closeTransport: 'after-slot-clear' };
-            case 'superseded':
-              return { reason: 'media-error-superseded', ...NONE, logSuperseded: true, clearIceTiming: true };
-            case 'no-slot':
-              return { reason: 'media-error-duplicate', ...NONE, clearIceTiming: true };
           }
           break;
         case 'stale-teardown':
@@ -285,31 +274,6 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
               return { reason: 'screen-out-close-guarded', ...NONE };
           }
           break;
-        case 'error-event':
-          switch (ctx.outcome) {
-            case 'live':
-              return {
-                reason: 'screen-out-error',
-                ...NONE,
-                closeTransport: 'after-slot-clear',
-                clearSlot: true,
-                clearScreenShareIceDisconnectedAt: true,
-                setDisconnectedStatus: 'screen-share',
-              };
-            case 'superseded':
-              return { reason: 'screen-out-error-superseded', ...NONE, logSuperseded: true };
-            case 'no-slot':
-              // Duplicate error: still drive the transport close (no-op if
-              // already closed, tears down an orphan FSM otherwise) but
-              // nothing else — no view event, no slot to clear.
-              return {
-                reason: 'screen-out-error-duplicate',
-                ...NONE,
-                closeTransport: 'after-slot-clear',
-                setDisconnectedStatus: 'screen-share',
-              };
-          }
-          break;
         case 'stale-teardown':
           switch (ctx.outcome) {
             case 'live':
@@ -365,33 +329,6 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
             case 'superseded':
             case 'no-slot':
               return { reason: 'screen-in-close-guarded', ...NONE };
-          }
-          break;
-        case 'error-event':
-          switch (ctx.outcome) {
-            case 'live':
-              return {
-                reason: 'screen-in-error',
-                ...NONE,
-                closeTransport: 'after-slot-clear',
-                clearSlot: true,
-                clearScreenShareStream: true,
-                fireEvent: 'peer-screen-share-disconnected',
-                setDisconnectedStatus: 'screen-share',
-              };
-            case 'superseded':
-              return { reason: 'screen-in-error-superseded', ...NONE, logSuperseded: true };
-            case 'no-slot':
-              // Declared change (a): the duplicate-error re-fire of
-              // `peer-screen-share-disconnected` is gone. A stale stream
-              // entry is still dropped.
-              return {
-                reason: 'screen-in-error-duplicate',
-                ...NONE,
-                closeTransport: 'after-slot-clear',
-                clearScreenShareStream: true,
-                setDisconnectedStatus: 'screen-share',
-              };
           }
           break;
         case 'stale-teardown':

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`ConnectionManager` now forwards FSM `error` events** (`ManagerEventType`
+  gains `'error'`). They were dropped silently before: negotiation exceptions
+  (`setLocalDescription`/`setRemoteDescription` throwing mid-handshake) and
+  data-channel errors were emitted by `RTCPeer`, re-emitted by the FSM, and
+  died at the manager boundary, so their root-cause text never reached any
+  consumer log. Forwarded verbatim as forensics — errors are symptoms, not
+  verdicts; the FSM still owns recovery and terminality is still communicated
+  by the `failed` phase. `data` is either the underlying exception or the
+  `{ blocked: true, ... }` record of a refused transition (which consumers may
+  choose to ignore: blocked transitions are already visible on the
+  `onTransition` stream with a `BLOCKED:` trigger).
+
 - **BREAKING: `TransitionRecorder` removed** (with `TransitionRecorderOptions`).
   Exported since 0.1.0, never constructed by any consumer outside its own test.
   Capture `onTransition` entries yourself if you need a portable record.

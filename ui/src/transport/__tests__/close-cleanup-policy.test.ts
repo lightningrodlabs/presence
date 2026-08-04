@@ -9,7 +9,7 @@ import type {
 } from '../close-cleanup-policy';
 
 /**
- * Round 3 item 1 — every (target × via × outcome) cell answered, the key
+ * Round 3 item 1 (as amended by review F2: errors are forensic-only and have no rows here) — every (target × via × outcome) cell answered, the key
  * rows pinned field-by-field, and cross-row invariants swept over the
  * whole table. The independent restatement below is deliberate: the
  * expected objects are written out, not derived from the policy's own
@@ -24,7 +24,6 @@ const TARGETS: CloseCleanupTarget[] = [
 ];
 const VIAS: CloseCleanupVia[] = [
   'close-event',
-  'error-event',
   'stale-teardown',
   'peer-leave',
 ];
@@ -107,40 +106,29 @@ describe('closeCleanupPlan — the media full close set, pinned field-by-field',
     ).toEqual({ reason: 'media-close', closeTransport: 'none', ...MEDIA_FULL_EXPECTED });
   });
 
-  it('error-event/live performs the SAME full set plus an after-slot-clear transport close (declared change b)', () => {
-    expect(
-      closeCleanupPlan({ target: 'media', via: 'error-event', outcome: 'live' }),
-    ).toEqual({
-      reason: 'media-error',
-      closeTransport: 'after-slot-clear',
-      ...MEDIA_FULL_EXPECTED,
-    });
-  });
 });
 
 describe('closeCleanupPlan — the guard rows', () => {
-  it.each(['close-event', 'error-event'] as const)(
-    'media %s/superseded logs and clears the event connection\'s ice timing, touching nothing else (the _iceTimings leak row)',
-    via => {
-      expect(closeCleanupPlan({ target: 'media', via, outcome: 'superseded' })).toEqual({
-        reason: `media-${via === 'close-event' ? 'close' : 'error'}-superseded`,
-        ...OFF,
-        logSuperseded: true,
-        clearIceTiming: true,
-      });
-    },
-  );
+  it("media close/superseded logs and clears the event connection's ice timing, touching nothing else (the _iceTimings leak row)", () => {
+    expect(
+      closeCleanupPlan({ target: 'media', via: 'close-event', outcome: 'superseded' }),
+    ).toEqual({
+      reason: 'media-close-superseded',
+      ...OFF,
+      logSuperseded: true,
+      clearIceTiming: true,
+    });
+  });
 
-  it.each(['close-event', 'error-event'] as const)(
-    'media %s/no-slot (duplicate) clears only the ice timing',
-    via => {
-      expect(closeCleanupPlan({ target: 'media', via, outcome: 'no-slot' })).toEqual({
-        reason: `media-${via === 'close-event' ? 'close' : 'error'}-duplicate`,
-        ...OFF,
-        clearIceTiming: true,
-      });
-    },
-  );
+  it('media close/no-slot (duplicate) clears only the ice timing', () => {
+    expect(
+      closeCleanupPlan({ target: 'media', via: 'close-event', outcome: 'no-slot' }),
+    ).toEqual({
+      reason: 'media-close-duplicate',
+      ...OFF,
+      clearIceTiming: true,
+    });
+  });
 
   it('screen close guards (superseded and no-slot, both directions) touch nothing', () => {
     for (const target of ['screen-share-outgoing', 'screen-share-incoming'] as const) {
@@ -151,38 +139,6 @@ describe('closeCleanupPlan — the guard rows', () => {
     }
   });
 
-  it('screen error/superseded logs and touches nothing else — a stale error must not tear down the live share', () => {
-    for (const target of ['screen-share-outgoing', 'screen-share-incoming'] as const) {
-      const plan = closeCleanupPlan({ target, via: 'error-event', outcome: 'superseded' });
-      expect(plan).toEqual({ reason: plan.reason, ...OFF, logSuperseded: true });
-    }
-  });
-
-  it('screen-share error with no slot does NOT fire peer-screen-share-disconnected (declared change a)', () => {
-    const incoming = closeCleanupPlan({
-      target: 'screen-share-incoming',
-      via: 'error-event',
-      outcome: 'no-slot',
-    });
-    expect(incoming).toEqual({
-      reason: 'screen-in-error-duplicate',
-      ...OFF,
-      closeTransport: 'after-slot-clear',
-      clearScreenShareStream: true,
-      setDisconnectedStatus: 'screen-share',
-    });
-    const outgoing = closeCleanupPlan({
-      target: 'screen-share-outgoing',
-      via: 'error-event',
-      outcome: 'no-slot',
-    });
-    expect(outgoing).toEqual({
-      reason: 'screen-out-error-duplicate',
-      ...OFF,
-      closeTransport: 'after-slot-clear',
-      setDisconnectedStatus: 'screen-share',
-    });
-  });
 });
 
 describe('closeCleanupPlan — the screen-share live rows', () => {
@@ -192,19 +148,6 @@ describe('closeCleanupPlan — the screen-share live rows', () => {
     ).toEqual({
       reason: 'screen-out-close',
       ...OFF,
-      clearSlot: true,
-      clearScreenShareIceDisconnectedAt: true,
-      setDisconnectedStatus: 'screen-share',
-    });
-  });
-
-  it('outgoing error matches outgoing close plus the transport close (family fix: _screenShareIceDisconnectedAt no longer leaks on the error path)', () => {
-    expect(
-      closeCleanupPlan({ target: 'screen-share-outgoing', via: 'error-event', outcome: 'live' }),
-    ).toEqual({
-      reason: 'screen-out-error',
-      ...OFF,
-      closeTransport: 'after-slot-clear',
       clearSlot: true,
       clearScreenShareIceDisconnectedAt: true,
       setDisconnectedStatus: 'screen-share',
@@ -224,19 +167,6 @@ describe('closeCleanupPlan — the screen-share live rows', () => {
     });
   });
 
-  it('incoming error matches incoming close plus the transport close', () => {
-    expect(
-      closeCleanupPlan({ target: 'screen-share-incoming', via: 'error-event', outcome: 'live' }),
-    ).toEqual({
-      reason: 'screen-in-error',
-      ...OFF,
-      closeTransport: 'after-slot-clear',
-      clearSlot: true,
-      clearScreenShareStream: true,
-      fireEvent: 'peer-screen-share-disconnected',
-      setDisconnectedStatus: 'screen-share',
-    });
-  });
 });
 
 describe('closeCleanupPlan — the stale rows (former staleTeardownPlan, preserved)', () => {
@@ -357,14 +287,11 @@ describe('closeCleanupPlan — cross-table invariants', () => {
     }
   });
 
-  it('close-first (nested full cleanup) is exclusively the stale and leave paths; error paths always clear the slot first', () => {
+  it('close-first (nested full cleanup) is exclusively the stale and leave paths', () => {
     for (const ctx of allCells) {
       const plan = closeCleanupPlan(ctx);
       if (plan.closeTransport === 'before-slot-clear') {
         expect(['stale-teardown', 'peer-leave'], JSON.stringify(ctx)).toContain(ctx.via);
-      }
-      if (plan.closeTransport === 'after-slot-clear') {
-        expect(ctx.via, JSON.stringify(ctx)).toBe('error-event');
       }
       // A close event never re-closes the transport that just closed.
       if (ctx.via === 'close-event') {
