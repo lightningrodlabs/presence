@@ -248,6 +248,11 @@ export class PresenceApp extends LitElement {
     this._mainRoomPresence.stop();
     if (this._unsubscribe) this._unsubscribe();
     if (this._cfTurnRefreshTimer) window.clearTimeout(this._cfTurnRefreshTimer);
+    // Release the room Web Lock and close the BroadcastChannel with its
+    // live onmessage closure — without this a later 'kick' mutates a
+    // detached component and the lock outlives the element (Round 3
+    // item 4b(3)). Idempotent when no lock is held.
+    this._releaseRoomLock();
     // The super call is what runs hostDisconnected on the reactive
     // controllers (profile/lobby StoreSubscribers).
     super.disconnectedCallback();

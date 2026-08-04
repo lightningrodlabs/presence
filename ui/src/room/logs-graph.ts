@@ -134,6 +134,12 @@ export class LogsGraph extends LitElement {
 
   disconnectedCallback(): void {
     this.eventUnsubscribers.forEach(unsubscribe => unsubscribe());
+    // Without the super call Lit never runs hostDisconnected, so the
+    // four @consume controllers on this element outlive it — the retro's
+    // leak #3 verbatim (Round 3 item 4b). Pinned in
+    // logs-graph-teardown.test.ts, which mocks plotly (not this file) so
+    // the pin cannot be hidden by the view-teardown suite's module mock.
+    super.disconnectedCallback();
   }
 
   myStreamTraces(): Data[] {

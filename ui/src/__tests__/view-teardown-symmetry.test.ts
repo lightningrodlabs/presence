@@ -33,6 +33,8 @@ vi.mock('../room/logs-graph', () => ({}));
 
 import '../room/room-view';
 import '../presence-app';
+import '../room/elements/audio-level-meter';
+import '../room/elements/peer-stats-panel';
 import { StreamsStore } from '../streams-store';
 import { PresenceLogger } from '../logging';
 
@@ -91,6 +93,96 @@ describe('PresenceApp.disconnectedCallback (leak 3, second copy)', () => {
     el.addController({ hostDisconnected });
     el.disconnectedCallback();
     expect(hostDisconnected).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('RoomView split-drag listeners (Round 3 item 4b(2))', () => {
+  it('a teardown mid-drag releases the document-level drag listeners', () => {
+    const el = makeRoomView();
+    el._onResizeStart(new MouseEvent('mousedown'));
+    expect(el._isResizing).toBe(true);
+    expect(el._releaseResizeListeners).toBeDefined();
+
+    el.disconnectedCallback();
+    expect(el._releaseResizeListeners).toBeUndefined();
+    // Dispatch probe: with the listeners gone, mouseup no longer reaches
+    // onEnd, so _isResizing stays true — proving removal, not a no-op.
+    document.dispatchEvent(new MouseEvent('mouseup'));
+    expect(el._isResizing).toBe(true);
+  });
+
+  it('negative control: the happy-path mouseup still ends the drag and releases once', () => {
+    const el = makeRoomView();
+    el._onResizeStart(new MouseEvent('mousedown'));
+    document.dispatchEvent(new MouseEvent('mouseup'));
+    expect(el._isResizing).toBe(false);
+    expect(el._releaseResizeListeners).toBeUndefined();
+  });
+
+  it('re-entry (a second start mid-drag) releases the first set — add/remove counts balance (review F3)', () => {
+    const el = makeRoomView();
+    const added = vi.spyOn(document, 'addEventListener');
+    const removed = vi.spyOn(document, 'removeEventListener');
+    const dragTypes = new Set(['mousemove', 'mouseup', 'touchmove', 'touchend']);
+    const countDrag = (spy: { mock: { calls: unknown[][] } }) =>
+      spy.mock.calls.filter(c => dragTypes.has(c[0] as string)).length;
+
+    try {
+      // Two starts (second finger's touchstart mid-drag), then teardown.
+      el._onResizeStart(new MouseEvent('mousedown'));
+      el._onResizeStart(new MouseEvent('mousedown'));
+      el.disconnectedCallback();
+      // 8 adds (2 starts × 4 listeners) must be matched by 8 removes
+      // (4 on re-entry + 4 on disconnect). Pre-fix the re-entry
+      // overwrote the release closure and only 4 were ever removed —
+      // the first drag's listeners were orphaned permanently.
+      expect(countDrag(added)).toBe(8);
+      expect(countDrag(removed)).toBe(countDrag(added));
+    } finally {
+      added.mockRestore();
+      removed.mockRestore();
+    }
+  });
+});
+
+describe('PresenceApp room lock (Round 3 item 4b(3))', () => {
+  it('disconnectedCallback releases the Web Lock and closes the room BroadcastChannel', () => {
+    const el = document.createElement('presence-app') as any;
+    const release = vi.fn();
+    const close = vi.fn();
+    el._roomLockRelease = release;
+    el._roomChannel = { close };
+    el.disconnectedCallback();
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(el._roomLockRelease).toBeUndefined();
+    expect(el._roomChannel).toBeUndefined();
+  });
+});
+
+describe('interval re-arm on Lit DOM reuse (Round 3 item 4b(4))', () => {
+  // repeat() can disconnect and reconnect an element without ever running
+  // firstUpdated again; an interval armed only in firstUpdated stays dead
+  // after reuse. clock.ts/timer.ts/peer-filmstrip.ts already re-arm in
+  // connectedCallback; these pin the two components that did not.
+  const reuseCycle = (tag: string) => {
+    const el = document.createElement(tag) as any;
+    document.body.appendChild(el);
+    expect(el._intervalId, `${tag}: armed on first connect`).toBeTruthy();
+    document.body.removeChild(el);
+    expect(el._intervalId, `${tag}: cleared on disconnect`).toBeFalsy();
+    document.body.appendChild(el);
+    const rearmed = el._intervalId;
+    document.body.removeChild(el);
+    expect(rearmed, `${tag}: re-armed on reconnect (the frozen-meter bug)`).toBeTruthy();
+  };
+
+  it('audio-level-meter re-arms its level poll on reconnect', () => {
+    reuseCycle('audio-level-meter');
+  });
+
+  it('peer-stats-panel re-arms its 1Hz stats poll on reconnect', () => {
+    reuseCycle('peer-stats-panel');
   });
 });
 

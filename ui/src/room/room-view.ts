@@ -806,6 +806,12 @@ export class RoomView extends LitElement {
 
   _onResizeStart = (e: MouseEvent | TouchEvent) => {
     e.preventDefault();
+    // Re-entry guard (review F3): a second start while a drag is live —
+    // e.g. a second finger's touchstart — would otherwise overwrite
+    // `_releaseResizeListeners` and orphan the first drag's four
+    // document-level listeners permanently, the exact shape this fix
+    // family removes. Release the previous set first.
+    this._releaseResizeListeners?.();
     this._isResizing = true;
 
     const onMove = (e: MouseEvent | TouchEvent) => {
@@ -834,10 +840,19 @@ export class RoomView extends LitElement {
 
     const onEnd = () => {
       this._isResizing = false;
+      this._releaseResizeListeners?.();
+    };
+
+    // Retained on the instance so disconnectedCallback can release the
+    // four document-level listeners when the element is torn down
+    // mid-drag — the happy-path onEnd was the only removal before
+    // (leak #1's shape; Round 3 item 4b(2)).
+    this._releaseResizeListeners = () => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onEnd);
       document.removeEventListener('touchmove', onMove);
       document.removeEventListener('touchend', onEnd);
+      this._releaseResizeListeners = undefined;
     };
 
     document.addEventListener('mousemove', onMove);
@@ -846,12 +861,19 @@ export class RoomView extends LitElement {
     document.addEventListener('touchend', onEnd);
   };
 
+  /** Set while a split-ratio drag is live; releasing removes the four
+   *  document-level drag listeners exactly once. */
+  _releaseResizeListeners: (() => void) | undefined;
+
   disconnectedCallback(): void {
     // The ping interval is owned by StreamsStore (cleared in disconnect()
     // below); room-view's own never-assigned handle and its no-op
     // clearInterval are gone (PR #4 F7).
     window.removeEventListener('resize', this._onWindowResize);
     document.removeEventListener('keydown', this.keyDownListener);
+    // A teardown mid-drag must not leave the four document-level drag
+    // listeners attached (item 4b(2)).
+    this._releaseResizeListeners?.();
     if (this._unsubscribe) this._unsubscribe();
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect('room-view-disconnectedCallback');

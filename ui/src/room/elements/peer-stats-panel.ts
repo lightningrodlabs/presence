@@ -121,9 +121,16 @@ export class PeerStatsPanel extends LitElement {
     `;
   }
 
-  firstUpdated() {
-    this._intervalId = window.setInterval(this._tick, 1000);
-    this._tick();
+  connectedCallback() {
+    super.connectedCallback();
+    // Armed here, not in firstUpdated: Lit DOM reuse inside repeat()
+    // reconnects an element without re-running firstUpdated, so the
+    // 1Hz poll stayed dead after reuse and the panel froze (Round 3
+    // item 4b(4); clock.ts/timer.ts/peer-filmstrip.ts are the template).
+    if (!this._intervalId) {
+      this._intervalId = window.setInterval(this._tick, 1000);
+      this._tick();
+    }
   }
 
   disconnectedCallback() {

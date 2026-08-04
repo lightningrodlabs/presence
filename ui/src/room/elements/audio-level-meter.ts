@@ -55,7 +55,20 @@ export class AudioLevelMeter extends LitElement {
 
   firstUpdated() {
     this._brickEls = Array.from(this.shadowRoot!.querySelectorAll('.brick'));
-    this._intervalId = window.setInterval(this._tick, 100);
+  }
+
+  connectedCallback() {
+    super.connectedCallback();
+    // Armed here, not in firstUpdated: Lit DOM reuse inside repeat()
+    // disconnects and reconnects an element without ever running
+    // firstUpdated again, so a firstUpdated-armed interval stayed dead
+    // after reuse and the meter froze (Round 3 item 4b(4) — the inverse
+    // of the teardown leaks; clock.ts/timer.ts/peer-filmstrip.ts are the
+    // template). The guard keeps the first connect + firstUpdated pair
+    // from double-arming.
+    if (!this._intervalId) {
+      this._intervalId = window.setInterval(this._tick, 100);
+    }
   }
 
   disconnectedCallback() {
