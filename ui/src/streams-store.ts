@@ -2309,22 +2309,17 @@ export class StreamsStore {
     return servers;
   }
 
-  setTurnUrl(url: string) {
-    this.deps.storage.local.setItem('turnUrl', url);
-  }
-
-  setTurnUsername(username: string) {
-    this.deps.storage.local.setItem('turnUsername', username);
-  }
-
-  setTurnCredential(credential: string) {
-    this.deps.storage.local.setItem('turnCredential', credential);
-  }
-
-  setSignalDelay(ms: number) {
-    this.signalDelayMs = ms;
-    this.deps.storage.local.setItem('signalDelayMs', String(ms));
-  }
+  // The setTurnUrl/setTurnUsername/setTurnCredential/setSignalDelay
+  // setters were deleted (Round 3 item 6, delete-and-declare): they had
+  // zero callers — the Settings panel writes localStorage directly —
+  // and public methods are invisible to noUnusedLocals. The declared
+  // semantics, stated where the panel renders them (presence-app.ts,
+  // pinned by settings-path.test.ts): TURN settings are live closures
+  // read when a connection is created, so edits apply to NEW
+  // connections; `signalDelayMs` is a start()-time snapshot, so edits
+  // take effect on the next room join. Live-apply of signalDelay
+  // mid-room would need a deliberate re-read path — add it as a
+  // decision, not by resurrecting a setter nothing calls.
 
   onEvent(cb: (ev: StoreEventPayload) => any) {
     this.eventCallback = cb;
