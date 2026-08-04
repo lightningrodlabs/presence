@@ -1,5 +1,12 @@
 # webrtc-peer — size & feature-necessity audit
 
+Status: HISTORICAL (assessment §8 item 7, second drift). The deletions this
+audit recommended are banked: `transition-recorder.ts` and the
+`ConnectionConfig.diagnostics` flag were deleted in Phase 5 (see CLAUDE.md's
+Post-Phase 5 facts and the package CHANGELOG), so the table below asserts
+files and flags that no longer exist. Re-run `wc -l packages/webrtc-peer/src/*.ts`
+for current figures; nothing below describes current code.
+
 Benchmark context: a reviewer evaluating whether to adopt this library flagged its
 size (~3.1k lines) against their own working implementation of ~450 lines
 (Perfect Negotiation + ICE restart, validated over a VPN). This document

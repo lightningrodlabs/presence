@@ -1,9 +1,19 @@
 # Transport Refactor — Phased Plan
 
+Status: HISTORICAL (superseded by CLAUDE.md's carrier facts — "Post-Phase 3
+carrier facts" and after — and `MAINTAINABILITY_ASSESSMENT.md`). This document
+drifted false a second time (assessment §8 item 7): its Phase 3 section
+describes symbols deleted in the 2026-07-29 carrier retirement as live
+(`_maybeAutoFlipImpl`, `setPeerImpl`, `auto-flip-policy.ts`, `decideAutoFlip`,
+`WebrtcImplFlip`, …), says screen share is SimplePeer-only, quotes a test count,
+and asserts the `tests/` workspace has no test files (see `tests/README.md`).
+Do not read any section below as a description of current code. The Phase 4–7
+direction (subscription axis, relay forwarding, SFU, QUIC) is retained as
+design rationale only; if that work is picked up, it gets a fresh plan cut
+against the code as it then stands.
+
 Phases 0–3 shipped and are on `main-0.6`; their entries below record what was
-built and are annotated where the code has since moved on. **Phases 4–7 (the
-subscription axis, relay forwarding, SFU, QUIC) are the live part of this
-document** — they are unbuilt and still describe the intended direction.
+built at the time.
 
 Originally worked in the `../presence-transport-refactor` worktree on branch
 `transport-refactor`, cut from `origin/main` at `c589a6b`. That lineage is dead —
