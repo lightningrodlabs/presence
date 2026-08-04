@@ -807,6 +807,12 @@ export class RoomView extends LitElement {
 
   _onResizeStart = (e: MouseEvent | TouchEvent) => {
     e.preventDefault();
+    // Re-entry guard (review F3): a second start while a drag is live —
+    // e.g. a second finger's touchstart — would otherwise overwrite
+    // `_releaseResizeListeners` and orphan the first drag's four
+    // document-level listeners permanently, the exact shape this fix
+    // family removes. Release the previous set first.
+    this._releaseResizeListeners?.();
     this._isResizing = true;
 
     const onMove = (e: MouseEvent | TouchEvent) => {
