@@ -433,16 +433,13 @@ describe('slot lifecycle applied from transport events (the exit criterion)', ()
   });
 });
 
-describe('the error path through the started store (Round 3 item 1)', () => {
-  it('a live media error performs the full close-path cleanup, and the duplicate is inert', () => {
+describe('the error path is forensic-only (Round 3 item 1 as amended by review F2)', () => {
+  it('THE LOG-ONLY PIN: a media error logs FsmError with the root-cause text and mutates NOTHING', () => {
     const { store, clock, transports, logger, events } = makeStarted();
     const media = transports.media!;
 
     media.emitPhase(peerA, 'conn-1', 'signaling');
     media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
-    // Per-peer bookkeeping the pre-table error path leaked (§8 item 1's
-    // seven-entry skip list — the publicly reachable members stand in
-    // for the set; the table test pins every field).
     store._pendingInits[peerA] = [{ connectionId: 'conn-1', t0: clock.now() }];
     store._iceDisconnectedAt[peerA] = clock.now() - 1000;
 
@@ -450,42 +447,67 @@ describe('the error path through the started store (Round 3 item 1)', () => {
       type: 'error',
       peer: peerA,
       connectionId: 'conn-1',
-      error: new Error('boom'),
+      error: new Error('setRemoteDescription failed: InvalidStateError'),
     });
 
-    // Slot cleared, transport close driven with the error-path reason.
-    expect(get(store._openConnections)[peerA]).toBeUndefined();
-    expect(media.closeCalls.some(c => c.reason === 'error event')).toBe(true);
-    // The full cleanup set ran — including entries the old inline error
-    // path skipped…
-    expect(store._pendingInits[peerA]).toBeUndefined();
-    expect(store._iceDisconnectedAt[peerA]).toBeUndefined();
-    expect(store._lastDisconnectTime[peerA]).toBe(clock.now());
-    // …and the CarrierSwitch downgrade forensic event (declared change
-    // b; the earlier signals->webrtc entry is the connect-time upgrade).
-    const downgrades = () =>
+    // The forensic landed, carrying the exception text that used to be
+    // dropped at the ConnectionManager boundary.
+    const errors = logger.eventsNamed('FsmError');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].detail).toContain('InvalidStateError');
+
+    // …and NOTHING else moved: errors are symptoms; the FSM owns
+    // recovery and the failed/closed phases own teardown.
+    expect(get(store._openConnections)[peerA]).toMatchObject({
+      connectionId: 'conn-1',
+      connected: true,
+    });
+    expect(media.closeCalls).toHaveLength(0);
+    expect(store._pendingInits[peerA]).toHaveLength(1);
+    expect(store._iceDisconnectedAt[peerA]).toBeDefined();
+    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
+    expect(events.filter(e => e.type === 'peer-disconnected')).toHaveLength(0);
+    expect(
       logger
         .eventsNamed('CarrierSwitch')
-        .filter(e => e.detail?.startsWith('webrtc->signals'));
-    expect(logger.eventsNamed('FsmError')).toHaveLength(1);
-    expect(downgrades()).toHaveLength(1);
-    const disconnects = events.filter(e => e.type === 'peer-disconnected');
-    expect(disconnects).toHaveLength(1);
+        .filter(e => e.detail?.startsWith('webrtc->signals')),
+    ).toHaveLength(0);
 
-    // Duplicate error (the transport close already happened): no second
-    // FsmError, no second CarrierSwitch, no re-fired peer-disconnected.
+    // A later error for the same connection is another forensic entry,
+    // still write-free.
     media.emit({
       type: 'error',
       peer: peerA,
       connectionId: 'conn-1',
-      error: new Error('boom again'),
+      error: new Error('again'),
     });
-    expect(logger.eventsNamed('FsmError')).toHaveLength(1);
-    expect(downgrades()).toHaveLength(1);
-    expect(events.filter(e => e.type === 'peer-disconnected')).toHaveLength(1);
+    expect(logger.eventsNamed('FsmError')).toHaveLength(2);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
   });
 
-  it('a stale error from a replaced FSM must not tear down the adopted connection', () => {
+  it('THE FORENSIC-SURVIVAL PIN: an error before establishment must not preempt IceNeverConnected on the eventual phase close', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+
+    // signaling stakes the establishment-timing record (t0).
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    // A negotiation exception mid-handshake: log-only, so the timing
+    // record must survive it (review F1's hazard — the first cut's
+    // error teardown wiped it via a nested close before emitting).
+    media.emit({
+      type: 'error',
+      peer: peerA,
+      connectionId: 'conn-1',
+      error: new Error('negotiation exploded'),
+    });
+    // The FSM gives up: the phase close row emits the failure-side
+    // latency forensic exactly once.
+    media.emitPhase(peerA, 'conn-1', 'failed', 'signaling');
+    expect(logger.eventsNamed('IceNeverConnected')).toHaveLength(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+  });
+
+  it('a stale error from a replaced FSM is attributed as SupersededError and cannot touch the adopted connection', () => {
     const { store, transports, logger } = makeStarted();
     const media = transports.media!;
 
@@ -501,16 +523,16 @@ describe('the error path through the started store (Round 3 item 1)', () => {
       error: new Error('stale'),
     });
 
-    // The adopted slot survives untouched; the stale error is a log line.
     expect(get(store._openConnections)[peerA]).toMatchObject({
       connectionId: 'conn-2',
     });
     expect(logger.eventsNamed('SupersededError')).toHaveLength(1);
+    expect(logger.eventsNamed('FsmError')).toHaveLength(0);
     expect(media.closeCalls).toHaveLength(0);
   });
 
-  it('screen-share error with no slot does not re-fire peer-screen-share-disconnected (declared change a)', () => {
-    const { store, transports, events } = makeStarted();
+  it('screen-share errors are log-only too: no slot change, no view event, teardown arrives with the phase', () => {
+    const { store, transports, logger, events } = makeStarted();
     const inc = transports['screen-share-in']!;
 
     inc.emitPhase(peerA, 'sv-1', 'signaling');
@@ -519,21 +541,22 @@ describe('the error path through the started store (Round 3 item 1)', () => {
       type: 'error',
       peer: peerA,
       connectionId: 'sv-1',
-      error: new Error('first'),
+      error: new Error('screen boom'),
     });
-    expect(get(store._screenShareConnectionsIncoming)[peerA]).toBeUndefined();
+
+    // Logged with the screen attribution; the share survives the symptom.
+    expect(
+      logger.eventsNamed('FsmError').filter(e => e.detail?.includes('path=screen')),
+    ).toHaveLength(1);
+    expect(get(store._screenShareConnectionsIncoming)[peerA]).toBeDefined();
     expect(
       events.filter(e => e.type === 'peer-screen-share-disconnected'),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
 
-    // The duplicate error — no slot left — must stay silent toward the
-    // view. Before the table, this re-fired on every duplicate.
-    inc.emit({
-      type: 'error',
-      peer: peerA,
-      connectionId: 'sv-1',
-      error: new Error('second'),
-    });
+    // The verdict is the phase: failed clears the slot and fires the
+    // view event exactly once.
+    inc.emitPhase(peerA, 'sv-1', 'failed', 'connected');
+    expect(get(store._screenShareConnectionsIncoming)[peerA]).toBeUndefined();
     expect(
       events.filter(e => e.type === 'peer-screen-share-disconnected'),
     ).toHaveLength(1);

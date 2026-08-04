@@ -818,6 +818,32 @@ describe('ConnectionManager', () => {
         }),
       );
     });
+
+    it('forwards FSM error events (they used to die here, losing the exception text)', async () => {
+      const { manager } = createManager();
+      const handler = vi.fn();
+      manager.on('error', handler);
+
+      manager.ensureConnection('agent-err');
+      const fsm = manager.getFSM('agent-err')!;
+      await fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer' });
+      const pc = fsm.peer!.pc as unknown as MockRTCPeerConnection;
+      pc.simulateConnectionState('connected');
+
+      // A data-channel error: RTCPeer emits 'error', the FSM re-emits it,
+      // and the manager must now forward it instead of dropping it.
+      const boom = new Error('sctp exploded');
+      (pc as any)._dataChannels[0].simulateError(boom);
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          remoteAgent: 'agent-err',
+          data: boom,
+        }),
+      );
+    });
   });
 
   /**

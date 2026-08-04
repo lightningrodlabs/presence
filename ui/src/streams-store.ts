@@ -22,7 +22,11 @@ import {
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
-import { routeTransportPhase, decideSlotWrite } from './transport/media-event-policy';
+import {
+  routeTransportPhase,
+  decideSlotWrite,
+  attributeSlotEvent,
+} from './transport/media-event-policy';
 import {
   carrierFor,
   computeSignalsTargets,
@@ -148,10 +152,12 @@ const INIT_RETRY_THRESHOLD = 5000;
 const PENDING_HANDSHAKE_TTL_MS = 20000;
 
 /**
- * Map a close/error `decideSlotWrite` result onto the cleanup table's
- * outcome axis. Only the guard outcomes a `closed`/`error` event can
- * produce appear here; `install`/`replace`/`set-connected` belong to
- * other event kinds and reaching this with one is a programming error.
+ * Map a `closed` `decideSlotWrite` result onto the cleanup table's
+ * outcome axis. Only the guard outcomes a `closed` event can produce
+ * appear here; `install`/`replace`/`set-connected` belong to other event
+ * kinds and reaching this with one is a programming error. (The log-only
+ * error handlers use `attributeSlotEvent` directly — they perform no
+ * slot write and never consult the cleanup table.)
  */
 function closeGuardOutcome(
   write: ReturnType<typeof decideSlotWrite>,
@@ -1281,16 +1287,16 @@ export class StreamsStore {
 
   /**
    * The single executor of `closeCleanupPlan` rows
-   * (transport/close-cleanup-policy.ts) — every connection-teardown path
-   * (close event, error event, stale teardown, peer leave; media and both
-   * screen-share directions) applies its cleanup through here. The
-   * step ORDER below is part of the contract: CarrierSwitch reads the
-   * slot's `connected` before the clear; `_emitIceNeverConnected` runs
-   * before `_clearIceTiming` wipes the record; an `after-slot-clear`
-   * transport close happens once the slot is gone so the synchronously
-   * emitted nested `closed` hits the no-slot guard, while a
-   * `before-slot-clear` close deliberately lets that nested event run the
-   * full close row first (see the policy header).
+   * (transport/close-cleanup-policy.ts) — every connection-TEARDOWN path
+   * (close event, stale teardown, peer leave; media and both
+   * screen-share directions) applies its cleanup through here. Error
+   * events are NOT a teardown path (F2 amendment) — their handlers are
+   * log-only and never reach this executor. The step ORDER below is part
+   * of the contract: CarrierSwitch reads the slot's `connected` before
+   * the clear; `_emitIceNeverConnected` runs before `_clearIceTiming`
+   * wipes the record; a `before-slot-clear` transport close deliberately
+   * lets the synchronously emitted nested `closed` event run the full
+   * close row first (see the policy header).
    */
   private _applyCloseCleanup(
     ctx: CloseCleanupContext,
@@ -1350,9 +1356,6 @@ export class StreamsStore {
         return currentValue;
       });
     }
-    if (plan.closeTransport === 'after-slot-clear') {
-      transport.closeConnection(pubKeyB64, closeReason);
-    }
 
     if (plan.clearPerceivedStreamInfo) {
       // Clear stale perceivedStreamInfo so icons don't show stale state
@@ -1400,7 +1403,7 @@ export class StreamsStore {
         console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
         this.screenShareOutTransport.closeConnection(
           pubKeyB64,
-          ctx.via === 'error-event' ? 'media peer error' : 'media peer closed',
+          'media peer closed',
         );
         this._screenShareConnectionsOutgoing.update(currentValue => {
           delete currentValue[pubKeyB64];
@@ -1662,57 +1665,46 @@ export class StreamsStore {
     }
   }
 
+  /**
+   * FORENSIC-ONLY (Round 3 item 1 as amended by review F2). Transport
+   * error events carry the root-cause text of RTCPeer operational
+   * failures — negotiation exceptions, data-channel errors — which the
+   * FSM's own recovery owns and its `failed` phase adjudicates. This
+   * handler logs and touches NOTHING else: no slot write, no transport
+   * close, no view event, no status change. Teardown has exactly one
+   * authority (the phase routes); wiring errors to teardown was the
+   * dual-controller race §3.4 documents. The log-only invariant is
+   * pinned in `streams-store-wiring.test.ts`.
+   */
   private _handleMediaError(
     pubKeyB64: AgentPubKeyB64,
     connectionId: string,
     error: Error,
   ): void {
     console.log('#### GOT ERROR EVENT ####: ', error);
-
-    // Guards live in `decideSlotWrite` (the `error` kind, Round 3 item 1
-    // — this handler used to hand-roll them and had diverged from the
-    // close path). Superseded: a stale error from a replaced FSM must not
-    // touch the slot a newer connection owns. No-slot: duplicate error —
-    // the first one already tore the connection down.
-    const slotWrite = decideSlotWrite(
-      { kind: 'error' },
+    const attribution = attributeSlotEvent(
       connectionId,
       get(this._openConnections)[pubKeyB64],
     );
-    const ctx: CloseCleanupContext = {
-      target: 'media',
-      via: 'error-event',
-      outcome: closeGuardOutcome(slotWrite),
-    };
-    const plan = closeCleanupPlan(ctx);
-
-    if (plan.logSuperseded && slotWrite.write === 'none') {
+    if (attribution.outcome === 'superseded') {
+      // A stale FSM's error, attributed so it cannot be misread as the
+      // live connection failing.
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
         event: 'SupersededError',
         connectionId,
-        detail: `superseded-by=${slotWrite.supersededBy}; err=${error.message || error}`,
+        detail: `superseded-by=${attribution.supersededBy}; err=${error.message || error}`,
       });
+      return;
     }
-
-    if (ctx.outcome === 'live') {
-      this._flushSdpAggregatesForConnection(connectionId);
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: this.clock.now(),
-        event: 'FsmError',
-        connectionId,
-        detail: error.message || String(error),
-      });
-    }
-
-    // The plan carries the full close-path cleanup set (declared change:
-    // the error path used to skip seven of the close path's cleanups and
-    // the CarrierSwitch forensic event) and drives the transport close
-    // after the slot clear, so the nested close event hits the no-slot
-    // guard.
-    this._applyCloseCleanup(ctx, plan, pubKeyB64, connectionId, 'error event');
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: this.clock.now(),
+      event: 'FsmError',
+      connectionId,
+      detail: `${error.message || String(error)}; slot=${attribution.outcome}`,
+    });
   }
 
   // --- screen-share transport event handlers ---
@@ -1873,44 +1865,33 @@ export class StreamsStore {
       `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
     );
 
-    // Supersede guard (review finding F1 of the Phase 3 branch), now the
-    // shared `decideSlotWrite` error kind: a stale error from a replaced
-    // FSM — the same replace-without-event route the adopt handling
-    // closes for phase events — must not clear the slot a newer
-    // connection owns, and on the incoming side must not delete
-    // `_screenShareStreams[peer]` out from under a live share's paint.
-    // The no-slot (duplicate-error) row no longer re-fires
-    // `peer-screen-share-disconnected` into the view (§8 item 1 declared
-    // change a).
-    const write = decideSlotWrite(
-      { kind: 'error' },
+    // FORENSIC-ONLY, like the media error handler above (Round 3 item 1
+    // as amended by review F2): the FSM owns screen-share recovery too,
+    // and its `failed`/`closed` phases drive the teardown rows. The
+    // attribution keeps a stale (replaced) FSM's error from reading as
+    // the live share failing — the Phase 3 review-F1 hazard, now with no
+    // writes to guard at all.
+    const attribution = attributeSlotEvent(
       connectionId,
       get(this._screenShareStore(initiator))[pubKeyB64],
     );
-    const ctx: CloseCleanupContext = {
-      target: initiator ? 'screen-share-outgoing' : 'screen-share-incoming',
-      via: 'error-event',
-      outcome: closeGuardOutcome(write),
-    };
-    const plan = closeCleanupPlan(ctx);
-
-    if (plan.logSuperseded && write.write === 'none') {
+    if (attribution.outcome === 'superseded') {
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
         event: 'SupersededError',
         connectionId,
-        detail: `superseded-by=${write.supersededBy}; err=${error.message || error}; path=screen`,
+        detail: `superseded-by=${attribution.supersededBy}; err=${error.message || error}; path=screen`,
       });
+      return;
     }
-
-    this._applyCloseCleanup(
-      ctx,
-      plan,
-      pubKeyB64,
+    this.logger.logAgentEvent({
+      agent: pubKeyB64,
+      timestamp: this.clock.now(),
+      event: 'FsmError',
       connectionId,
-      'screen-share error event',
-    );
+      detail: `${error.message || String(error)}; path=screen; slot=${attribution.outcome}`,
+    });
   }
 
   /**
