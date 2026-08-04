@@ -231,6 +231,33 @@ export class FsmTransport implements PeerTransport {
       });
     });
 
+    this._manager.on('error', (e: any) => {
+      // Forensic forwarding only (Round 3 item 1 as amended): the FSM
+      // owns recovery and communicates terminality via the `failed`
+      // phase, so an error event never drives teardown — it carries the
+      // root-cause text (negotiation/data-channel exceptions) that used
+      // to be dropped at the manager boundary.
+      //
+      // Declared decision — blocked-transition errors are NOT forwarded:
+      // the FSM reports refused transitions on the `onTransition` stream
+      // too, which the store already logs as `FsmTransition` entries
+      // with a `BLOCKED:` trigger. Forwarding them here would state the
+      // same fact under a second event name (one authority per concept).
+      if (e.data && typeof e.data === 'object' && e.data.blocked === true) {
+        return;
+      }
+      const err =
+        e.data instanceof Error
+          ? e.data
+          : new Error(typeof e.data === 'string' ? e.data : JSON.stringify(e.data));
+      this._emit({
+        type: 'error',
+        peer: e.remoteAgent,
+        connectionId: e.connectionId,
+        error: err,
+      });
+    });
+
     this._manager.on('connection-closed', (e: any) => {
       const prev = this._lastPhase.get(e.remoteAgent) ?? 'connected';
       this._lastPhase.delete(e.remoteAgent);

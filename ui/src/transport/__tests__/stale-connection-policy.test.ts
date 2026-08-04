@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  decideStaleConnectionCleanup,
-  staleTeardownPlan,
-} from '../stale-connection-policy';
+import { decideStaleConnectionCleanup } from '../stale-connection-policy';
 import type {
   StaleConnectionInputs,
   StaleConnectionDecision,
@@ -169,29 +166,6 @@ describe('decideStaleConnectionCleanup — no slot', () => {
   });
 });
 
-describe('staleTeardownPlan — the cleanup sets, pinned', () => {
-  // These two rows ARE the divergence the three inline copies used to
-  // hide. Editing a row here is a decision; before Phase 2b it was drift.
-  it('video teardown clears the video slot, video pending inits, and the stream slot', () => {
-    expect(staleTeardownPlan('video')).toEqual({
-      slot: 'open-connections',
-      pendingInits: 'video',
-      clearVideoStreamSlot: true,
-    });
-  });
-
-  it('screen-share teardown clears the outgoing slot only — no pending map (Phase 3), no stream slot', () => {
-    expect(staleTeardownPlan('screen-share-outgoing')).toEqual({
-      slot: 'screen-share-connections-outgoing',
-      pendingInits: 'none',
-      clearVideoStreamSlot: false,
-    });
-  });
-
-  it('the two targets never share a slot or a pending map', () => {
-    const video = staleTeardownPlan('video');
-    const screen = staleTeardownPlan('screen-share-outgoing');
-    expect(video.slot).not.toBe(screen.slot);
-    expect(video.pendingInits).not.toBe(screen.pendingInits);
-  });
-});
+// The Phase 2b cleanup sets (`staleTeardownPlan`) moved to
+// `closeCleanupPlan` — their rows are pinned, with every other teardown
+// path's, in `close-cleanup-policy.test.ts` (Round 3 item 1).

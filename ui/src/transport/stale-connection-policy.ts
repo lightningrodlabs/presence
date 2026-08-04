@@ -7,11 +7,12 @@
  * dead? The predicate was written inline three times, verbatim
  * (MAINTAINABILITY_ASSESSMENT.md §3.9) — once for video and twice for
  * outgoing screen share — each followed by a different cleanup set. This
- * file is the single authority for the *predicate*, and (since Phase 2b)
- * for the *cleanup sets*: `staleTeardownPlan` states, per target, which
- * slot and pending map a teardown clears, and
- * `StreamsStore._applyStaleTeardown` is the one executor all three sites
- * call.
+ * file is the single authority for the *predicate*. The cleanup sets
+ * (Phase 2b's `staleTeardownPlan`) moved to `closeCleanupPlan` in
+ * `close-cleanup-policy.ts` (Round 3 item 1), which states every
+ * teardown path's cleanup in one table; the stale rows there are these
+ * teardowns'. `StreamsStore._applyStaleTeardown` is still the one
+ * executor all three stale call sites use.
  *
  * Two behavioural changes are folded in, both deliberate:
  *
@@ -127,59 +128,6 @@ export function decideStaleConnectionCleanup(
   return { action: 'keep', reason: 'ice-healthy' };
 }
 
-// ---------------------------------------------------------------------------
-// Cleanup sets (Phase 2b)
-// ---------------------------------------------------------------------------
-
-/** Which kind of connection a stale teardown is clearing. */
-export type StaleTeardownTarget = 'video' | 'screen-share-outgoing';
-
-/**
- * What a stale teardown must clear, per target. Every field names a
- * `StreamsStore` structure; `_applyStaleTeardown` is the single executor.
- */
-export type StaleTeardownPlan = {
-  /** The connection slot to delete after closing the transport connection. */
-  slot: 'open-connections' | 'screen-share-connections-outgoing';
-  /**
-   * The pending-init map to clear, so the next pong re-initiates cleanly.
-   * `none` for screen share since Phase 3 retired its InitRequest
-   * handshake — the FSM owns retry and there is no reservation to clear.
-   */
-  pendingInits: 'video' | 'none';
-  /**
-   * Whether to drop the peer's entry in `_videoStreams`. Only the video
-   * teardown has a per-peer stream slot to clear; `_screenShareStreams`
-   * (wired by Phase 3) tracks *incoming* shares and is cleared by the
-   * incoming-side close/error handlers, never by this outgoing teardown.
-   */
-  clearVideoStreamSlot: boolean;
-};
-
-/**
- * The formerly-divergent cleanup sets, stated once. Two of the three call
- * sites share the `screen-share-outgoing` row; the divergence between the
- * rows is real (different slots, different pending maps, only video has a
- * stream slot), and the table test pins it so an edit to one row is a
- * visible decision rather than a drift.
- */
-export function staleTeardownPlan(target: StaleTeardownTarget): StaleTeardownPlan {
-  switch (target) {
-    case 'video':
-      return {
-        slot: 'open-connections',
-        pendingInits: 'video',
-        clearVideoStreamSlot: true,
-      };
-    case 'screen-share-outgoing':
-      return {
-        slot: 'screen-share-connections-outgoing',
-        pendingInits: 'none',
-        clearVideoStreamSlot: false,
-      };
-    default: {
-      const exhaustive: never = target;
-      return exhaustive;
-    }
-  }
-}
+// The Phase 2b cleanup sets (`staleTeardownPlan`) were absorbed into
+// `closeCleanupPlan` (close-cleanup-policy.ts, Round 3 item 1) — one
+// cleanup authority for every teardown path, stale included.

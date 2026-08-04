@@ -91,11 +91,36 @@ function slotActionFor(input: TransportPhaseInputs): SlotAction {
 export type SlotState = { connectionId: string; connected: boolean };
 
 /** The three route outcomes that touch the slot, as a discriminated input.
- *  `ignore` routes never reach this decision. */
+ *  `ignore` routes never reach this decision. Transport `error` events do
+ *  NOT appear here: they are forensic-only (Round 3 item 1 as amended —
+ *  the FSM owns recovery and terminality arrives as a phase), so they
+ *  never write the slot; their live/superseded/duplicate attribution is
+ *  `attributeSlotEvent` below, the same guard this decision applies. */
 export type SlotEvent =
   | { kind: 'signaling'; slot: SlotAction }
   | { kind: 'connected' }
   | { kind: 'closed' };
+
+/** Whose connection an event with a connectionId belongs to, relative to
+ *  the peer's slot. The ONE supersede/no-slot guard — `decideSlotWrite`'s
+ *  `connected`/`closed` arms apply it before writing, and the log-only
+ *  error handlers apply it for attribution (before Round 3 both error
+ *  handlers hand-rolled this and had diverged). */
+export type SlotEventAttribution =
+  | { outcome: 'live' }
+  | { outcome: 'superseded'; supersededBy: string }
+  | { outcome: 'no-slot' };
+
+export function attributeSlotEvent(
+  eventConnectionId: string,
+  current: SlotState | undefined,
+): SlotEventAttribution {
+  if (!current) return { outcome: 'no-slot' };
+  if (current.connectionId !== eventConnectionId) {
+    return { outcome: 'superseded', supersededBy: current.connectionId };
+  }
+  return { outcome: 'live' };
+}
 
 export type SlotWrite =
   /** Create the slot fresh. Both `install` and `replace` start from
@@ -160,29 +185,41 @@ export function decideSlotWrite(
       return exhaustiveAction;
     }
     case 'connected': {
-      if (!current) return { write: 'none', reason: 'no-slot' };
-      if (current.connectionId !== eventConnectionId) {
-        return {
-          write: 'none',
-          reason: 'superseded',
-          supersededBy: current.connectionId,
-        };
+      const attribution = attributeSlotEvent(eventConnectionId, current);
+      switch (attribution.outcome) {
+        case 'no-slot':
+          return { write: 'none', reason: 'no-slot' };
+        case 'superseded':
+          return {
+            write: 'none',
+            reason: 'superseded',
+            supersededBy: attribution.supersededBy,
+          };
+        case 'live':
+          return {
+            write: 'set-connected',
+            slot: { connectionId: current!.connectionId, connected: true },
+          };
       }
-      return {
-        write: 'set-connected',
-        slot: { connectionId: current.connectionId, connected: true },
-      };
+      const exhaustiveAttribution: never = attribution;
+      return exhaustiveAttribution;
     }
     case 'closed': {
-      if (!current) return { write: 'none', reason: 'no-slot' };
-      if (current.connectionId !== eventConnectionId) {
-        return {
-          write: 'none',
-          reason: 'superseded',
-          supersededBy: current.connectionId,
-        };
+      const attribution = attributeSlotEvent(eventConnectionId, current);
+      switch (attribution.outcome) {
+        case 'no-slot':
+          return { write: 'none', reason: 'no-slot' };
+        case 'superseded':
+          return {
+            write: 'none',
+            reason: 'superseded',
+            supersededBy: attribution.supersededBy,
+          };
+        case 'live':
+          return { write: 'clear' };
       }
-      return { write: 'clear' };
+      const exhaustiveAttribution: never = attribution;
+      return exhaustiveAttribution;
     }
   }
   const exhaustive: never = ev;
