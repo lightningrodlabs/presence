@@ -2,6 +2,7 @@ import { LitElement, html, css } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import type { StreamsStore } from '../../streams-store';
 import { MEDIA_LIVE_WINDOW_MS } from '../../presence-policy';
+import { decideFlowGlyph } from '../../transport/carrier-stats-policy';
 import { filmstripController } from '../modules/video-filmstrip';
 
 /**
@@ -155,40 +156,26 @@ export class PeerStatsPanel extends LitElement {
     const jitter = peerStats.jitterMs;
     const loss = peerStats.lossPercent;
 
-    // Flow detection: is audio actually moving in each direction right now?
-    // Carrier says who OWNS the link; the flow glyph surfaces whether
-    // frames are actually moving — recent frames in/out, per direction.
-    // Same question as the media-flowing predicate, so it reads that
-    // predicate's window (a local 2000ms literal silently disagreed with
-    // it until the 2026-08 retro — working agreement 2).
-    const FLOW_WINDOW_MS = MEDIA_LIVE_WINDOW_MS;
+    // Flow glyph: is audio actually moving in each direction right now?
+    // The decision is `decideFlowGlyph` (carrier-stats-policy.ts, Round
+    // 3 item 5) — both carrier arms answer via the media-flowing
+    // predicate's rules, on that predicate's window. This _tick only
+    // gathers the snapshot.
     // signalsLastRecv/-Sent are stamped from the store clock, so the
     // freshness comparison must read the same clock (PR #4 F2).
     const now = this.streamsStore.clock.now();
-    let tx = false;
-    let rx = false;
-    if (carrier === 'signals') {
-      const encoderRunning = this.streamsStore.voiceEncoderRunning;
-      const lastSent = this.streamsStore.signalsLastSent.get(this.agentPubKeyB64);
-      const lastRecv = this.streamsStore.signalsLastRecv.get(this.agentPubKeyB64);
-      tx = !!encoderRunning && !!lastSent && now - lastSent < FLOW_WINDOW_MS;
-      rx = !!lastRecv && now - lastRecv < FLOW_WINDOW_MS;
-    } else {
-      // WebRTC: approximate flow from conn.audio/video presence.
-      // Receiving counts as rx; sending is implied by our own mic being
-      // unmuted while the connection is audio-enabled.
-      const conn = this.streamsStore.openConnectionInfo(this.agentPubKeyB64);
-      rx = !!conn?.audio;
-      tx = !!conn?.connected;
-    }
-    let flow: 'both' | 'tx' | 'rx' | 'idle' | 'muted' =
-      tx && rx ? 'both' : tx ? 'tx' : rx ? 'rx' : 'idle';
-    // Idle silence is misleading when the silence is intentional. The
-    // muted glyph wins over idle but never over actual flow.
-    if (flow === 'idle') {
-      const link = this.streamsStore.audioLinkFor(this.agentPubKeyB64);
-      if (link === 'muted') flow = 'muted';
-    }
+    const conn = this.streamsStore.openConnectionInfo(this.agentPubKeyB64);
+    const flow = decideFlowGlyph({
+      carrier,
+      now,
+      windowMs: MEDIA_LIVE_WINDOW_MS,
+      encoderRunning: !!this.streamsStore.voiceEncoderRunning,
+      lastSentMs: this.streamsStore.signalsLastSent.get(this.agentPubKeyB64),
+      lastRecvMs: this.streamsStore.signalsLastRecv.get(this.agentPubKeyB64),
+      webrtcConnected: !!conn?.connected,
+      webrtcAudioIn: !!conn?.audio,
+      linkMuted: this.streamsStore.audioLinkFor(this.agentPubKeyB64) === 'muted',
+    }).flow;
 
     // Video filmstrip stats (only for peers actively sending us video).
     // We pull from the controller's map; the controller clears the map

@@ -83,6 +83,7 @@ import {
   getShareModules,
   shareMaximizeKey,
 } from './modules/registry';
+import { parseConversationPayload } from './modules/conversation';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
 import './modules'; // side-effect: registers all modules
@@ -2426,14 +2427,17 @@ export class RoomView extends LitElement {
    * piggybacks on the existing render cycle.
    */
   private _renderAudioLevelMeter(pubkeyB64: AgentPubKeyB64) {
-    // Hide when peer's mic is muted — no audio to show levels for
-    const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
-    if (peerConv) {
-      try {
-        const p = JSON.parse(peerConv.payload);
-        if (p.micMuted || p.muted) return html``;
-      } catch {}
-    }
+    // Hide when peer's mic is muted — no audio to show levels for. The
+    // payload read goes through `parseConversationPayload` (Round 3
+    // item 5): the authority normalizes the legacy `muted` encoding and
+    // returns null for an INACTIVE module, so a deactivated module's
+    // stale payload no longer suppresses the meter (declared change —
+    // the raw JSON.parse here read micMuted out of payloads the
+    // authority rejects).
+    const peerConv =
+      this._peerModuleStates.value?.[pubkeyB64]?.['conversation'] ?? null;
+    const payload = parseConversationPayload(peerConv);
+    if (payload?.micMuted) return html``;
     return html`
       <audio-level-meter style="margin-left:3px"
         .streamsStore=${this.streamsStore}
@@ -2452,28 +2456,21 @@ export class RoomView extends LitElement {
    * indicator instead of the dropdown.
    */
   private _renderCarrierToggle(pubkeyB64: AgentPubKeyB64) {
-    // Did the peer force signals from their side (globally, or for us
-    // specifically via their disableWebrtcWith list)?
-    let disabledByPeer = false;
-    const peerConv = this._peerModuleStates.value?.[pubkeyB64]?.['conversation'];
-    if (peerConv) {
-      try {
-        const p = JSON.parse(peerConv.payload);
-        if (p.webrtcDisabled) disabledByPeer = true;
-        if (Array.isArray(p.disableWebrtcWith) &&
-            p.disableWebrtcWith.includes(this.streamsStore.myPubKeyB64)) {
-          disabledByPeer = true;
-        }
-      } catch {}
-    }
-
-    if (disabledByPeer) {
+    // Is WebRTC off for this link? ONE authority —
+    // `StreamsStore.webrtcDisabled` — the same predicate the carrier
+    // gate applies (Round 3 item 5). The raw payload re-parse this
+    // replaces omitted our OWN disableWebrtcWith list and skipped the
+    // legacy-encoding normalization in conversation.ts, so the icon and
+    // the actual gate could disagree (declared change: they now agree —
+    // the forced-signals indicator also shows when WE disabled the
+    // link, hence the side-neutral tooltip).
+    if (this.streamsStore.webrtcDisabled(pubkeyB64)) {
       return html`
         <sl-tooltip
           hoist
           class="tooltip-filled"
           placement="top"
-          content="Carrier forced to signals by agent"
+          content="Carrier forced to signals for this link"
         >
           <sl-icon
             style="color: #e7a008; height: 24px; width: 24px; opacity: 0.6;"
