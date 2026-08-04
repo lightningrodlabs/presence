@@ -755,3 +755,33 @@ Already open elsewhere, not re-listed: the `packages/webrtc-peer` version/CHANGE
 - **Waits for items 1–2:** anything touching connection lifecycle, teardown, or carrier eligibility.
 - **Waits for items 4–5:** anything touching the room UI's tiles, shares, or per-peer paint.
 - **A phase, not a feature (declared):** a third signals-carried media type. `isMediaLive`, `computePresentPeers`, `decideAudioLink`, and `buildPeerLinkSnapshot` all take voice and filmstrip as named fields; a third carrier changes four policy signatures and their tables, the `PeerLinkSnapshot` wire fields, the `OpenConnectionInfo` track axes, and adds a third `_reconcileSignalsX`/`_xEncoderRunning`/`XSource` set. Schedule it as its own reviewed phase when wanted.
+
+## 9. Follow-on plan — sequencing the recorded remainder (2026-08-04)
+
+Written at Round 3 close. **This section adds no new findings** — every item below was verified when recorded (§7.4, §7.5 item 5, §8's recorded-not-scheduled table); this is only grouping and sequencing. Nothing here gates feature development (§8's readiness declaration stands); the process is unchanged (working agreement 9, one intent per branch, `--no-ff` after review).
+
+### Now: three small standalone branches, any order
+
+1. **`chore/webrtc-peer-release`** — the Phase 0 addendum, oldest open row. Bank the Unreleased CHANGELOG entries (BREAKING `TransitionRecorder` removal, error forwarding) as a release: bump to **0.4.0** (0.x semver: breaking → minor), move Unreleased under the version heading, align `ui`'s `^0.3.0` range. Exit: `verify` green; CHANGELOG has no unreleased breaking entries.
+2. **`fix/encoder-flag-wedge`** — the one recorded item that is a live field defect: a failed `startCapture` leaves `_voiceEncoderRunning`/`_videoEncoderRunning` desynced from reality, so signals audio/video stays off until the target set next changes, and `disconnect()` reads the flags for teardown (`_reconcileSignalsAudio`/`_reconcileSignalsVideo`). Smallest fix per the table: re-invoke the reconciler on failure. Exit: a wiring test with an injected failing capture; mutation — removing the retry goes red.
+3. **`chore/round-3-fossils`** — the sanctioned janitorial pass: the `S I M P L E   P E E R` banner, the `'within-threshold'` log line announcing an init request it does not send, the `&&&&`/`###` debug logs. Deletions only; anything needing a decision stays behind. Exit: `verify` green, no behavior change claimed.
+
+### Next: one store-hygiene round (three small branches, after the above)
+
+4. **`feat/signals-rtt-policy`** — move the inline RTT fold out of `handlePongUi` into `carrier-stats-policy.ts`: the bare `60000` plausibility bound and `alpha = 0.3` get names, the map-write/emit-gate interleave becomes a pure decision. Working agreement 2 applies: each constant names its predicate.
+5. **`fix/init-accept-lifecycle`** — the item-1 family remainder: `handleInitAccept`'s untracked 15s SDP-timeout timer (can fire against a successor attempt) and its `_openConnections` write outside the slot policy; fold the peer-leave removal path for `_lastReconcileTime`/`_lastDisconnectTime` (a rejoining peer currently inherits the departed session's cooldown) into the same branch — same lifecycle, same tests.
+6. **`chore/broadcast-send-seam`** — the six verbatim broadcast-to-all-peers loops plus the conditional seventh collapse onto one send-side seam beside `rtc-message-policy.ts`, unifying the alternating error/warn catches. Mechanical; the win is one place to put future per-peer send policy.
+
+Opportunistic, no owning branch: the nine unnamed timing windows (notably the `3 * PING_INTERVAL` re-derivation of `PRESENT_STALENESS_MS` and the `CEILING_MS` hand-copy of `SDP_EXCHANGE_TIMEOUT`) get named when a branch touches their file — working agreement 2, as recorded.
+
+### Then: the view-layer decision round (§7.5 item 5's open remainder)
+
+One deciding round, not piecemeal: choose **extract-or-declare** for the view layer (the §8 view-misc list is the work queue: `<agent-avatar>` element collision, `audibleCount` fallback vs the Phase 4 copy rule, tile count written three times, four stream-onto-`<video>` implementations, stats-panel cache invalidation, the ambient `Date.now()` in `agent-connection-status-icon.ts`, `_reconnectAudio`). The cross-pane room-ownership protocol (Web Locks + `BroadcastChannel('presence-room')`, unnamed 2000/3000ms windows, zero tests) is the flagship extraction candidate and gets its timing windows named when it moves. Entry criterion for the round: decide whether a mount/render harness is worth building, because several items are unpinnable without one.
+
+### Dormant until their trigger (unchanged from §8)
+
+- `StreamsStore.onEvent`'s single overwritable callback slot — first second-consumer feature.
+- Settings unification (ten `@state` localStorage mirrors, seventeen raw `setItem` sites) — only if a live-apply decision ever reverses item 6's delete-and-declare.
+- A third signals-carried media type — a phase, by declaration.
+- eslint repair/replacement — inside the EOL-deps decision (§7.4 item 4), which deserves its own scheduled slot but has no date; it blocks nothing (`verify` carries the unused-code flags).
+- Rust validation and the `tests/` workspace version alignment — the 0.7 upgrade. Conductor-level validation — manual, by declaration.
