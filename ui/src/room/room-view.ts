@@ -50,7 +50,7 @@ import './elements/shared-wal-embed';
 import { roomStoreContext, streamsStoreContext } from '../contexts';
 import { sharedStyles } from '../sharedStyles';
 import './elements/avatar-with-nickname';
-import { RoomInfo, SharedWalPayload, StreamAndTrackInfo, weaveClientContext } from '../types';
+import { RoomInfo, SharedWalPayload, StoreEventPayload, StreamAndTrackInfo, weaveClientContext } from '../types';
 import { RoomStore } from './room-store';
 import './elements/attachment-element';
 import './elements/agent-connection-status';
@@ -77,7 +77,12 @@ import {
 import { StreamsStore } from '../streams-store';
 import { OBSERVER_FRESHNESS_MS } from '../presence-policy';
 import { AgentInfo, ConnectionStatuses, ModuleStateEnvelope, OpenConnectionInfo } from '../types';
-import { getAllModules, getModule, getShareModules } from './modules/registry';
+import {
+  getAllModules,
+  getModule,
+  getShareModules,
+  shareMaximizeKey,
+} from './modules/registry';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
 import './modules'; // side-effect: registers all modules
@@ -416,12 +421,12 @@ export class RoomView extends LitElement {
     );
   }
 
-  async firstUpdated() {
-    this.addEventListener('click', this.sideClickListener);
-    document.addEventListener('keydown', this.keyDownListener);
-    window.addEventListener('resize', this._onWindowResize);
-    this._updateGrid();
-    this.streamsStore.onEvent(async event => {
+  /**
+   * The store-event handler, extracted from the firstUpdated closure so
+   * the event arms are drivable under jsdom (Round 3 item 4a — the
+   * maximize-key pin exercises the real arm, not a copy).
+   */
+  async _onStoreEvent(event: StoreEventPayload) {
       switch (event.type) {
         case 'error': {
           this.notifyError(event.error);
@@ -462,7 +467,16 @@ export class RoomView extends LitElement {
           break;
         }
         case 'my-screen-share-off': {
-          if (this._maximizedVideo === MY_OWN_SCREEN_VIDEO_ID) {
+          // The own-share tile is keyed by shareMaximizeKey, exactly like
+          // a peer's. The old comparison here was against the <video>
+          // element id ('my-own-screen'), a key no tile is ever laid out
+          // by — so stopping your own maximized share left
+          // `_maximizedVideo` wedged and the room blank (item 4a).
+          const myKey = shareMaximizeKey(
+            'screen-share',
+            encodeHashToBase64(this.roomStore.client.client.myPubKey),
+          );
+          if (this._maximizedVideo === myKey) {
             this._maximizedVideo = undefined;
           }
           break;
@@ -525,9 +539,12 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-screen-share-disconnected': {
-          // Maximize is now keyed by share-${moduleId}-${pubkey}, not connectionId.
           // Clear maximize if this peer's screen share was maximized.
-          if (this._maximizedVideo === `share-screen-share-${event.pubKeyB64}`) {
+          // Same key constructor as the tile render (item 4a).
+          if (
+            this._maximizedVideo ===
+            shareMaximizeKey('screen-share', event.pubKeyB64)
+          ) {
             this._maximizedVideo = undefined;
           }
           break;
@@ -535,7 +552,14 @@ export class RoomView extends LitElement {
         default:
           break;
       }
-    });
+  }
+
+  async firstUpdated() {
+    this.addEventListener('click', this.sideClickListener);
+    document.addEventListener('keydown', this.keyDownListener);
+    window.addEventListener('resize', this._onWindowResize);
+    this._updateGrid();
+    this.streamsStore.onEvent(event => this._onStoreEvent(event));
     this._leaveAudio.volume = 0.05;
     this._joinAudio.volume = 0.07;
     this._reconnectAudio.volume = 0.1;
@@ -2310,11 +2334,11 @@ export class RoomView extends LitElement {
     // tears down peer screen-share <video> elements and loses srcObject.
     return html`${repeat(
       shares,
-      ({ moduleId, agentPubKeyB64 }) => `share-${moduleId}-${agentPubKeyB64}`,
+      ({ moduleId, agentPubKeyB64 }) => shareMaximizeKey(moduleId, agentPubKeyB64),
       ({ moduleId, agentPubKeyB64, state, isMe }) => {
         const mod = getModule(moduleId);
         if (!mod) return html``;
-        const shareKey = `share-${moduleId}-${agentPubKeyB64}`;
+        const shareKey = shareMaximizeKey(moduleId, agentPubKeyB64);
         const layout = this.idToLayout(shareKey, true);
         const wrapperClass = mod.shareWrapperClass ?? 'video-container screen-share';
         const context: ModuleRenderContext = {
