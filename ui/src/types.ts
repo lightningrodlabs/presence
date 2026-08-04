@@ -171,6 +171,16 @@ export type PongMetaDataV1 = {
   video?: boolean;
   /** Active module states for this agent, keyed by moduleId */
   moduleStates?: Record<string, ModuleStateEnvelope>;
+  /**
+   * When `moduleStates` was serialized, on the SENDER's clock — the same
+   * clock that mints `ModuleStateEnvelope.updatedAt`, so the receiver's
+   * pong sweep can LWW-gate deletions against it
+   * (`module-state-policy.ts`, Round 3 item 3). Stamped whenever pong
+   * meta is built, including when `moduleStates` is omitted ("zero
+   * active modules as of this stamp"). Absent on pongs from builds that
+   * predate it.
+   */
+  moduleStatesAt?: number;
 };
 
 /**

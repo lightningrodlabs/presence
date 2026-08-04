@@ -634,6 +634,93 @@ describe('acceptor eligibility through the started store (Round 3 item 2)', () =
   });
 });
 
+describe('module-state merge through the started store (Round 3 item 3)', () => {
+  const envelopeOf = (
+    moduleId: string,
+    updatedAt: number,
+    active = true,
+    payload = '{}'
+  ) => ({ moduleId, active, payload, updatedAt });
+
+  const pongPayload = (
+    moduleStates: Record<string, unknown> | undefined,
+    moduleStatesAt: number | undefined
+  ) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStates, moduleStatesAt },
+    });
+
+  it('push-then-stale-pong keeps the module (the flicker interleave); a genuinely newer pong sweeps it', async () => {
+    const { store, bus } = makeStarted();
+
+    // Peer activates 'clock' at t=2000 (their clock) and pushes.
+    await bus.deliver(
+      message(peerAKey, 'ModuleState', JSON.stringify(envelopeOf('clock', 2000)))
+    );
+    expect(get(store._peerModuleStates)[peerA]?.clock).toBeDefined();
+
+    // An in-flight pong serialized at t=1500 — before the activation —
+    // carries no module states. Pre-policy, this deleted the module and
+    // it flickered back ~2s later. It must survive.
+    await bus.deliver(message(peerAKey, 'PongUi', pongPayload(undefined, 1500)));
+    expect(get(store._peerModuleStates)[peerA]?.clock).toBeDefined();
+
+    // A pong serialized after the entry's stamp is genuine deactivation
+    // evidence and sweeps it.
+    await bus.deliver(message(peerAKey, 'PongUi', pongPayload(undefined, 2500)));
+    expect(get(store._peerModuleStates)[peerA]?.clock).toBeUndefined();
+  });
+
+  it('a stale push loses to a newer held entry, in the real handleSignal glue (declared change)', async () => {
+    const { store, bus } = makeStarted();
+    await bus.deliver(
+      message(
+        peerAKey,
+        'ModuleState',
+        JSON.stringify(envelopeOf('clock', 3000, true, '{"v":"newer"}'))
+      )
+    );
+    await bus.deliver(
+      message(
+        peerAKey,
+        'ModuleState',
+        JSON.stringify(envelopeOf('clock', 2500, true, '{"v":"stale"}'))
+      )
+    );
+    expect(get(store._peerModuleStates)[peerA]?.clock?.payload).toBe('{"v":"newer"}');
+  });
+
+  it('a pong entry stamped newer than the held entry replaces it; a stale pong entry does not', async () => {
+    const { store, bus } = makeStarted();
+    await bus.deliver(
+      message(
+        peerAKey,
+        'ModuleState',
+        JSON.stringify(envelopeOf('clock', 2000, true, '{"v":"pushed"}'))
+      )
+    );
+    // Stale pong entry (t=1500) loses.
+    await bus.deliver(
+      message(
+        peerAKey,
+        'PongUi',
+        pongPayload({ clock: envelopeOf('clock', 1500, true, '{"v":"old"}') }, 1500)
+      )
+    );
+    expect(get(store._peerModuleStates)[peerA]?.clock?.payload).toBe('{"v":"pushed"}');
+    // Newer pong entry (t=2600) wins.
+    await bus.deliver(
+      message(
+        peerAKey,
+        'PongUi',
+        pongPayload({ clock: envelopeOf('clock', 2600, true, '{"v":"healed"}') }, 2600)
+      )
+    );
+    expect(get(store._peerModuleStates)[peerA]?.clock?.payload).toBe('{"v":"healed"}');
+  });
+});
+
 describe('the manual clock drives the ambient cadences through start()', () => {
   it('the presence tick armed by start() evicts a stale peer with no store write', () => {
     const { store, clock } = makeStarted();

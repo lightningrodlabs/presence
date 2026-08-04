@@ -49,6 +49,7 @@ import {
 import type { RtcStatsReportLike } from './transport/track-health-policy';
 import { decideInitRetry } from './transport/init-retry-policy';
 import { buildDiagnosticSnapshot } from './diagnostic-snapshot-policy';
+import { decideModuleStateMerge } from './module-state-policy';
 import { decideScreenSignalRoute } from './transport/screen-signal-policy';
 import {
   derived,
@@ -4324,19 +4325,28 @@ export class StreamsStore {
       }
       const envelope = parsed.value;
       const prev = get(this._peerModuleStates)[pubkeyB64]?.[envelope.moduleId] || null;
+      // The merge rule is `decideModuleStateMerge` (module-state-policy.ts,
+      // Round 3 item 3) — shared with the pong sweep in handlePongUi.
+      // Declared change: a push whose stamp is older than the held entry
+      // is now ignored instead of applied unconditionally.
+      const decision = decideModuleStateMerge({
+        current: prev,
+        incoming: envelope,
+        source: 'push',
+      });
+      if (decision.action === 'keep') return;
       this._peerModuleStates.update(all => {
         const updated = { ...all };
-        if (!updated[pubkeyB64]) updated[pubkeyB64] = {};
-        if (envelope.active) {
-          updated[pubkeyB64] = { ...updated[pubkeyB64], [envelope.moduleId]: envelope };
+        const agentModules = { ...(updated[pubkeyB64] ?? {}) };
+        if (decision.action === 'set') {
+          agentModules[envelope.moduleId] = decision.envelope;
         } else {
-          const agentModules = { ...updated[pubkeyB64] };
           delete agentModules[envelope.moduleId];
-          updated[pubkeyB64] = agentModules;
         }
+        updated[pubkeyB64] = agentModules;
         return updated;
       });
-      const next = envelope.active ? envelope : null;
+      const next = decision.action === 'set' ? decision.envelope : null;
       this._dispatchPeerModuleTransition(pubkeyB64, envelope.moduleId, prev, next);
       this._dispatchPeerModulePayloadChange(pubkeyB64, envelope.moduleId, prev, next);
     } catch (e) {
@@ -4532,6 +4542,7 @@ export class StreamsStore {
           moduleStates: Object.keys(get(this._myModuleStates)).length > 0
             ? get(this._myModuleStates)
             : undefined,
+          moduleStatesAt: this.clock.now(),
         },
       };
       try {
@@ -5614,6 +5625,7 @@ export class StreamsStore {
           moduleStates: Object.keys(get(this._myModuleStates)).length > 0
             ? get(this._myModuleStates)
             : undefined,
+          moduleStatesAt: this.clock.now(),
         },
       };
       await this.deps.bus.sendMessage(
@@ -5855,24 +5867,39 @@ export class StreamsStore {
         }
         return knownAgents;
       });
-      // Reconcile module states from pong for late-joiners
-      if (metaData.data.moduleStates) {
-        const current = get(this._peerModuleStates)[pubkeyB64] || {};
-        const prevSnapshot = { ...current };
-        const incoming = metaData.data.moduleStates;
+      // Reconcile module states from the pong (late-joiner catch-up and
+      // lost-push healing). The per-module merge rule is
+      // `decideModuleStateMerge` (module-state-policy.ts, Round 3
+      // item 3) — the SAME rule the push path applies. The sweep stamp
+      // is the sender's `moduleStatesAt` (or, for legacy pongs, the max
+      // updatedAt across the pong's own entries), so an in-flight pong
+      // serialized before a fresh push cannot delete the pushed module —
+      // the ~2s module flicker this replaces.
+      {
+        const currentModules = get(this._peerModuleStates)[pubkeyB64] || {};
+        const prevSnapshot = { ...currentModules };
+        const incoming = metaData.data.moduleStates ?? {};
+        const incomingStamps = Object.values(incoming).map(e => e.updatedAt);
+        const sweepStamp =
+          metaData.data.moduleStatesAt ??
+          (incomingStamps.length ? Math.max(...incomingStamps) : undefined);
+        const merged = { ...currentModules };
         let changed = false;
-        const merged = { ...current };
-        for (const [moduleId, envelope] of Object.entries(incoming)) {
-          if (!merged[moduleId] ||
-              (envelope.updatedAt > merged[moduleId].updatedAt &&
-               (envelope.payload !== merged[moduleId].payload || envelope.active !== merged[moduleId].active))) {
-            merged[moduleId] = envelope;
+        const allIds = new Set([
+          ...Object.keys(currentModules),
+          ...Object.keys(incoming),
+        ]);
+        for (const moduleId of allIds) {
+          const decision = decideModuleStateMerge({
+            current: currentModules[moduleId] ?? null,
+            incoming: incoming[moduleId] ?? null,
+            source: 'pong-sweep',
+            sweepStamp,
+          });
+          if (decision.action === 'set') {
+            merged[moduleId] = decision.envelope;
             changed = true;
-          }
-        }
-        // Remove modules no longer in pong (agent deactivated them)
-        for (const moduleId of Object.keys(merged)) {
-          if (!incoming[moduleId]) {
+          } else if (decision.action === 'delete') {
             delete merged[moduleId];
             changed = true;
           }
@@ -5880,25 +5907,11 @@ export class StreamsStore {
         if (changed) {
           this._peerModuleStates.update(all => ({ ...all, [pubkeyB64]: merged }));
           // Fire transition + payload-change callbacks for affected modules
-          const allIds = new Set([...Object.keys(prevSnapshot), ...Object.keys(merged)]);
           for (const moduleId of allIds) {
             const prevEnv = prevSnapshot[moduleId] || null;
             const nextEnv = merged[moduleId] || null;
             this._dispatchPeerModuleTransition(pubkeyB64, moduleId, prevEnv, nextEnv);
             this._dispatchPeerModulePayloadChange(pubkeyB64, moduleId, prevEnv, nextEnv);
-          }
-        }
-      } else {
-        // No module states in pong — clear any we had for this peer
-        const cleared = get(this._peerModuleStates)[pubkeyB64];
-        if (cleared && Object.keys(cleared).length > 0) {
-          this._peerModuleStates.update(all => {
-            const updated = { ...all };
-            delete updated[pubkeyB64];
-            return updated;
-          });
-          for (const [moduleId, envelope] of Object.entries(cleared)) {
-            this._dispatchPeerModuleTransition(pubkeyB64, moduleId, envelope, null);
           }
         }
       }
