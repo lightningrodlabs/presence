@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { routeTransportPhase, decideSlotWrite } from '../media-event-policy';
+import {
+  routeTransportPhase,
+  decideSlotWrite,
+  attributeSlotEvent,
+} from '../media-event-policy';
 import type { TransportPhaseRoute } from '../media-event-policy';
 import type { ConnectionPhase } from '../types';
 
@@ -216,25 +220,27 @@ describe('decideSlotWrite — the slot transition, shared by store and harness',
     });
   });
 
-  // Round 3 item 1: the `error` kind shares the closed guard structure.
-  // Before it existed both error handlers hand-rolled these guards and
-  // had diverged (the screen path re-fired a view event on no-slot).
-  it('error with the matching id clears the slot', () => {
-    expect(decideSlotWrite({ kind: 'error' }, 'live-1', live)).toEqual({ write: 'clear' });
+});
+
+describe('attributeSlotEvent — the one supersede/no-slot guard, exported for the log-only error handlers (Round 3 item 1 as amended)', () => {
+  // The write-bearing arms of decideSlotWrite apply this same guard;
+  // transport error events are forensic-only (review F2 — they never
+  // write the slot) and use it for live/superseded/duplicate attribution
+  // in the FsmError/SupersededError log entries.
+  const live = { connectionId: 'live-1', connected: true };
+
+  it('a matching id is the live connection', () => {
+    expect(attributeSlotEvent('live-1', live)).toEqual({ outcome: 'live' });
   });
 
-  it('error with a mismatched id is superseded — a stale error must not touch the new slot', () => {
-    expect(decideSlotWrite({ kind: 'error' }, 'old-0', live)).toEqual({
-      write: 'none',
-      reason: 'superseded',
+  it('a mismatched id is superseded, naming the connection that outranks it', () => {
+    expect(attributeSlotEvent('old-0', live)).toEqual({
+      outcome: 'superseded',
       supersededBy: 'live-1',
     });
   });
 
-  it('error with no slot is a duplicate error — nothing to write', () => {
-    expect(decideSlotWrite({ kind: 'error' }, 'live-1', undefined)).toEqual({
-      write: 'none',
-      reason: 'no-slot',
-    });
+  it('no slot at all is a no-slot attribution (e.g. an error after the phase close cleared the slot)', () => {
+    expect(attributeSlotEvent('live-1', undefined)).toEqual({ outcome: 'no-slot' });
   });
 });

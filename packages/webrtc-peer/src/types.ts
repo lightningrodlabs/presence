@@ -274,7 +274,15 @@ export type ManagerEventType =
   | 'remote-stream'
   | 'remote-track'
   | 'data-channel-message'
-  | 'establishment-timeline';
+  | 'establishment-timeline'
+  /** FSM error events, forwarded verbatim (`data` is the FSM error
+   *  event's `data`: an exception from an RTCPeer operation, or a
+   *  `{ blocked: true, ... }` record for a refused transition). Errors
+   *  are SYMPTOMS, not verdicts: the FSM owns recovery, and its give-up
+   *  signal remains the `failed` phase. Consumers should treat these as
+   *  forensics; before this member existed they were dropped here
+   *  silently, losing negotiation/data-channel exception text. */
+  | 'error';
 
 export type ManagerEvent = {
   type: ManagerEventType;
