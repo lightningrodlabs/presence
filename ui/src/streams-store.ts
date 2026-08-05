@@ -1184,7 +1184,6 @@ export class StreamsStore {
       }
       return;
     }
-    console.log('#### CONNECTED with', pubKeyB64);
     this._flushSdpAggregatesForConnection(connectionId);
     // Record this peer as a genuine call participant for diagnostic-log
     // targeting. Kept for the whole session even if they later drop.
@@ -1407,7 +1406,6 @@ export class StreamsStore {
       // and block re-initiation when the peer rejoins.
       const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
       if (outgoingScreenShare) {
-        console.log(`#### TEARING DOWN OUTGOING SCREEN SHARE TO ${pubKeyB64.slice(0, 8)} (video peer closed)`);
         this.screenShareOutTransport.closeConnection(
           pubKeyB64,
           'media peer closed',
@@ -1448,7 +1446,6 @@ export class StreamsStore {
      *  a give-up is distinguishable from an ordinary close in the log. */
     cause = 'close-event',
   ): void {
-    console.log('#### GOT CLOSE EVENT ####');
 
     // Guards live in `decideSlotWrite` (shared with the carrier-handover
     // harness). Superseded: the slot points at a different connectionId, a
@@ -1512,11 +1509,6 @@ export class StreamsStore {
       event: 'StreamReceived',
       connectionId,
     });
-    console.log(
-      '#### GOT STREAM with tracks from:',
-      pubKeyB64,
-      stream.getTracks()
-    );
     this._videoStreams[pubKeyB64] = stream;
 
     const audioTracks = stream.getAudioTracks();
@@ -1550,7 +1542,6 @@ export class StreamsStore {
     track: MediaStreamTrack,
     stream: MediaStream,
   ): void {
-    console.log('#### GOT TRACK from:', pubKeyB64, track, 'muted:', track.muted);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: this.clock.now(),
@@ -1572,7 +1563,6 @@ export class StreamsStore {
       return;
     }
 
-    console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} arrived muted (${track.kind}), waiting for unmute...`);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: this.clock.now(),
@@ -1591,7 +1581,6 @@ export class StreamsStore {
 
     const unmuteTimeout = this.clock.setTimeout(() => {
       if (track.muted) {
-        console.warn(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) still muted after 5s timeout`);
         this.logger.logAgentEvent({
           agent: pubKeyB64,
           timestamp: this.clock.now(),
@@ -1603,7 +1592,6 @@ export class StreamsStore {
 
     track.onunmute = () => {
       this.clock.clearTimeout(unmuteTimeout);
-      console.log(`#### TRACK from ${pubKeyB64.slice(0, 8)} (${track.kind}) unmuted!`);
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
@@ -1641,7 +1629,6 @@ export class StreamsStore {
           break;
         }
         case 'refresh-tracks': {
-          console.log(`#### GOT request-track-refresh from ${pubKeyB64.slice(0, 8)}`);
           this.logger.logCustomMessage(
             `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
           );
@@ -1688,7 +1675,6 @@ export class StreamsStore {
     connectionId: string,
     error: Error,
   ): void {
-    console.log('#### GOT ERROR EVENT ####: ', error);
     const attribution = attributeSlotEvent(
       connectionId,
       get(this._openConnections)[pubKeyB64],
@@ -1727,7 +1713,6 @@ export class StreamsStore {
     _connectionId: string,
     initiator: boolean,
   ): void {
-    console.log('#### SCREEN SHARE CONNECTED');
 
     const store = this._screenShareStore(initiator);
     // Supersede guard, same decision as the media path: a `connected` for
@@ -1779,7 +1764,6 @@ export class StreamsStore {
     connectionId: string,
     initiator: boolean,
   ): void {
-    console.log('#### GOT SCREEN SHARE CLOSE EVENT ####');
 
     // Supersede guard: a stale close from a replaced FSM must not clear
     // the slot a newer connection owns (decideSlotWrite drops it).
@@ -1807,10 +1791,6 @@ export class StreamsStore {
     connectionId: string,
     stream: MediaStream,
   ): void {
-    console.log(
-      '#### GOT SCREEN SHARE STREAM. With tracks: ',
-      stream.getTracks()
-    );
     // Keep the stream reachable for room-view's paint-restore path
     // (`_screenShareStreams` was declared for exactly this and written
     // nowhere — the unscheduled-defects table; wired here by Phase 3).
@@ -1841,7 +1821,6 @@ export class StreamsStore {
     connectionId: string,
     track: MediaStreamTrack,
   ): void {
-    console.log('#### GOT TRACK: ', track);
     this._screenShareConnectionsIncoming.update(currentValue => {
       const relevantConnection = currentValue[pubKeyB64];
       if (!relevantConnection) return currentValue;
@@ -1867,7 +1846,6 @@ export class StreamsStore {
     error: Error,
     initiator: boolean,
   ): void {
-    console.log('#### GOT SCREEN SHARE ERROR EVENT ####: ', error);
     this.logger.logCustomMessage(
       `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
     );
@@ -2911,7 +2889,6 @@ export class StreamsStore {
   }
 
   async audioOff() {
-    console.log('### AUDIO OFF');
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
@@ -2977,7 +2954,6 @@ export class StreamsStore {
     if (get(this._screenShareConnectionsOutgoing)[pubkeyB64]) return;
     if (!this._peerCaps(pubkeyB64).has(CAP_SDP_FSM_SCREEN)) return;
 
-    console.log(`#### STARTING SCREEN SHARE CONNECTION TO ${pubkeyB64.slice(0, 8)}`);
     this.screenShareOutTransport.setLocalStream(this.screenShareStream);
     const connectionId = this.screenShareOutTransport.ensureConnection(pubkeyB64, {
       sdpExchangeTimeoutMs: this._computeSdpTimeout(pubkeyB64),
@@ -4421,12 +4397,6 @@ export class StreamsStore {
     }
   }
 
-  // ********************************************************************************************
-  //
-  //   S I M P L E   P E E R   H A N D L I N G
-  //
-  // ********************************************************************************************
-
   /**
    * Marks a received track as ready — sets the audio/video flag on the connection
    * and fires the appropriate event callback. Called either immediately when a track
@@ -5705,7 +5675,6 @@ export class StreamsStore {
    */
   async handleLeaveUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`#### GOT LeaveUi FROM ${pubkeyB64.slice(0, 8)}`);
     this.logger.logAgentEvent({
       agent: pubkeyB64,
       timestamp: this.clock.now(),
@@ -5991,7 +5960,6 @@ export class StreamsStore {
         graceMs: ICE_DISCONNECTED_GRACE_MS,
       });
       if (existingConn && decision.action === 'teardown') {
-        console.log(`#### CLEANING UP STALE VIDEO CONNECTION TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
         this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState} ${decision.reason}`);
         this.logger.logAgentEvent({
           agent: pubkeyB64,
@@ -6033,7 +6001,6 @@ export class StreamsStore {
       switch (decision.action) {
         case 'send-init': {
           if (decision.reason === 'no-pending-init') {
-            console.log('#### SENDING FIRST INIT REQUEST.');
             const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
             if (lastDisconnect) {
               const gap = this.clock.now() - lastDisconnect;
@@ -6041,8 +6008,6 @@ export class StreamsStore {
                 `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
               );
             }
-          } else {
-            console.log(`#--# SENDING INIT REQUEST NUMBER ${decision.attempt}.`);
           }
           const newConnectionId = uuidv4();
           this._pendingInits[pubkeyB64] = [
@@ -6061,13 +6026,6 @@ export class StreamsStore {
           this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
           break;
         case 'hold': {
-          if (decision.reason === 'within-threshold') {
-            // Inherited: the inline code printed the "sending" line before
-            // the threshold check, so it logs on held pongs too.
-            console.log(
-              `#--# SENDING INIT REQUEST NUMBER ${(pendingInits?.length ?? 0) + 1}.`
-            );
-          }
           if (decision.reason === 'already-open' && metaDataExt?.data.streamInfo) {
             // If the connection is already open, reconcile with our expected stream state
             this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
@@ -6127,7 +6085,6 @@ export class StreamsStore {
         graceMs: ICE_DISCONNECTED_GRACE_MS,
       });
       if (decision.action === 'teardown') {
-        console.log(`#### CLEANING UP STALE OUTGOING SCREEN SHARE TO ${pubkeyB64.slice(0, 8)} (ICE: ${iceState}, ${decision.reason})`);
         this._applyStaleTeardown('screen-share-outgoing', pubkeyB64, iceState);
       }
     }
@@ -6161,11 +6118,6 @@ export class StreamsStore {
       event: 'InitRequest',
       connectionId: connection_id,
     });
-    console.log(
-      `#### GOT ${
-        connection_type === 'screen' ? 'SCREEN SHARE ' : ''
-      }INIT REQUEST.`
-    );
 
     // Log retry gap if this is a reconnection attempt
     const lastDisconnect = this._lastDisconnectTime[pubKey64];
@@ -6206,7 +6158,6 @@ export class StreamsStore {
             break;
           case 'webrtc-globally-disabled':
           case 'peer-webrtc-disabled':
-            console.log(`#### IGNORING INIT REQUEST from ${pubKey64.slice(0, 8)}: WebRTC disabled`);
             break;
           case 'peer-lacks-sdp-fsm-cap':
             // A peer whose build cannot parse SdpFsm has no WebRTC path
@@ -6224,10 +6175,6 @@ export class StreamsStore {
         }
         return;
       }
-      console.log(
-        '#### SENDING INIT ACCEPT. connection_type: ',
-        connection_type
-      );
       // No reservation is needed on the acceptor side: the FSM creates
       // per-peer state lazily from the incoming offer (SdpFsm), so the
       // InitAccept is purely the initiator's go-signal. `_pendingAccepts`
@@ -6310,7 +6257,6 @@ export class StreamsStore {
             );
           }
 
-          console.log('#### RECEIVED INIT ACCEPT AND CEATING INITIATING PEER.');
           // Capture any prior openConnection for this peer for forensic
           // logging. ensureConnection with a new connectionId triggers
           // the transport's internal supersede (closes the old peer).
@@ -6536,9 +6482,6 @@ export class StreamsStore {
    * Handle a DiagnosticRequest signal — gather recent logs and send back.
    */
   async handleDiagnosticRequest(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`#### GOT DiagnosticRequest from ${pubkeyB64.slice(0, 8)}`);
-
     const allRecentEvents = this.logger.getRecentAgentEvents();
     const flatEvents = Object.values(allRecentEvents).flat();
     const recentCustomLogs = this.logger.getRecentCustomLogs();
@@ -6564,7 +6507,6 @@ export class StreamsStore {
    */
   handleDiagnosticResponse(signal: Extract<RoomSignal, { type: 'Message' }>) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    console.log(`#### GOT DiagnosticResponse from ${pubkeyB64.slice(0, 8)}`);
 
     try {
       const parsedSnapshot = parseSignalPayload<DiagnosticSnapshot>(signal.payload);
