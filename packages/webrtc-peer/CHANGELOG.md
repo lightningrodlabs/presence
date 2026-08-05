@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+Banks the Phase 3–Round 3 library changes (0.x semver: breaking → minor).
 
 - **`ConnectionManager` now forwards FSM `error` events** (`ManagerEventType`
   gains `'error'`). They were dropped silently before: negotiation exceptions
@@ -22,10 +24,6 @@
   consumer and the one consuming app dropped `DIAG:` entries unconditionally.
   Real connection events (ICE state, dropped stale signals, new peer sessions,
   establishment timeline) are unaffected.
-
-(Note: the workspace version string predates these changes and the epoch work;
-see the consuming repo's MAINTAINABILITY_ASSESSMENT.md Phase 0 addendum on
-package-version hygiene.)
 
 ## 0.3.0
 
