@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   decodeRtcMessage,
+  encodeRtcAction,
   KNOWN_ACTION_MESSAGES,
 } from '../rtc-message-policy';
 import type { RtcAction } from '../rtc-message-policy';
@@ -83,5 +84,15 @@ describe('decodeRtcMessage — inherited edges, kept deliberately', () => {
     expect(decodeRtcMessage('4')).toEqual([
       { kind: 'ignore', reason: 'not-action' },
     ]);
+  });
+});
+
+describe('encodeRtcAction — the send side of the wire shape (§9 item 6)', () => {
+  it('every known action round-trips through the decoder as a real action, never an ignore', () => {
+    for (const message of KNOWN_ACTION_MESSAGES) {
+      const decoded = decodeRtcMessage(encodeRtcAction(message));
+      expect(decoded).toHaveLength(1);
+      expect(['ignore', 'parse-error']).not.toContain(decoded[0].kind);
+    }
   });
 });
