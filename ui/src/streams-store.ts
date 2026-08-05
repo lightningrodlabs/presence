@@ -28,11 +28,10 @@ import {
   attributeSlotEvent,
 } from './transport/media-event-policy';
 import {
-  carrierFor,
   computeSignalsTargets,
   decideWebrtcEligibility,
 } from './transport/carrier-coverage';
-import { statsForPeer } from './transport/carrier-stats-policy';
+import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import { closeCleanupPlan } from './transport/close-cleanup-policy';
@@ -5783,26 +5782,35 @@ export class StreamsStore {
       this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
       metaDataExt = metaData;
 
-      // Compute signals-carrier RTT from the echoed ping timestamp.
-      // Smooth with EWMA so single-cycle jitter doesn't make the display
-      // jump around. Alpha = 0.3 gives ~3-sample effective window.
-      if (typeof metaData.data.pingT0 === 'number') {
-        const rtt = this.clock.now() - metaData.data.pingT0;
-        if (rtt >= 0 && rtt < 60000) {
-          const prev = this._signalsRttEwma.get(pubkeyB64) ?? rtt;
-          const next = Math.round(0.3 * rtt + 0.7 * prev);
-          this._signalsRttEwma.set(pubkeyB64, next);
+      // The pong-echo RTT fold — plausibility bound, EWMA smoothing, and
+      // the emit gate — is one pure decision (`foldSignalsRtt`,
+      // carrier-stats-policy.ts, §9 item 4). This block only executes it.
+      const rttFold = foldSignalsRtt({
+        pingT0:
+          typeof metaData.data.pingT0 === 'number'
+            ? metaData.data.pingT0
+            : undefined,
+        now: this.clock.now(),
+        prevEwmaMs: this._signalsRttEwma.get(pubkeyB64),
+        slot: get(this._openConnections)[pubkeyB64],
+      });
+      switch (rttFold.action) {
+        case 'no-sample':
+          // Peer on old code — their pong doesn't echo pingT0 yet.
+          console.debug(
+            `[stats] No pingT0 in pong from ${pubkeyB64.slice(0, 8)} — remote may be on older code`
+          );
+          break;
+        case 'drop':
+          break;
+        case 'fold': {
+          this._signalsRttEwma.set(pubkeyB64, rttFold.ewmaMs);
           const existing = this.signalsStats.get(pubkeyB64) ?? {
             rttMs: null, jitterMs: null, lossPercent: null,
           };
-          existing.rttMs = next;
+          existing.rttMs = rttFold.ewmaMs;
           this.signalsStats.set(pubkeyB64, existing);
-          // Only evaluate bucket on the signals path if signals is the
-          // active carrier for this peer — otherwise the webrtc poll is
-          // the source of truth and will emit if bucket changes. Same
-          // authority as statsFor: carrierFor, never a hand-rolled read.
-          const openConn = get(this._openConnections)[pubkeyB64];
-          if (carrierFor(openConn).carrier === 'signals') {
+          if (rttFold.emitQualityCheck) {
             this._maybeEmitQualityChange(
               pubkeyB64,
               'signals',
@@ -5811,12 +5819,12 @@ export class StreamsStore {
               existing.lossPercent,
             );
           }
+          break;
         }
-      } else {
-        // Peer on old code — their pong doesn't echo pingT0 yet.
-        console.debug(
-          `[stats] No pingT0 in pong from ${pubkeyB64.slice(0, 8)} — remote may be on older code`
-        );
+        default: {
+          const exhaustive: never = rttFold;
+          void exhaustive;
+        }
       }
       this._othersConnectionStatuses.update(statuses => {
         const newStatuses = statuses;

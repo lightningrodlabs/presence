@@ -56,6 +56,88 @@ export function statsForPeer(snap: PeerStatsSnapshot): PeerStats {
 }
 
 // ---------------------------------------------------------------------------
+// Signals-RTT fold (§9 item 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Plausibility bound on a single pong-echo RTT sample. Serves the
+ * signals-STATS display predicate only — a sample at or above this is a
+ * clock artifact (peer wall-clock step, machine resumed from sleep), not
+ * a measurement, and is dropped rather than folded. This is NOT a
+ * liveness window; liveness predicates live in `presence-policy.ts`.
+ */
+export const SIGNALS_RTT_PLAUSIBLE_MAX_MS = 60_000;
+
+/**
+ * EWMA smoothing factor for the signals-carrier RTT display. 0.3 gives a
+ * ~3-sample effective window: enough to stop single-cycle jitter from
+ * making the stats panel jump, small enough to track a real change
+ * within a few ping cadences. Display smoothing only — same predicate
+ * note as `SIGNALS_RTT_PLAUSIBLE_MAX_MS`.
+ */
+export const SIGNALS_RTT_EWMA_ALPHA = 0.3;
+
+export type SignalsRttFoldInputs = {
+  /** Echoed ping t0 from the pong meta; undefined = peer on older code. */
+  pingT0: number | undefined;
+  /** Receive stamp, on the store clock (same clock that stamped t0). */
+  now: number;
+  /** Previous EWMA value for this peer, if any (`_signalsRttEwma`). */
+  prevEwmaMs: number | undefined;
+  /** The peer's `_openConnections` entry — carrier via `carrierFor`. */
+  slot: WebrtcSlot | undefined;
+};
+
+export type SignalsRttFold =
+  | { action: 'no-sample'; reason: 'no-ping-echo' }
+  | { action: 'drop'; reason: 'implausible'; rawRttMs: number }
+  | {
+      action: 'fold';
+      reason: 'signals-active' | 'webrtc-active';
+      /** The new EWMA value: write it to the map and the stats entry. */
+      ewmaMs: number;
+      /**
+       * The emit-gate half of the old interleave: evaluate the quality
+       * bucket on the signals path ONLY when signals is the active
+       * carrier — otherwise the webrtc getStats poll is the source of
+       * truth and will emit if the bucket changes. Carrier by
+       * `carrierFor`, the one carrier authority, never a hand-rolled
+       * slot read.
+       */
+      emitQualityCheck: boolean;
+    };
+
+/**
+ * The pong-echo RTT fold, extracted from `handlePongUi`'s inline block
+ * (§9 item 4): sample plausibility, EWMA smoothing, and the
+ * map-write/emit-gate interleave as one pure decision. The caller owns
+ * the writes (`_signalsRttEwma`, `signalsStats`) and the
+ * `_maybeEmitQualityChange` call; this function owns every number.
+ *
+ * Constrains `StreamsStore.handlePongUi`.
+ */
+export function foldSignalsRtt(input: SignalsRttFoldInputs): SignalsRttFold {
+  if (input.pingT0 === undefined) {
+    return { action: 'no-sample', reason: 'no-ping-echo' };
+  }
+  const raw = input.now - input.pingT0;
+  if (raw < 0 || raw >= SIGNALS_RTT_PLAUSIBLE_MAX_MS) {
+    return { action: 'drop', reason: 'implausible', rawRttMs: raw };
+  }
+  const prev = input.prevEwmaMs ?? raw;
+  const ewmaMs = Math.round(
+    SIGNALS_RTT_EWMA_ALPHA * raw + (1 - SIGNALS_RTT_EWMA_ALPHA) * prev
+  );
+  const carrier = carrierFor(input.slot).carrier;
+  return {
+    action: 'fold',
+    reason: carrier === 'signals' ? 'signals-active' : 'webrtc-active',
+    ewmaMs,
+    emitQualityCheck: carrier === 'signals',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Flow glyph (Round 3 item 5)
 // ---------------------------------------------------------------------------
 
