@@ -70,7 +70,6 @@ import {
   PongMetaData,
   PongMetaDataV1,
   RoomSignal,
-  RTCMessage,
   ModuleStateEnvelope,
   StoreEventPayload,
   StreamAndTrackInfo,
@@ -99,7 +98,8 @@ import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
 import { parseSignalPayload } from './signal-payload';
-import { decodeRtcMessage } from './rtc-message-policy';
+import { decodeRtcMessage, encodeRtcAction } from './rtc-message-policy';
+import type { ActionMessage } from './rtc-message-policy';
 
 declare const __APP_VERSION__: string;
 
@@ -1907,6 +1907,45 @@ export class StreamsStore {
   }
 
   /**
+   * The ONE send-side seam for RTCMessage action frames (§9 item 6);
+   * the decode side is `decodeRtcMessage` and the wire shape is
+   * `encodeRtcAction`, both in rtc-message-policy.ts. Six verbatim
+   * broadcast loops, the pong-side conditional audio-off, and the
+   * track-refresh request all send through here — future per-peer send
+   * policy (rate limits, capability gating) goes in this method,
+   * nowhere else. A per-peer send failure is logged (console.warn —
+   * the alternating error/warn catches are unified, console output
+   * only) and does not stop the remaining sends.
+   *
+   * Returns the number of sends that did not throw — the track-refresh
+   * caller couples its stale-count reset to that.
+   */
+  private _sendRtcAction(
+    message: ActionMessage,
+    peers: AgentPubKeyB64[],
+  ): number {
+    const encoded = encodeRtcAction(message);
+    let sent = 0;
+    for (const peerB64 of peers) {
+      try {
+        this.mediaTransport.send(peerB64, encoded);
+        sent += 1;
+      } catch (e) {
+        console.warn(`Could not send '${message}' message to peer: `, e);
+      }
+    }
+    return sent;
+  }
+
+  /** `_sendRtcAction` to every peer with an open media connection. */
+  private _broadcastRtcAction(message: ActionMessage): number {
+    return this._sendRtcAction(
+      message,
+      Object.keys(get(this._openConnections)),
+    );
+  }
+
+  /**
    * Start or stop the voice encoder based on whether the mic is held AND
    * at least one peer needs audio via signals. Called from the
    * _signalsTargets subscription and from audioOn/audioOff.
@@ -2601,20 +2640,7 @@ export class StreamsStore {
     // _onCameraTrackChange's device-change branch to replaceTrack on
     // mainStream and on every transport. Mirrors changeAudioInput.
     await this.cameraSource.changeDevice(deviceId);
-    Object.keys(get(this._openConnections)).forEach(peerB64 => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'change-video-input',
-      };
-      try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          "Failed to send 'change-video-input' message to peer: ",
-          e.toString()
-        );
-      }
-    });
+    this._broadcastRtcAction('change-video-input');
   }
 
   async videoOn() {
@@ -2665,17 +2691,7 @@ export class StreamsStore {
     });
 
     // Send 'video-on' signal to peers
-    Object.keys(get(this._openConnections)).forEach(peerB64 => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'video-on',
-      };
-      try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
-      } catch (e) {
-        console.warn('Could not send video-on message to peer: ', e);
-      }
-    });
+    this._broadcastRtcAction('video-on');
   }
 
   /**
@@ -2789,17 +2805,7 @@ export class StreamsStore {
     // a "video off" click.
     this._reconcileSignalsVideo();
 
-    Object.keys(get(this._openConnections)).forEach(peerB64 => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'video-off',
-      };
-      try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
-      } catch (e) {
-        console.warn('Could not send video-off message to peer: ', e);
-      }
-    });
+    this._broadcastRtcAction('video-off');
 
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
@@ -2824,20 +2830,7 @@ export class StreamsStore {
     // If no consumer currently holds the mic (WebRTC off + voice off), the
     // id is stored and the next acquire picks it up.
     await this.micSource.changeDevice(deviceId);
-    Object.keys(get(this._openConnections)).forEach(peerB64 => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'change-audio-input',
-      };
-      try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          "Failed to send 'change-audio-input' message to peer: ",
-          e.toString()
-        );
-      }
-    });
+    this._broadcastRtcAction('change-audio-input');
   }
 
   async audioOn(enabled: boolean) {
@@ -2882,20 +2875,7 @@ export class StreamsStore {
 
     this.eventCallback({ type: 'my-audio-on' });
 
-    Object.keys(get(this._openConnections)).forEach(peerB64 => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'audio-on',
-      };
-      try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          "Failed to send 'audio-on' message to peer: ",
-          e.toString()
-        );
-      }
-    });
+    this._broadcastRtcAction('audio-on');
   }
 
   /**
@@ -2938,20 +2918,7 @@ export class StreamsStore {
     // strips update.
     await this._syncConversationPayload({ micMuted: true });
 
-    Object.keys(get(this._openConnections)).forEach(peerB64 => {
-      const msg: RTCMessage = {
-        type: 'action',
-        message: 'audio-off',
-      };
-      try {
-        this.mediaTransport.send(peerB64, JSON.stringify(msg));
-      } catch (e: any) {
-        console.error(
-          'Failed to send audio-off message to peer: ',
-          e.toString()
-        );
-      }
-    });
+    this._broadcastRtcAction('audio-off');
     this.eventCallback({
       type: 'my-audio-off',
     });
@@ -5442,16 +5409,9 @@ export class StreamsStore {
             `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
           );
 
-          const msg: RTCMessage = {
-            type: 'action',
-            message: 'request-track-refresh',
-          };
-          try {
-            this.mediaTransport.send(pubKeyB64, JSON.stringify(msg));
+          if (this._sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
             // Reset stale count to avoid spamming
             this._staleCycles[pubKeyB64] = { audio: 0, video: 0 };
-          } catch (e: any) {
-            console.error('Failed to send request-track-refresh:', e.toString());
           }
         }
       } catch (e) {
@@ -6092,18 +6052,7 @@ export class StreamsStore {
     // send an audio-off signal
     if (alreadyOpen && metaDataExt?.data.audio) {
       if (!this.mainStream?.getAudioTracks()[0]?.enabled) {
-        const msg: RTCMessage = {
-          type: 'action',
-          message: 'audio-off',
-        };
-        try {
-          this.mediaTransport.send(pubkeyB64, JSON.stringify(msg));
-        } catch (e: any) {
-          console.error(
-            'Failed to send audio-off message to peer: ',
-            e.toString()
-          );
-        }
+        this._sendRtcAction('audio-off', [pubkeyB64]);
       }
     }
 

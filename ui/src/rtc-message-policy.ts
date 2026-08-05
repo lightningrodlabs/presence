@@ -18,7 +18,7 @@
 import type { RTCMessage } from './types';
 import type { SimpleEventType } from './logging';
 
-type ActionMessage = Extract<RTCMessage, { type: 'action' }>['message'];
+export type ActionMessage = Extract<RTCMessage, { type: 'action' }>['message'];
 
 /**
  * Every action message the decoder knows. `satisfies` makes omitting a
@@ -118,4 +118,15 @@ export function decodeRtcMessage(raw: unknown): RtcAction[] {
   } catch (e) {
     return [{ kind: 'parse-error', detail: JSON.stringify(e) }];
   }
+}
+
+/**
+ * Encode an action frame for the media data channel — the send-side
+ * counterpart of `decodeRtcMessage`, so the wire shape is stated once,
+ * next to the decoder that parses it (§9 item 6). The one consumer is
+ * `StreamsStore._sendRtcAction`, the single send-side seam.
+ */
+export function encodeRtcAction(message: ActionMessage): string {
+  const msg: RTCMessage = { type: 'action', message };
+  return JSON.stringify(msg);
 }

@@ -994,3 +994,38 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(store._lastReconcileTime[peerA]).toBeUndefined();
   });
 });
+
+describe('the RTCMessage send seam (§9 item 6)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('a broadcast reaches every open-connection peer, and one failing send does not stop the rest', async () => {
+    const started = makeStarted();
+    const { store, transports } = started;
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-a', 'signaling');
+    media.emitPhase(peerB, 'conn-b', 'signaling');
+
+    // peerA's channel throws; the per-peer catch must let peerB's send
+    // proceed (the unified catch is per peer, not per broadcast).
+    const realSend = media.send.bind(media);
+    vi.spyOn(media, 'send').mockImplementation((peer, data) => {
+      if (peer === peerA) throw new Error('channel closed');
+      realSend(peer, data);
+    });
+
+    // changeAudioInput broadcasts unconditionally (no consumer holds
+    // the mic in node, so MicSource just stores the id).
+    await store.changeAudioInput('device-2');
+
+    const frames = media.sentData.filter(f => {
+      const parsed = JSON.parse(String(f.data)) as {
+        type?: string;
+        message?: string;
+      };
+      return parsed.type === 'action' && parsed.message === 'change-audio-input';
+    });
+    expect(frames.map(f => f.peer)).toEqual([peerB]);
+  });
+});
