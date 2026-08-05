@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
-import { StreamsStore } from '../streams-store';
+import { StreamsStore, SDP_EXCHANGE_TIMEOUT } from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
 import type { FakeDeps } from '../store-deps.testing';
@@ -879,5 +879,118 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
     expect(spy).toHaveBeenCalledTimes(1);
     await tick(started);
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('InitAccept lifecycle (§9 item 5)', () => {
+  /** Seed a pending init and deliver the matching video InitAccept. */
+  async function acceptVideo(started: Started, connectionId: string) {
+    started.store._pendingInits[peerA] = [
+      { connectionId, t0: started.clock.now() },
+    ];
+    await started.bus.deliver(
+      message(
+        peerAKey,
+        'InitAccept',
+        JSON.stringify({ connection_id: connectionId, connection_type: 'video' })
+      )
+    );
+  }
+
+  it('the initiator slot install goes through the slot policy; the tracked SDP timer tears down its own attempt', async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+
+    // The slot exists, keyed to the transport-returned connectionId,
+    // fresh (connected: false), with SdpExchange status — the same
+    // decideSlotWrite apply the transport event glue runs, not a
+    // hand-written update.
+    const slot = get(store._openConnections)[peerA];
+    expect(slot).toBeDefined();
+    expect(slot.connectionId).toBe('init-1');
+    expect(slot.connected).toBe(false);
+    expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
+
+    // The attempt never connects: ITS OWN timer fires and tears it down.
+    clock.advance(SDP_EXCHANGE_TIMEOUT);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+    expect(get(store._connectionStatuses)[peerA]?.type).toBe('Disconnected');
+  });
+
+  it('THE SUCCESSOR PIN: a replacement attempt survives the predecessor SDP timer firing', async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+
+    // Halfway through the window the transport replaces the FSM in
+    // place (the adopt route) — a successor attempt now owns the slot.
+    clock.advance(SDP_EXCHANGE_TIMEOUT / 2);
+    media.emitPhase(peerA, 'conn-2', 'signaling');
+    expect(get(store._openConnections)[peerA].connectionId).toBe('conn-2');
+
+    // The predecessor's deadline passes. Before §9 item 5 the untracked
+    // timer saw SdpExchange status + an unconnected slot and destroyed
+    // the SUCCESSOR. Attempt-scoping makes it a no-op.
+    clock.advance(SDP_EXCHANGE_TIMEOUT / 2);
+    expect(get(store._openConnections)[peerA]?.connectionId).toBe('conn-2');
+    expect(media.closeCalls).toHaveLength(0);
+    expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
+  });
+
+  it('a new attempt after teardown replaces the tracked timer; disconnect() disarms it', async () => {
+    const started = makeStarted();
+    const { store, clock } = started;
+    await acceptVideo(started, 'init-1');
+    const armed = clock.pendingTimerCount;
+
+    // A fresh attempt for the same peer re-arms, not stacks.
+    started.transports.media!.emitPhase(peerA, 'init-1', 'closed', 'signaling');
+    await acceptVideo(started, 'init-2');
+    expect(clock.pendingTimerCount).toBe(armed);
+
+    // disconnect() leaves no timer behind (start/disconnect symmetry).
+    store.disconnect('sdp-timer-hygiene');
+    live.length = 0;
+    expect(clock.pendingTimerCount).toBe(0);
+  });
+
+  it('peer-leave wipes the init-retry cooldown and reconcile throttle; a plain close keeps the cooldown (the rejoin-inheritance fix)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    store._knownAgents.set(knownFresh(clock, peerA));
+
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    store._lastReconcileTime[peerA] = clock.now();
+
+    // A close STAMPS the cooldown and leaves the throttle alone — the
+    // retry-gap semantics, unchanged.
+    media.emitPhase(peerA, 'conn-1', 'failed', 'connected');
+    expect(store._lastDisconnectTime[peerA]).toBeDefined();
+    expect(store._lastReconcileTime[peerA]).toBeDefined();
+
+    // The peer LEAVES mid-connection: the leave row's deletes must win
+    // even though the nested close (transport closes first) re-stamps
+    // the cooldown on the way down — the executor-order pin.
+    media.emitPhase(peerA, 'conn-2', 'signaling');
+    media.emitPhase(peerA, 'conn-2', 'connected', 'connecting');
+    await bus.deliver(message(peerAKey, 'LeaveUi', ''));
+    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
+    expect(store._lastReconcileTime[peerA]).toBeUndefined();
+
+    // And the no-slot leave clears them too (the clears are
+    // unconditional per leave, as they always were on this path).
+    store._lastDisconnectTime[peerA] = clock.now();
+    store._lastReconcileTime[peerA] = clock.now();
+    await bus.deliver(message(peerAKey, 'LeaveUi', ''));
+    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
+    expect(store._lastReconcileTime[peerA]).toBeUndefined();
   });
 });

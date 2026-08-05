@@ -27,6 +27,7 @@ import {
   decideSlotWrite,
   attributeSlotEvent,
 } from './transport/media-event-policy';
+import type { SlotAction } from './transport/media-event-policy';
 import {
   computeSignalsTargets,
   decideWebrtcEligibility,
@@ -107,7 +108,7 @@ declare const __APP_VERSION__: string;
  * from SdpExchange to Connected within this duration, the stale peer is destroyed
  * and the connection is reset to Disconnected so the next ping/pong cycle can retry.
  */
-const SDP_EXCHANGE_TIMEOUT = 15000;
+export const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
  * How long an established peer may sit in iceConnectionState 'disconnected'
@@ -655,55 +656,12 @@ export class StreamsStore {
         });
         switch (route.handler) {
           case 'signaling':
-            if (route.slot.action === 'adopt') {
-              // The FSM behind the slot's connectionId was replaced in place
-              // by ConnectionManager (higher-epoch offer, or a new remote
-              // session) via `fsm.destroy()`, which emits no transition — so
-              // no `closed` ever reached us for it. Re-point the slot at the
-              // live connection; leaving the stale id would make every later
-              // connect/close for this peer hit its supersede guard, and a
-              // slot that was `connected: true` at replacement would stay
-              // that way forever. Mirrors the initiator path's supersede
-              // handling in `handleInitAccept`.
-              this.logger.logAgentEvent({
-                agent: event.peer,
-                timestamp: this.clock.now(),
-                event: 'Superseded',
-                connectionId: route.slot.supersedes,
-                detail: `superseded-by=${event.connectionId}; path=transport-replace`,
-              });
-              this._clearIceTiming(event.peer, route.slot.supersedes);
-              // Keyed to the old connection; the new connection's
-              // ice-diagnostic events set their own.
-              delete this._iceDisconnectedAt[event.peer];
-            }
-            this._stakeIceTiming(event.peer, event.connectionId);
-            {
-              // `install`: FSM acceptor path — an incoming offer creates an
-              // FSM without streams-store knowing in advance, so the slot
-              // has to exist for later connect/stream events to mutate.
-              // `replace` (adopt): same write, replacing a slot whose
-              // connection is gone. The decision — including that both start
-              // from `connected: false` — is `decideSlotWrite`, shared with
-              // the carrier-handover harness so the two cannot drift.
-              const slotWrite = decideSlotWrite(
-                { kind: 'signaling', slot: route.slot },
-                event.connectionId,
-                get(this._openConnections)[event.peer],
-              );
-              if (slotWrite.write === 'install' || slotWrite.write === 'replace') {
-                this._openConnections.update(currentValue => {
-                  currentValue[event.peer] = {
-                    ...slotWrite.slot,
-                    video: false,
-                    audio: false,
-                    direction: 'duplex',
-                  };
-                  return currentValue;
-                });
-                this.updateConnectionStatus(event.peer, { type: 'SdpExchange' });
-              }
-            }
+            this._applyMediaSignalingRoute(
+              event.peer,
+              event.connectionId,
+              route.slot,
+              'transport-replace',
+            );
             break;
           case 'media-connected':
             this._handleMediaConnected(event.peer, event.connectionId);
@@ -743,6 +701,69 @@ export class StreamsStore {
       case 'error':
         this._handleMediaError(event.peer, event.connectionId, event.error);
         break;
+    }
+  }
+
+  /**
+   * The apply half of a media `signaling` route — ONE apply for the ONE
+   * slot-write policy. Two callers: the transport event glue
+   * (`_dispatchMediaEvent`) and the initiator path (`handleInitAccept`,
+   * which used to hand-write `_openConnections` around the policy — §9
+   * item 5). `path` tags the Superseded forensic with which caller
+   * adopted.
+   *
+   * `install`: FSM acceptor path — an incoming offer creates an FSM
+   * without streams-store knowing in advance, so the slot has to exist
+   * for later connect/stream events to mutate. `replace` (adopt): same
+   * write, replacing a slot whose connection is gone. The decision —
+   * including that both start from `connected: false` — is
+   * `decideSlotWrite`, shared with the carrier-handover harness so the
+   * two cannot drift.
+   */
+  private _applyMediaSignalingRoute(
+    peer: AgentPubKeyB64,
+    connectionId: string,
+    slotAction: SlotAction,
+    path: 'transport-replace' | 'initiator',
+  ): void {
+    if (slotAction.action === 'adopt') {
+      // The FSM behind the slot's connectionId was replaced in place
+      // by ConnectionManager (higher-epoch offer, or a new remote
+      // session) via `fsm.destroy()`, which emits no transition — so
+      // no `closed` ever reached us for it. Re-point the slot at the
+      // live connection; leaving the stale id would make every later
+      // connect/close for this peer hit its supersede guard, and a
+      // slot that was `connected: true` at replacement would stay
+      // that way forever.
+      this.logger.logAgentEvent({
+        agent: peer,
+        timestamp: this.clock.now(),
+        event: 'Superseded',
+        connectionId: slotAction.supersedes,
+        detail: `superseded-by=${connectionId}; path=${path}`,
+      });
+      this._clearIceTiming(peer, slotAction.supersedes);
+      // Keyed to the old connection; the new connection's
+      // ice-diagnostic events set their own.
+      delete this._iceDisconnectedAt[peer];
+    }
+    this._stakeIceTiming(peer, connectionId);
+    const slotWrite = decideSlotWrite(
+      { kind: 'signaling', slot: slotAction },
+      connectionId,
+      get(this._openConnections)[peer],
+    );
+    if (slotWrite.write === 'install' || slotWrite.write === 'replace') {
+      this._openConnections.update(currentValue => {
+        currentValue[peer] = {
+          ...slotWrite.slot,
+          video: false,
+          audio: false,
+          direction: 'duplex',
+        };
+        return currentValue;
+      });
+      this.updateConnectionStatus(peer, { type: 'SdpExchange' });
     }
   }
 
@@ -1348,6 +1369,13 @@ export class StreamsStore {
     if (plan.recordLastDisconnect) {
       this._lastDisconnectTime[pubKeyB64] = this.clock.now();
     }
+    // The clears run AFTER recordLastDisconnect on purpose: on the
+    // peer-leave/live path the nested close-event row (via the
+    // synchronous `closed` from closeTransport above) has already
+    // stamped the cooldown, and the leave row's delete must win — a
+    // rejoining peer starts clean (§9 item 5).
+    if (plan.clearLastDisconnectTime) delete this._lastDisconnectTime[pubKeyB64];
+    if (plan.clearLastReconcileTime) delete this._lastReconcileTime[pubKeyB64];
     if (plan.clearVideoStreamSlot) delete this._videoStreams[pubKeyB64];
     // A closed connection's pending InitRequests are dead reservations:
     // clearing them lets the next pong cycle re-initiate immediately
@@ -2218,6 +2246,10 @@ export class StreamsStore {
       this.clock.clearInterval(this._presenceTickInterval);
       this._presenceTickInterval = undefined;
     }
+    for (const handle of Object.values(this._sdpTimeoutTimers)) {
+      this.clock.clearTimeout(handle);
+    }
+    this._sdpTimeoutTimers = {};
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -3190,6 +3222,15 @@ export class StreamsStore {
   private _videoKeepaliveTrack: MediaStreamTrack | null = null;
   private _videoKeepaliveCanvas: HTMLCanvasElement | null = null;
   private _videoKeepaliveStream: MediaStream | null = null;
+
+  /**
+   * Pending SDP-exchange timeout handles, one per peer, armed by
+   * `handleInitAccept`. Tracked so a successor attempt (or `disconnect()`)
+   * disarms the predecessor's timer instead of leaving it to fire against
+   * state it no longer owns (§9 item 5); the timer body is additionally
+   * attempt-scoped on its connectionId.
+   */
+  private _sdpTimeoutTimers: Record<AgentPubKeyB64, number> = {};
 
   /**
    * Tracks the last time reconcileVideoStreamState was triggered per agent,
@@ -6265,11 +6306,6 @@ export class StreamsStore {
             );
           }
 
-          // Capture any prior openConnection for this peer for forensic
-          // logging. ensureConnection with a new connectionId triggers
-          // the transport's internal supersede (closes the old peer).
-          const priorOpenForInitAccept = get(this._openConnections)[pubKey64];
-
           // Make sure the transport has the latest local stream cached
           // so the initial offer includes our tracks. Set on both impls
           // so a future swap doesn't lose the stream.
@@ -6299,63 +6335,61 @@ export class StreamsStore {
             epoch: this._nextConnectionEpoch(pubKey64),
           });
 
-          this._openConnections.update(currentValue => {
-            currentValue[pubKey64] = {
-              connectionId: effectiveConnId,
-              video: false,
-              audio: false,
-              connected: false,
-              direction: 'duplex',
-            };
-            return currentValue;
+          // The slot write goes through the ONE slot policy — the same
+          // routeTransportPhase('signaling') + decideSlotWrite pair the
+          // transport event glue runs — instead of the hand-written
+          // `_openConnections.update` this replaces (§9 item 5). If the
+          // transport synchronously emitted `signaling` during
+          // ensureConnection the route resolves to `keep` and the write
+          // half is a no-op; against a transport that emits nothing this
+          // is the installer. (The old code also carried a supersede
+          // block here that could never run: it read the slot inside the
+          // no-open-connection guard, before ensureConnection, so its
+          // prior-slot capture was always undefined. The adopt arm of
+          // the shared apply now owns that path for real.)
+          const route = routeTransportPhase({
+            phase: 'signaling',
+            connectionId: effectiveConnId,
+            openConnectionId: get(this._openConnections)[pubKey64]?.connectionId,
           });
-
-          if (
-            priorOpenForInitAccept &&
-            priorOpenForInitAccept.connectionId !== connection_id
-          ) {
-            this.logger.logCustomMessage(
-              `Superseding [${pubKey64.slice(0, 8)}]: prior open ` +
-                `connId=${priorOpenForInitAccept.connectionId.slice(0, 8)} ` +
-                `replaced by new connId=${connection_id.slice(0, 8)} (initiator path)`
+          if (route.handler === 'signaling') {
+            this._applyMediaSignalingRoute(
+              pubKey64,
+              effectiveConnId,
+              route.slot,
+              'initiator',
             );
-            this.logger.logAgentEvent({
-              agent: pubKey64,
-              timestamp: this.clock.now(),
-              event: 'Superseded',
-              connectionId: priorOpenForInitAccept.connectionId,
-              detail: `superseded-by=${connection_id}; path=initiator`,
-            });
-            // The prior peer's close handler will hit the supersede
-            // guard in _handleMediaClosed and return early without
-            // running cleanup, so any _iceDisconnectedAt entry from the
-            // old connection would leak. The new peer's ICE listener
-            // will set/clear based on its own state transitions.
-            delete this._iceDisconnectedAt[pubKey64];
-            // Transport's ensureConnection has already closed the old peer.
           }
 
           delete this._pendingInits[pubKey64];
 
-          this.updateConnectionStatus(pubKey64, { type: 'SdpExchange' });
-
-          // SDP exchange timeout: if still not connected after 15s, clean up and retry
-          this.clock.setTimeout(() => {
+          // SDP exchange timeout: if still not connected after 15s, clean
+          // up and retry. The timer is ATTEMPT-scoped and TRACKED (§9
+          // item 5): it may only tear down the attempt that armed it — a
+          // successor attempt's slot must survive this timer firing — and
+          // a new attempt for the same peer disarms the previous timer,
+          // as does disconnect().
+          const priorSdpTimer = this._sdpTimeoutTimers[pubKey64];
+          if (priorSdpTimer !== undefined) this.clock.clearTimeout(priorSdpTimer);
+          this._sdpTimeoutTimers[pubKey64] = this.clock.setTimeout(() => {
+            delete this._sdpTimeoutTimers[pubKey64];
+            const conn = get(this._openConnections)[pubKey64];
+            // A successor attempt owns the slot now: its own timer owns
+            // its deadline. (Pinned by the successor-survival wiring test.)
+            if (conn && conn.connectionId !== effectiveConnId) return;
             const currentStatus = get(this._connectionStatuses)[pubKey64];
-            if (currentStatus && currentStatus.type === 'SdpExchange') {
-              this.logger.logCustomMessage(
-                `SDP timeout [${pubKey64.slice(0, 8)}]: destroying stale connection`
-              );
-              const conn = get(this._openConnections)[pubKey64];
-              if (conn && !conn.connected) {
-                this.mediaTransport.closeConnection(pubKey64, 'SDP exchange timeout');
-                this._openConnections.update(current => {
-                  delete current[pubKey64];
-                  return current;
-                });
-              }
-              this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
+            if (!currentStatus || currentStatus.type !== 'SdpExchange') return;
+            this.logger.logCustomMessage(
+              `SDP timeout [${pubKey64.slice(0, 8)}]: destroying stale connection`
+            );
+            if (conn && !conn.connected) {
+              this.mediaTransport.closeConnection(pubKey64, 'SDP exchange timeout');
+              this._openConnections.update(current => {
+                delete current[pubKey64];
+                return current;
+              });
             }
+            this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
           }, SDP_EXCHANGE_TIMEOUT);
         }
       }

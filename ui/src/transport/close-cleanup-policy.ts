@@ -117,6 +117,18 @@ export type CloseCleanupPlan = {
   clearWebrtcExitReason: boolean;
   /** Stamp `_lastDisconnectTime[peer] = now` (init-retry cooldown input). */
   recordLastDisconnect: boolean;
+  /**
+   * Delete `_lastDisconnectTime[peer]`. Peer-leave rows only (§9 item 5):
+   * a REJOINING peer must not inherit the departed session's retry-gap
+   * cooldown. Close rows keep the stamp — that is the retry-gap
+   * semantics. On `media-leave`/live the nested close-event row stamps
+   * `recordLastDisconnect` first (transport closes before the clears);
+   * the executor runs this delete after, so the delete wins — pinned in
+   * the wiring suite.
+   */
+  clearLastDisconnectTime: boolean;
+  /** Delete `_lastReconcileTime[peer]` — same rejoin-inheritance rule. */
+  clearLastReconcileTime: boolean;
   /** Wipe `perceivedStreamInfo` in `_othersConnectionStatuses`. */
   clearPerceivedStreamInfo: boolean;
   removeAudioAnalyser: boolean;
@@ -150,6 +162,8 @@ const NONE: Omit<CloseCleanupPlan, 'reason'> = {
   clearQualityBucket: false,
   clearWebrtcExitReason: false,
   recordLastDisconnect: false,
+  clearLastDisconnectTime: false,
+  clearLastReconcileTime: false,
   clearPerceivedStreamInfo: false,
   removeAudioAnalyser: false,
   clearWebrtcStats: false,
@@ -234,6 +248,8 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 clearVideoStreamSlot: true,
                 clearPendingInits: true,
                 clearQualityBucket: true,
+                clearLastDisconnectTime: true,
+                clearLastReconcileTime: true,
                 setDisconnectedStatus: 'media',
               };
             case 'no-slot':
@@ -244,6 +260,8 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 clearVideoStreamSlot: true,
                 clearPendingInits: true,
                 clearQualityBucket: true,
+                clearLastDisconnectTime: true,
+                clearLastReconcileTime: true,
                 setDisconnectedStatus: 'media',
               };
             case 'superseded':

@@ -49,6 +49,8 @@ const OFF: Omit<CloseCleanupPlan, 'reason'> = {
   clearQualityBucket: false,
   clearWebrtcExitReason: false,
   recordLastDisconnect: false,
+  clearLastDisconnectTime: false,
+  clearLastReconcileTime: false,
   clearPerceivedStreamInfo: false,
   removeAudioAnalyser: false,
   clearWebrtcStats: false,
@@ -89,6 +91,10 @@ describe('closeCleanupPlan — the media full close set, pinned field-by-field',
     clearQualityBucket: true,
     clearWebrtcExitReason: true,
     recordLastDisconnect: true,
+    // The cooldown DELETES belong to peer-leave only: a close keeps the
+    // stamp (retry-gap semantics), a leave wipes it (§9 item 5).
+    clearLastDisconnectTime: false,
+    clearLastReconcileTime: false,
     clearPerceivedStreamInfo: true,
     removeAudioAnalyser: true,
     clearWebrtcStats: true,
@@ -218,6 +224,10 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
       clearVideoStreamSlot: true,
       clearPendingInits: true,
       clearQualityBucket: true,
+      // §9 item 5: a rejoining peer must not inherit the departed
+      // session's init-retry cooldown or reconcile throttle.
+      clearLastDisconnectTime: true,
+      clearLastReconcileTime: true,
       setDisconnectedStatus: 'media',
     });
   });
@@ -231,6 +241,8 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
       clearVideoStreamSlot: true,
       clearPendingInits: true,
       clearQualityBucket: true,
+      clearLastDisconnectTime: true,
+      clearLastReconcileTime: true,
       setDisconnectedStatus: 'media',
     });
   });
