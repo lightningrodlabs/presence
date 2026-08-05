@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
@@ -8,6 +8,7 @@ import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
 import type { FakeDeps } from '../store-deps.testing';
 import { PING_INTERVAL, PRESENT_STALENESS_MS } from '../presence-policy';
 import { voiceController } from '../room/modules/voice';
+import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
 
 /**
@@ -783,5 +784,100 @@ describe('start()/disconnect() symmetry', () => {
     // A signal delivered after disconnect reaches nothing: no pong.
     await bus.deliver(message(peerAKey, 'PingUi', ''));
     expect(bus.sentOfType('PongUi')).toHaveLength(0);
+  });
+});
+
+describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
+  // The retry cadence is the presence tick: `_signalsTargets` notifies
+  // once per tick (the derived chain rebuilds its objects), so the
+  // reconcilers re-run within PING_INTERVAL of a failed start. These
+  // tests are the pin the reconcilers' comments cite — if store
+  // notification semantics ever get memoized, the retry dies and these
+  // go red.
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  /** Arm the voice gate: a present signals target + a held mic. */
+  function armVoice(started: Started) {
+    const { store, clock } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    (store as unknown as { _webrtcMicHandle: unknown })._webrtcMicHandle = {
+      release: () => {},
+    };
+  }
+
+  /** One presence tick with the target peer kept ping-fresh. */
+  async function tick(started: Started) {
+    const { store, clock } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    clock.advance(PING_INTERVAL);
+    await flush();
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('a startCapture that resolves false is retried on the next presence tick', async () => {
+    const spy = vi
+      .spyOn(voiceController, 'startCapture')
+      .mockResolvedValue(false);
+    const started = makeStarted();
+    armVoice(started);
+
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(1);
+    // The failure resolved: the flag converged to reality.
+    expect(started.store.voiceEncoderRunning).toBe(false);
+
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(started.store.voiceEncoderRunning).toBe(false);
+  });
+
+  it('a startCapture that REJECTS resets the flag and retries — the wedge: no rejection arm left the flag true forever', async () => {
+    const spy = vi
+      .spyOn(voiceController, 'startCapture')
+      .mockRejectedValue(new Error('NotAllowedError: mic denied'));
+    const started = makeStarted();
+    armVoice(started);
+
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(1);
+    // Without the rejection arm this read `true` while no encoder ran,
+    // and every later reconcile no-opped: signals audio off until the
+    // mic/target gate cycled.
+    expect(started.store.voiceEncoderRunning).toBe(false);
+
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a healthy start is not re-invoked by the tick (the flag gates the reconciler)', async () => {
+    const spy = vi
+      .spyOn(voiceController, 'startCapture')
+      .mockResolvedValue(true);
+    const started = makeStarted();
+    armVoice(started);
+
+    await tick(started);
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(true);
+  });
+
+  it('the filmstrip reconciler retries a rejected startCapture the same way', async () => {
+    const spy = vi
+      .spyOn(filmstripController, 'startCapture')
+      .mockRejectedValue(new Error('camera busy'));
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    (
+      started.store as unknown as { _webrtcCameraHandle: unknown }
+    )._webrtcCameraHandle = { release: () => {} };
+
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(1);
+    await tick(started);
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 });
