@@ -609,8 +609,15 @@ export class StreamsStore {
     // Subscribe to _signalsTargets changes. When the set transitions
     // between empty and non-empty while the mic / camera is held, start
     // or stop the corresponding signals-carrier encoder. The subscription
-    // fires on every _activeAgents or _openConnections change; the
-    // reconcilers are cheap (a boolean check + set size).
+    // fires on every _activeAgents or _openConnections change — which
+    // includes once per presence tick, because the derived chain rebuilds
+    // its objects each recompute; the reconcilers are cheap (a boolean
+    // check + set size). That per-tick firing is load-bearing: it is the
+    // encoder-start RETRY cadence after a failed startCapture (the
+    // reconcilers reset the running flag on failure and this subscription
+    // re-invokes them within PING_INTERVAL). Pinned by the encoder-retry
+    // wiring tests — if store notification semantics ever get memoized,
+    // those tests go red and the retry needs an explicit home.
     this._signalsTargetsUnsub = this._signalsTargets.subscribe(() => {
       this._reconcileSignalsAudio();
       this._reconcileSignalsVideo();
@@ -1886,12 +1893,26 @@ export class StreamsStore {
       // Only start the encoder (send side). The controller is already
       // bound to the store at construction time so the receive side works
       // regardless.
-      voiceController.startCapture().then(ok => {
-        if (!ok) {
+      //
+      // Failure (resolved false OR rejection) resets the flag so the next
+      // reconcile retries. The retry cadence is the presence tick: the
+      // `_signalsTargets` subscription in start() fires once per tick
+      // whenever this store is live, so a failed start is re-attempted
+      // within PING_INTERVAL — pinned by the encoder-retry wiring tests.
+      // Without the rejection arm the flag wedged true forever and signals
+      // audio stayed off until the mic/target gate cycled (§9 item 2).
+      voiceController.startCapture().then(
+        ok => {
+          if (!ok) {
+            this._voiceEncoderRunning = false;
+            console.warn('Voice encoder failed to start');
+          }
+        },
+        e => {
           this._voiceEncoderRunning = false;
-          console.warn('Voice encoder failed to start');
+          console.warn('Voice encoder failed to start', e);
         }
-      });
+      );
       this._voiceEncoderRunning = true;
     } else if (!shouldRun && this._voiceEncoderRunning) {
       voiceController.stopCapture().catch(() => {});
@@ -1915,12 +1936,22 @@ export class StreamsStore {
     const shouldRun = cameraHeld && hasTargets;
 
     if (shouldRun && !this._filmstripEncoderRunning) {
-      filmstripController.startCapture().then(ok => {
-        if (!ok) {
+      // Failure handling mirrors `_reconcileSignalsAudio`: both failure
+      // shapes reset the flag; the presence-tick-driven `_signalsTargets`
+      // subscription retries within PING_INTERVAL (pinned by the
+      // encoder-retry wiring tests).
+      filmstripController.startCapture().then(
+        ok => {
+          if (!ok) {
+            this._filmstripEncoderRunning = false;
+            console.warn('Filmstrip encoder failed to start');
+          }
+        },
+        e => {
           this._filmstripEncoderRunning = false;
-          console.warn('Filmstrip encoder failed to start');
+          console.warn('Filmstrip encoder failed to start', e);
         }
-      });
+      );
       this._filmstripEncoderRunning = true;
     } else if (!shouldRun && this._filmstripEncoderRunning) {
       filmstripController.stopCapture().catch(() => {});
