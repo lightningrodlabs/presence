@@ -524,14 +524,12 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-screen-share-stream': {
-          console.log('&&&& GOT SCREEN STREAM');
           // We want to make sure that the video element is actually in the DOM
           // so we add a timeout here.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
               peerScreenVideoId(event.pubKeyB64)
             ) as HTMLVideoElement | undefined;
-            console.log('&&&& Trying to set video element (screen share)');
             if (videoEl) {
               videoEl.autoplay = true;
               videoEl.srcObject = event.stream;
