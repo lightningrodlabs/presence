@@ -85,6 +85,10 @@ const PINNED_FILES: Array<{
     relPath: '../room/elements/agent-connection-status-icon.ts',
     patterns: WIRE_TIMEBASE_PATTERNS,
   },
+  // The cross-pane ownership protocol: its ack window runs on the clock
+  // seam. (AbortSignal.timeout is deliberately outside the patterns'
+  // reach — see the module doc — but a bare timer creeping in is not.)
+  { relPath: '../room-ownership.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {

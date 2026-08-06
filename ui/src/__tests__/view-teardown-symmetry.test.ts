@@ -146,17 +146,42 @@ describe('RoomView split-drag listeners (Round 3 item 4b(2))', () => {
 });
 
 describe('PresenceApp room lock (Round 3 item 4b(3))', () => {
-  it('disconnectedCallback releases the Web Lock and closes the room BroadcastChannel', () => {
+  it('disconnectedCallback releases the Web Lock and closes the room BroadcastChannel', async () => {
+    // The protocol moved into RoomOwnership (view-layer round); the pin
+    // now drives a REAL acquire over fake seams and asserts the element
+    // teardown reaches release() — lock let go, channel closed.
+    const { RoomOwnership } = await import('../room-ownership');
+    let lockReleased = false;
+    const channel = {
+      onmessage: null as ((e: { data: unknown }) => void) | null,
+      postMessage: vi.fn(),
+      close: vi.fn(),
+    };
+    const ownership = new RoomOwnership({
+      getLocks: () => ({
+        async request(_name: string, _opts: object, cb: (lock: object | null) => unknown) {
+          const held = cb({});
+          void Promise.resolve(held).then(() => {
+            lockReleased = true;
+          });
+        },
+      }),
+      openChannel: () => channel,
+      clock: { now: () => 0, setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 1, clearInterval: () => {} },
+    });
+    expect(await ownership.acquire('dna1', { onKicked: () => {} })).toBe(
+      'acquired'
+    );
+    expect(ownership.holding).toBe(true);
+
     const el = document.createElement('presence-app') as any;
-    const release = vi.fn();
-    const close = vi.fn();
-    el._roomLockRelease = release;
-    el._roomChannel = { close };
+    el._roomOwnership = ownership;
     el.disconnectedCallback();
-    expect(release).toHaveBeenCalledTimes(1);
-    expect(close).toHaveBeenCalledTimes(1);
-    expect(el._roomLockRelease).toBeUndefined();
-    expect(el._roomChannel).toBeUndefined();
+    await Promise.resolve();
+    expect(ownership.holding).toBe(false);
+    expect(lockReleased).toBe(true);
+    expect(channel.close).toHaveBeenCalledTimes(1);
+    expect(el._roomAlreadyOpen).toBe(false);
   });
 });
 
