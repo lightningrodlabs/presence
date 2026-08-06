@@ -30,6 +30,13 @@ import { fileURLToPath } from 'node:url';
  * paint-timer idiom in the view files, visible in review. `presence-app.ts`
  * alone is allowed *argument-taking* `new Date(ts)` (timestamp formatting
  * for display — not a clock read); no-arg `new Date()` stays banned there.
+ * `room/elements/agent-connection-status-icon.ts` is allowed exactly ONE
+ * `Date.now()`, and only as the second argument of `lastSeenBucket(...)`:
+ * that fallback compares a REMOTE peer's wire timestamp against local wall
+ * clock, which is the declared-correct timebase for cross-peer comparisons
+ * (CLAUDE.md, Phase 2 facts) — the store clock would be wrong there. The
+ * dedicated describe at the bottom holds that count to one, so the
+ * relaxation cannot quietly widen into general ambient time reads.
  *
  * If this test failed for you: route the new call through the file's clock.
  */
@@ -54,6 +61,14 @@ const DISPLAY_FORMATTING_PATTERNS: Array<[name: string, re: RegExp]> = [
   ['bare setInterval()', /(?<![.\w])setInterval\s*\(/],
 ];
 
+// agent-connection-status-icon's ONE sanctioned Date.now (see header) —
+// everything else ambient stays banned in that file.
+const WIRE_TIMEBASE_PATTERNS: Array<[name: string, re: RegExp]> = [
+  ['new Date()', /\bnew\s+Date\s*\(/],
+  ['bare setTimeout()', /(?<![.\w])setTimeout\s*\(/],
+  ['bare setInterval()', /(?<![.\w])setInterval\s*\(/],
+];
+
 const PINNED_FILES: Array<{
   relPath: string;
   patterns: Array<[string, RegExp]>;
@@ -66,6 +81,10 @@ const PINNED_FILES: Array<{
     patterns: FULL_PATTERNS,
   },
   { relPath: '../presence-app.ts', patterns: DISPLAY_FORMATTING_PATTERNS },
+  {
+    relPath: '../room/elements/agent-connection-status-icon.ts',
+    patterns: WIRE_TIMEBASE_PATTERNS,
+  },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
@@ -86,3 +105,25 @@ for (const { relPath, patterns } of PINNED_FILES) {
     });
   });
 }
+
+describe('agent-connection-status-icon: the wire-timebase relaxation stays exactly one call', () => {
+  const source = readFileSync(
+    fileURLToPath(
+      new URL(
+        '../room/elements/agent-connection-status-icon.ts',
+        import.meta.url
+      )
+    ),
+    'utf8'
+  );
+
+  it('contains exactly one Date.now(), as the lastSeenBucket wall-clock argument', () => {
+    const occurrences = source.match(/\bDate\.now\s*\(/g) ?? [];
+    expect(occurrences).toHaveLength(1);
+    // The sanctioned shape: a remote wire timestamp bucketed against
+    // local wall clock. Any other placement is a new ambient read.
+    expect(source).toMatch(
+      /lastSeenBucket\(this\.lastSeen,\s*Date\.now\(\)\)/
+    );
+  });
+});
