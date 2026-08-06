@@ -86,7 +86,9 @@ export class AgentConnectionStatusIcon extends LitElement {
    * `lastSeenBucket` instead (room-view's my-video / my-screen-share
    * paths), so the only input that reaches this line is a remote peer's
    * timestamp — a cross-peer wire comparison, which wall clock is the
-   * correct timebase for.
+   * correct timebase for. This is the file's ONE sanctioned ambient
+   * wall-clock read, held to exactly one call by no-ambient-clock.test.ts
+   * — a second one anywhere in this file (comments included) fails it.
    */
   private _effectiveLastSeenBucket(): LastSeenBucket {
     return this.lastSeenBucket ?? lastSeenBucket(this.lastSeen, Date.now());
