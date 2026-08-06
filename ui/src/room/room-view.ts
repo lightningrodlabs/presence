@@ -308,9 +308,6 @@ export class RoomView extends LitElement {
   _leaveAudio = new Audio('percussive-drum-hit.mp3');
 
   @state()
-  _reconnectAudio = new Audio('old-phone-ring-connect.mp3#t=0,3.5');
-
-  @state()
   _showAttachmentsPanel = false;
 
   @state()
@@ -561,7 +558,6 @@ export class RoomView extends LitElement {
     this.streamsStore.onEvent(event => this._onStoreEvent(event));
     this._leaveAudio.volume = 0.05;
     this._joinAudio.volume = 0.07;
-    this._reconnectAudio.volume = 0.1;
 
     // Join/leave sounds arrive as 'peer-joined-presence' /
     // 'peer-left-presence' store events (see the onEvent handler above),

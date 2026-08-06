@@ -78,7 +78,7 @@ export class ListOnlineAgents extends LitElement {
               <div
                 class="column"
                 style="${this.avatarSize
-                  ? `height: ${this.avatarSize}; width: ${this.avatarSize}`
+                  ? `height: ${this.avatarSize}px; width: ${this.avatarSize}px;`
                   : 'height: 40px; width: 40px;'}
                   background: gray;
                   align-items: center;
