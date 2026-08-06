@@ -1,4 +1,4 @@
-import { LitElement, html, css } from 'lit';
+import { LitElement, html, css, PropertyValues } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import type { StreamsStore } from '../../streams-store';
 import { MEDIA_LIVE_WINDOW_MS } from '../../presence-policy';
@@ -120,6 +120,32 @@ export class PeerStatsPanel extends LitElement {
         </div>
       ` : html``}
     `;
+  }
+
+  /**
+   * repeat() reuses this element for a DIFFERENT peer when the roster
+   * shifts — the keyed tile above survives, the panel inside it gets a
+   * new agentPubKeyB64. The `_last*` cache belongs to the OLD peer; left
+   * in place it renders the old peer's numbers for up to a full poll
+   * interval (and forever if the new peer's numbers happen to match the
+   * change-detection compare). Reset the cache and resample now, in the
+   * same update cycle.
+   */
+  willUpdate(changed: PropertyValues) {
+    if (changed.has('agentPubKeyB64')) {
+      this._lastCarrier = 'none';
+      this._lastRtt = null;
+      this._lastJitter = null;
+      this._lastLoss = null;
+      this._lastFlow = 'idle';
+      this._lastVidFps = null;
+      this._lastVidJitter = null;
+      this._lastVidTransit = null;
+      this._lastVidBuf = null;
+      this._lastVidLoss = null;
+      this._lastVidSkew = null;
+      this._tick();
+    }
   }
 
   connectedCallback() {
