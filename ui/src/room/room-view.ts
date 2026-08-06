@@ -46,6 +46,14 @@ import '@shoelace-style/shoelace/dist/components/menu/menu.js';
 import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
 import { AssetStoreContent, WAL, weaveUrlFromWal, WeaveClient } from '@theweave/api';
 import './elements/shared-wal-embed';
+// room-view renders <agent-avatar> (logs-graph button); import the
+// registration it depends on directly instead of riding presence-app's
+// transitive lobby import. The tag is OUR lobby/agent-avatar.ts — the
+// profiles library ships an element with the same tag name, and whichever
+// module evaluates second throws on customElements.define. The registry
+// pin in __tests__/agent-avatar-registration.test.ts holds the tag to the
+// local class; never import @holochain-open-dev/profiles/dist/elements/*.
+import '../lobby/agent-avatar';
 
 import { roomStoreContext, streamsStoreContext } from '../contexts';
 import { sharedStyles } from '../sharedStyles';
