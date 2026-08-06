@@ -152,10 +152,33 @@ describe('room-view binds video only through the authority', () => {
     expect(calls.length).toBeGreaterThanOrEqual(6);
   });
 
-  it('uses the named paint delays, no bare magic reapply timeouts', () => {
-    expect(src).toContain('MAXIMIZE_REAPPLY_DELAY_MS');
-    expect(src).toContain('LAYOUT_SWITCH_REAPPLY_DELAY_MS');
-    expect(src).toContain('STREAM_EVENT_DOM_SETTLE_MS');
-    expect(src).not.toMatch(/_reapplyVideoStreams\(\),\s*\d/);
+  it('every bind-family setTimeout uses a named delay, checked per call site (review F2)', () => {
+    // The first cut of this pin was toContain on the constant names,
+    // which the import line alone satisfied — a re-inlined literal 200
+    // at a call site was invisible. This walks each setTimeout whose
+    // window touches the bind family and asserts the delay is named,
+    // not a literal, at THAT site.
+    const lines = src.split('\n');
+    const NAMED =
+      /MAXIMIZE_REAPPLY_DELAY_MS|LAYOUT_SWITCH_REAPPLY_DELAY_MS|STREAM_EVENT_DOM_SETTLE_MS/;
+    const bindSites: number[] = [];
+    lines.forEach((line, i) => {
+      if (!/setTimeout\s*\(/.test(line)) return;
+      const windowText = lines.slice(i, i + 12).join('\n');
+      if (!/bindVideoStream\(|_reapplyVideoStreams\(/.test(windowText)) return;
+      bindSites.push(i + 1);
+      expect(
+        NAMED.test(windowText),
+        `room-view.ts:${i + 1}: bind-family timeout must use a named delay`
+      ).toBe(true);
+      expect(
+        /[,(]\s*\d+\s*\)/.test(windowText),
+        `room-view.ts:${i + 1}: bind-family timeout carries a literal delay`
+      ).toBe(false);
+    });
+    // The four known sites: maximize reapply, layout-switch reapply,
+    // peer-stream, peer-screen-share-stream. A fifth bind-family timer
+    // must show up here and pass the same bar.
+    expect(bindSites).toHaveLength(4);
   });
 });
