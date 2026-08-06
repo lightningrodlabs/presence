@@ -49,6 +49,26 @@ export function bestColumns(
   return bestCols;
 }
 
+/**
+ * The one tile-count rule for the people grid: present peers + phantom
+ * placeholders + the own tile, own only when self-view actually occupies
+ * a grid slot (hidden self-view is display:none and takes none). Before
+ * this function, three room-view sites hand-copied the sum with
+ * keep-in-sync comments (_updateGrid, idToLayout, the CSS-var `n`) —
+ * PR #4 F7 was exactly one of them drifting on `_selfViewHidden`.
+ */
+export function gridTileCount(input: {
+  visiblePeerCount: number;
+  phantomCount: number;
+  selfViewHidden: boolean;
+}): number {
+  return (
+    input.visiblePeerCount +
+    input.phantomCount +
+    (input.selfViewHidden ? 0 : 1)
+  );
+}
+
 /** Column/row shape for n tiles in a W:H box of the given tile aspect. */
 export function gridShape(
   W: number,

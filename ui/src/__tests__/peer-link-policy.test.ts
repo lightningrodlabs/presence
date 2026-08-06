@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { decideAudioLink, buildPeerLinkSnapshot } from '../peer-link-policy';
+import {
+  decideAudioLink,
+  buildPeerLinkSnapshot,
+  countAudiblePeers,
+} from '../peer-link-policy';
 import type { AudioLinkInputs } from '../peer-link-policy';
 
 const NOW = 100_000;
@@ -201,5 +205,58 @@ describe('buildPeerLinkSnapshot — wire fields keep their carrier-tagged meanin
         lastSeen: 'fresh',
       }).video,
     ).toBe('muted');
+  });
+});
+
+describe('countAudiblePeers — one rule for the icon-strip audible counter', () => {
+  const links = (...ls: string[]) => ls as any[];
+
+  it('self basis: counts webrtc and signals links only', () => {
+    expect(
+      countAudiblePeers({
+        selfLinks: links('webrtc', 'signals', 'muted', 'down', 'absent', 'negotiating', 'blocked'),
+        observerStatusTypes: [],
+      }),
+    ).toEqual({ count: 2, basis: 'self-links' });
+  });
+
+  it('observer basis: counts the broadcast peerLinks, same audibility rule', () => {
+    expect(
+      countAudiblePeers({
+        observerLinks: [
+          { audioLink: 'webrtc' },
+          { audioLink: 'muted' },
+          { audioLink: 'signals' },
+        ],
+        observerStatusTypes: ['Connected', 'Connected', 'Connected'],
+      }),
+    ).toEqual({ count: 2, basis: 'observer-links' });
+  });
+
+  it('an EMPTY broadcast still wins over the fallback — "I hear nobody" is data, not absence', () => {
+    expect(
+      countAudiblePeers({
+        observerLinks: [],
+        observerStatusTypes: ['Connected', 'Connected'],
+      }),
+    ).toEqual({ count: 0, basis: 'observer-links' });
+  });
+
+  it('selfLinks beats observerLinks when both are present', () => {
+    expect(
+      countAudiblePeers({
+        selfLinks: links('webrtc'),
+        observerLinks: [{ audioLink: 'muted' as any }],
+        observerStatusTypes: [],
+      }),
+    ).toEqual({ count: 1, basis: 'self-links' });
+  });
+
+  it("fallback counts only 'Connected' (ICE+DTLS, the Phase 4 copy rule) — declared legacy lower bound", () => {
+    expect(
+      countAudiblePeers({
+        observerStatusTypes: ['Connected', 'InitSent', 'SdpExchange', 'Disconnected', 'Connected'],
+      }),
+    ).toEqual({ count: 2, basis: 'connected-fallback' });
   });
 });

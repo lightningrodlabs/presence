@@ -172,3 +172,66 @@ export function buildPeerLinkSnapshot(s: PeerLinkInputs): PeerLinkSnapshot {
     lastSeen: s.lastSeen,
   };
 }
+
+/** An audio link an observer can actually hear over — either carrier. */
+const AUDIBLE_LINKS: ReadonlySet<AudioLinkState> = new Set([
+  'webrtc',
+  'signals',
+]);
+
+export type AudibleCountInputs = {
+  /**
+   * Present only when the observer is US (the self icon strip): our own
+   * per-peer answers from `audioLinkFor`. Highest precedence.
+   */
+  selfLinks?: AudioLinkState[];
+  /**
+   * Present when the rendered observer broadcast per-peer link snapshots
+   * (`peerLinks` in their pong metadata). Precedence over the status
+   * fallback even when EMPTY — an empty broadcast is the observer saying
+   * "I hear nobody", which must not be silently replaced by our guess.
+   */
+  observerLinks?: Array<Pick<PeerLinkSnapshot, 'audioLink'>>;
+  /**
+   * Last resort: the observer's raw ConnectionStatus type tags.
+   */
+  observerStatusTypes: string[];
+};
+
+export type AudibleCount = {
+  count: number;
+  basis: 'self-links' | 'observer-links' | 'connected-fallback';
+};
+
+/**
+ * Count peers an observer can actually hear — AudioLink ∈
+ * {webrtc, signals}. One rule for the icon strips' "(n)" counter;
+ * room-view used to inline this as a three-arm IIFE.
+ *
+ * The fallback arm is DECLARED legacy semantics, kept as-is: counting
+ * `status.type === 'Connected'` reserves the word for ICE + DTLS up
+ * (the Phase 4 copy rule), so it undercounts signals-only audibility
+ * and counts connected-but-silent links. It exists only for observers
+ * that broadcast no `peerLinks` at all (pre-Phase-4 builds, or a
+ * snapshot that predates the field); inventing audibility the observer
+ * never claimed would be worse than the honest lower bound.
+ */
+export function countAudiblePeers(s: AudibleCountInputs): AudibleCount {
+  if (s.selfLinks) {
+    return {
+      count: s.selfLinks.filter(l => AUDIBLE_LINKS.has(l)).length,
+      basis: 'self-links',
+    };
+  }
+  if (s.observerLinks) {
+    return {
+      count: s.observerLinks.filter(l => AUDIBLE_LINKS.has(l.audioLink))
+        .length,
+      basis: 'observer-links',
+    };
+  }
+  return {
+    count: s.observerStatusTypes.filter(t => t === 'Connected').length,
+    basis: 'connected-fallback',
+  };
+}

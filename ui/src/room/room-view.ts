@@ -97,9 +97,11 @@ import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-shar
 import './modules'; // side-effect: registers all modules
 import {
   bestColumns,
+  gridTileCount,
   GRID_MIN_TILE_WIDTH,
   GRID_TOOLBAR_RESERVE,
 } from './layout';
+import { countAudiblePeers } from '../peer-link-policy';
 
 declare const __APP_VERSION__: string;
 
@@ -721,6 +723,21 @@ export class RoomView extends LitElement {
     return this._presentPeers.value;
   }
 
+  /**
+   * Tiles occupying grid slots right now — the gridTileCount authority
+   * (layout.ts) over this element's live inputs. Every site that needs
+   * the count (_updateGrid, idToLayout, the CSS-var n) calls this;
+   * hand-rolling the sum again is pinned red by
+   * __tests__/view-count-authorities.test.ts.
+   */
+  private _tileCount(): number {
+    return gridTileCount({
+      visiblePeerCount: this._visiblePeers().length,
+      phantomCount: this.streamsStore.phantomAgents().length,
+      selfViewHidden: this._selfViewHidden,
+    });
+  }
+
   private _updateGrid() {
     if (this._maximizedVideo || this._getActiveShares().length > 0) {
       this._setGrid(0, 0);
@@ -742,11 +759,9 @@ export class RoomView extends LitElement {
     );
     const H = Math.max(0, doc.clientHeight - headerHeight - GRID_TOOLBAR_RESERVE);
 
-    // Count tiles actually laid out: peers + phantoms + own (unless hidden,
-    // in which case it is display:none and takes no grid slot).
-    const phantomCount = this.streamsStore.phantomAgents().length;
-    let n = this._visiblePeers().length + phantomCount;
-    if (!this._selfViewHidden) n += 1;
+    // Count tiles actually laid out — the one rule is gridTileCount
+    // (layout.ts); idToLayout and the CSS-var n read the same authority.
+    const n = this._tileCount();
 
     // A lone tile keeps the existing fill-the-viewport behavior (.single),
     // which sets an explicit height; pinning width too would break it.
@@ -894,17 +909,9 @@ export class RoomView extends LitElement {
 
     // Phantom tiles (reported-by-others but not connected to us) render
     // alongside active tiles in the same grid and must be counted toward
-    // layout sizing. Without this the layout class is computed for fewer
-    // tiles than actually render, and every tile is oversized.
-    const phantomCount = this.streamsStore.phantomAgents().length;
-    // Same count as _updateGrid and the CSS-var n: present peers +
-    // phantoms + self, and self only when it actually occupies a grid
-    // slot. Honouring _selfViewHidden here is what makes all three agree
-    // unconditionally rather than only when self-view is visible (PR #4 F7).
-    const videoOnlyCount =
-      this._visiblePeers().length +
-      phantomCount +
-      (this._selfViewHidden ? 0 : 1);
+    // layout sizing — gridTileCount includes them. Same authority as
+    // _updateGrid and the CSS-var n (PR #4 F7 was these sums drifting).
+    const videoOnlyCount = this._tileCount();
     const totalCount = videoOnlyCount + activeShareCount;
 
     // In split mode, size items based on their panel's count
@@ -2660,26 +2667,24 @@ export class RoomView extends LitElement {
         ? undefined
         : this._othersConnectionStatuses.value[pubkeyb64!]?.peerLinks;
 
-    // Count peers this observer can actually hear — AudioLink ∈
-    // {webrtc, signals}. Replaces the old WebRTC-Connected count, which
-    // undercounted signals-only peers and overcounted connected-but-silent
-    // links.
-    const audibleCount = (() => {
-      if (type === 'my-video') {
-        return Object.keys(connectionStatuses).filter(pk => {
-          const s = this.streamsStore.audioLinkFor(pk);
-          return s === 'webrtc' || s === 'signals';
-        }).length;
-      }
-      if (observerLinks) {
-        return Object.values(observerLinks).filter(
-          l => l.audioLink === 'webrtc' || l.audioLink === 'signals',
-        ).length;
-      }
-      return Object.values(connectionStatuses).filter(
-        s => s.type === 'Connected',
-      ).length;
-    })();
+    // Count peers this observer can actually hear — countAudiblePeers
+    // (peer-link-policy.ts) owns the rule, including the declared
+    // legacy 'Connected' fallback for observers that broadcast no
+    // peerLinks.
+    const audibleCount = countAudiblePeers({
+      selfLinks:
+        type === 'my-video'
+          ? Object.keys(connectionStatuses).map(pk =>
+              this.streamsStore.audioLinkFor(pk),
+            )
+          : undefined,
+      observerLinks: observerLinks
+        ? Object.values(observerLinks)
+        : undefined,
+      observerStatusTypes: Object.values(connectionStatuses).map(
+        s => s.type,
+      ),
+    }).count;
 
     // Iteration set is the global presence union, with the observer
     // themselves removed — an icon strip is "this observer's view of
@@ -2944,11 +2949,8 @@ export class RoomView extends LitElement {
           : ''}"
         style="${autoGrid && this._gridCols > 0
           ? (() => {
-              // n must match _updateGrid's count: peers + phantoms + self (unless hidden).
-              const n =
-                this._visiblePeers().length +
-                this.streamsStore.phantomAgents().length +
-                (this._selfViewHidden ? 0 : 1);
+              // Same tile-count authority as _updateGrid and idToLayout.
+              const n = this._tileCount();
               const lastK = ((n - 1) % this._gridCols) + 1;
               // When the last row has a single item (the common odd-n / cols=2
               // case), let it span the row so justify-items:center centers it
