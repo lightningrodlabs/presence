@@ -1,5 +1,7 @@
 # Presence — Maintainability Assessment and Forward Plan
 
+Status: HISTORICAL (2026-08-06 — the §10 ratification, recommendation 4 adopted in strengthened form: the whole document is demoted, not just the round record frozen). A dated record of the 2026-07→08 maintainability effort; every claim speaks as of its own date and nothing here is corrected in place any longer. The live invariants this effort produced are the tests and CLAUDE.md's fact bullets; §3's defect inventory describes the v0.14.8 build, not the current trunk; the live copy of the §9 dormant-until-trigger list moved to CLAUDE.md at the demotion.
+
 **Scope:** `main-0.6` @ `8eb07e5` — the line that shipped as v0.14.8 (webhapp `7fb64e01dee9…`, released 2026-06-16).
 **Date:** 2026-07-27.
 
