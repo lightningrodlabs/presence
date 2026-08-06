@@ -797,3 +797,54 @@ One deciding round, not piecemeal: choose **extract-or-declare** for the view la
 - A third signals-carried media type — a phase, by declaration.
 - eslint repair/replacement — inside the EOL-deps decision (§7.4 item 4), which deserves its own scheduled slot but has no date; it blocks nothing (`verify` carries the unused-code flags).
 - Rust validation and the `tests/` workspace version alignment — the 0.7 upgrade. Conductor-level validation — manual, by declaration.
+
+---
+
+## 10. Meta-review — 2026-08-05: did the loop create as much debt as it cleaned?
+
+Written at the room owner's request after nine rounds (Phases 0–6.5, the §7.5 retro round, Round 3/§8, §9 items 1–6), against the stated worry: the paydown loop has run for over a week, is still emitting follow-ups, and may have generated as much debt as it retired.
+
+**Method.** All quantities below were measured from git and the working tree on 2026-08-05, not taken from this document's earlier sections. Baseline is the parent of the commit that added this assessment (`d48ab0a^`); reproduce with `git diff --numstat d48ab0a^..HEAD` bucketed by path (production = `ui/src`/`packages/webrtc-peer/src` excluding tests; tests = `__tests__`/`.test.`/`.spec.`/`harness/`; docs = `*.md`), and `git log --since=2026-07-25 --no-merges --pretty=%s` for the commit-type mix. Per-round defect yield was read from §1, §8, and §9's own records, each of which was adversarially reviewed when written.
+
+### 10.1 Verdict
+
+The hypothesis is not supported on the defect ledger — the retired debt is real, gate-enforced, and of a different kind than the overhead the loop created. But the hypothesis has a true core in two parts: (a) the loop's product was never smaller or simpler code — the repository is ~11k lines larger than at baseline — and (b) the loop built a second liability, a large prose-and-pin corpus with a permanent carrying cost, whose drift the loop itself has already had to police twice (§7.3, and the working-agreement-2 violations §7.4 found in the consolidation phases' own output). Meanwhile the live-field-defect yield per round has fallen to zero. Both halves of the verdict point the same way: the paydown worked, and the loop should stop.
+
+### 10.2 The ledger (baseline → 2026-08-05)
+
+Ten days, 154 commits, ~30 `--no-ff` merges.
+
+| Bucket | Net lines | Detail |
+|---|---|---|
+| Production source | +2,845 | `streams-store.ts` 6,600 → 6,534 (−1%); 18 new production modules (policy/authority/seam files); 4 production files deleted (SimplePeer transport, auto-flip, signaling adapter, `TransitionRecorder`) |
+| Tests + harness | +6,883 | 315 tests run by nothing (§2) → 790 in CI (`212 + 578` at the §9 merge) plus the nightly real-ICE harness |
+| Docs (`*.md`) | +319 net | this assessment 347 → 797 lines; `CLAUDE.md` 0 → ~32KB; three plan docs demoted HISTORICAL rather than deleted |
+| Commit mix | — | 45 of 121 non-merge commits (37%) are `docs:` — the doc-sync tax, quantified |
+
+What the +2,845 production lines bought is §7.2's admitted trade, restated: the decisions left the god file, the orchestration stayed, and the system became *verifiable* without becoming *small*. The retirement side is genuine deletion, not deprecation: no `simple-peer` dependency, no escape hatch, no auto-flip; liveness sources 21 → 16; the 5,600ms hand-copies 5 → 0; `room-view` store-internal reads 65 → 18. The character of fixes flipped from field firefighting (17 in the 90 days pre-loop) to pre-merge review findings, and the fixed-three-times-in-three-layers pattern has not recurred. Every gate `CLAUDE.md` names was executed, not read, at the retro.
+
+### 10.3 The debt the loop created
+
+Three classes, named as debt:
+
+1. **A prose corpus with demonstrated rot.** §7.3 is the loop auditing itself: drift displaced into plan documents and `CLAUDE.md`; documents corrected in Phase 0 drifted false again; a false tag claim survived a week in the bootstrap prose. The response was more machinery — `claude-md-drift.test.ts`, the status-header rule, the "True today" governance contract. The machinery works, but it exists because the loop's own records kept going false. A ~800-line assessment and a ~32KB `CLAUDE.md` are now surfaces someone must keep true indefinitely, and this document is the largest ungated one.
+2. **Pin density as coupling.** The test growth includes suites that pin wiring facts at fine grain — §9 item 2 is the specimen: the encoder retry rode an unpinned accident (the per-tick `_signalsTargets` subscription refire), and the fix promoted the accident to a pinned contract. The 1,000-line wiring suite is why the gates catch regressions; it is also a tax on every future refactor of that glue. Chosen deliberately; recorded here as a trade, not a free win.
+3. **Rule violations by the loop itself.** Two unnamed thresholds were introduced by the consolidation phases (§7.4 item 2); working agreement 3 contradicted Phase 0 item 6 until the retro decided it. Both were caught — by further rounds, which is the follow-up-generates-follow-up dynamic prompting this review.
+
+The counterweight distinguishing created from cleaned debt: everything in classes 1–3 is under surveillance (gated, dated, or headered). The original 21-source liveness sprawl never was. Created-debt-with-a-gate and cleaned-debt are not the same currency, and the ledger should not net them as if they were.
+
+### 10.4 The yield curve
+
+Live field defects fixed, per round: Phases 0–2 — several (the §3.0 signal-processing kill, §3.1 carrier gating and its one-way-audio variant, the `_pendingInits` leak). Round 3 (§8) — one user-facing bug (screen-share maximize blanking the room), one silent flicker (`_peerModuleStates`), recurrences of the retro's leak shapes. §9 — exactly one recorded field defect (the encoder wedge), and on contact half of it turned out to already self-heal by accident; the round's adversarial review returned no findings. The remaining view-round queue (§9) contains zero known field defects — it is hygiene. §9 says of itself: "this section adds no new findings — only grouping and sequencing."
+
+Structurally the queue is draining, not growing: the view round is a fixed enumerated list whose one open decision (harness) was decided 2026-08-05; everything else is dormant-until-trigger. But the emission rate of new findings has hit zero while the per-round process cost (branch-per-intent, independent review, trial merges, mutation reproduction, doc-sync) is constant. That is the stopping condition.
+
+### 10.5 Recommendations
+
+1. **Declare the loop closed.** §8's readiness declaration is a round old and unexercised. The only remaining test of the paydown is feature traffic: whether the policy seams receive new work and the gates catch a feature's regressions. No further round can answer that.
+2. **Demote the view round (§9 "Then") from scheduled to opportunistic.** Nothing in it is a field defect; its items fit working agreement 2's existing pattern — named/extracted when a room-UI feature touches their file. The Option A decision stands as the recorded method whenever an item is picked up.
+3. **Adopt a stop rule for future rounds:** a round is scheduled only if it names at least one live field defect; everything else goes to the opportunistic or dormant lists. §9 would have failed this test for most of its items.
+4. **Freeze this document's round record.** §10 is the last appended round-section; future work records as ordinary PRs and `CLAUDE.md` fact-bullets. Dated in-place corrections continue (the document stays active; §6's working agreements remain in force). This recommendation applies to itself: a future meta-review that finds this one wrong corrects it in place.
+5. **One `CLAUDE.md` consolidation later, not now.** After feature development has run for a while, collapse the per-phase fact-bullets into a single current-authorities table; the per-phase history already lives here. Doing it now would be a tenth round.
+
+**Decisions required from the room owner:** ratify 1–4 (5 is deferred by construction). Until ratified, §9's "Then" sequencing remains the recorded plan.
