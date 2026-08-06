@@ -74,6 +74,12 @@ import { fetchCloudflareTurnCredentials } from './cloudflare-turn';
 import { DescendentRoom, weaveClientContext } from './types';
 import { systemClock } from './clock';
 import {
+  RoomOwnership,
+  TAKEOVER_LOCK_WAIT_MS,
+  type LockManagerLike,
+  type RoomChannelLike,
+} from './room-ownership';
+import {
   PassiveParticipant,
   PassivePresenceTracker,
 } from './passive-presence';
@@ -130,14 +136,23 @@ export class PresenceApp extends LitElement {
   @state()
   _roomAlreadyOpen = false;
 
-  private _roomLockRelease: (() => void) | undefined;
+  /**
+   * The cross-pane ownership protocol (room-ownership.ts) over the
+   * production seams. Live navigator.locks read per acquire; the
+   * BroadcastChannel cast is the RoomChannelLike slice documented on
+   * the type.
+   */
+  private _roomOwnership = new RoomOwnership({
+    getLocks: () => (navigator as { locks?: LockManagerLike }).locks,
+    openChannel: name =>
+      new BroadcastChannel(name) as unknown as RoomChannelLike,
+    clock: systemClock,
+  });
 
   private _currentRoomDnaB64: string | undefined;
 
   @state()
   _currentRoomName: string | undefined;
-
-  private _roomChannel: BroadcastChannel | undefined;
 
   @state()
   _takingOver = false;
@@ -560,12 +575,6 @@ export class PresenceApp extends LitElement {
   }
 
   /**
-   * Acquire an exclusive same-origin lock for a room's DNA. If another pane in
-   * this Moss applet origin is already holding it, the lock request is denied
-   * and `_roomAlreadyOpen` is set so the render path shows a notice instead of
-   * a second room-container (which would cause duplicate signaling/streams).
-   */
-  /**
    * Resolve a human-readable room name from a role name. The provisioned
    * 'presence' cell is the Main Room; cloned cells carry their name in room
    * info. Falls back to a generic label if the lookup fails.
@@ -585,6 +594,13 @@ export class PresenceApp extends LitElement {
     return msg('this room');
   }
 
+  /**
+   * Enter a room as its exclusive same-origin pane. The whole lock +
+   * takeover protocol lives in room-ownership.ts; this method only maps
+   * its outcomes onto view state: 'already-open' shows the notice pane
+   * instead of a second room-container (which would duplicate
+   * signaling/streams), a later kick returns us to the enter pane.
+   */
   private async _enterRoom(
     dnaHashB64: string,
     opts: { waitMs?: number } = {}
@@ -596,103 +612,21 @@ export class PresenceApp extends LitElement {
       this._currentRoomName = name;
     });
     this._roomAlreadyOpen = false;
-    const locks = (navigator as any).locks;
-    if (!locks) {
-      this._pageView = PageView.Room;
-      return;
-    }
-    const lockName = `presence-room:${dnaHashB64}`;
-    // If waitMs is set, request the lock and wait up to that many ms for the
-    // current holder to release. Otherwise fail fast via `ifAvailable: true`.
-    const requestOpts: LockOptions = opts.waitMs
-      ? { signal: AbortSignal.timeout(opts.waitMs) }
-      : { ifAvailable: true };
-    const acquired = new Promise<{ release?: () => void }>(resolveOuter => {
-      locks
-        .request(lockName, requestOpts, (lock: Lock | null) => {
-          if (!lock) {
-            resolveOuter({});
-            return undefined;
-          }
-          return new Promise<void>(resolveInner => {
-            resolveOuter({ release: resolveInner });
-          });
-        })
-        .catch((err: any) => {
-          if (err && err.name !== 'AbortError') {
-            console.warn('locks.request failed', err);
-          }
-          resolveOuter({});
-        });
+    const outcome = await this._roomOwnership.acquire(dnaHashB64, {
+      waitMs: opts.waitMs,
+      onKicked: () => {
+        this._roomAlreadyOpen = false;
+        this._pageView = PageView.EnterRoom;
+      },
     });
-    const { release } = await acquired;
-    if (!release) {
+    if (outcome === 'already-open') {
       this._roomAlreadyOpen = true;
-    } else {
-      this._roomLockRelease = release;
-      // Listen for take-over requests from other panes in the same origin.
-      const channel = new BroadcastChannel('presence-room');
-      channel.onmessage = (e: MessageEvent) => {
-        const data = e.data;
-        if (!data || typeof data !== 'object') return;
-        if (data.dnaHashB64 !== dnaHashB64) return;
-        if (data.type === 'kick') {
-          // Another pane is asking us to release this room so it can take over.
-          // Send the ack BEFORE releasing — _releaseRoomLock closes this same
-          // channel, after which postMessage would throw and the taker would
-          // time out.
-          try {
-            channel.postMessage({ type: 'released', dnaHashB64 });
-          } catch (err) {
-            console.warn('released broadcast failed', err);
-          }
-          this._releaseRoomLock();
-          this._pageView = PageView.EnterRoom;
-        }
-      };
-      this._roomChannel = channel;
     }
     this._pageView = PageView.Room;
   }
 
-  /**
-   * Ask the pane currently holding the room lock to release it, then take over
-   * here. Resolves true if we got the lock, false if no one acknowledged in
-   * time.
-   */
-  private async _takeOverRoom(dnaHashB64: string): Promise<boolean> {
-    const channel = new BroadcastChannel('presence-room');
-    const released = new Promise<boolean>(resolve => {
-      const timer = window.setTimeout(() => {
-        resolve(false);
-      }, 2000);
-      channel.onmessage = (e: MessageEvent) => {
-        const data = e.data;
-        if (
-          data &&
-          data.type === 'released' &&
-          data.dnaHashB64 === dnaHashB64
-        ) {
-          window.clearTimeout(timer);
-          resolve(true);
-        }
-      };
-    });
-    channel.postMessage({ type: 'kick', dnaHashB64 });
-    const ok = await released;
-    channel.close();
-    return ok;
-  }
-
   private _releaseRoomLock() {
-    if (this._roomLockRelease) {
-      this._roomLockRelease();
-      this._roomLockRelease = undefined;
-    }
-    if (this._roomChannel) {
-      this._roomChannel.close();
-      this._roomChannel = undefined;
-    }
+    this._roomOwnership.release();
     this._roomAlreadyOpen = false;
   }
 
@@ -1557,12 +1491,12 @@ export class PresenceApp extends LitElement {
                       if (!this._currentRoomDnaB64) return;
                       this._takingOver = true;
                       try {
-                        const ok = await this._takeOverRoom(
+                        const ok = await this._roomOwnership.requestTakeover(
                           this._currentRoomDnaB64
                         );
                         if (ok) {
                           await this._enterRoom(this._currentRoomDnaB64, {
-                            waitMs: 3000,
+                            waitMs: TAKEOVER_LOCK_WAIT_MS,
                           });
                         } else {
                           this.notifyError(
