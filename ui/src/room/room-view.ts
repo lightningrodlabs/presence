@@ -102,6 +102,12 @@ import {
   GRID_TOOLBAR_RESERVE,
 } from './layout';
 import { countAudiblePeers } from '../peer-link-policy';
+import {
+  bindVideoStream,
+  MAXIMIZE_REAPPLY_DELAY_MS,
+  LAYOUT_SWITCH_REAPPLY_DELAY_MS,
+  STREAM_EVENT_DOM_SETTLE_MS,
+} from './video-bind';
 
 declare const __APP_VERSION__: string;
 
@@ -451,9 +457,8 @@ export class RoomView extends LitElement {
         case 'my-video-on': {
           const myVideo = this.shadowRoot?.getElementById(
             'my-own-stream'
-          ) as HTMLVideoElement;
-          myVideo.autoplay = true;
-          myVideo.srcObject = this.streamsStore.mainStream!;
+          ) as HTMLVideoElement | null;
+          bindVideoStream(myVideo, this.streamsStore.mainStream, 'ensure');
           this._camera = true;
           break;
         }
@@ -467,11 +472,12 @@ export class RoomView extends LitElement {
           await this.updateComplete;
           const myScreenVideo = this.shadowRoot?.getElementById(
             MY_OWN_SCREEN_VIDEO_ID
-          ) as HTMLVideoElement;
-          if (myScreenVideo) {
-            myScreenVideo.autoplay = true;
-            myScreenVideo.srcObject = this.streamsStore.screenShareStream!;
-          }
+          ) as HTMLVideoElement | null;
+          bindVideoStream(
+            myScreenVideo,
+            this.streamsStore.screenShareStream,
+            'ensure'
+          );
           break;
         }
         case 'my-screen-share-off': {
@@ -516,32 +522,26 @@ export class RoomView extends LitElement {
           break;
         }
         case 'peer-stream': {
-          // We want to make sure that the video element is actually in the DOM
-          // so we add a timeout here.
+          // Wait for the tile's first render before binding.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
               `video-${event.pubKeyB64}`
             ) as HTMLVideoElement | undefined;
-            if (videoEl) {
-              videoEl.autoplay = true;
-              videoEl.srcObject = event.stream;
+            const bound = bindVideoStream(videoEl, event.stream, 'ensure');
+            if (bound.action === 'bound') {
               console.log('@peer-stream: Tracks: ', event.stream.getTracks());
             }
-          }, 200);
+          }, STREAM_EVENT_DOM_SETTLE_MS);
           break;
         }
         case 'peer-screen-share-stream': {
-          // We want to make sure that the video element is actually in the DOM
-          // so we add a timeout here.
+          // Wait for the tile's first render before binding.
           setTimeout(() => {
             const videoEl = this.shadowRoot?.getElementById(
               peerScreenVideoId(event.pubKeyB64)
             ) as HTMLVideoElement | undefined;
-            if (videoEl) {
-              videoEl.autoplay = true;
-              videoEl.srcObject = event.stream;
-            }
-          }, 200);
+            bindVideoStream(videoEl, event.stream, 'ensure');
+          }, STREAM_EVENT_DOM_SETTLE_MS);
           break;
         }
         case 'peer-screen-share-disconnected': {
@@ -673,7 +673,7 @@ export class RoomView extends LitElement {
     // Re-apply video srcObjects after maximize/minimize, which destroys video
     // rendering context via the display:contents transition.
     if (changedProperties.has('_maximizedVideo')) {
-      setTimeout(() => this._reapplyVideoStreams(), 50);
+      setTimeout(() => this._reapplyVideoStreams(), MAXIMIZE_REAPPLY_DELAY_MS);
     }
     this._updateGrid();
     this._ensurePeerVideoStreams();
@@ -692,16 +692,13 @@ export class RoomView extends LitElement {
   private _ensurePeerVideoStreams() {
     for (const [pubkeyB64, conn] of Object.entries(this._openConnections.value)) {
       if (!conn?.connected) continue;
-      const stream = this.streamsStore._videoStreams[pubkeyB64];
-      if (!stream) continue;
-      const el = this.shadowRoot?.getElementById(
-        `video-${pubkeyB64}`
-      ) as HTMLVideoElement | null;
-      if (el && el.srcObject !== stream) {
-        el.autoplay = true;
-        el.srcObject = stream;
-        el.play().catch(() => {});
-      }
+      bindVideoStream(
+        this.shadowRoot?.getElementById(
+          `video-${pubkeyB64}`
+        ) as HTMLVideoElement | null,
+        this.streamsStore._videoStreams[pubkeyB64],
+        'ensure'
+      );
     }
   }
 
@@ -784,14 +781,12 @@ export class RoomView extends LitElement {
   }
 
   private _reapplyVideoStreams() {
-    const restoreVideo = (el: HTMLVideoElement | null, stream: MediaStream | undefined | null) => {
-      if (!el || !stream) return;
-      // Force re-assign to recover from display:contents transition
-      el.srcObject = null;
-      el.srcObject = stream;
-      el.autoplay = true;
-      el.play().catch(() => {});
-    };
+    // Forced null-then-reassign to recover from the display:contents
+    // transition — the 'restore' mode of the one bind implementation.
+    const restoreVideo = (
+      el: HTMLVideoElement | null,
+      stream: MediaStream | undefined | null
+    ) => bindVideoStream(el, stream, 'restore');
 
     // Own screen share
     restoreVideo(
@@ -2096,7 +2091,10 @@ export class RoomView extends LitElement {
             @click=${() => {
               this.streamsStore.setReceiverOverride(pubkeyB64, null);
               // Switching back to video creates a new <video> element — reapply srcObject
-              setTimeout(() => this._reapplyVideoStreams(), 100);
+              setTimeout(
+                () => this._reapplyVideoStreams(),
+                LAYOUT_SWITCH_REAPPLY_DELAY_MS
+              );
             }}
           >
             <sl-icon slot="prefix" .src=${wrapPathInSvg(mdiVideo)} style="font-size: 16px;"></sl-icon>
