@@ -1,14 +1,5 @@
-import {
-  SignedActionHashed,
-  AgentPubKey,
-  Create,
-  Update,
-  Delete,
-  CreateLink,
-  DeleteLink,
-  DnaHash,
-  AgentPubKeyB64,
-} from '@holochain/client';
+import { AgentPubKey, DnaHash, AgentPubKeyB64 } from '@holochain/client';
+import { ActionCommittedSignal } from '@holochain-open-dev/utils';
 import { WeaveClient } from '@theweave/api';
 import { createContext } from '@lit/context';
 
@@ -444,34 +435,29 @@ export type RoomSignal =
       msg_type: string;
       payload: string;
     }
-  | {
-      type: 'EntryCreated';
-      action: SignedActionHashed<Create>;
-      app_entry: EntryTypes;
-    }
-  | {
-      type: 'EntryUpdated';
-      action: SignedActionHashed<Update>;
-      app_entry: EntryTypes;
-      original_app_entry: EntryTypes;
-    }
-  | {
-      type: 'EntryDeleted';
-      action: SignedActionHashed<Delete>;
-      original_app_entry: EntryTypes;
-    }
-  | {
-      type: 'LinkCreated';
-      action: SignedActionHashed<CreateLink>;
-      link_type: string;
-    }
-  | {
-      type: 'LinkDeleted';
-      action: SignedActionHashed<DeleteLink>;
-      link_type: string;
-    };
+  | ActionCommittedSignal<EntryTypes, LinkTypes>;
 
-export type EntryTypes = {};
+/**
+ * Mirrors the integrity zome's `EntryTypes` enum
+ * (dnas/presence/zomes/integrity/room/src/lib.rs), which is
+ * `#[serde(tag = "type")]` — each entry arrives as its fields plus a
+ * `type` discriminant carrying the variant name.
+ */
+export type EntryTypes =
+  | ({ type: 'RoomInfo' } & RoomInfo)
+  | ({ type: 'Attachment' } & Attachment)
+  | ({ type: 'DescendentRoom' } & DescendentRoom);
+
+/**
+ * Mirrors the integrity zome's `LinkTypes` enum (same file); unit
+ * variants serialize as their names.
+ */
+export type LinkTypes =
+  | 'RoomInfoUpdates'
+  | 'AllAgents'
+  | 'AllDescendentRooms'
+  | 'AttachmentUpdates'
+  | 'AllAttachments';
 
 /**
  * One node's recent logs, gathered over the DiagnosticRequest/
