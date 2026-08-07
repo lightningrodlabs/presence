@@ -31,6 +31,17 @@ Contents:
   (§7.5 item 4). It is a measurement instrument, not a regression gate — its
   assertions are delivery sanity checks, not thresholds. Run it with
   `npm run test:latency -w tests`; it is deliberately excluded from `test`.
+- `src/signal-latency/direct-signal-latency.test.ts` — the phase-0 instrument
+  of `docs/DIRECT_SIGNALS_PLAN.md` (2026-08): Holochain 0.7 `SendDirectSignal`
+  vs the zome-call `send_message` path, across TWO conductors (same-conductor
+  sends short-circuit in-process and flatter the numbers). Also settles the
+  raw wire encoding for the request's `Vec<u8>` field, since
+  @holochain/client 0.21.0 has no direct-signal support — its raw-wire
+  helpers are the template for the phase-1 ui adapter. Same status as the
+  file above: instrument, not gate; runs under `test:latency`, excluded from
+  `test`. Both latency files need a current `workdir/presence.happ`
+  (`npm run build:happ`) — a stale pre-0.7 bundle fails app install with an
+  "unknown field `signal_url`" manifest error.
 
 What belongs here eventually: zome tests exercising each
 `ValidateCallbackResult::Invalid` branch of the integrity zomes — the
