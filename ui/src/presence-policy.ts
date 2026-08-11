@@ -140,6 +140,50 @@ export function isMediaLive(s: MediaLiveSnapshot): boolean {
   return false;
 }
 
+/**
+ * The **signal-carrier-down** predicate's window: if no known peer has
+ * ponged within this long, the bidirectional Holochain signal path is
+ * presumed down. 3 ticks of the presence clock, same reasoning as
+ * `PRESENT_STALENESS_MS` (absorb one lost ping/pong pair without a
+ * flap) — but this is a distinct predicate: carrier health, not peer
+ * presence. `_signalCarrierDownSince` (`streams-store.ts`) is the one
+ * store field it feeds, and `decideSignalsMediaCadence`
+ * (`transport/signals-cadence-policy.ts`) is the one downstream
+ * consumer of the resulting `down` flag.
+ */
+export const SIGNAL_CARRIER_DOWN_MS = 3 * PING_INTERVAL;
+
+export type SignalCarrierState =
+  | { down: false }
+  | { down: true; downSince: number };
+
+/**
+ * The **signal-carrier-down** predicate: down when we know of at least
+ * one peer but none of them have ponged within `SIGNAL_CARRIER_DOWN_MS`.
+ * Zero known peers is defined as up — no evidence of peers is not
+ * evidence the channel is dead, so a freshly-joined room with nobody
+ * else in it never reports a down carrier.
+ *
+ * `downSince` is sticky across calls while still down (`prevDownSince`
+ * carries the stamp from the first down evaluation forward) so the
+ * duration reported at recovery is measured from the actual onset, not
+ * from whichever tick last happened to call this.
+ */
+export function decideSignalCarrier(inputs: {
+  /** lastSeen stamps for known, non-self, non-blocked peers. */
+  knownPeerLastSeen: number[];
+  prevDownSince: number | undefined;
+  now: number;
+}): SignalCarrierState {
+  const { knownPeerLastSeen, prevDownSince, now } = inputs;
+  if (knownPeerLastSeen.length === 0) return { down: false };
+  const anyFresh = knownPeerLastSeen.some(
+    t => now - t < SIGNAL_CARRIER_DOWN_MS
+  );
+  if (anyFresh) return { down: false };
+  return { down: true, downSince: prevDownSince ?? now };
+}
+
 export interface PresentPeersSnapshot {
   /** Keys of the ping-fresh set (already excludes self and blocked). */
   activeAgents: AgentPubKeyB64[];

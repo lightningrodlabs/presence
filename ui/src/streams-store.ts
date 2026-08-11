@@ -9,6 +9,7 @@ import {
   computeActiveAgents,
   computePresentPeers,
   decidePresenceSoundEvents,
+  decideSignalCarrier,
   INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
   lastSeenBucket,
@@ -2540,12 +2541,14 @@ export class StreamsStore {
   }
 
   /**
-   * Per-ping-cycle forensics (diagnostic only, no behaviour change):
+   * Per-ping-cycle forensics and the signal-carrier-down authority:
    *
-   *  - SignalCarrierDown/Up — inferred from pong freshness. If we know
-   *    peers but none have ponged within 3*PING_INTERVAL, the bidirectional
-   *    Holochain signal path is presumed down. Makes signal-relay outages
-   *    visible in merged logs — without this they are invisible.
+   *  - SignalCarrierDown/Up — delegates to `decideSignalCarrier`
+   *    (`presence-policy.ts`), which is down when we know peers but none
+   *    have ponged within `SIGNAL_CARRIER_DOWN_MS`. Makes signal-relay
+   *    outages visible in merged logs, and the resulting
+   *    `_signalCarrierDownSince` feeds `decideSignalsMediaCadence`
+   *    (Tasks 7-8) — this is no longer forensic-only.
    *  - PresenceAdd/PresenceRemove — diff of `globalPresenceSet()` with the
    *    reason a peer entered (media-live / ping-fresh / observer-reported),
    *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
@@ -2558,23 +2561,27 @@ export class StreamsStore {
     const knownPeers = Object.keys(known).filter(
       k => k !== this.myPubKeyB64 && !blocked.includes(k),
     );
-    if (knownPeers.length > 0) {
-      const anyFresh = knownPeers.some(k => {
-        const ls = known[k]?.lastSeen;
-        return ls !== undefined && now - ls < 3 * PING_INTERVAL;
-      });
-      if (!anyFresh && this._signalCarrierDownSince === undefined) {
-        this._signalCarrierDownSince = now;
-        this.logger.logCustomMessage(
-          `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
-        );
-      } else if (anyFresh && this._signalCarrierDownSince !== undefined) {
-        const downMs = now - this._signalCarrierDownSince;
-        this._signalCarrierDownSince = undefined;
-        this.logger.logCustomMessage(
-          `SignalCarrierUp: pong path recovered after ${downMs}ms`,
-        );
-      }
+    const knownPeerLastSeen = knownPeers
+      .map(k => known[k]?.lastSeen)
+      .filter((ls): ls is number => ls !== undefined);
+    const prevDownSince = this._signalCarrierDownSince;
+    const carrierState = decideSignalCarrier({
+      knownPeerLastSeen,
+      prevDownSince,
+      now,
+    });
+    this._signalCarrierDownSince = carrierState.down
+      ? carrierState.downSince
+      : undefined;
+    if (carrierState.down && prevDownSince === undefined) {
+      this.logger.logCustomMessage(
+        `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
+      );
+    } else if (!carrierState.down && prevDownSince !== undefined) {
+      const downMs = now - prevDownSince;
+      this.logger.logCustomMessage(
+        `SignalCarrierUp: pong path recovered after ${downMs}ms`,
+      );
     }
 
     const current = this.globalPresenceSet();
@@ -4154,9 +4161,14 @@ export class StreamsStore {
   private _lastWebrtcExitReason = new Map<AgentPubKeyB64, string>();
 
   /**
-   * Wall-clock ms since the signal carrier was inferred down (no pong from
-   * any known peer), or undefined while it is up. Drives the
-   * SignalCarrierDown/Up forensic events emitted from `pingAgents`.
+   * The **signal-carrier-down** authority's state: `this.clock` timestamp
+   * since `decideSignalCarrier` (`presence-policy.ts`) found no known
+   * peer ponged within `SIGNAL_CARRIER_DOWN_MS`, or undefined while it is
+   * up. Set from `_emitPresenceForensics`, which also emits the
+   * SignalCarrierDown/Up log lines on the transition. No longer
+   * forensic-only: this is the one field Tasks 7-8 (signals media
+   * cadence) read to decide `carrierDown` for
+   * `decideSignalsMediaCadence` (`transport/signals-cadence-policy.ts`).
    */
   private _signalCarrierDownSince: number | undefined;
 

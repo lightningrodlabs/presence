@@ -3,6 +3,7 @@ import {
   computeActiveAgents,
   computePresentPeers,
   decidePresenceSoundEvents,
+  decideSignalCarrier,
   INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
   lastSeenBucket,
@@ -348,5 +349,20 @@ describe('decidePresenceSoundEvents', () => {
 
   it('leave dwell is 2 ping ticks (the present predicate clock)', () => {
     expect(PRESENCE_LEAVE_DWELL_MS).toBe(2 * PING_INTERVAL);
+  });
+});
+
+describe('decideSignalCarrier', () => {
+  it('down when no known peer is fresh within SIGNAL_CARRIER_DOWN_MS', () => {
+    expect(decideSignalCarrier({ knownPeerLastSeen: [1000, 2000], prevDownSince: undefined, now: 10_000 }))
+      .toEqual({ down: true, downSince: 10_000 });
+  });
+  it('preserves downSince while still down', () => {
+    expect(decideSignalCarrier({ knownPeerLastSeen: [1000], prevDownSince: 8_000, now: 12_000 }))
+      .toEqual({ down: true, downSince: 8_000 });
+  });
+  it('up when any peer is fresh; up with zero known peers (no evidence is not channel death)', () => {
+    expect(decideSignalCarrier({ knownPeerLastSeen: [9_500], prevDownSince: 8_000, now: 10_000 })).toEqual({ down: false });
+    expect(decideSignalCarrier({ knownPeerLastSeen: [], prevDownSince: undefined, now: 10_000 })).toEqual({ down: false });
   });
 });
