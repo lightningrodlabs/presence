@@ -16,7 +16,7 @@
 
 import { RTCPeer } from './rtc-peer.js';
 import type { RTCPeerOptions } from './rtc-peer.js';
-import { DefaultReconnectPolicy } from './reconnect-policy.js';
+import { DefaultReconnectPolicy, DEFAULT_RECONNECT_OPTIONS } from './reconnect-policy.js';
 import type {
   ConnectionPhase,
   ConnectionConfig,
@@ -672,10 +672,19 @@ export class PeerConnectionFSM {
         }
         this._disconnectedRetryCount++;
 
-        // Auto-retry with jitter to desynchronize both peers' retry cadence.
-        // Without jitter, both sides create new NAT mappings simultaneously,
-        // invalidating each other's previous STUN bindings.
-        const jitterMs = 500 + Math.floor(Math.random() * 1500); // 500-2000ms
+        // Exponential backoff with jitter, using the reconnect policy's pacing
+        // fields. Flat 500-2000ms jitter let a dead relay drive 11 sessions in
+        // 144s in the field (2026-08-11), each re-flooding candidates. Jitter
+        // still runs on every attempt (not just after the first) to
+        // desynchronize both peers' retry cadence — without it, both sides
+        // create new NAT mappings simultaneously, invalidating each other's
+        // previous STUN bindings.
+        const attempt = this._disconnectedRetryCount - 1; // incremented just above
+        const baseDelayMs = this._reconnectPolicy.baseDelayMs ?? DEFAULT_RECONNECT_OPTIONS.baseDelayMs;
+        const maxDelayMs = this._reconnectPolicy.maxDelayMs ?? DEFAULT_RECONNECT_OPTIONS.maxDelayMs;
+        const jitterCapMs = this._reconnectPolicy.jitterMs ?? DEFAULT_RECONNECT_OPTIONS.jitterMs;
+        const base = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
+        const jitterMs = base + Math.floor(Math.random() * jitterCapMs);
         this._startTimer('retry-jitter', jitterMs, () => {
           if (this._state === 'disconnected') {
             this.connect();
