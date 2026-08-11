@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Changed:** disconnected auto-retry uses exponential backoff with jitter
+  from the reconnect policy's pacing fields, replacing flat 500-2000ms
+  jitter. `min(maxDelayMs, baseDelayMs * 2^attempt) + random(0..jitterMs)`,
+  read from the `ReconnectPolicy` instance's own `baseDelayMs`/`maxDelayMs`/
+  `jitterMs` (`DefaultReconnectPolicy` defaults: 300/7000/1000ms — falls back
+  to `DEFAULT_RECONNECT_OPTIONS` for a policy that omits them). A dead relay
+  drove 11 back-to-back retry sessions in 144s in the field (2026-08-11),
+  each re-flooding candidates; backoff spaces them 0.3s -> 7s.
 - **Changed:** outbound trickle candidates are filtered (active-TCP/discard-port
   dropped, exact per-m-section duplicates deduped) via the exported
   `shouldTrickleCandidate` predicate. Candidate batching (multiple candidates

@@ -310,19 +310,23 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('signaling');
     });
 
-    it('disconnected auto-retries with jitter (500-2000ms)', () => {
+    it('disconnected auto-retries with exponential backoff + jitter (attempt 0: 300-1299ms)', () => {
+      // Declared change: flat 500-2000ms jitter replaced by exponential
+      // backoff (base*2^attempt, capped, then jittered) — see the
+      // 'spaces disconnected retries exponentially' test in the
+      // 'reconnection' describe for the full attempt sequence.
       const ctx = createFSM();
       ctx.fsm.connect();
       // SDP timeout → disconnected
       vi.advanceTimersByTime(15_001);
       expect(ctx.fsm.state).toBe('disconnected');
 
-      // Jitter hasn't fired yet at 499ms
-      vi.advanceTimersByTime(499);
+      // Retry hasn't fired yet at 299ms (attempt 0 base delay alone is 300ms)
+      vi.advanceTimersByTime(299);
       expect(ctx.fsm.state).toBe('disconnected');
 
-      // By 2001ms the jitter must have fired (max jitter is 2000ms)
-      vi.advanceTimersByTime(1502);
+      // By 1300ms the retry must have fired (attempt 0 max = 300 base + 999 jitter)
+      vi.advanceTimersByTime(1001);
       expect(ctx.fsm.state).toBe('signaling');
     });
 
@@ -562,6 +566,36 @@ describe('PeerConnectionFSM', () => {
 
       expect(ctx.fsm.state).toBe('connected');
       expect(ctx.fsm.viewModel.retry).toBeNull();
+    });
+
+    it('spaces disconnected retries exponentially (base*2^n, capped, jittered)', () => {
+      // Deterministic jitter = 0 so only the exponential component is checked.
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+      try {
+        const ctx = createFSM();
+        ctx.fsm.connect();
+
+        // Expected delay per disconnected entry: min(7000, 300*2^attempt).
+        const expectedDelays = [300, 600, 1200, 2400, 4800, 7000]; // attempt 5: 9600 -> capped
+
+        for (const delay of expectedDelays) {
+          // SDP exchange timeout (signaling → disconnected) arms the retry timer.
+          // Advance by exactly the timeout so no slop bleeds into the retry
+          // timer's own countdown checked immediately below.
+          vi.advanceTimersByTime(DEFAULT_CONFIG.sdpExchangeTimeoutMs);
+          expect(ctx.fsm.state).toBe('disconnected');
+
+          // Retry has not fired one tick before the expected delay.
+          vi.advanceTimersByTime(delay - 1);
+          expect(ctx.fsm.state).toBe('disconnected');
+
+          // Retry fires exactly at the expected delay, returning to signaling.
+          vi.advanceTimersByTime(1);
+          expect(ctx.fsm.state).toBe('signaling');
+        }
+      } finally {
+        randomSpy.mockRestore();
+      }
     });
   });
 

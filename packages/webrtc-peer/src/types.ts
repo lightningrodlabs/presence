@@ -429,6 +429,21 @@ export interface ReconnectPolicy {
 
   /** Maximum number of retry attempts */
   readonly maxAttempts: number;
+
+  /**
+   * Pacing fields for the FSM's `disconnected`-state auto-retry (distinct
+   * from `nextRetryDelayMs`, which paces `reconnecting`-state attempts):
+   * delay = `min(maxDelayMs, baseDelayMs * 2 ** attempt) + random(0, jitterMs)`.
+   * Optional so a minimal custom `ReconnectPolicy` (e.g. a test double
+   * supplying only `nextRetryDelayMs`/`strategy`/`maxAttempts`) still
+   * type-checks; the FSM falls back to `DEFAULT_RECONNECT_OPTIONS` when a
+   * policy omits them. `DefaultReconnectPolicy` exposes the exact values
+   * `nextRetryDelayMs` itself uses, so there is one source of truth per
+   * policy instance.
+   */
+  readonly baseDelayMs?: number;
+  readonly maxDelayMs?: number;
+  readonly jitterMs?: number;
 }
 
 // ---------------------------------------------------------------------------
