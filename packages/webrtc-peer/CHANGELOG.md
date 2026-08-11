@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Fixed:** the disconnected-state retry-limit give-up was an illegal
+  transition (logged BLOCKED and left a dead FSM in disconnected);
+  disconnected → failed is now a valid edge, so the manager emits
+  connection-closed through the normal path.
 - **Fixed:** equal-epoch session-staleness deadlock — the remote peerSessionId
   counter is now scoped to the remote FSM's connectionId; a recreated remote
   FSM re-latches instead of having its answers/candidates dropped as stale,

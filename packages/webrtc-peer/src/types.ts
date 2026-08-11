@@ -56,7 +56,7 @@ export const VALID_TRANSITIONS: Record<ConnectionPhase, Set<ConnectionPhase>> = 
   connecting:    new Set(['connected', 'signaling', 'disconnected', 'closed']),
   connected:     new Set(['reconnecting', 'disconnected', 'failed', 'closed']),
   reconnecting:  new Set(['reconnecting', 'signaling', 'connected', 'disconnected', 'failed', 'closed']),
-  disconnected:  new Set(['signaling', 'idle', 'closed']),
+  disconnected:  new Set(['signaling', 'idle', 'failed', 'closed']),
   failed:        new Set(['idle', 'closed']),
   closed:        new Set([]),  // terminal — no transitions out
 };
