@@ -36,6 +36,27 @@ export type RTCPeerOptions = {
   logger?: Logger;
 };
 
+/**
+ * Outbound trickle filter. Active-TCP candidates advertise the discard port
+ * (9) and cannot be connected to by the remote; libwebrtc re-emits identical
+ * candidates per m-section under bundle. Both classes only pad the signaling
+ * channel — the 2026-08-11 field logs show ~35-candidate floods per retry,
+ * roughly half of them tcp:9 repeats. End-of-candidates ('' ) always passes.
+ */
+export function shouldTrickleCandidate(
+  candidate: RTCIceCandidateInit,
+  alreadySent: ReadonlySet<string>,
+): { send: true } | { send: false; reason: 'tcp-active' | 'duplicate' } {
+  const str = candidate.candidate ?? '';
+  if (str === '') return { send: true };
+  if (/ tcp /i.test(str) && (/tcptype active/i.test(str) || / 9 typ /.test(str))) {
+    return { send: false, reason: 'tcp-active' };
+  }
+  const key = `${candidate.sdpMid ?? ''}|${str}`;
+  if (alreadySent.has(key)) return { send: false, reason: 'duplicate' };
+  return { send: true };
+}
+
 export class RTCPeer {
   readonly pc: RTCPeerConnection;
   private _polite: boolean;
@@ -45,6 +66,11 @@ export class RTCPeer {
   private _handlers: Map<string, RTCPeerEventHandler[]> = new Map();
   private _dataChannel: RTCDataChannel | null = null;
   private _remoteDataChannels: RTCDataChannel[] = [];
+  // Outbound trickle dedup — keyed by `${sdpMid}|${candidate}`. `pc` is
+  // readonly and assigned exactly once (constructor), so this needs no
+  // separate reset site; if a future change makes the pc replaceable, this
+  // set must be cleared alongside it (see shouldTrickleCandidate).
+  private _sentCandidateKeys: Set<string> = new Set();
 
   // Outbound messages enqueued while the data channel isn't open (e.g. ICE+DTLS
   // are up and the call is `connected`, but the channel hasn't opened yet, or is
@@ -465,7 +491,12 @@ export class RTCPeer {
       if (this._destroyed) return;
       if (event.candidate) {
         if (this._trickleICE) {
-          this._onSignal(event.candidate.toJSON ? event.candidate.toJSON() : event.candidate);
+          const init = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+          const verdict = shouldTrickleCandidate(init, this._sentCandidateKeys);
+          if (verdict.send) {
+            this._sentCandidateKeys.add(`${init.sdpMid ?? ''}|${init.candidate ?? ''}`);
+            this._onSignal(init);
+          }
         }
         // Non-trickle: candidates accumulate in pc.localDescription automatically
       } else {

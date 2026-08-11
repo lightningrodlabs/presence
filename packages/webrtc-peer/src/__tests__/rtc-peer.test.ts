@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { RTCPeer } from '../rtc-peer';
+import { RTCPeer, shouldTrickleCandidate } from '../rtc-peer';
 import type { ConnectionConfig } from '../types';
 import {
   MockRTCPeerConnection,
@@ -818,5 +818,25 @@ describe('RTCPeer', () => {
         expect.objectContaining({ name: 'InvalidStateError' }),
       );
     });
+  });
+});
+
+describe('shouldTrickleCandidate', () => {
+  const sent = new Set<string>();
+  it('drops active-TCP discard-port candidates', () => {
+    const c = { candidate: 'candidate:2 1 tcp 1518214911 192.168.1.131 9 typ host tcptype active generation 0', sdpMid: '0' };
+    expect(shouldTrickleCandidate(c, sent)).toEqual({ send: false, reason: 'tcp-active' });
+  });
+  it('sends UDP host/srflx candidates', () => {
+    const c = { candidate: 'candidate:1 1 udp 2122260223 192.168.1.131 50124 typ host generation 0', sdpMid: '0' };
+    expect(shouldTrickleCandidate(c, sent)).toEqual({ send: true });
+  });
+  it('drops an exact repeat (same sdpMid + candidate string)', () => {
+    const c = { candidate: 'candidate:1 1 udp 2122260223 192.168.1.131 50124 typ host generation 0', sdpMid: '0' };
+    const seen = new Set([`0|${c.candidate}`]);
+    expect(shouldTrickleCandidate(c, seen)).toEqual({ send: false, reason: 'duplicate' });
+  });
+  it('never filters the end-of-candidates marker', () => {
+    expect(shouldTrickleCandidate({ candidate: '' }, sent)).toEqual({ send: true });
   });
 });
