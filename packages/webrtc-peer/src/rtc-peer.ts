@@ -259,6 +259,11 @@ export class RTCPeer {
   /** Trigger ICE restart */
   restartIce(): void {
     if (this._destroyed) return;
+    // An ICE restart starts a new candidate generation on the same pc, so
+    // the dedupe namespace resets with it — otherwise a re-gathered
+    // byte-identical candidate (ufrag lives in separate SDP lines, not the
+    // candidate attribute) is wrongly suppressed as a stale duplicate.
+    this._sentCandidateKeys.clear();
     this.pc.restartIce();
   }
 
