@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Changed:** outbound trickle candidates are filtered (active-TCP/discard-port
+  dropped, exact per-m-section duplicates deduped) via the exported
+  `shouldTrickleCandidate` predicate. Candidate batching (multiple candidates
+  per signal) is deferred — it changes the signal payload shape and needs a
+  capability gate.
 - **Fixed:** the disconnected-state retry-limit give-up was an illegal
   transition (logged BLOCKED and left a dead FSM in disconnected);
   disconnected → failed is now a valid edge, so the manager emits
