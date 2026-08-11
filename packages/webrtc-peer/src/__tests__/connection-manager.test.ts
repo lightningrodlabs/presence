@@ -505,6 +505,49 @@ describe('ConnectionManager', () => {
       // did not get through.
       expect(manager.getFSM('agent-bbb')!.remoteConnectionId).toBe('b-dead');
     });
+
+    it('same epoch: peer whose FSM was recreated (closed-FSM replacement) can still deliver answers', () => {
+      const { a, channel } = createPair();
+      const bAdapter = channel.createAdapter('agent-bbb');
+
+      // A and B connected attempt at epoch 5. Epoch is equal on both sides, so
+      // the manager deliberately skips its connectionId-equality filter
+      // (WEBRTC_RECONNECT_IDENTITY.md §7 step 3) and relies on the FSM-level
+      // session validation — which is exactly what this task fixes.
+      a.manager.ensureConnection('agent-bbb', { epoch: 5 });
+      const fsm = a.manager.getFSM('agent-bbb')!;
+      expect(fsm.epoch).toBe(5);
+
+      // B's first FSM answers, latching a high remote session.
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'b-old',
+        peerSessionId: 11,
+        epoch: 5,
+        data: { type: 'answer', sdp: 'answer-old' },
+      });
+      expect(fsm.remoteConnectionId).toBe('b-old');
+      expect(fsm.remotePeerSessionId).toBe(11);
+
+      // B's FSM closes (retry budget) and recreates at the same epoch: fresh
+      // connectionId, peerSessionId counter restarted. A's long-lived FSM
+      // whose _session.remote latched a higher value must re-latch onto B's
+      // fresh answer instead of dropping it as stale (the deadlock).
+      const logBefore = a.transitionLog.length;
+      bAdapter.sendSignal('agent-aaa', {
+        type: 'answer',
+        connectionId: 'b-new',
+        peerSessionId: 1,
+        epoch: 5,
+        data: { type: 'answer', sdp: 'answer-new' },
+      });
+
+      expect(
+        a.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale answer'))
+      ).toBe(false);
+      expect(a.manager.getFSM('agent-bbb')!.remoteConnectionId).toBe('b-new');
+      expect(a.manager.getFSM('agent-bbb')!.remotePeerSessionId).toBe(1);
+    });
   });
 
   describe('peerSessionId filtering (intra-FSM stale signals)', () => {

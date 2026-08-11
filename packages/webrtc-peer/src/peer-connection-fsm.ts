@@ -195,6 +195,14 @@ export class PeerConnectionFSM {
   // remote: updated when accepting an offer/answer with a higher session ID.
   private _session = { local: 0, remote: 0 };
 
+  // Remote connectionIds we have latched and then moved on from. `_session.remote`
+  // is only ordered within the remote FSM instance identified by
+  // `_remoteConnectionId` — a different id means a recreated remote FSM whose
+  // counter restarted, not a stale signal. Tombstoning the abandoned id makes
+  // re-latching deterministic against reordered stale bursts from that dead FSM
+  // (docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, defect D2).
+  private _abandonedRemoteConnectionIds = new Set<string>();
+
   // View model — reactive store (simple callback-based for now, will be wrapped in Writable by ConnectionManager)
   private _viewModelListeners: Set<(vm: ConnectionViewModel) => void> = new Set();
 
@@ -330,9 +338,31 @@ export class PeerConnectionFSM {
     }
 
     // Validate signal session — part of the FSM's contract
-    const validation = this._validateSignalSession(signal, remotePeerSessionId);
+    const validation = this._validateSignalSession(signal, remotePeerSessionId, remoteConnectionId);
     if (validation === 'drop') return;
-    if (validation === 'update') {
+    if (validation === 'relatch') {
+      // The remote FSM was recreated (or this is first contact after a local
+      // reset): tombstone the abandoned id, if any, so a later resurrected
+      // signal from it cannot re-latch, then adopt the new one. Un-tombstone
+      // the id we're adopting — it may have been tombstoned by an earlier,
+      // now-superseded relatch away from it (re-review N1: leaving it tombstoned
+      // would drop this same id's own future signals for the FSM's lifetime
+      // once it becomes the live latch again).
+      // Accepted trade-off (review F3): an id we've never seen before (not
+      // tombstoned, not previously latched) is trusted on first sight — a
+      // forged/misrouted id could transiently hijack the latch, but the live
+      // peer recovers as soon as it sends its next offer (offers bypass the
+      // tombstone check) and re-adopts the latch, which un-tombstones it —
+      // recovery is bounded to at most one offer from the live peer, not
+      // indefinite lockout (restored by the N1 fix above).
+      if (this._remoteConnectionId) this._abandonedRemoteConnectionIds.add(this._remoteConnectionId);
+      if (remoteConnectionId) this._abandonedRemoteConnectionIds.delete(remoteConnectionId);
+      this._remoteConnectionId = remoteConnectionId ?? null;
+      this._session.remote = remotePeerSessionId ?? 0;
+      this._logTransition(
+        `Re-latched remote connection ${remoteConnectionId?.slice(0, 8)} at session ${this._session.remote}`,
+      );
+    } else if (validation === 'update') {
       this._session.remote = remotePeerSessionId ?? 0;
     }
 
@@ -346,6 +376,13 @@ export class PeerConnectionFSM {
     // match the new offer (causes "order of m-lines doesn't match" error).
     // Transition to signaling creates a fresh peer via _newPeerSession().
     if (this._state === 'disconnected' && 'type' in signal && signal.type === 'offer') {
+      // A different id here means the remote FSM was recreated while we were
+      // disconnected — tombstone the abandoned one before `_newPeerSession()`
+      // nulls the latch (below), so a later resurrected signal from it can't
+      // re-latch (review F1/F2, docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4).
+      if (remoteConnectionId && this._remoteConnectionId && remoteConnectionId !== this._remoteConnectionId) {
+        this._abandonedRemoteConnectionIds.add(this._remoteConnectionId);
+      }
       this._transition('signaling', { trigger: 'remote signal received' });
     }
 
@@ -363,6 +400,12 @@ export class PeerConnectionFSM {
     if ((this._state === 'reconnecting' || this._state === 'connecting') &&
         'type' in signal && signal.type === 'offer' &&
         isNewRemoteSession) {
+      // The remote FSM was recreated (a genuinely new id) — tombstone the
+      // abandoned one before `_newPeerSession()` nulls the latch, same
+      // reasoning as the disconnected+offer branch above.
+      if (this._remoteConnectionId) {
+        this._abandonedRemoteConnectionIds.add(this._remoteConnectionId);
+      }
       this._transition('signaling', {
         trigger: `fresh peer for new remote connection ${remoteConnectionId!.slice(0, 8)} (was ${this._remoteConnectionId?.slice(0, 8) ?? 'null'})`,
       });
@@ -371,6 +414,26 @@ export class PeerConnectionFSM {
     // Record the remote peer's connectionId from offer/answer signals.
     // Must happen after entry action which resets _remoteConnectionId.
     if (remoteConnectionId && 'type' in signal && (signal.type === 'offer' || signal.type === 'answer')) {
+      const isNewRemoteNamespace = this._remoteConnectionId !== remoteConnectionId;
+      // Latching a new id abandons the previous one — tombstone it so a
+      // later resurrected signal from the old remote FSM is dropped, not
+      // re-latched (docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, defect D2).
+      if (this._remoteConnectionId && isNewRemoteNamespace) {
+        this._abandonedRemoteConnectionIds.add(this._remoteConnectionId);
+      }
+      // Un-tombstone the id we're adopting: it may have been tombstoned by an
+      // earlier relatch away from it (offers bypass the tombstone check, so
+      // this is the recovery path — re-review N1). Without this, the id
+      // would drop its own future non-offer signals for the rest of the
+      // FSM's life once re-adopted.
+      this._abandonedRemoteConnectionIds.delete(remoteConnectionId);
+      if (isNewRemoteNamespace) {
+        // The remote's session counter is scoped to its connectionId's
+        // namespace — adopting a different id means the previously-latched
+        // counter value belongs to a different remote FSM and does not order
+        // against this one's signals (review F2, same defect D2).
+        this._session.remote = remotePeerSessionId ?? 0;
+      }
       this._remoteConnectionId = remoteConnectionId;
     }
 
@@ -706,23 +769,60 @@ export class PeerConnectionFSM {
   /**
    * Signal session validation — part of the FSM's contract.
    * Determines whether an incoming signal should be accepted, accepted with
-   * a remote session update, or dropped as stale.
+   * a remote session update, dropped as stale, or should re-latch onto a
+   * recreated remote FSM.
    *
    * Rules:
    * - Offers always pass (they establish a new remote session)
+   * - Non-offers whose remoteConnectionId differs from the latched one —
+   *   including a null latch — are either a recreated/first-contact remote
+   *   FSM (re-latch) or a resurrected signal from an already-abandoned one
+   *   (drop, tombstoned; tombstone check runs first, so only a never-seen id
+   *   can claim a null latch)
    * - Non-offers with session < _session.remote → 'drop' (stale)
    * - Non-offers with session >= _session.remote → 'accept' or 'update'
    */
   private _validateSignalSession(
     signal: RTCSessionDescriptionInit | RTCIceCandidateInit,
     remotePeerSessionId: number | undefined,
-  ): 'accept' | 'update' | 'drop' {
+    remoteConnectionId: string | undefined,
+  ): 'accept' | 'update' | 'drop' | 'relatch' {
     const sessionId = remotePeerSessionId ?? 0;
     const isOffer = 'type' in signal && signal.type === 'offer';
 
     // Offers always accepted — they indicate a new remote peer session
     if (isOffer) {
       return sessionId > this._session.remote ? 'update' : 'accept';
+    }
+
+    // A tombstoned remote connectionId is known-dead regardless of whether
+    // anything is currently latched — the latch can be nulled independently
+    // (e.g. by our own local `_newPeerSession()`), so gating this check on a
+    // non-null latch would let a resurrected signal from an already-abandoned
+    // remote FSM slip back in and re-latch (review F1 on
+    // docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, D2).
+    if (remoteConnectionId && this._abandonedRemoteConnectionIds.has(remoteConnectionId)) {
+      const signalType = 'type' in signal ? signal.type : 'candidate';
+      this._logTransition(
+        `Dropped stale ${signalType}: abandoned remote connection ${remoteConnectionId.slice(0, 8)}`,
+      );
+      return 'drop';
+    }
+
+    // The remote session counter is only ordered WITHIN one remote FSM
+    // (identified by its connectionId). An id that differs from the latch —
+    // including a null latch (our own local reset left no namespace to
+    // compare against) — is either a recreated remote FSM whose counter
+    // restarted, or first contact after a local reset; either way the
+    // leftover counter value belongs to a different (or no) namespace and
+    // must not gate it — comparing across namespaces is the deadlock this
+    // guards against (docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, D2).
+    // Safe against a null-latch resurrection (re-review N2): the tombstone
+    // check above already ran for this id, so only an id we have never seen
+    // tombstoned can reach here and claim a null latch — the accepted F3
+    // trade-off, not a re-opening of it.
+    if (remoteConnectionId && remoteConnectionId !== this._remoteConnectionId) {
+      return 'relatch';
     }
 
     // Non-offers: reject if from older session
@@ -805,6 +905,15 @@ export class PeerConnectionFSM {
 
     this._localCandidateCount = 0;
     this._remoteCandidateCount = 0;
+    // Deliberately NOT tombstoning `_remoteConnectionId` here: `_newPeerSession()`
+    // also runs for purely-local resets (our own ICE-failure full reconnect)
+    // where the remote FSM hasn't changed and will resurface with the SAME id
+    // — tombstoning it unconditionally would permanently lock out a still-live
+    // peer once F1 makes the tombstone check latch-independent. Callers that
+    // KNOW the remote FSM was recreated (a genuinely new id) tombstone the old
+    // one themselves before triggering the transition that leads here — see
+    // the disconnected+offer and isNewRemoteSession branches in
+    // `handleRemoteSignal` (docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, D2).
     this._remoteConnectionId = null;
     this._session.local++;
 
