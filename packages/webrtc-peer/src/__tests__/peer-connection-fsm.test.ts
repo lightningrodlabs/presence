@@ -501,6 +501,26 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('failed');
     });
 
+    it('gives up cleanly: retry limit reached in disconnected transitions to failed (not BLOCKED)', () => {
+      // maxAttempts: 0 means the very first entry to 'disconnected' already
+      // has _disconnectedRetryCount (0) >= maxAttempts (0), so the give-up
+      // guard fires immediately instead of scheduling a jittered retry.
+      const ctx = createFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 0 }),
+      });
+      ctx.fsm.connect();
+      expect(ctx.fsm.state).toBe('signaling');
+
+      // SDP exchange timeout: signaling → disconnected, which immediately
+      // hits the exhausted retry-limit guard.
+      vi.advanceTimersByTime(15_001);
+
+      // Entering disconnected with the limit already hit must reach failed,
+      // not get silently refused and left stuck in disconnected.
+      expect(ctx.fsm.state).toBe('failed');
+      expect(ctx.transitionLog.some(t => t.trigger.startsWith('BLOCKED:'))).toBe(false);
+    });
+
     it('a connected path that dies and never recovers reaches failed within maxAttempts (bounded, no infinite churn)', async () => {
       // The headline reconnection scenario: an established connection's transport
       // dies (e.g. network change with no usable path) and never comes back.
