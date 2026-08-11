@@ -341,14 +341,22 @@ export class PeerConnectionFSM {
     const validation = this._validateSignalSession(signal, remotePeerSessionId, remoteConnectionId);
     if (validation === 'drop') return;
     if (validation === 'relatch') {
-      // The remote FSM was recreated: tombstone the abandoned id so a later
-      // resurrected signal from it cannot re-latch, then adopt the new one.
+      // The remote FSM was recreated (or this is first contact after a local
+      // reset): tombstone the abandoned id, if any, so a later resurrected
+      // signal from it cannot re-latch, then adopt the new one. Un-tombstone
+      // the id we're adopting — it may have been tombstoned by an earlier,
+      // now-superseded relatch away from it (re-review N1: leaving it tombstoned
+      // would drop this same id's own future signals for the FSM's lifetime
+      // once it becomes the live latch again).
       // Accepted trade-off (review F3): an id we've never seen before (not
       // tombstoned, not previously latched) is trusted on first sight — a
-      // forged/misrouted id could transiently hijack the latch, but recovery
-      // is bounded to at most one more retry cycle, and the alternative
-      // (distrust-by-default) would re-introduce the deadlock this fixes.
+      // forged/misrouted id could transiently hijack the latch, but the live
+      // peer recovers as soon as it sends its next offer (offers bypass the
+      // tombstone check) and re-adopts the latch, which un-tombstones it —
+      // recovery is bounded to at most one offer from the live peer, not
+      // indefinite lockout (restored by the N1 fix above).
       if (this._remoteConnectionId) this._abandonedRemoteConnectionIds.add(this._remoteConnectionId);
+      if (remoteConnectionId) this._abandonedRemoteConnectionIds.delete(remoteConnectionId);
       this._remoteConnectionId = remoteConnectionId ?? null;
       this._session.remote = remotePeerSessionId ?? 0;
       this._logTransition(
@@ -413,6 +421,12 @@ export class PeerConnectionFSM {
       if (this._remoteConnectionId && isNewRemoteNamespace) {
         this._abandonedRemoteConnectionIds.add(this._remoteConnectionId);
       }
+      // Un-tombstone the id we're adopting: it may have been tombstoned by an
+      // earlier relatch away from it (offers bypass the tombstone check, so
+      // this is the recovery path — re-review N1). Without this, the id
+      // would drop its own future non-offer signals for the rest of the
+      // FSM's life once re-adopted.
+      this._abandonedRemoteConnectionIds.delete(remoteConnectionId);
       if (isNewRemoteNamespace) {
         // The remote's session counter is scoped to its connectionId's
         // namespace — adopting a different id means the previously-latched
@@ -760,9 +774,11 @@ export class PeerConnectionFSM {
    *
    * Rules:
    * - Offers always pass (they establish a new remote session)
-   * - Non-offers whose remoteConnectionId differs from the latched one are
-   *   either a recreated remote FSM (re-latch) or a resurrected signal from
-   *   an already-abandoned one (drop, tombstoned)
+   * - Non-offers whose remoteConnectionId differs from the latched one —
+   *   including a null latch — are either a recreated/first-contact remote
+   *   FSM (re-latch) or a resurrected signal from an already-abandoned one
+   *   (drop, tombstoned; tombstone check runs first, so only a never-seen id
+   *   can claim a null latch)
    * - Non-offers with session < _session.remote → 'drop' (stale)
    * - Non-offers with session >= _session.remote → 'accept' or 'update'
    */
@@ -794,15 +810,18 @@ export class PeerConnectionFSM {
     }
 
     // The remote session counter is only ordered WITHIN one remote FSM
-    // (identified by its connectionId). A different id at the same epoch is a
-    // recreated remote FSM whose counter restarted — comparing across
-    // namespaces is the deadlock this guards against
-    // (docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, D2).
-    if (
-      remoteConnectionId &&
-      this._remoteConnectionId !== null &&
-      remoteConnectionId !== this._remoteConnectionId
-    ) {
+    // (identified by its connectionId). An id that differs from the latch —
+    // including a null latch (our own local reset left no namespace to
+    // compare against) — is either a recreated remote FSM whose counter
+    // restarted, or first contact after a local reset; either way the
+    // leftover counter value belongs to a different (or no) namespace and
+    // must not gate it — comparing across namespaces is the deadlock this
+    // guards against (docs/WEBRTC_RECONNECT_IDENTITY.md §7 step 4, D2).
+    // Safe against a null-latch resurrection (re-review N2): the tombstone
+    // check above already ran for this id, so only an id we have never seen
+    // tombstoned can reach here and claim a null latch — the accepted F3
+    // trade-off, not a re-opening of it.
+    if (remoteConnectionId && remoteConnectionId !== this._remoteConnectionId) {
       return 'relatch';
     }
 
