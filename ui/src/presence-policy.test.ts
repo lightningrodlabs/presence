@@ -365,4 +365,24 @@ describe('decideSignalCarrier', () => {
     expect(decideSignalCarrier({ knownPeerLastSeen: [9_500], prevDownSince: 8_000, now: 10_000 })).toEqual({ down: false });
     expect(decideSignalCarrier({ knownPeerLastSeen: [], prevDownSince: undefined, now: 10_000 })).toEqual({ down: false });
   });
+  it('a nonempty roster where nobody has ever ponged is indistinguishable from an empty roster', () => {
+    // Mirrors the call site's filter (streams-store.ts _emitPresenceForensics):
+    // three known peers, none has a lastSeen stamp yet, so knownPeerLastSeen
+    // comes out empty even though the roster itself has three entries. The
+    // function only ever sees stamps, never roster size, so this input is
+    // bitwise identical to the zero-known-peers case above -- deliberately:
+    // "never ponged" and "not here" both read as "no evidence" here.
+    const neverPongedRoster: Array<number | undefined> = [
+      undefined,
+      undefined,
+      undefined,
+    ];
+    const knownPeerLastSeen = neverPongedRoster.filter(
+      (ls): ls is number => ls !== undefined
+    );
+    expect(knownPeerLastSeen).toEqual([]);
+    expect(
+      decideSignalCarrier({ knownPeerLastSeen, prevDownSince: undefined, now: 10_000 })
+    ).toEqual({ down: false });
+  });
 });

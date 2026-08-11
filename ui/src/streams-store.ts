@@ -2544,8 +2544,9 @@ export class StreamsStore {
    * Per-ping-cycle forensics and the signal-carrier-down authority:
    *
    *  - SignalCarrierDown/Up — delegates to `decideSignalCarrier`
-   *    (`presence-policy.ts`), which is down when we know peers but none
-   *    have ponged within `SIGNAL_CARRIER_DOWN_MS`. Makes signal-relay
+   *    (`presence-policy.ts`), which is down when at least one known
+   *    peer has ponged before but none of those ponged-at-least-once
+   *    peers is fresh within `SIGNAL_CARRIER_DOWN_MS`. Makes signal-relay
    *    outages visible in merged logs, and the resulting
    *    `_signalCarrierDownSince` feeds `decideSignalsMediaCadence`
    *    (Tasks 7-8) — this is no longer forensic-only.
@@ -2561,6 +2562,21 @@ export class StreamsStore {
     const knownPeers = Object.keys(known).filter(
       k => k !== this.myPubKeyB64 && !blocked.includes(k),
     );
+    // Peers with no `lastSeen` yet are deliberately excluded here, not
+    // passed through as a value `decideSignalCarrier` could treat as
+    // "not fresh" — there are three paths that leave `lastSeen`
+    // undefined: initial roster seeding (`this._knownAgents.update` in
+    // the all-agents subscription, ~2474), a peer-leave clear
+    // (~5715), and a told-only agent we've never received a Pong from
+    // directly (~5877). Declared behavior change from the old inline
+    // predicate: it counted a known-but-never-ponged peer as
+    // "not fresh", so a relay that was dead from the very first tick
+    // (nobody had ponged yet) logged a spurious SignalCarrierDown on
+    // tick 1. `decideSignalCarrier` cannot distinguish "never ponged"
+    // from "not here" and refuses to call either one channel death, so
+    // that dead-from-start detection is forfeited on purpose — it survives
+    // as long as at least one peer has ponged at least once and then
+    // goes stale.
     const knownPeerLastSeen = knownPeers
       .map(k => known[k]?.lastSeen)
       .filter((ls): ls is number => ls !== undefined);

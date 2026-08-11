@@ -158,11 +158,18 @@ export type SignalCarrierState =
   | { down: true; downSince: number };
 
 /**
- * The **signal-carrier-down** predicate: down when we know of at least
- * one peer but none of them have ponged within `SIGNAL_CARRIER_DOWN_MS`.
- * Zero known peers is defined as up — no evidence of peers is not
- * evidence the channel is dead, so a freshly-joined room with nobody
- * else in it never reports a down carrier.
+ * The **signal-carrier-down** predicate: down when at least one known
+ * peer has *ever* ponged, but none of those ponged-at-least-once peers
+ * is fresh within `SIGNAL_CARRIER_DOWN_MS`. This predicate runs only
+ * over peers who have a `lastSeen` stamp at all — a known peer with no
+ * stamp yet contributes no timestamp to `knownPeerLastSeen` and is
+ * therefore invisible to this function, indistinguishable from that
+ * peer not being in the roster. An all-unstamped roster is `down:
+ * false` for the same reason an empty roster is: this function cannot
+ * tell "nobody has answered yet" from "nobody is here", and refuses to
+ * call either one channel death. (Call sites that exclude unstamped
+ * peers before calling this, and what that forfeits, are documented at
+ * the call site — see `streams-store.ts`'s `_emitPresenceForensics`.)
  *
  * `downSince` is sticky across calls while still down (`prevDownSince`
  * carries the stamp from the first down evaluation forward) so the
@@ -170,7 +177,12 @@ export type SignalCarrierState =
  * from whichever tick last happened to call this.
  */
 export function decideSignalCarrier(inputs: {
-  /** lastSeen stamps for known, non-self, non-blocked peers. */
+  /**
+   * lastSeen stamps for known, non-self, non-blocked peers who have
+   * ponged at least once. Peers with no stamp yet (`lastSeen ===
+   * undefined`) are excluded by the caller, not represented here as
+   * zero or omitted-but-counted — see the call-site note above.
+   */
   knownPeerLastSeen: number[];
   prevDownSince: number | undefined;
   now: number;

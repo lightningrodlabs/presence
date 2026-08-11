@@ -11,7 +11,7 @@
  * `decideSignalCarrier` (`presence-policy.ts`), the signal-carrier-down
  * authority — this module does not re-derive it.
  *
- * Hysteresis: a mode escalates (full -> voice-only -> collapsed) the
+ * Hysteresis: a mode escalates (full -> voice-only -> paused) the
  * instant its threshold is crossed, but only recovers one level per
  * evaluation, and only once the RTT has fallen below *half* the
  * threshold that would re-trigger it. That asymmetry is what stops a RTT

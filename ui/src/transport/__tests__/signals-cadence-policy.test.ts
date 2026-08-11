@@ -12,6 +12,13 @@ describe('decideSignalsMediaCadence', () => {
     ['no flap at threshold edge', { carrierDown: false, bestRttEwmaMs: 1900, prevMode: 'voice-only' }, { mode: 'voice-only', reason: 'rtt-degraded' }],
     ['recovers below half threshold', { carrierDown: false, bestRttEwmaMs: 900, prevMode: 'voice-only' }, { mode: 'full', reason: 'healthy' }],
     ['paused recovers one level',     { carrierDown: false, bestRttEwmaMs: 2200, prevMode: 'paused' },   { mode: 'voice-only', reason: 'rtt-degraded' }],
+    // no-sample bypasses hysteresis outright, from any prevMode
+    ['no sample bypasses hysteresis from voice-only', { carrierDown: false, bestRttEwmaMs: undefined, prevMode: 'voice-only' }, { mode: 'full', reason: 'no-sample' }],
+    ['no sample bypasses hysteresis from paused', { carrierDown: false, bestRttEwmaMs: undefined, prevMode: 'paused' }, { mode: 'full', reason: 'no-sample' }],
+    // exact-half boundaries: recovery needs STRICTLY below half, not at it
+    ['exactly half the degraded threshold does not recover', { carrierDown: false, bestRttEwmaMs: 1000, prevMode: 'voice-only' }, { mode: 'voice-only', reason: 'rtt-degraded' }],
+    ['exactly half the collapsed threshold does not recover', { carrierDown: false, bestRttEwmaMs: 2500, prevMode: 'paused' }, { mode: 'paused', reason: 'rtt-collapsed' }],
+    ['carrier down from paused stays paused, reason switches to carrier-down', { carrierDown: true, bestRttEwmaMs: 100, prevMode: 'paused' }, { mode: 'paused', reason: 'carrier-down' }],
   ];
   it.each(cases)('%s', (_n, input, expected) => {
     expect(decideSignalsMediaCadence(input)).toEqual(expected);
