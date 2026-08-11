@@ -285,6 +285,20 @@ is exactly as today, so the 200 package tests stay green):
 4. **FSM** (`peer-connection-fsm.ts`): accept/store the epoch, expose a getter,
    and thread `remoteEpoch` into `handleRemoteSignal` / `_validateSignalSession`
    so the within‑FSM `peerSessionId` ordering becomes a *sub‑order* under epoch.
+   **Landed** (branch `fix/session-relatch-on-remote-fsm-recreate`): closes the
+   *equal-epoch* hole the epoch mechanism (items 1–3) didn't cover — within one
+   epoch, `_session.remote` is only ordered while the remote FSM identified by
+   `_remoteConnectionId` hasn't changed. `_validateSignalSession` now threads
+   `remoteConnectionId` and returns `'relatch'` when a non-offer arrives from a
+   *different* remote connectionId than the one latched: a fresh remote FSM
+   (counter restarted) re-latches and is accepted; a resurrected signal from an
+   already-abandoned remote FSM is dropped via a new `_abandonedRemoteConnectionIds`
+   tombstone set, populated wherever `_remoteConnectionId` is about to be
+   overwritten or reset (`_newPeerSession`, the offer latch). See
+   `packages/webrtc-peer/src/__tests__/peer-connection-fsm.test.ts`
+   (`signal session validation` describe) and
+   `packages/webrtc-peer/src/__tests__/connection-manager.test.ts`
+   (`epoch ordering` describe, "same epoch: peer whose FSM was recreated…").
 5. **Timing (D3):** for the Presence carrier orchestrator, keep the FSM's
    reconnect attempts low (fail fast, per README) and collapse the two 15 s grace
    windows to a single owner, so a superseded attempt is abandoned in ~1

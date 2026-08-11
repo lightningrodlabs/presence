@@ -948,6 +948,50 @@ describe('PeerConnectionFSM', () => {
       );
       expect(ctx.fsm.remotePeerSessionId).toBe(5);
     });
+
+    it('re-latches when the remote FSM was recreated (non-offer with new remoteConnectionId and regressed session)', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      // Latch remote FSM "A" at a high session via an offer.
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-a' }, 'remote-A', 11);
+      expect(ctx.fsm.remotePeerSessionId).toBe(11);
+
+      // Remote side recreated its FSM at the same epoch: new id, counter restarted.
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-B',
+        1,
+      );
+
+      // Must NOT log a stale drop; the candidate must reach the peer.
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale'))
+      ).toBe(false);
+      expect(ctx.mockPc.addIceCandidate).toHaveBeenCalledTimes(1);
+      expect(ctx.fsm.remotePeerSessionId).toBe(1);
+    });
+
+    it('still drops non-offers from an abandoned (tombstoned) remote FSM', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-a' }, 'remote-A', 3);
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-b' }, 'remote-B', 1); // remote recreated; A is now abandoned
+
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-A',
+        3,
+      ); // resurrected dead burst
+
+      const dropEntry = ctx.transitionLog.slice(logBefore).find(
+        t => t.trigger.includes('Dropped stale candidate')
+      );
+      expect(dropEntry).toBeDefined();
+    });
   });
 
   describe('DTLS stall watchdog', () => {

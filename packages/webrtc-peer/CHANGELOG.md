@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** equal-epoch session-staleness deadlock — the remote peerSessionId
+  counter is now scoped to the remote FSM's connectionId; a recreated remote
+  FSM re-latches instead of having its answers/candidates dropped as stale,
+  with tombstones preventing resurrected dead-session signals
+  (WEBRTC_RECONNECT_IDENTITY.md §7 step 4, defect D2).
+
 ## 0.4.0
 
 Banks the Phase 3–Round 3 library changes (0.x semver: breaking → minor).
