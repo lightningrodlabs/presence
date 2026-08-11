@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-08-11
 
 - **Changed:** disconnected auto-retry uses exponential backoff with jitter
   from the reconnect policy's pacing fields, replacing flat 500-2000ms
