@@ -136,6 +136,27 @@ export const SDP_TIMEOUT_RTT_MULTIPLIER = 20;
 export const SDP_TIMEOUT_FLOOR_MS = 5000;
 
 /**
+ * Ceiling for the store's tracked SDP-exchange backstop timer
+ * (`_computeSdpBackstopTimeout`), NOT the same predicate as
+ * `SDP_TIMEOUT_CEILING_MS`. The backstop is second-line cleanup for an
+ * FSM that wedges without ever emitting a phase transition — it must
+ * always leave the FSM's own per-attempt timeout (`_computeSdpTimeout`,
+ * passed as `sdpExchangeTimeoutMs`) and that timeout's own first backoff
+ * retry undisturbed, so it is pinned strictly greater than the per-attempt
+ * timeout (2x) rather than sharing its value. Sharing the value was
+ * Task 9's original defect (review C1, 2026-08-11): the backstop fired in
+ * the same tick as the FSM's own timeout, destroying the FSM's in-place
+ * Task-4 recovery retry instead of letting it run.
+ */
+export const SDP_BACKSTOP_CEILING_MS = 60_000;
+
+/** Multiplier applied to the per-attempt SDP timeout to get the store's
+ *  tracked backstop timeout (`_computeSdpBackstopTimeout`) — kept at 2x
+ *  so the backstop can never fire before the FSM's own timeout has had a
+ *  chance to run its first in-place retry. */
+export const SDP_BACKSTOP_MULTIPLIER = 2;
+
+/**
  * How long an established peer may sit in iceConnectionState 'disconnected'
  * before the stale-connection net would tear it down. WebRTC treats
  * 'disconnected' as recoverable: it keeps probing the active candidate pair
@@ -2778,6 +2799,24 @@ export class StreamsStore {
     );
   }
 
+  /**
+   * Timeout (ms) for the store's own tracked SDP-exchange backstop timer
+   * — second-line cleanup for an FSM that wedges without ever emitting a
+   * phase transition. Deliberately NOT the same value as
+   * `_computeSdpTimeout` (the FSM's own per-attempt timeout, passed as
+   * `sdpExchangeTimeoutMs`): the backstop must always leave that timeout
+   * and its first in-place backoff retry undisturbed, so it is pinned
+   * strictly greater — `SDP_BACKSTOP_MULTIPLIER` (2x) times the
+   * per-attempt timeout, capped at `SDP_BACKSTOP_CEILING_MS`. Sharing the
+   * per-attempt value was Task 9's original defect (review C1): the
+   * backstop fired in the same tick as the FSM's own timeout and
+   * destroyed its in-place recovery attempt instead of letting it run.
+   */
+  private _computeSdpBackstopTimeout(peerB64: AgentPubKeyB64): number {
+    const perAttempt = this._computeSdpTimeout(peerB64) ?? SDP_EXCHANGE_TIMEOUT;
+    return Math.min(SDP_BACKSTOP_CEILING_MS, perAttempt * SDP_BACKSTOP_MULTIPLIER);
+  }
+
   async changeVideoInput(deviceId: string) {
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
@@ -4995,6 +5034,9 @@ export class StreamsStore {
    *  blowing the SDP-exchange ceiling — the retries were noise, not
    *  recovery attempts. */
   private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS = 30_000;
+  /** RTT multiplier for the diagnostic attempt timeout
+   *  (`_computeDiagnosticAttemptTimeout`). */
+  private static readonly DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER = 4;
 
   /**
    * Request diagnostic logs from a specific peer (or, with no argument,
@@ -5055,7 +5097,10 @@ export class StreamsStore {
     }
     return Math.min(
       StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS,
-      Math.max(StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS, Math.round(rtt * 4))
+      Math.max(
+        StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS,
+        Math.round(rtt * StreamsStore.DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER)
+      )
     );
   }
 
@@ -6522,14 +6567,18 @@ export class StreamsStore {
 
           delete this._pendingInits[pubKey64];
 
-          // SDP exchange timeout: if still not connected within the
-          // RTT-scaled window (`_computeSdpTimeout`, falling back to the
-          // fixed SDP_EXCHANGE_TIMEOUT default with no RTT sample), clean
-          // up and retry. The timer is ATTEMPT-scoped and TRACKED (§9
-          // item 5): it may only tear down the attempt that armed it — a
-          // successor attempt's slot must survive this timer firing — and
-          // a new attempt for the same peer disarms the previous timer,
-          // as does disconnect().
+          // Second-line backstop: if the FSM wedges without ever emitting
+          // a phase transition, this store-level timer cleans up and lets
+          // the next ping/pong cycle retry. Deliberately NOT the same
+          // window as the FSM's own per-attempt SDP timeout above
+          // (`sdpExchangeTimeoutMs: _computeSdpTimeout(...)`) — it is
+          // `_computeSdpBackstopTimeout`, pinned strictly greater (2x, own
+          // ceiling) so it never preempts the FSM's own timeout and first
+          // in-place backoff retry (review C1). The timer is
+          // ATTEMPT-scoped and TRACKED (§9 item 5): it may only tear down
+          // the attempt that armed it — a successor attempt's slot must
+          // survive this timer firing — and a new attempt for the same
+          // peer disarms the previous timer, as does disconnect().
           const priorSdpTimer = this._sdpTimeoutTimers[pubKey64];
           if (priorSdpTimer !== undefined) this.clock.clearTimeout(priorSdpTimer);
           this._sdpTimeoutTimers[pubKey64] = this.clock.setTimeout(() => {
@@ -6551,7 +6600,7 @@ export class StreamsStore {
               });
             }
             this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
-          }, this._computeSdpTimeout(pubKey64) ?? SDP_EXCHANGE_TIMEOUT);
+          }, this._computeSdpBackstopTimeout(pubKey64));
         }
       }
     }
