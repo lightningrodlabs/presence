@@ -77,10 +77,16 @@ export interface VoiceFramePayload extends VoiceFrame {
    * Up to `redundancy` immediately-preceding frames, oldest→newest, carried
    * redundantly so a frame lost in its own packet can be recovered from the
    * copy piggybacked on a later packet. The signals carrier (Holochain
-   * remote-signal relay) routinely drops 10–50% of packets; RED-style
-   * redundancy turns that into near-zero effective loss for ~2× the (tiny)
-   * audio bytes. Absent on legacy senders — receivers fall back to the
-   * single primary frame, so the wire format stays compatible both ways.
+   * remote-signal relay) routinely drops 10–50% of packets. On the
+   * per-frame path, RED-style redundancy makes any single (and most
+   * double) consecutive packet losses fully recoverable for ~2× the
+   * (tiny) audio bytes. On the batched path (`packVoiceFrames`) the block
+   * rides only the batch's first frame and covers the `redundancy` frames
+   * preceding the batch, so a wholly-lost batch loses `VOICE_BATCH_FRAMES`
+   * frames and the next packet recovers `redundancy` of them — bounded
+   * recovery, not near-zero loss. Absent on legacy senders — receivers
+   * fall back to the single primary frame, so the wire format stays
+   * compatible both ways.
    */
   red?: VoiceFrame[];
 }
@@ -443,7 +449,16 @@ class VoiceController {
     // owned by the reconcilers/`_signalsTargets`, so recovery is just this
     // check reading a different mode. Voice keeps sending in 'voice-only';
     // frames encoded while paused are dropped, not buffered (stale audio).
-    if (this.store.signalsCadence().mode === 'paused') return;
+    if (this.store.signalsCadence().mode === 'paused') {
+      // A pause also discards any partially-accumulated batch (review
+      // I1): a pause lasts seconds-to-minutes, so frames buffered before
+      // it are stale audio by resume time — left in place they led the
+      // first post-resume batch (a playout reset, and their old `wts`
+      // briefly poisoning av-sync). The dropped seqs read as ordinary
+      // loss at the receiver — truthful accounting.
+      this.batchBuffer = [];
+      return;
+    }
     const buf = new Uint8Array(chunk.byteLength);
     chunk.copyTo(buf);
     const frame: VoiceFrame = {

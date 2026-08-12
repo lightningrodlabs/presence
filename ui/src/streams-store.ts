@@ -1379,6 +1379,10 @@ export class StreamsStore {
     // rejoining peer starts clean (§9 item 5).
     if (plan.clearLastDisconnectTime) delete this._lastDisconnectTime[pubKeyB64];
     if (plan.clearLastReconcileTime) delete this._lastReconcileTime[pubKeyB64];
+    // Rejoin-inheritance clear (review M5): the EWMA feeds the cadence
+    // decision, so a departed session's collapsed value must not pause a
+    // healthy rejoin. Peer-leave rows only, like the two deletes above.
+    if (plan.clearSignalsRttEwma) this._signalsRttEwma.delete(pubKeyB64);
     if (plan.clearVideoStreamSlot) delete this._videoStreams[pubKeyB64];
     // A closed connection's pending InitRequests are dead reservations:
     // clearing them lets the next pong cycle re-initiate immediately

@@ -1088,14 +1088,21 @@ describe('signals media cadence gates the senders (Task 7)', () => {
   }
 
   /** A PongUi from peerA echoing a pingT0 `rttMs` in the past — the real
-   *  foldSignalsRtt input (first sample seeds the EWMA at the raw RTT). */
+   *  foldSignalsRtt input (first sample seeds the EWMA at the raw RTT).
+   *  Carries `moduleStatesAt` matching the capsDeclaration stamp so the
+   *  pong does not read as a legacy no-stamp pong, whose unconditional
+   *  sweep would wipe the caps declaration between sends. */
   function pongEchoing(started: Started, rttMs: number): RoomSignal {
     return message(
       peerAKey,
       'PongUi',
       JSON.stringify({
         formatVersion: 1,
-        data: { connectionStatuses: {}, pingT0: started.clock.now() - rttMs },
+        data: {
+          connectionStatuses: {},
+          pingT0: started.clock.now() - rttMs,
+          moduleStatesAt: 1,
+        },
       })
     );
   }
@@ -1275,5 +1282,158 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     encodeVoiceFrame(); // starts a NEW batch; must not flush the old one
     await flush();
     expect(moduleData(bus, 'voice')).toHaveLength(0);
+  });
+
+  /** Walk the RTT EWMA back down with fresh pongs, one presence tick per
+   *  iteration, until the cadence leaves `stopAt` (bounded). Returns the
+   *  mode observed after each tick. */
+  async function walkRecovery(
+    started: Started,
+    stopWhile: (mode: string) => boolean
+  ): Promise<string[]> {
+    const { store, clock, bus } = started;
+    const modes: string[] = [];
+    for (let i = 0; i < 12 && stopWhile(store.signalsCadence().mode); i++) {
+      store._knownAgents.set(knownFresh(clock, peerA));
+      await bus.deliver(pongEchoing(started, 0));
+      clock.advance(PING_INTERVAL);
+      await store.pingAgents();
+      modes.push(store.signalsCadence().mode);
+    }
+    return modes;
+  }
+
+  it('a pause discards a partially-accumulated batch — the first post-resume flush carries only fresh frames (review I1)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+
+    // Two frames buffered pre-pause — stale audio by resume time.
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // Collapse the RTT → paused; a frame encoded while paused is dropped.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence().mode).toBe('paused');
+    encodeVoiceFrame(333);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // Recover past 'paused' (voice sends in 'voice-only' too).
+    await walkRecovery(started, mode => mode === 'paused');
+    expect(store.signalsCadence().mode).not.toBe('paused');
+
+    // The next flush contains ONLY post-resume frames: the pre-pause
+    // timestamps are gone, and their seqs are simply absent — they read
+    // as ordinary loss at the receiver (truthful accounting).
+    encodeVoiceFrame(444);
+    encodeVoiceFrame(555);
+    encodeVoiceFrame(666);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(1);
+    const batch = JSON.parse(sent[0].chunk) as {
+      frames: Array<{ seq: number; ts: number }>;
+    };
+    expect(batch.frames.map(f => f.ts)).toEqual([444, 555, 666]);
+    // seqs 0,1 (buffered pre-pause) never reached the wire; the frame
+    // encoded while paused never consumed a seq at all.
+    expect(batch.frames.map(f => f.seq)).toEqual([2, 3, 4]);
+  });
+
+  it('a cap flip mid-batch flushes the buffered frames per-frame, in seq order (review I2)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+
+    // Two frames buffer under the cap gate…
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // …then a caps-silent peer becomes a signals target (mixed room).
+    store._knownAgents.set(knownFresh(clock, peerA, peerB));
+    expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(false);
+
+    // The next frame flushes the buffered two per-frame FIRST, then
+    // itself: 3 legacy sends in seq order — nothing stranded, nothing
+    // reordered behind newer frames.
+    encodeVoiceFrame(333);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(3);
+    const parsed = sent.map(
+      s => JSON.parse(s.chunk) as { seq: number; ts: number; v?: number }
+    );
+    expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
+    expect(parsed.map(p => p.seq)).toEqual([0, 1, 2]);
+    expect(parsed.map(p => p.ts)).toEqual([111, 222, 333]);
+  });
+
+  it('recovery walks paused → voice-only → full via the per-tick re-evaluation, and sends resume (review I3)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+
+    // Collapse: sends stop.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'rtt-collapsed',
+    });
+    encodeVoiceFrame();
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(0);
+
+    // Fresh pongs walk the EWMA down; each ping cycle re-evaluates. The
+    // hysteresis recovers ONE level per evaluation — never paused → full
+    // in a single tick.
+    const modes = [
+      'paused',
+      ...(await walkRecovery(started, mode => mode !== 'full')),
+    ];
+    const transitions = modes.filter((m, i) => i === 0 || m !== modes[i - 1]);
+    expect(transitions).toEqual(['paused', 'voice-only', 'full']);
+
+    // Sends actually resume at full — voice AND filmstrip. This is the
+    // permanently-muted-audio pin: if the per-tick re-evaluation ever
+    // breaks, the walk above never reaches 'full' and this fails.
+    encodeVoiceFrame();
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(1);
+  });
+
+  it("a rejoining peer does not inherit the departed session's collapsed RTT EWMA (review M5)", async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence().mode).toBe('paused');
+
+    // The peer LEAVES: the media peer-leave cleanup row deletes their
+    // _signalsRttEwma entry (closeCleanupPlan clearSignalsRttEwma).
+    await bus.deliver(message(peerAKey, 'LeaveUi', ''));
+
+    // They rejoin ping-fresh. With no sample, the very next evaluation is
+    // full/no-sample — not a ~5-tick hysteresis walk-back against the
+    // departed session's collapsed EWMA on a healthy network.
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'full',
+      reason: 'no-sample',
+    });
   });
 });
