@@ -433,6 +433,11 @@ class FilmstripController {
     if (!this.store) return;
     const targets = get(this.store._signalsTargets);
     if (targets.size === 0) return;
+    // Cadence gate (`decideSignalsMediaCadence` via the store): filmstrip
+    // is the heaviest signals payload, so clips go out only at 'full'
+    // cadence — 'voice-only' and 'paused' both drop them. Gates the SEND
+    // only: capture teardown stays owned by the reconcilers.
+    if (this.store.signalsCadence().mode !== 'full') return;
 
     const buf = new Uint8Array(msg.bytes);
     const payload: FilmstripClipPayload = {
@@ -506,8 +511,15 @@ class FilmstripController {
   async stopCapture(): Promise<void> {
     // Send an explicit stop payload to peers we've been transmitting
     // to, so they clear their display immediately rather than waiting
-    // for the inactivity TTL to fire.
-    if (this.store && this.peerLastSentMs.size > 0) {
+    // for the inactivity TTL to fire. Cadence-gated like the clip send:
+    // below 'full' the courtesy stop is skipped (receivers fall back to
+    // the TTL) — the condition wraps only the send so the worker/camera
+    // teardown below always runs.
+    if (
+      this.store &&
+      this.peerLastSentMs.size > 0 &&
+      this.store.signalsCadence().mode === 'full'
+    ) {
       const recentTargets = new Set(this.peerLastSentMs.keys());
       const stopPayload: FilmstripStopPayload = {
         kind: 'stop',

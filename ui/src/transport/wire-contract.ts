@@ -88,7 +88,21 @@ export const CAP_SDP_FSM = 'sdp-fsm';
  *  drove screen share over SimplePeer/`SdpData`, which Phase 3 retires. */
 export const CAP_SDP_FSM_SCREEN = 'sdp-fsm-screen';
 
-export type WireCap = typeof CAP_SDP_FSM | typeof CAP_SDP_FSM_SCREEN;
+/** The peer's build can parse v2 batched voice payloads inside `ModuleData`
+ *  (`{ v: 2, frames }` — `packVoiceFrames`, `room/modules/voice.ts`). NOT a
+ *  signal-type gate: `ModuleData` itself stays baseline; this gates a
+ *  payload *format* upgrade. The production gate is
+ *  `StreamsStore.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)` in the voice
+ *  sender — one broadcast serves the whole target set, so batches are
+ *  emitted only when every current signals target declares this; a mixed
+ *  room falls back to the legacy per-frame payload for everyone. Receivers
+ *  parse both formats regardless (`unpackVoicePayload`). */
+export const CAP_VOICE_BATCH = 'voice-batch-v1';
+
+export type WireCap =
+  | typeof CAP_SDP_FSM
+  | typeof CAP_SDP_FSM_SCREEN
+  | typeof CAP_VOICE_BATCH;
 
 /** The capabilities this build declares in its conversation payload
  *  (`ConversationPayload.caps`). A future wire feature adds a string here —
@@ -96,6 +110,7 @@ export type WireCap = typeof CAP_SDP_FSM | typeof CAP_SDP_FSM_SCREEN;
 export const WIRE_CAPS = [
   CAP_SDP_FSM,
   CAP_SDP_FSM_SCREEN,
+  CAP_VOICE_BATCH,
 ] as const satisfies readonly WireCap[];
 
 // ---------------------------------------------------------------------------

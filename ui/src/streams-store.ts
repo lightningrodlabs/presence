@@ -34,6 +34,8 @@ import {
   decideWebrtcEligibility,
 } from './transport/carrier-coverage';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
+import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
+import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import { closeCleanupPlan } from './transport/close-cleanup-policy';
@@ -1377,6 +1379,10 @@ export class StreamsStore {
     // rejoining peer starts clean (§9 item 5).
     if (plan.clearLastDisconnectTime) delete this._lastDisconnectTime[pubKeyB64];
     if (plan.clearLastReconcileTime) delete this._lastReconcileTime[pubKeyB64];
+    // Rejoin-inheritance clear (review M5): the EWMA feeds the cadence
+    // decision, so a departed session's collapsed value must not pause a
+    // healthy rejoin. Peer-leave rows only, like the two deletes above.
+    if (plan.clearSignalsRttEwma) this._signalsRttEwma.delete(pubKeyB64);
     if (plan.clearVideoStreamSlot) delete this._videoStreams[pubKeyB64];
     // A closed connection's pending InitRequests are dead reservations:
     // clearing them lets the next pong cycle re-initiate immediately
@@ -2538,6 +2544,50 @@ export class StreamsStore {
 
     // Forensics: signal-carrier liveness + presence-set membership.
     this._emitPresenceForensics();
+
+    // Signals media cadence: one evaluation per ping cycle, AFTER the
+    // forensics call so `_signalCarrierDownSince` is this tick's verdict.
+    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
+    // targets — the healthiest link bounds what the relay can still
+    // deliver; targets with no sample yet contribute nothing, and no
+    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
+    // policy's declared design).
+    let bestRttEwmaMs: number | undefined;
+    for (const target of get(this._signalsTargets)) {
+      const rtt = this._signalsRttEwma.get(target);
+      if (rtt !== undefined && (bestRttEwmaMs === undefined || rtt < bestRttEwmaMs)) {
+        bestRttEwmaMs = rtt;
+      }
+    }
+    this._signalsCadence = decideSignalsMediaCadence({
+      carrierDown: this._signalCarrierDownSince !== undefined,
+      bestRttEwmaMs,
+      prevMode: this._signalsCadence.mode,
+    });
+  }
+
+  /** The signals media cadence the voice/filmstrip senders must obey —
+   *  see `_signalsCadence` for who evaluates it and when. */
+  signalsCadence(): SignalsMediaCadence {
+    return this._signalsCadence;
+  }
+
+  /**
+   * True when EVERY current signals target's build declares `cap`
+   * (`conversationPayloadCaps` — the one capability read). The voice
+   * batching gate: `sendModuleData` is one broadcast for the whole target
+   * set, so a payload-format upgrade applies only when every recipient
+   * can parse it — a mixed room falls back to the legacy format for
+   * everyone. False with no targets (nothing to send to; senders gate on
+   * the target set first).
+   */
+  signalsTargetsAllHaveCap(cap: string): boolean {
+    const targets = get(this._signalsTargets);
+    if (targets.size === 0) return false;
+    for (const target of targets) {
+      if (!this._peerCaps(target).has(cap)) return false;
+    }
+    return true;
   }
 
   /**
@@ -2590,6 +2640,13 @@ export class StreamsStore {
       ? carrierState.downSince
       : undefined;
     if (carrierState.down && prevDownSince === undefined) {
+      // Immediate back-off, in the same breath as the flip: the per-tick
+      // evaluation in pingAgents() would land on 'paused' anyway, but the
+      // senders must not get frames into a relay that just proved dead
+      // for however long a caller-ordering change could delay that
+      // evaluation. Recovery is NOT forced here — it rides the per-tick
+      // evaluation and the policy's one-level-per-tick hysteresis.
+      this._signalsCadence = { mode: 'paused', reason: 'carrier-down' };
       this.logger.logCustomMessage(
         `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
       );
@@ -4187,6 +4244,20 @@ export class StreamsStore {
    * `decideSignalsMediaCadence` (`transport/signals-cadence-policy.ts`).
    */
   private _signalCarrierDownSince: number | undefined;
+
+  /**
+   * The signals-carried media cadence — how much media the voice/filmstrip
+   * senders may put on the signals carrier right now. ONE authority:
+   * `decideSignalsMediaCadence` (`transport/signals-cadence-policy.ts`),
+   * re-evaluated once per presence tick in `pingAgents()` AFTER
+   * `_emitPresenceForensics` (so it reads this tick's carrier verdict),
+   * and forced to `paused` in the same breath as a carrier-down flip.
+   * Senders read it via `signalsCadence()`: voice sends in `full` and
+   * `voice-only` and drops frames while `paused`; filmstrip sends only in
+   * `full`. The gate is on the SEND — capture ownership stays with the
+   * reconcilers/`_signalsTargets`, so recovery needs no re-arm.
+   */
+  _signalsCadence: SignalsMediaCadence = { mode: 'full', reason: 'no-sample' };
 
   /**
    * Last computed `globalPresenceSet()`, kept so the ping cycle can diff
