@@ -140,6 +140,62 @@ export function isMediaLive(s: MediaLiveSnapshot): boolean {
   return false;
 }
 
+/**
+ * The **signal-carrier-down** predicate's window: if no known peer has
+ * ponged within this long, the bidirectional Holochain signal path is
+ * presumed down. 3 ticks of the presence clock, same reasoning as
+ * `PRESENT_STALENESS_MS` (absorb one lost ping/pong pair without a
+ * flap) — but this is a distinct predicate: carrier health, not peer
+ * presence. `_signalCarrierDownSince` (`streams-store.ts`) is the one
+ * store field it feeds, and `decideSignalsMediaCadence`
+ * (`transport/signals-cadence-policy.ts`) is the one downstream
+ * consumer of the resulting `down` flag.
+ */
+export const SIGNAL_CARRIER_DOWN_MS = 3 * PING_INTERVAL;
+
+export type SignalCarrierState =
+  | { down: false }
+  | { down: true; downSince: number };
+
+/**
+ * The **signal-carrier-down** predicate: down when at least one known
+ * peer has *ever* ponged, but none of those ponged-at-least-once peers
+ * is fresh within `SIGNAL_CARRIER_DOWN_MS`. This predicate runs only
+ * over peers who have a `lastSeen` stamp at all — a known peer with no
+ * stamp yet contributes no timestamp to `knownPeerLastSeen` and is
+ * therefore invisible to this function, indistinguishable from that
+ * peer not being in the roster. An all-unstamped roster is `down:
+ * false` for the same reason an empty roster is: this function cannot
+ * tell "nobody has answered yet" from "nobody is here", and refuses to
+ * call either one channel death. (Call sites that exclude unstamped
+ * peers before calling this, and what that forfeits, are documented at
+ * the call site — see `streams-store.ts`'s `_emitPresenceForensics`.)
+ *
+ * `downSince` is sticky across calls while still down (`prevDownSince`
+ * carries the stamp from the first down evaluation forward) so the
+ * duration reported at recovery is measured from the actual onset, not
+ * from whichever tick last happened to call this.
+ */
+export function decideSignalCarrier(inputs: {
+  /**
+   * lastSeen stamps for known, non-self, non-blocked peers who have
+   * ponged at least once. Peers with no stamp yet (`lastSeen ===
+   * undefined`) are excluded by the caller, not represented here as
+   * zero or omitted-but-counted — see the call-site note above.
+   */
+  knownPeerLastSeen: number[];
+  prevDownSince: number | undefined;
+  now: number;
+}): SignalCarrierState {
+  const { knownPeerLastSeen, prevDownSince, now } = inputs;
+  if (knownPeerLastSeen.length === 0) return { down: false };
+  const anyFresh = knownPeerLastSeen.some(
+    t => now - t < SIGNAL_CARRIER_DOWN_MS
+  );
+  if (anyFresh) return { down: false };
+  return { down: true, downSince: prevDownSince ?? now };
+}
+
 export interface PresentPeersSnapshot {
   /** Keys of the ping-fresh set (already excludes self and blocked). */
   activeAgents: AgentPubKeyB64[];
