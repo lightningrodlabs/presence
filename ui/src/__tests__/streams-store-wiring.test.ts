@@ -2,7 +2,11 @@ import { describe, expect, it, afterEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
-import { StreamsStore, SDP_EXCHANGE_TIMEOUT } from '../streams-store';
+import {
+  StreamsStore,
+  SDP_EXCHANGE_TIMEOUT,
+  SDP_TIMEOUT_CEILING_MS,
+} from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
 import type { FakeDeps } from '../store-deps.testing';
@@ -85,6 +89,30 @@ function message(
   payload: string
 ): RoomSignal {
   return { type: 'Message', from_agent: from, msg_type: msgType, payload };
+}
+
+/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds
+ *  `_signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
+ *  first-sample-seeds-raw). Carries `moduleStatesAt` so it doesn't read
+ *  as a legacy no-stamp pong (same shape as the Task 7 `pongEchoing`
+ *  fixture in the cadence describe below). */
+function pongEchoingRtt(
+  from: AgentPubKey,
+  clock: ManualClock,
+  rttMs: number
+): RoomSignal {
+  return message(
+    from,
+    'PongUi',
+    JSON.stringify({
+      formatVersion: 1,
+      data: {
+        connectionStatuses: {},
+        pingT0: clock.now() - rttMs,
+        moduleStatesAt: 1,
+      },
+    })
+  );
 }
 
 afterEach(() => {
@@ -1072,6 +1100,77 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
     expect(store._lastDisconnectTime[peerA]).toBeUndefined();
     expect(store._lastReconcileTime[peerA]).toBeUndefined();
+  });
+
+  it('an elevated signals RTT arms the tracked SDP timer at the raised 30s ceiling (Task 9)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    // Seed _signalsRttEwma[peerA] = 2_000ms before the InitAccept arrives.
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 2_000));
+
+    await acceptVideo(started, 'init-1');
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+
+    // min(SDP_TIMEOUT_CEILING_MS, 20 * 2_000) = 30_000 — before Task 9
+    // this timer armed at the fixed 15_000 SDP_EXCHANGE_TIMEOUT and would
+    // already have fired by this point.
+    clock.advance(SDP_TIMEOUT_CEILING_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+  });
+
+  it('a low signals RTT keeps the timer below the raised ceiling, unchanged (Task 9)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    // Seed _signalsRttEwma[peerA] = 400ms: 20 * 400 = 8_000, well under
+    // both the old and new ceiling — behavior must be unchanged.
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 400));
+
+    await acceptVideo(started, 'init-1');
+
+    clock.advance(7_999);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+  });
+});
+
+describe('diagnostic attempt timeout scales with signals RTT (Task 9)', () => {
+  it('an elevated signals RTT (5_000ms) scales the per-attempt timeout to 4x RTT (20_000ms)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 5_000));
+
+    await store.requestDiagnosticLogs(peerA);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+
+    // 4 * 5_000 = 20_000, under DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS (30_000).
+    clock.advance(19_999);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+    clock.advance(1);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(2);
+  });
+
+  it('no RTT sample keeps the per-attempt timeout at the unscaled 8_000ms default', async () => {
+    const started = makeStarted();
+    const { store, clock } = started;
+
+    await store.requestDiagnosticLogs(peerA);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+
+    clock.advance(7_999);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+    clock.advance(1);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(2);
   });
 });
 

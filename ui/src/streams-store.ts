@@ -110,8 +110,30 @@ declare const __APP_VERSION__: string;
  * Timeout in ms for the SDP exchange phase. If a connection does not progress
  * from SdpExchange to Connected within this duration, the stale peer is destroyed
  * and the connection is reset to Disconnected so the next ping/pong cycle can retry.
+ * Used as the no-RTT-sample fallback for `_computeSdpTimeout`.
  */
 export const SDP_EXCHANGE_TIMEOUT = 15000;
+
+/**
+ * Ceiling for the RTT-scaled SDP-exchange timeout (`_computeSdpTimeout`).
+ * Serves the SDP-exchange predicate: how long an initiator's own attempt
+ * may go unanswered before it is torn down and retried.
+ *
+ * Field observation (2026-08-11): 8 consecutive SDP timeouts sat at the
+ * former 15s ceiling while measured signals RTT was 20-58s. At K=20 that
+ * RTT range needs 400-1160s to clear on its own multiplier — the ceiling
+ * was always going to bind, so every attempt was pure teardown-and-reflood
+ * with no chance to succeed. Raised to 30s so links in the low end of
+ * that range get a timeout retrying can actually complete within.
+ */
+export const SDP_TIMEOUT_CEILING_MS = 30_000;
+
+/** RTT multiplier for the SDP-exchange timeout (`_computeSdpTimeout`). */
+export const SDP_TIMEOUT_RTT_MULTIPLIER = 20;
+
+/** Floor for the RTT-scaled SDP-exchange timeout (`_computeSdpTimeout`),
+ *  avoiding an over-tight timeout on very low-RTT links. */
+export const SDP_TIMEOUT_FLOOR_MS = 5000;
 
 /**
  * How long an established peer may sit in iceConnectionState 'disconnected'
@@ -2743,17 +2765,17 @@ export class StreamsStore {
    * ping/pong, so the signals-carrier RTT EWMA is the correct latency
    * proxy. K is kept generous to absorb signal-relay retransmits; the
    * floor avoids an over-tight timeout on very low-RTT links; the ceiling
-   * equals today's fixed default so the change can never make a
-   * no-improvement case worse. K/FLOOR are provisional — see
-   * docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
+   * (`SDP_TIMEOUT_CEILING_MS`) is raised past today's fixed default —
+   * see that constant's comment for the field rationale. K/FLOOR are
+   * provisional — see docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
    */
   private _computeSdpTimeout(peerB64: AgentPubKeyB64): number | undefined {
     const rtt = this._signalsRttEwma.get(peerB64);
     if (rtt === undefined || rtt <= 0) return undefined;
-    const K = 20;
-    const FLOOR_MS = 5000;
-    const CEILING_MS = 15000;
-    return Math.min(CEILING_MS, Math.max(FLOOR_MS, Math.round(rtt * K)));
+    return Math.min(
+      SDP_TIMEOUT_CEILING_MS,
+      Math.max(SDP_TIMEOUT_FLOOR_MS, Math.round(rtt * SDP_TIMEOUT_RTT_MULTIPLIER))
+    );
   }
 
   async changeVideoInput(deviceId: string) {
@@ -4962,15 +4984,25 @@ export class StreamsStore {
 
   /** Maximum number of attempts before marking a diagnostic request failed. */
   private static readonly DIAGNOSTIC_MAX_ATTEMPTS = 3;
-  /** Per-attempt timeout (ms) before retrying or giving up. */
+  /** Per-attempt timeout (ms) before retrying or giving up — the no-RTT-
+   *  sample default, and the floor for the RTT-scaled timeout below.
+   *  Diagnostic attempt cadence, NOT a liveness predicate. */
   private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MS = 8_000;
+  /** Ceiling for the RTT-scaled diagnostic attempt timeout
+   *  (`_computeDiagnosticAttemptTimeout`). Diagnostic attempt cadence,
+   *  NOT a liveness predicate. Field observation (2026-08-11): diagnostic
+   *  requests failed 3x8s against the same 20-58s signals RTTs that were
+   *  blowing the SDP-exchange ceiling — the retries were noise, not
+   *  recovery attempts. */
+  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS = 30_000;
 
   /**
    * Request diagnostic logs from a specific peer (or, with no argument,
    * every peer in this conversation) via Holochain signal. Retries up to
-   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within
-   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS per attempt. Peers that exhaust retries
-   * land in `_failedDiagnosticRequests`.
+   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within the
+   * per-attempt timeout (`_computeDiagnosticAttemptTimeout` — RTT-scaled,
+   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS with no RTT sample). Peers that exhaust
+   * retries land in `_failedDiagnosticRequests`.
    *
    * The room-level recipient set is the union of `_conversationParticipants`
    * (peers we have had a media connection with this session, incl. ones who
@@ -5004,6 +5036,26 @@ export class StreamsStore {
 
     this.logger.logCustomMessage(
       `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
+    );
+  }
+
+  /**
+   * RTT-scaled diagnostic-attempt timeout (ms) for `peerB64`. Reuses the
+   * same signals RTT EWMA that scales the SDP-exchange timeout
+   * (`_computeSdpTimeout`) — a slow signals path gets a diagnostic
+   * round-trip window it can actually clear instead of retrying blind.
+   * No RTT sample yet -> the fixed DIAGNOSTIC_ATTEMPT_TIMEOUT_MS default
+   * (unchanged behaviour). Diagnostic attempt cadence, NOT a liveness
+   * predicate.
+   */
+  private _computeDiagnosticAttemptTimeout(peerB64: AgentPubKeyB64): number {
+    const rtt = this._signalsRttEwma.get(peerB64);
+    if (rtt === undefined || rtt <= 0) {
+      return StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS;
+    }
+    return Math.min(
+      StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS,
+      Math.max(StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS, Math.round(rtt * 4))
     );
   }
 
@@ -5048,7 +5100,7 @@ export class StreamsStore {
         });
         this._failedDiagnosticRequests.update(curr => ({ ...curr, [peerB64]: true }));
       }
-    }, StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS);
+    }, this._computeDiagnosticAttemptTimeout(peerB64));
   }
 
   /**
@@ -6470,7 +6522,9 @@ export class StreamsStore {
 
           delete this._pendingInits[pubKey64];
 
-          // SDP exchange timeout: if still not connected after 15s, clean
+          // SDP exchange timeout: if still not connected within the
+          // RTT-scaled window (`_computeSdpTimeout`, falling back to the
+          // fixed SDP_EXCHANGE_TIMEOUT default with no RTT sample), clean
           // up and retry. The timer is ATTEMPT-scoped and TRACKED (§9
           // item 5): it may only tear down the attempt that armed it — a
           // successor attempt's slot must survive this timer firing — and
@@ -6497,7 +6551,7 @@ export class StreamsStore {
               });
             }
             this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
-          }, SDP_EXCHANGE_TIMEOUT);
+          }, this._computeSdpTimeout(pubKey64) ?? SDP_EXCHANGE_TIMEOUT);
         }
       }
     }
