@@ -312,6 +312,17 @@ describe('carrier-hold', () => {
     expect(r).toEqual([]);
   });
 
+  it('the exact boundary (now - downSince === PRESENCE_CARRIER_HOLD_MAX_MS) is NOT held — the guard is a strict `<`', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 50_000,
+      carrierDownSince: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+
   it('never holds blocked peers or self, and does not duplicate fresh peers', () => {
     const r = computePresentPeers({
       ...base,
