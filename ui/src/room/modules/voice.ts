@@ -7,6 +7,7 @@ import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
 import type { MicAcquireResult } from '../../mic-source';
 import { Clock, systemClock } from '../../clock';
+import { CAP_VOICE_BATCH } from '../../transport/wire-contract';
 
 /**
  * How long a playout anchor stays projectable after it was set. NOT a
@@ -71,7 +72,7 @@ interface VoiceFrame {
   wts?: number;
 }
 
-interface VoiceFramePayload extends VoiceFrame {
+export interface VoiceFramePayload extends VoiceFrame {
   /**
    * Up to `redundancy` immediately-preceding frames, oldest→newest, carried
    * redundantly so a frame lost in its own packet can be recovered from the
@@ -118,6 +119,34 @@ interface PeerVoiceState {
 const JITTER_BUFFER_MS = 80;
 const PLAYBACK_RESET_DRIFT_MS = 400;
 
+/**
+ * Frames per batched voice signal when every current signals target
+ * advertises `voice-batch-v1` (`CAP_VOICE_BATCH`, wire-contract.ts).
+ * Batching adds ≤ `VOICE_BATCH_FRAMES` × 20 ms = 60 ms send latency —
+ * inside the existing 80 ms jitter buffer (`JITTER_BUFFER_MS`) — and cuts
+ * the zome-call rate from 50/s to ~17/s, which is what stops the voice
+ * sender from collapsing the Holochain signal relay under load. NOT a
+ * liveness threshold: it serves send cadence only.
+ */
+export const VOICE_BATCH_FRAMES = 3;
+
+/** Wire encoding of a voice batch: `{ v: 2, frames }`. Receivers accept
+ *  this AND the legacy single-object payload regardless of capability —
+ *  the cap gates what we *send*, never what we can parse. */
+export function packVoiceFrames(frames: VoiceFramePayload[]): string {
+  return JSON.stringify({ v: 2, frames });
+}
+
+/** Inverse of `packVoiceFrames`, tolerant of legacy senders: a v2 batch
+ *  yields its frames, any other JSON value is treated as one legacy
+ *  single-frame payload (`[obj]`). Throws only on non-JSON — callers keep
+ *  the drop-one-signal try/catch. */
+export function unpackVoicePayload(json: string): VoiceFramePayload[] {
+  const parsed = JSON.parse(json);
+  if (parsed && parsed.v === 2 && Array.isArray(parsed.frames)) return parsed.frames;
+  return [parsed];
+}
+
 class VoiceController {
   private store: StreamsStore | null = null;
 
@@ -145,6 +174,15 @@ class VoiceController {
   private redundancy = 2;
   /** Ring of the last `redundancy` encoded frames, oldest→newest. */
   private redBuffer: VoiceFrame[] = [];
+
+  /**
+   * Frames accumulated toward the next batched send (see
+   * `handleEncodedChunk`). Non-empty only while every current signals
+   * target advertises `CAP_VOICE_BATCH`. Dropped — never sent — on
+   * `stopCapture()`: by then the buffered audio is stale, and a trailing
+   * send would race the reconciler teardown that stopped the capture.
+   */
+  private batchBuffer: VoiceFramePayload[] = [];
 
   // Receive-side state
   private audioContext: AudioContext | null = null;
@@ -400,6 +438,12 @@ class VoiceController {
     // store value — no per-chunk recomputation, just a property read.
     const targets = get(this.store._signalsTargets);
     if (targets.size === 0) return;
+    // Cadence gate (`decideSignalsMediaCadence` via the store's per-tick
+    // evaluation): `paused` gates the SEND only — capture teardown remains
+    // owned by the reconcilers/`_signalsTargets`, so recovery is just this
+    // check reading a different mode. Voice keeps sending in 'voice-only';
+    // frames encoded while paused are dropped, not buffered (stale audio).
+    if (this.store.signalsCadence().mode === 'paused') return;
     const buf = new Uint8Array(chunk.byteLength);
     chunk.copyTo(buf);
     const frame: VoiceFrame = {
@@ -409,23 +453,73 @@ class VoiceController {
       data: bytesToBase64(buf),
       wts: Date.now(),
     };
+
+    // Batching applies only when EVERY current signals target advertises
+    // `voice-batch-v1`: the payload is one broadcast (`sendModuleData`),
+    // so a single legacy peer forces per-frame for everyone (mixed room ⇒
+    // legacy). Batching adds ≤ VOICE_BATCH_FRAMES × 20 ms = 60 ms send
+    // latency — inside the 80 ms jitter buffer. Receivers parse both
+    // formats regardless of capability (`unpackVoicePayload`).
+    if (this.store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)) {
+      // RED stays at `redundancy` (2) and rides the batch's PRIMARY —
+      // its first frame: at this point `redBuffer` holds exactly the
+      // frames preceding the batch, i.e. the ones a lost previous packet
+      // took. Later batch members carry no red block — their
+      // predecessors travel in the same packet, so a copy would be
+      // in-packet duplication with zero loss protection.
+      const payload: VoiceFramePayload =
+        this.batchBuffer.length === 0 &&
+        this.redundancy > 0 &&
+        this.redBuffer.length > 0
+          ? { ...frame, red: this.redBuffer.slice() }
+          : frame;
+      this.batchBuffer.push(payload);
+      this.retainForRed(frame);
+      if (this.batchBuffer.length < VOICE_BATCH_FRAMES) return;
+      const packed = packVoiceFrames(this.batchBuffer);
+      this.batchBuffer = [];
+      this.stampSent(targets);
+      this.store.sendModuleData('voice', packed, targets).catch(() => {});
+      return;
+    }
+
+    // Legacy per-frame path — the wire shape every released build parses.
+    // A cap flip mid-batch (a legacy peer just became a signals target)
+    // flushes the buffered frames per-frame first, so they are neither
+    // stranded nor reordered behind newer frames.
+    if (this.batchBuffer.length > 0) {
+      const buffered = this.batchBuffer;
+      this.batchBuffer = [];
+      for (const p of buffered) {
+        this.store.sendModuleData('voice', JSON.stringify(p), targets).catch(() => {});
+      }
+    }
     const payload: VoiceFramePayload =
       this.redundancy > 0 && this.redBuffer.length > 0
         ? { ...frame, red: this.redBuffer.slice() }
         : frame;
-    // Retain this frame to piggyback on subsequent packets.
-    if (this.redundancy > 0) {
-      this.redBuffer.push(frame);
-      while (this.redBuffer.length > this.redundancy) this.redBuffer.shift();
-    }
-    // Local send stamp (not a wire timestamp — `wts` above is that, and
-    // stays wall-clock). The stats panel compares this against
-    // peerLastRecvMs, so both must share the store's timebase (PR #4 F2).
+    this.retainForRed(frame);
+    this.stampSent(targets);
+    this.store.sendModuleData('voice', JSON.stringify(payload), targets).catch(() => {});
+  }
+
+  /** Retain a frame to piggyback redundantly on subsequent packets. */
+  private retainForRed(frame: VoiceFrame): void {
+    if (this.redundancy <= 0) return;
+    this.redBuffer.push(frame);
+    while (this.redBuffer.length > this.redundancy) this.redBuffer.shift();
+  }
+
+  /** Local send stamp (not a wire timestamp — `wts` is that, and stays
+   *  wall-clock). The stats panel compares this against peerLastRecvMs,
+   *  so both must share the store's timebase (PR #4 F2). Stamped at
+   *  actual send time — batching defers it by ≤ 60 ms, well inside every
+   *  consumer's window. */
+  private stampSent(targets: ReadonlySet<string>): void {
     const now = this._clock.now();
     for (const peer of targets) {
       this.peerLastSentMs.set(peer, now);
     }
-    this.store.sendModuleData('voice', JSON.stringify(payload), targets).catch(() => {});
   }
 
   async stopCapture(): Promise<void> {
@@ -445,6 +539,10 @@ class VoiceController {
     }
     this.seq = 0;
     this.redBuffer = [];
+    // Drop, don't send: buffered batch frames are stale audio by the time
+    // capture stops, and a trailing send would race the teardown that
+    // stopped us (see `batchBuffer`).
+    this.batchBuffer = [];
   }
 
   // ----- receive side -----------------------------------------------------
@@ -467,9 +565,11 @@ class VoiceController {
   }
 
   receiveFrame(agentPubKeyB64: string, chunk: string) {
-    let payload: VoiceFramePayload;
+    // Both wire formats, regardless of what capability we advertise: a v2
+    // batch yields its member payloads, a legacy sender yields one.
+    let payloads: VoiceFramePayload[];
     try {
-      payload = JSON.parse(chunk);
+      payloads = unpackVoicePayload(chunk);
     } catch {
       return;
     }
@@ -479,17 +579,26 @@ class VoiceController {
       if (!created) return;
       state = created;
     }
-    if (payload.seq <= state.lastSeq && state.lastSeq !== 0) {
-      // The newest (primary) frame is already played, so every redundant
-      // copy it carries is older still — duplicate/out-of-order; cheap drop.
-      return;
-    }
+    const st = state;
+    // Per-payload dedupe against the playhead — a primary already played
+    // means every redundant copy it carries is older still; a batch member
+    // is judged on its own seq, exactly as its legacy single-frame
+    // equivalent was. Also drops non-frame JSON a legacy parse accepted.
+    const fresh = payloads.filter(
+      p =>
+        p != null &&
+        typeof p.seq === 'number' &&
+        !(st.lastSeq !== 0 && p.seq <= st.lastSeq)
+    );
+    if (fresh.length === 0) return;
 
     this.peerLastRecvMs.set(agentPubKeyB64, this._clock.now());
 
-    // --- jitter: EWMA of absolute deviation of packet inter-arrival from the
-    // 20ms Opus nominal period. alpha = 0.1 for slow smoothing. Measured per
-    // packet (not per recovered frame). ---
+    // --- jitter: EWMA of absolute deviation of packet inter-arrival from
+    // the nominal period. Measured per PACKET (one signal arrival), not per
+    // carried frame: a v2 batch of N frames nominally arrives N×20ms after
+    // its predecessor, so the nominal period scales with the frame count
+    // (legacy payloads keep the old 20ms). alpha = 0.1 for slow smoothing. ---
     const now = Date.now();
     if (state.lastArrivalMs > 0) {
       const delta = now - state.lastArrivalMs;
@@ -498,32 +607,37 @@ class VoiceController {
       // jitter — feeding it raw spiked the EWMA to nonsense values
       // (e.g. jit=148966ms in merged logs). 200ms is well past any real
       // jitter for 20ms Opus frames.
-      const deviation = Math.min(Math.abs(delta - 20), 200);
+      const nominalMs = 20 * payloads.length;
+      const deviation = Math.min(Math.abs(delta - nominalMs), 200);
       state.jitterEwma = 0.1 * deviation + 0.9 * state.jitterEwma;
     }
     state.lastArrivalMs = now;
 
-    // Assemble redundant (older) frames + the primary, ascending by seq, and
-    // play any we haven't yet. A frame dropped in its own packet is recovered
-    // here from the copy piggybacked on this later packet. Loss is now counted
-    // post-recovery: only seqs carried by NO packet count as lost, which is
-    // exactly the UX-relevant figure.
-    const frames: VoiceFrame[] = [];
-    if (Array.isArray(payload.red)) {
-      for (const f of payload.red) frames.push(f);
-    }
-    frames.push({ seq: payload.seq, ts: payload.ts, type: payload.type, data: payload.data, wts: payload.wts });
-    frames.sort((a, b) => a.seq - b.seq);
-
-    for (const f of frames) {
-      if (state.lastSeq !== 0 && f.seq <= state.lastSeq) continue; // already played
-      if (state.lastSeq !== 0) {
-        const gap = f.seq - state.lastSeq - 1;
-        if (gap > 0) state.lostCount += gap;
+    // Iterate batch members in order through the existing per-frame path.
+    // For each payload: assemble redundant (older) frames + the primary,
+    // ascending by seq, and play any we haven't yet. A frame dropped in its
+    // own packet is recovered here from the copy piggybacked on a later
+    // packet. Loss is counted post-recovery and per FRAME (not per packet):
+    // only seqs carried by NO packet count as lost, which is exactly the
+    // UX-relevant figure — a wholly-lost batch of 3 counts 3.
+    for (const payload of fresh) {
+      const frames: VoiceFrame[] = [];
+      if (Array.isArray(payload.red)) {
+        for (const f of payload.red) frames.push(f);
       }
-      state.receivedCount += 1;
-      this.decodeVoiceFrame(state, f);
-      state.lastSeq = f.seq;
+      frames.push({ seq: payload.seq, ts: payload.ts, type: payload.type, data: payload.data, wts: payload.wts });
+      frames.sort((a, b) => a.seq - b.seq);
+
+      for (const f of frames) {
+        if (state.lastSeq !== 0 && f.seq <= state.lastSeq) continue; // already played
+        if (state.lastSeq !== 0) {
+          const gap = f.seq - state.lastSeq - 1;
+          if (gap > 0) state.lostCount += gap;
+        }
+        state.receivedCount += 1;
+        this.decodeVoiceFrame(state, f);
+        state.lastSeq = f.seq;
+      }
     }
 
     // Publish stats on a ~1s cadence (when the window closes). Computing

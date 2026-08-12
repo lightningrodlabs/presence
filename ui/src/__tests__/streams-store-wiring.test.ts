@@ -6,7 +6,17 @@ import { StreamsStore, SDP_EXCHANGE_TIMEOUT } from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
 import type { FakeDeps } from '../store-deps.testing';
-import { PING_INTERVAL, PRESENT_STALENESS_MS } from '../presence-policy';
+import {
+  PING_INTERVAL,
+  PRESENT_STALENESS_MS,
+  SIGNAL_CARRIER_DOWN_MS,
+} from '../presence-policy';
+import {
+  SIGNALS_RTT_COLLAPSED_MS,
+  SIGNALS_RTT_DEGRADED_MS,
+} from '../transport/signals-cadence-policy';
+import { CAP_VOICE_BATCH } from '../transport/wire-contract';
+import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
@@ -1027,5 +1037,243 @@ describe('the RTCMessage send seam (§9 item 6)', () => {
       return parsed.type === 'action' && parsed.message === 'change-audio-input';
     });
     expect(frames.map(f => f.peer)).toEqual([peerB]);
+  });
+});
+
+describe('signals media cadence gates the senders (Task 7)', () => {
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** ModuleData sends for one module, envelope-parsed. */
+  function moduleData(bus: Started['bus'], moduleId: string) {
+    return bus
+      .sentOfType('ModuleData')
+      .map(m => JSON.parse(m.payload!) as { moduleId: string; chunk: string })
+      .filter(p => p.moduleId === moduleId);
+  }
+
+  /** Drive one encoded voice frame through the bound controller — the
+   *  real handleEncodedChunk send path, minus WebCodecs. */
+  function encodeVoiceFrame(ts = 0) {
+    (
+      voiceController as unknown as {
+        handleEncodedChunk(c: unknown): void;
+      }
+    ).handleEncodedChunk({
+      byteLength: 2,
+      timestamp: ts,
+      type: 'key',
+      copyTo: (_buf: Uint8Array) => {},
+    });
+  }
+
+  /** Drive one filmstrip clip through the bound controller's send site. */
+  function sendFilmstripClip() {
+    (
+      filmstripController as unknown as {
+        _handleClipFromWorker(m: unknown): void;
+      }
+    )._handleClipFromWorker({
+      bytes: new ArrayBuffer(2),
+      w: 1,
+      h: 1,
+      n: 1,
+      p: 1,
+      t0: 1,
+      capturedAt: 1,
+    });
+  }
+
+  /** A PongUi from peerA echoing a pingT0 `rttMs` in the past — the real
+   *  foldSignalsRtt input (first sample seeds the EWMA at the raw RTT). */
+  function pongEchoing(started: Started, rttMs: number): RoomSignal {
+    return message(
+      peerAKey,
+      'PongUi',
+      JSON.stringify({
+        formatVersion: 1,
+        data: { connectionStatuses: {}, pingT0: started.clock.now() - rttMs },
+      })
+    );
+  }
+
+  /** peerA's conversation payload declaring `caps`. */
+  function capsDeclaration(caps: string[]): RoomSignal {
+    return message(
+      peerAKey,
+      'ModuleState',
+      JSON.stringify({
+        moduleId: 'conversation',
+        active: true,
+        payload: JSON.stringify({ caps }),
+        updatedAt: 1,
+      })
+    );
+  }
+
+  it('paused cadence (collapsed RTT) stops ModuleData sends without tearing down capture', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    const stopSpy = vi.spyOn(voiceController, 'stopCapture');
+
+    // Baseline: full cadence, one legacy frame per encoded chunk.
+    expect(store.signalsCadence().mode).toBe('full');
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+
+    // Drive peerA's RTT EWMA above SIGNALS_RTT_COLLAPSED_MS through the
+    // fake bus (a pong echoing an old t0), then run the ping cycle the
+    // per-tick evaluation rides.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'rtt-collapsed',
+    });
+
+    // The gate holds for voice AND filmstrip…
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(0);
+    // …while capture is untouched: paused gates the send, not the
+    // pipeline — teardown stays owned by the reconcilers/_signalsTargets,
+    // and the peer is still a signals target.
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(get(store._signalsTargets).has(peerA)).toBe(true);
+  });
+
+  it('carrier-down pauses immediately (no pong from any peer for SIGNAL_CARRIER_DOWN_MS)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, logger } = started;
+    // peerA has ponged at least once (a lastSeen stamp) — never-ponged
+    // peers are excluded from decideSignalCarrier by declared design.
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+    expect(store.signalsCadence().mode).toBe('full');
+
+    // Three silent ticks: the forensics call inside pingAgents flips the
+    // carrier down and forces the cadence to paused in the same breath.
+    clock.advance(SIGNAL_CARRIER_DOWN_MS);
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+    expect(
+      logger.customMessages.some(m => m.startsWith('SignalCarrierDown'))
+    ).toBe(true);
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+  });
+
+  it('voice-only cadence (degraded RTT) drops filmstrip clips but keeps voice flowing', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(1);
+
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_DEGRADED_MS + 500));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'voice-only',
+      reason: 'rtt-degraded',
+    });
+
+    sendFilmstripClip();
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(1);
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+  });
+
+  it('voice batches VOICE_BATCH_FRAMES frames per signal when every target holds the cap; RED rides the batch primary', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(true);
+
+    // Two frames buffer; the third flushes ONE packed signal.
+    encodeVoiceFrame(0);
+    encodeVoiceFrame(20_000);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+    encodeVoiceFrame(40_000);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(1);
+    const batch1 = JSON.parse(sent[0].chunk) as {
+      v: number;
+      frames: Array<{ seq: number; red?: Array<{ seq: number }> }>;
+    };
+    expect(batch1.v).toBe(2);
+    expect(batch1.frames.map(f => f.seq)).toEqual([0, 1, 2]);
+    expect(batch1.frames).toHaveLength(VOICE_BATCH_FRAMES);
+    // Nothing preceded the first batch: no red anywhere.
+    expect(batch1.frames.every(f => f.red === undefined)).toBe(true);
+
+    // Second batch: RED (redundancy 2) rides the batch's FIRST frame and
+    // carries exactly the two frames preceding the batch; later members
+    // carry none (their predecessors travel in the same packet).
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    await flush();
+    const sent2 = moduleData(bus, 'voice');
+    expect(sent2).toHaveLength(2);
+    const batch2 = JSON.parse(sent2[1].chunk) as typeof batch1;
+    expect(batch2.frames.map(f => f.seq)).toEqual([3, 4, 5]);
+    expect(batch2.frames[0].red!.map(f => f.seq)).toEqual([1, 2]);
+    expect(batch2.frames[1].red).toBeUndefined();
+    expect(batch2.frames[2].red).toBeUndefined();
+  });
+
+  it('a mixed room (one target without the cap) falls back to legacy per-frame for everyone', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA, peerB));
+    // peerA declares the cap; peerB declares nothing (baseline caps only).
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(false);
+
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(3);
+    // Legacy single-frame shape (no v2 envelope), each one broadcast to
+    // BOTH targets — the one-broadcast constraint the cap rule exists for.
+    for (const s of sent) {
+      expect((JSON.parse(s.chunk) as { v?: number }).v).toBeUndefined();
+    }
+    const raw = bus.sentOfType('ModuleData');
+    expect(raw[0].to.slice().sort()).toEqual([peerA, peerB].sort());
+  });
+
+  it('stopCapture drops buffered batch frames instead of sending them (stale audio)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    await voiceController.stopCapture();
+    encodeVoiceFrame(); // starts a NEW batch; must not flush the old one
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
   });
 });
