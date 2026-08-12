@@ -410,8 +410,11 @@ export class StreamsStore {
         Writable<Record<AgentPubKeyB64, OpenConnectionInfo>>,
         Writable<number>,
       ],
-      ([active, connections, _tick]) =>
-        computePresentPeers({
+      ([active, connections, _tick]) => {
+        // heldPresent is last tick's result, read before this tick
+        // overwrites it below — see the field comment on
+        // `_lastComputedPresent` for why that staleness is intentional.
+        const result = computePresentPeers({
           activeAgents: Object.keys(active),
           openConnections: connections,
           lastVoiceMs: voiceController.peerLastRecvMs,
@@ -420,7 +423,12 @@ export class StreamsStore {
           myPubKey: this.myPubKeyB64,
           now: this.clock.now(),
           mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
-        }),
+          carrierDownSince: this._signalCarrierDownSince,
+          heldPresent: this._lastComputedPresent,
+        });
+        this._lastComputedPresent = result;
+        return result;
+      },
     );
 
     // Signals is the complement of *WebRTC carrying media*, not of *a
@@ -472,9 +480,24 @@ export class StreamsStore {
 
     // Drive the presence tick from the store clock so _activeAgents
     // re-evaluates staleness once per ping cadence even when no store
-    // write happens (Phase 2 item 4).
+    // write happens (Phase 2 item 4). _emitPresenceForensics() runs
+    // FIRST, in the same breath, so _signalCarrierDownSince is current
+    // before the tick bump triggers _presentPeers' recompute: carrier-
+    // down (SIGNAL_CARRIER_DOWN_MS) and a lone surviving peer's own
+    // ping-staleness (PRESENT_STALENESS_MS) are the same 3-tick window
+    // by design, so they cross on the SAME tick, and pingAgents() (the
+    // only other _emitPresenceForensics call site) is not guaranteed to
+    // run before this interval fires — without this, the carrier-hold
+    // (Task 8) reads a stale `undefined` on exactly the tick it needs
+    // to catch, and _lastComputedPresent gets wiped before the hold can
+    // apply. decideSignalCarrier's stickiness makes calling this from
+    // both sites idempotent: whichever call notices the transition
+    // first logs it, the other sees it already applied and no-ops.
     this._presenceTickInterval = this.clock.setInterval(
-      () => this._presenceTick.update(n => n + 1),
+      () => {
+        this._emitPresenceForensics();
+        this._presenceTick.update(n => n + 1);
+      },
       PING_INTERVAL
     );
 
@@ -2357,6 +2380,7 @@ export class StreamsStore {
     this._screenShareConnectionsIncoming.set({});
     this._screenShareStreams = {};
     this._pendingInits = {};
+    this._lastComputedPresent = [];
   }
 
   enableTrickleICE() {
@@ -3484,6 +3508,18 @@ export class StreamsStore {
    * chimes, tiles, grid counts and phantom exclusion.
    */
   _presentPeers!: Readable<AgentPubKeyB64[]>;
+
+  /**
+   * The previous tick's `computePresentPeers` output — what
+   * `PRESENCE_CARRIER_HOLD_MAX_MS` holds alive while
+   * `_signalCarrierDownSince` is set. Updated at the end of every
+   * `_presentPeers` re-evaluation, so it is always exactly one
+   * evaluation stale by construction: the tick that reads it as
+   * `heldPresent` is deciding this tick's set from last tick's, never
+   * its own. Reset on `disconnect()` so a stale held set from a prior
+   * session can't leak into the next one.
+   */
+  private _lastComputedPresent: AgentPubKeyB64[] = [];
 
   /** State of the join/leave sound decision; see decidePresenceSoundEvents. */
   private _presenceSoundState: PresenceSoundState = INITIAL_PRESENCE_SOUND_STATE;
