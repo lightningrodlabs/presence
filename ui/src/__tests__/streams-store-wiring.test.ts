@@ -2,10 +2,15 @@ import { describe, expect, it, afterEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
-import { StreamsStore, SDP_EXCHANGE_TIMEOUT } from '../streams-store';
+import {
+  StreamsStore,
+  SDP_EXCHANGE_TIMEOUT,
+  SDP_TIMEOUT_CEILING_MS,
+  SDP_BACKSTOP_MULTIPLIER,
+} from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
-import type { FakeDeps } from '../store-deps.testing';
+import type { FakeDeps, FakeTransport } from '../store-deps.testing';
 import {
   PING_INTERVAL,
   PRESENT_STALENESS_MS,
@@ -85,6 +90,43 @@ function message(
   payload: string
 ): RoomSignal {
   return { type: 'Message', from_agent: from, msg_type: msgType, payload };
+}
+
+/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds
+ *  `_signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
+ *  first-sample-seeds-raw). Carries `moduleStatesAt` so it doesn't read
+ *  as a legacy no-stamp pong (same shape as the Task 7 `pongEchoing`
+ *  fixture in the cadence describe below). */
+function pongEchoingRtt(
+  from: AgentPubKey,
+  clock: ManualClock,
+  rttMs: number
+): RoomSignal {
+  return message(
+    from,
+    'PongUi',
+    JSON.stringify({
+      formatVersion: 1,
+      data: {
+        connectionStatuses: {},
+        pingT0: clock.now() - rttMs,
+        moduleStatesAt: 1,
+      },
+    })
+  );
+}
+
+/** The `sdpExchangeTimeoutMs` the store's most recent `ensureConnection`
+ *  call passed to the media transport — the FSM's own per-attempt SDP
+ *  override, distinct from the store's tracked backstop timer (review
+ *  C1). `FakeTransport.ensureCalls` types `opts` as `unknown`; this is
+ *  the one place that narrows it back. */
+function lastSdpOverride(media: FakeTransport): number | undefined {
+  const calls = media.ensureCalls;
+  const opts = calls[calls.length - 1]?.opts as
+    | { sdpExchangeTimeoutMs?: number }
+    | undefined;
+  return opts?.sdpExchangeTimeoutMs;
 }
 
 afterEach(() => {
@@ -977,6 +1019,13 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     );
   }
 
+  // The store's tracked SDP backstop with no RTT sample: SDP_EXCHANGE_TIMEOUT
+  // (the FSM's own no-sample default) * SDP_BACKSTOP_MULTIPLIER (review C1 —
+  // the backstop is pinned strictly greater than the FSM's per-attempt
+  // timeout, never equal to it; see _computeSdpBackstopTimeout). This is a
+  // declared change from the pre-review-C1 value of a flat SDP_EXCHANGE_TIMEOUT.
+  const NO_SAMPLE_BACKSTOP_MS = SDP_EXCHANGE_TIMEOUT * SDP_BACKSTOP_MULTIPLIER;
+
   it('the initiator slot install goes through the slot policy; the tracked SDP timer tears down its own attempt', async () => {
     const started = makeStarted();
     const { store, clock, transports } = started;
@@ -993,8 +1042,16 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(slot.connected).toBe(false);
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
 
-    // The attempt never connects: ITS OWN timer fires and tears it down.
-    clock.advance(SDP_EXCHANGE_TIMEOUT);
+    // No RTT sample: the FSM's own per-attempt timeout is undefined (its
+    // own 15s default applies inside the FSM, out of view here).
+    expect(lastSdpOverride(media)).toBeUndefined();
+
+    // The attempt never connects: ITS OWN backstop timer fires and tears
+    // it down, at NO_SAMPLE_BACKSTOP_MS (30_000) — NOT the plain
+    // SDP_EXCHANGE_TIMEOUT (15_000) it used before review C1.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
     expect(
       media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
@@ -1008,16 +1065,16 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     const media = transports.media!;
     await acceptVideo(started, 'init-1');
 
-    // Halfway through the window the transport replaces the FSM in
-    // place (the adopt route) — a successor attempt now owns the slot.
-    clock.advance(SDP_EXCHANGE_TIMEOUT / 2);
+    // Halfway through the backstop window the transport replaces the FSM
+    // in place (the adopt route) — a successor attempt now owns the slot.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
     media.emitPhase(peerA, 'conn-2', 'signaling');
     expect(get(store._openConnections)[peerA].connectionId).toBe('conn-2');
 
     // The predecessor's deadline passes. Before §9 item 5 the untracked
     // timer saw SdpExchange status + an unconnected slot and destroyed
     // the SUCCESSOR. Attempt-scoping makes it a no-op.
-    clock.advance(SDP_EXCHANGE_TIMEOUT / 2);
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
     expect(get(store._openConnections)[peerA]?.connectionId).toBe('conn-2');
     expect(media.closeCalls).toHaveLength(0);
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
@@ -1072,6 +1129,130 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
     expect(store._lastDisconnectTime[peerA]).toBeUndefined();
     expect(store._lastReconcileTime[peerA]).toBeUndefined();
+  });
+
+  it('an elevated signals RTT: the FSM override sits at the raised 30s ceiling, and the tracked backstop is 2x that (review C1) (Task 9)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    // Seed _signalsRttEwma[peerA] = 2_000ms before the InitAccept arrives.
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 2_000));
+
+    await acceptVideo(started, 'init-1');
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+
+    // The FSM's own per-attempt timeout (sdpExchangeTimeoutMs, passed to
+    // ensureConnection): min(SDP_TIMEOUT_CEILING_MS, 20 * 2_000) = 30_000.
+    expect(lastSdpOverride(media)).toBe(SDP_TIMEOUT_CEILING_MS);
+
+    // The store's own tracked backstop is deliberately NOT the same value
+    // (review C1 — sharing it destroyed the FSM's in-place recovery retry
+    // mid-flight): min(SDP_BACKSTOP_CEILING_MS, 2 * 30_000) = 60_000.
+    clock.advance(2 * SDP_TIMEOUT_CEILING_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+  });
+
+  it('a low signals RTT: the FSM override is unaffected, and the tracked backstop is 2x it, not equal to it (review C1) (Task 9)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    // Seed _signalsRttEwma[peerA] = 400ms: 20 * 400 = 8_000, well under
+    // both the old and new ceiling.
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 400));
+
+    await acceptVideo(started, 'init-1');
+
+    // FSM override: 20 * 400 = 8_000 — unaffected by review C1.
+    expect(lastSdpOverride(media)).toBe(8_000);
+
+    // Backstop: 2 * 8_000 = 16_000. Before review C1 this timer shared
+    // the override's value (8_000) and would already have fired by now.
+    clock.advance(15_999);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+  });
+
+  it('invariant: the tracked backstop always arms strictly greater than the FSM per-attempt override, across RTTs (review C1)', async () => {
+    const cases: Array<{
+      rttMs: number | undefined;
+      expectedOverride: number | undefined;
+      expectedBackstop: number;
+    }> = [
+      // No sample: FSM falls back to its own default (undefined here);
+      // the backstop is 2x SDP_EXCHANGE_TIMEOUT.
+      { rttMs: undefined, expectedOverride: undefined, expectedBackstop: 30_000 },
+      // Below the floor multiplier: unaffected by either ceiling.
+      { rttMs: 400, expectedOverride: 8_000, expectedBackstop: 16_000 },
+      // Ceiling-bound override: the backstop's own doubling still clears
+      // its own ceiling comfortably (60_000 < SDP_BACKSTOP_CEILING_MS's
+      // cap point isn't hit until 2x would exceed it).
+      { rttMs: 2_000, expectedOverride: 30_000, expectedBackstop: 60_000 },
+      // Deep into the plausible RTT range: override still ceiling-bound,
+      // backstop still just the doubled ceiling.
+      { rttMs: 5_000, expectedOverride: 30_000, expectedBackstop: 60_000 },
+    ];
+
+    for (const { rttMs, expectedOverride, expectedBackstop } of cases) {
+      const started = makeStarted();
+      const { store, clock, bus, transports } = started;
+      const media = transports.media!;
+      if (rttMs !== undefined) {
+        await bus.deliver(pongEchoingRtt(peerAKey, clock, rttMs));
+      }
+
+      await acceptVideo(started, 'init-1');
+      expect(lastSdpOverride(media)).toBe(expectedOverride);
+      expect(expectedBackstop).toBeGreaterThan(
+        expectedOverride ?? SDP_EXCHANGE_TIMEOUT
+      );
+
+      clock.advance(expectedBackstop - 1);
+      expect(get(store._openConnections)[peerA]).toBeDefined();
+      clock.advance(1);
+      expect(get(store._openConnections)[peerA]).toBeUndefined();
+      expect(
+        media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+      ).toBe(true);
+    }
+  });
+});
+
+describe('diagnostic attempt timeout scales with signals RTT (Task 9)', () => {
+  it('an elevated signals RTT (5_000ms) scales the per-attempt timeout to 4x RTT (20_000ms)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 5_000));
+
+    await store.requestDiagnosticLogs(peerA);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+
+    // 4 * 5_000 = 20_000, under DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS (30_000).
+    clock.advance(19_999);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+    clock.advance(1);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(2);
+  });
+
+  it('no RTT sample keeps the per-attempt timeout at the unscaled 8_000ms default', async () => {
+    const started = makeStarted();
+    const { store, clock } = started;
+
+    await store.requestDiagnosticLogs(peerA);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+
+    clock.advance(7_999);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+    clock.advance(1);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(2);
   });
 });
 
