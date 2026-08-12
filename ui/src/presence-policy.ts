@@ -196,6 +196,18 @@ export function decideSignalCarrier(inputs: {
   return { down: true, downSince: prevDownSince ?? now };
 }
 
+/**
+ * The **signal-carrier-outage hold** window: while `carrierDownSince` is
+ * set and within this many ms of `now`, `computePresentPeers` keeps the
+ * previous tick's present set alive even though pongs have gone silent
+ * — a dead relay is channel evidence, not peer evidence. Equals
+ * `LAST_SEEN_GONE_MS`: once a peer would read "gone" on the reachable
+ * ladder anyway, holding it present any longer buys nothing. Serves the
+ * **present** predicate on the presence clock, same family as
+ * `PRESENT_STALENESS_MS`.
+ */
+export const PRESENCE_CARRIER_HOLD_MAX_MS = 30_000;
+
 export interface PresentPeersSnapshot {
   /** Keys of the ping-fresh set (already excludes self and blocked). */
   activeAgents: AgentPubKeyB64[];
@@ -206,17 +218,23 @@ export interface PresentPeersSnapshot {
   myPubKey: AgentPubKeyB64;
   now: number;
   mediaLiveWindowMs: number;
+  /** `StreamsStore._signalCarrierDownSince` — set while `decideSignalCarrier` reports the channel down. */
+  carrierDownSince?: number;
+  /** The previous tick's `computePresentPeers` output — what the hold keeps alive. */
+  heldPresent?: AgentPubKeyB64[];
 }
 
 /**
  * The **present** predicate: ping-fresh OR media-flowing on either
- * carrier. THE authority for every join/leave-shaped effect — chimes,
+ * carrier, plus (while the signal carrier is down) whatever was present
+ * last tick. THE authority for every join/leave-shaped effect — chimes,
  * tiles, grid counts, phantom exclusion (Phase 2 item 5). A peer with
  * flowing media is present regardless of pong staleness; a signal-relay
  * hiccup must not remove (or re-announce) a peer we can still hear.
  *
  * Ordering: ping-fresh peers first in their given order, then media-only
- * peers sorted lexically, so tile order is stable across evaluations.
+ * peers sorted lexically, then (during a carrier outage) held-over peers
+ * in `heldPresent`'s order, so tile order is stable across evaluations.
  */
 export function computePresentPeers(s: PresentPeersSnapshot): AgentPubKeyB64[] {
   const out: AgentPubKeyB64[] = [...s.activeAgents];
@@ -244,7 +262,21 @@ export function computePresentPeers(s: PresentPeersSnapshot): AgentPubKeyB64[] {
     }
   }
   extras.sort();
-  return [...out, ...extras];
+  const result = [...out, ...extras];
+
+  if (
+    s.carrierDownSince !== undefined &&
+    s.now - s.carrierDownSince < PRESENCE_CARRIER_HOLD_MAX_MS
+  ) {
+    for (const key of s.heldPresent ?? []) {
+      if (key === s.myPubKey) continue;
+      if (s.blocked.includes(key)) continue;
+      if (result.includes(key)) continue;
+      result.push(key); // held peers appended after evidenced ones, input order
+    }
+  }
+
+  return result;
 }
 
 /**

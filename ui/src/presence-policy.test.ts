@@ -278,6 +278,74 @@ describe('computePresentPeers', () => {
   });
 });
 
+describe('carrier-hold', () => {
+  const noVoice = new Map<string, number>();
+  const noFilmstrip = new Map<string, number>();
+  const base = {
+    openConnections: {},
+    lastVoiceMs: noVoice,
+    lastFilmstripMs: noFilmstrip,
+    blocked: [] as string[],
+    myPubKey: 'me',
+    mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+  };
+
+  it('holds previously-present peers while the carrier is down', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 20_000,
+      carrierDownSince: 15_000,
+      heldPresent: ['peerA', 'peerB'],
+    });
+    expect(r).toEqual(['peerA', 'peerB']);
+  });
+
+  it('does not hold past PRESENCE_CARRIER_HOLD_MAX_MS', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 50_001,
+      carrierDownSince: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+
+  it('the exact boundary (now - downSince === PRESENCE_CARRIER_HOLD_MAX_MS) is NOT held — the guard is a strict `<`', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 50_000,
+      carrierDownSince: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+
+  it('never holds blocked peers or self, and does not duplicate fresh peers', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: ['peerA'],
+      blocked: ['peerC'],
+      now: 20_000,
+      carrierDownSince: 15_000,
+      heldPresent: ['peerA', 'peerC', 'me'],
+    });
+    expect(r).toEqual(['peerA']);
+  });
+
+  it('carrier up: absent carrierDownSince changes nothing', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+});
+
 describe('decidePresenceSoundEvents', () => {
   const DWELL = PRESENCE_LEAVE_DWELL_MS;
 

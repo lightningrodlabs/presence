@@ -10,6 +10,7 @@ import {
   PING_INTERVAL,
   PRESENT_STALENESS_MS,
   SIGNAL_CARRIER_DOWN_MS,
+  PRESENCE_CARRIER_HOLD_MAX_MS,
 } from '../presence-policy';
 import {
   SIGNALS_RTT_COLLAPSED_MS,
@@ -763,6 +764,75 @@ describe('the manual clock drives the ambient cadences through start()', () => {
     await store.pingAgents();
     // Past the TTL: swept by the pure prune through the real call site.
     expect(store._pendingInits[peerA]).toBeUndefined();
+  });
+
+  it('holds a peer through a signal-carrier outage, then drops it past PRESENCE_CARRIER_HOLD_MAX_MS, with no peer-left-presence during the hold (Task 8)', async () => {
+    const { store, clock, events } = makeStarted();
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+    expect(get(store._presentPeers)).toEqual([peerA]);
+
+    // Silent ticks: no PongUi delivered, so lastSeen never refreshes.
+    // By SIGNAL_CARRIER_DOWN_MS (== PRESENT_STALENESS_MS) the carrier
+    // flips down in the same breath peerA's own ping-freshness expires
+    // (both windows are 3 ticks by design — the exact scenario this
+    // task exists for). A couple more silent ticks confirm the hold
+    // keeps applying, not just surviving the one boundary tick.
+    for (let i = 0; i < 5; i++) {
+      clock.advance(PING_INTERVAL);
+      await store.pingAgents();
+    }
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+    // Held, not evidenced: activeAgents/openConnections/media all say
+    // absent, yet the peer is still present because the carrier — not
+    // the peer — is what went quiet.
+    expect(get(store._presentPeers)).toEqual([peerA]);
+    expect(events.some(e => e.type === 'peer-left-presence')).toBe(false);
+
+    // Past the cap: absence wins even though the carrier is still down.
+    clock.advance(PRESENCE_CARRIER_HOLD_MAX_MS);
+    expect(get(store._presentPeers)).toEqual([]);
+    expect(events.some(e => e.type === 'peer-left-presence')).toBe(true);
+  });
+
+  it('holds through a mid-cycle crossing where pingAgents() is the FIRST evaluator to see it (review C1)', async () => {
+    const { store, clock } = makeStarted();
+
+    // Stamp lastSeen 500ms into the cycle, off the presence-tick's own
+    // 2000ms phase, so the staleness/carrier-down crossing (lastSeen +
+    // 6000 = +6500) falls strictly BETWEEN two ticks (+6000 and +8000)
+    // instead of landing exactly on one — pingAgents(), not the tick
+    // interval, is then the first evaluator to observe it.
+    clock.advance(500);
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+
+    // Three pre-crossing ticks: still ping-fresh throughout.
+    clock.advance(1500); // -> +2000
+    clock.advance(2000); // -> +4000
+    clock.advance(2000); // -> +6000
+    expect(get(store._presentPeers)).toEqual([peerA]);
+
+    // pingAgents() lands at +6600 — past the +6500 crossing, and
+    // strictly before the next tick at +8000. Without forensics-first
+    // (review C1), its own `_knownAgents.set()` write would re-derive
+    // `_presentPeers` against a still-`undefined` carrierDownSince and
+    // wipe `_lastComputedPresent` to [] before forensics ever runs.
+    clock.advance(600); // -> +6600
+    await store.pingAgents();
+    expect(get(store._presentPeers)).toEqual([peerA]);
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+
+    // The next tick (+8000) confirms the hold persists, not just the
+    // single evaluation that caught the crossing.
+    clock.advance(1400); // -> +8000
+    expect(get(store._presentPeers)).toEqual([peerA]);
   });
 });
 

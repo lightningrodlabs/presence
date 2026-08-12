@@ -410,8 +410,11 @@ export class StreamsStore {
         Writable<Record<AgentPubKeyB64, OpenConnectionInfo>>,
         Writable<number>,
       ],
-      ([active, connections, _tick]) =>
-        computePresentPeers({
+      ([active, connections, _tick]) => {
+        // heldPresent is last tick's result, read before this tick
+        // overwrites it below — see the field comment on
+        // `_lastComputedPresent` for why that staleness is intentional.
+        const result = computePresentPeers({
           activeAgents: Object.keys(active),
           openConnections: connections,
           lastVoiceMs: voiceController.peerLastRecvMs,
@@ -420,7 +423,12 @@ export class StreamsStore {
           myPubKey: this.myPubKeyB64,
           now: this.clock.now(),
           mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
-        }),
+          carrierDownSince: this._signalCarrierDownSince,
+          heldPresent: this._lastComputedPresent,
+        });
+        this._lastComputedPresent = result;
+        return result;
+      },
     );
 
     // Signals is the complement of *WebRTC carrying media*, not of *a
@@ -472,9 +480,28 @@ export class StreamsStore {
 
     // Drive the presence tick from the store clock so _activeAgents
     // re-evaluates staleness once per ping cadence even when no store
-    // write happens (Phase 2 item 4).
+    // write happens (Phase 2 item 4). _emitPresenceForensics() runs
+    // FIRST, in the same breath, so _signalCarrierDownSince is current
+    // before the tick bump triggers _presentPeers' recompute: carrier-
+    // down (SIGNAL_CARRIER_DOWN_MS) and a lone surviving peer's own
+    // ping-staleness (PRESENT_STALENESS_MS) are the same 3-tick window
+    // by design, so they cross on the SAME tick, and pingAgents() (the
+    // only other _emitPresenceForensics call site) is not guaranteed to
+    // run before this interval fires — without this, the carrier-hold
+    // (Task 8) reads a stale `undefined` on exactly the tick it needs
+    // to catch, and _lastComputedPresent gets wiped before the hold can
+    // apply. decideSignalCarrier's stickiness makes calling this from
+    // both sites idempotent: whichever call notices the transition
+    // first logs it, the other sees it already applied and no-ops.
+    // pingAgents() has the matching guard internally (forensics runs
+    // before ITS OWN `_knownAgents.set()` write, review C1) — the two
+    // fixes are independent because either evaluator can be the first
+    // to observe a given crossing.
     this._presenceTickInterval = this.clock.setInterval(
-      () => this._presenceTick.update(n => n + 1),
+      () => {
+        this._emitPresenceForensics();
+        this._presenceTick.update(n => n + 1);
+      },
       PING_INTERVAL
     );
 
@@ -2357,6 +2384,7 @@ export class StreamsStore {
     this._screenShareConnectionsIncoming.set({});
     this._screenShareStreams = {};
     this._pendingInits = {};
+    this._lastComputedPresent = [];
   }
 
   enableTrickleICE() {
@@ -2460,6 +2488,22 @@ export class StreamsStore {
   }
 
   async pingAgents() {
+    // Forensics FIRST, before the roster-merge write below: the merge
+    // only adds unstamped entries (new agents) or upgrades `type` for
+    // already-known agents while preserving their `lastSeen` — it never
+    // touches an existing `lastSeen` stamp, so `_emitPresenceForensics`
+    // reading the PRE-merge `_knownAgents` sees the identical
+    // `knownPeerLastSeen` input either way. Ordering here is NOT
+    // cosmetic: the merge's `_knownAgents.set()` below synchronously
+    // re-derives `_activeAgents` -> `_presentPeers` (Task 8's carrier
+    // hold reads `_signalCarrierDownSince` there), so if forensics ran
+    // after that write, the hold would see this cycle's carrier verdict
+    // one write too late on exactly the tick a lone surviving peer's
+    // own staleness crosses — review C1, reproduced with a mid-cycle
+    // crossing (pingAgents() as the FIRST evaluator after the flip,
+    // ahead of the next presence tick).
+    this._emitPresenceForensics();
+
     const knownAgents = get(this._knownAgents);
     this.allAgents
       .map(agent => encodeHashToBase64(agent))
@@ -2542,11 +2586,14 @@ export class StreamsStore {
     // Flush any SdpData bursts that ended without a follow-up event.
     this._flushStaleSdpAggregates();
 
-    // Forensics: signal-carrier liveness + presence-set membership.
-    this._emitPresenceForensics();
+    // Forensics (signal-carrier liveness + presence-set membership)
+    // already ran at the top of this function, before the roster-merge
+    // write — see the comment there. Not repeated here (review C1: a
+    // second call this late would just be dead weight, since nothing
+    // between the two spots can change `_knownAgents`' lastSeen stamps).
 
-    // Signals media cadence: one evaluation per ping cycle, AFTER the
-    // forensics call so `_signalCarrierDownSince` is this tick's verdict.
+    // Signals media cadence: one evaluation per ping cycle, reading
+    // `_signalCarrierDownSince` from this cycle's forensics call above.
     // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
     // targets — the healthiest link bounds what the relay can still
     // deliver; targets with no sample yet contribute nothing, and no
@@ -3484,6 +3531,18 @@ export class StreamsStore {
    * chimes, tiles, grid counts and phantom exclusion.
    */
   _presentPeers!: Readable<AgentPubKeyB64[]>;
+
+  /**
+   * The previous tick's `computePresentPeers` output — what
+   * `PRESENCE_CARRIER_HOLD_MAX_MS` holds alive while
+   * `_signalCarrierDownSince` is set. Updated at the end of every
+   * `_presentPeers` re-evaluation, so it is always exactly one
+   * evaluation stale by construction: the tick that reads it as
+   * `heldPresent` is deciding this tick's set from last tick's, never
+   * its own. Reset on `disconnect()` so a stale held set from a prior
+   * session can't leak into the next one.
+   */
+  private _lastComputedPresent: AgentPubKeyB64[] = [];
 
   /** State of the join/leave sound decision; see decidePresenceSoundEvents. */
   private _presenceSoundState: PresenceSoundState = INITIAL_PRESENCE_SOUND_STATE;
