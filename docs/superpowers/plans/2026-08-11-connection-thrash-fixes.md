@@ -1,6 +1,6 @@
 # Connection-Thrash Fixes Implementation Plan
 
-**Status: Tasks 1-10 landed on `main-0.6` as of this doc-sync merge (2026-08-12); Task 11 (forward-port to `main-0.7`) pending.** See `CLAUDE.md`'s "Connection-thrash round facts" bullet for the doc-sync summary.
+**Status: COMPLETE. Tasks 1-10 landed on `main-0.6` (2026-08-12), the final-review fix wave 2026-08-13, and Task 11 (forward-port + profiles bump + local gets) merged into `main-0.7`.** See `CLAUDE.md`'s "Connection-thrash round facts" bullet for the doc-sync summary.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
