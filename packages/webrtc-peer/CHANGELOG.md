@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 — 2026-08-11
+
+- **Changed:** disconnected auto-retry uses exponential backoff with jitter
+  from the reconnect policy's pacing fields, replacing flat 500-2000ms
+  jitter. `min(maxDelayMs, baseDelayMs * 2^attempt) + random(0..jitterMs)`,
+  read from the `ReconnectPolicy` instance's own `baseDelayMs`/`maxDelayMs`/
+  `jitterMs` (`DefaultReconnectPolicy` defaults: 300/7000/1000ms — falls back
+  to `DEFAULT_RECONNECT_OPTIONS` for a policy that omits them). A dead relay
+  drove 11 back-to-back retry sessions in 144s in the field (2026-08-11),
+  each re-flooding candidates; backoff spaces them 0.3s -> 7s.
+- **Changed:** outbound trickle candidates are filtered (active-TCP/discard-port
+  dropped, exact per-m-section duplicates deduped) via the exported
+  `shouldTrickleCandidate` predicate. Candidate batching (multiple candidates
+  per signal) is deferred — it changes the signal payload shape and needs a
+  capability gate.
+- **Fixed:** the disconnected-state retry-limit give-up was an illegal
+  transition (logged BLOCKED and left a dead FSM in disconnected);
+  disconnected → failed is now a valid edge, so the manager emits
+  connection-closed through the normal path.
+- **Fixed:** equal-epoch session-staleness deadlock — the remote peerSessionId
+  counter is now scoped to the remote FSM's connectionId; a recreated remote
+  FSM re-latches instead of having its answers/candidates dropped as stale,
+  with tombstones preventing resurrected dead-session signals
+  (WEBRTC_RECONNECT_IDENTITY.md §7 step 4, defect D2).
+
 ## 0.4.0
 
 Banks the Phase 3–Round 3 library changes (0.x semver: breaking → minor).

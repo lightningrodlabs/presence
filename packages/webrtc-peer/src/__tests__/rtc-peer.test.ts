@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { RTCPeer } from '../rtc-peer';
+import { RTCPeer, shouldTrickleCandidate } from '../rtc-peer';
 import type { ConnectionConfig } from '../types';
 import {
   MockRTCPeerConnection,
@@ -337,6 +337,42 @@ describe('RTCPeer', () => {
       // restartIce was called once during setup (negotiationneeded fires it indirectly)
       // but not after destroy
       expect(mockPc.restartIce).not.toHaveBeenCalled();
+    });
+
+    it('dedupes a repeated candidate before restart (one delivery)', () => {
+      const onSignal = vi.fn();
+      const { mockPc } = createPeer({ onSignal, trickleICE: true });
+      onSignal.mockClear();
+
+      const candidate = { candidate: 'candidate:1 1 udp 2122260223 192.168.1.131 50124 typ host generation 0', sdpMid: '0', sdpMLineIndex: 0 };
+      mockPc.simulateIceCandidate(candidate);
+      mockPc.simulateIceCandidate(candidate);
+
+      const deliveries = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.candidate === candidate.candidate,
+      );
+      expect(deliveries).toHaveLength(1);
+    });
+
+    it('re-delivers a byte-identical candidate re-emitted after restartIce (new candidate generation, same pc)', () => {
+      const onSignal = vi.fn();
+      const { peer, mockPc } = createPeer({ onSignal, trickleICE: true });
+      onSignal.mockClear();
+
+      const candidate = { candidate: 'candidate:1 1 udp 2122260223 192.168.1.131 50124 typ host generation 0', sdpMid: '0', sdpMLineIndex: 0 };
+      mockPc.simulateIceCandidate(candidate);
+
+      peer.restartIce();
+
+      // ICE restart re-gathers on the same pc; ufrag lives in separate SDP
+      // lines, so the candidate attribute string itself can come back
+      // byte-identical. It must still be delivered.
+      mockPc.simulateIceCandidate(candidate);
+
+      const deliveries = onSignal.mock.calls.filter(
+        (call: any[]) => call[0]?.candidate === candidate.candidate,
+      );
+      expect(deliveries).toHaveLength(2);
     });
   });
 
@@ -818,5 +854,25 @@ describe('RTCPeer', () => {
         expect.objectContaining({ name: 'InvalidStateError' }),
       );
     });
+  });
+});
+
+describe('shouldTrickleCandidate', () => {
+  const sent = new Set<string>();
+  it('drops active-TCP discard-port candidates', () => {
+    const c = { candidate: 'candidate:2 1 tcp 1518214911 192.168.1.131 9 typ host tcptype active generation 0', sdpMid: '0' };
+    expect(shouldTrickleCandidate(c, sent)).toEqual({ send: false, reason: 'tcp-active' });
+  });
+  it('sends UDP host/srflx candidates', () => {
+    const c = { candidate: 'candidate:1 1 udp 2122260223 192.168.1.131 50124 typ host generation 0', sdpMid: '0' };
+    expect(shouldTrickleCandidate(c, sent)).toEqual({ send: true });
+  });
+  it('drops an exact repeat (same sdpMid + candidate string)', () => {
+    const c = { candidate: 'candidate:1 1 udp 2122260223 192.168.1.131 50124 typ host generation 0', sdpMid: '0' };
+    const seen = new Set([`0|${c.candidate}`]);
+    expect(shouldTrickleCandidate(c, seen)).toEqual({ send: false, reason: 'duplicate' });
+  });
+  it('never filters the end-of-candidates marker', () => {
+    expect(shouldTrickleCandidate({ candidate: '' }, sent)).toEqual({ send: true });
   });
 });

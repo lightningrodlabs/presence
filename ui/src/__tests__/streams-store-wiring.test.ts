@@ -2,11 +2,27 @@ import { describe, expect, it, afterEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
-import { StreamsStore, SDP_EXCHANGE_TIMEOUT } from '../streams-store';
+import {
+  StreamsStore,
+  SDP_EXCHANGE_TIMEOUT,
+  SDP_TIMEOUT_CEILING_MS,
+  SDP_BACKSTOP_MULTIPLIER,
+} from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
-import type { FakeDeps } from '../store-deps.testing';
-import { PING_INTERVAL, PRESENT_STALENESS_MS } from '../presence-policy';
+import type { FakeDeps, FakeTransport } from '../store-deps.testing';
+import {
+  PING_INTERVAL,
+  PRESENT_STALENESS_MS,
+  SIGNAL_CARRIER_DOWN_MS,
+  PRESENCE_CARRIER_HOLD_MAX_MS,
+} from '../presence-policy';
+import {
+  SIGNALS_RTT_COLLAPSED_MS,
+  SIGNALS_RTT_DEGRADED_MS,
+} from '../transport/signals-cadence-policy';
+import { CAP_VOICE_BATCH } from '../transport/wire-contract';
+import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
@@ -74,6 +90,43 @@ function message(
   payload: string
 ): RoomSignal {
   return { type: 'Message', from_agent: from, msg_type: msgType, payload };
+}
+
+/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds
+ *  `_signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
+ *  first-sample-seeds-raw). Carries `moduleStatesAt` so it doesn't read
+ *  as a legacy no-stamp pong (same shape as the Task 7 `pongEchoing`
+ *  fixture in the cadence describe below). */
+function pongEchoingRtt(
+  from: AgentPubKey,
+  clock: ManualClock,
+  rttMs: number
+): RoomSignal {
+  return message(
+    from,
+    'PongUi',
+    JSON.stringify({
+      formatVersion: 1,
+      data: {
+        connectionStatuses: {},
+        pingT0: clock.now() - rttMs,
+        moduleStatesAt: 1,
+      },
+    })
+  );
+}
+
+/** The `sdpExchangeTimeoutMs` the store's most recent `ensureConnection`
+ *  call passed to the media transport — the FSM's own per-attempt SDP
+ *  override, distinct from the store's tracked backstop timer (review
+ *  C1). `FakeTransport.ensureCalls` types `opts` as `unknown`; this is
+ *  the one place that narrows it back. */
+function lastSdpOverride(media: FakeTransport): number | undefined {
+  const calls = media.ensureCalls;
+  const opts = calls[calls.length - 1]?.opts as
+    | { sdpExchangeTimeoutMs?: number }
+    | undefined;
+  return opts?.sdpExchangeTimeoutMs;
 }
 
 afterEach(() => {
@@ -754,6 +807,75 @@ describe('the manual clock drives the ambient cadences through start()', () => {
     // Past the TTL: swept by the pure prune through the real call site.
     expect(store._pendingInits[peerA]).toBeUndefined();
   });
+
+  it('holds a peer through a signal-carrier outage, then drops it past PRESENCE_CARRIER_HOLD_MAX_MS, with no peer-left-presence during the hold (Task 8)', async () => {
+    const { store, clock, events } = makeStarted();
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+    expect(get(store._presentPeers)).toEqual([peerA]);
+
+    // Silent ticks: no PongUi delivered, so lastSeen never refreshes.
+    // By SIGNAL_CARRIER_DOWN_MS (== PRESENT_STALENESS_MS) the carrier
+    // flips down in the same breath peerA's own ping-freshness expires
+    // (both windows are 3 ticks by design — the exact scenario this
+    // task exists for). A couple more silent ticks confirm the hold
+    // keeps applying, not just surviving the one boundary tick.
+    for (let i = 0; i < 5; i++) {
+      clock.advance(PING_INTERVAL);
+      await store.pingAgents();
+    }
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+    // Held, not evidenced: activeAgents/openConnections/media all say
+    // absent, yet the peer is still present because the carrier — not
+    // the peer — is what went quiet.
+    expect(get(store._presentPeers)).toEqual([peerA]);
+    expect(events.some(e => e.type === 'peer-left-presence')).toBe(false);
+
+    // Past the cap: absence wins even though the carrier is still down.
+    clock.advance(PRESENCE_CARRIER_HOLD_MAX_MS);
+    expect(get(store._presentPeers)).toEqual([]);
+    expect(events.some(e => e.type === 'peer-left-presence')).toBe(true);
+  });
+
+  it('holds through a mid-cycle crossing where pingAgents() is the FIRST evaluator to see it (review C1)', async () => {
+    const { store, clock } = makeStarted();
+
+    // Stamp lastSeen 500ms into the cycle, off the presence-tick's own
+    // 2000ms phase, so the staleness/carrier-down crossing (lastSeen +
+    // 6000 = +6500) falls strictly BETWEEN two ticks (+6000 and +8000)
+    // instead of landing exactly on one — pingAgents(), not the tick
+    // interval, is then the first evaluator to observe it.
+    clock.advance(500);
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+
+    // Three pre-crossing ticks: still ping-fresh throughout.
+    clock.advance(1500); // -> +2000
+    clock.advance(2000); // -> +4000
+    clock.advance(2000); // -> +6000
+    expect(get(store._presentPeers)).toEqual([peerA]);
+
+    // pingAgents() lands at +6600 — past the +6500 crossing, and
+    // strictly before the next tick at +8000. Without forensics-first
+    // (review C1), its own `_knownAgents.set()` write would re-derive
+    // `_presentPeers` against a still-`undefined` carrierDownSince and
+    // wipe `_lastComputedPresent` to [] before forensics ever runs.
+    clock.advance(600); // -> +6600
+    await store.pingAgents();
+    expect(get(store._presentPeers)).toEqual([peerA]);
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+
+    // The next tick (+8000) confirms the hold persists, not just the
+    // single evaluation that caught the crossing.
+    clock.advance(1400); // -> +8000
+    expect(get(store._presentPeers)).toEqual([peerA]);
+  });
 });
 
 describe('start()/disconnect() symmetry', () => {
@@ -897,6 +1019,13 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     );
   }
 
+  // The store's tracked SDP backstop with no RTT sample: SDP_EXCHANGE_TIMEOUT
+  // (the FSM's own no-sample default) * SDP_BACKSTOP_MULTIPLIER (review C1 —
+  // the backstop is pinned strictly greater than the FSM's per-attempt
+  // timeout, never equal to it; see _computeSdpBackstopTimeout). This is a
+  // declared change from the pre-review-C1 value of a flat SDP_EXCHANGE_TIMEOUT.
+  const NO_SAMPLE_BACKSTOP_MS = SDP_EXCHANGE_TIMEOUT * SDP_BACKSTOP_MULTIPLIER;
+
   it('the initiator slot install goes through the slot policy; the tracked SDP timer tears down its own attempt', async () => {
     const started = makeStarted();
     const { store, clock, transports } = started;
@@ -913,8 +1042,16 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(slot.connected).toBe(false);
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
 
-    // The attempt never connects: ITS OWN timer fires and tears it down.
-    clock.advance(SDP_EXCHANGE_TIMEOUT);
+    // No RTT sample: the FSM's own per-attempt timeout is undefined (its
+    // own 15s default applies inside the FSM, out of view here).
+    expect(lastSdpOverride(media)).toBeUndefined();
+
+    // The attempt never connects: ITS OWN backstop timer fires and tears
+    // it down, at NO_SAMPLE_BACKSTOP_MS (30_000) — NOT the plain
+    // SDP_EXCHANGE_TIMEOUT (15_000) it used before review C1.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
     expect(
       media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
@@ -928,16 +1065,16 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     const media = transports.media!;
     await acceptVideo(started, 'init-1');
 
-    // Halfway through the window the transport replaces the FSM in
-    // place (the adopt route) — a successor attempt now owns the slot.
-    clock.advance(SDP_EXCHANGE_TIMEOUT / 2);
+    // Halfway through the backstop window the transport replaces the FSM
+    // in place (the adopt route) — a successor attempt now owns the slot.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
     media.emitPhase(peerA, 'conn-2', 'signaling');
     expect(get(store._openConnections)[peerA].connectionId).toBe('conn-2');
 
     // The predecessor's deadline passes. Before §9 item 5 the untracked
     // timer saw SdpExchange status + an unconnected slot and destroyed
     // the SUCCESSOR. Attempt-scoping makes it a no-op.
-    clock.advance(SDP_EXCHANGE_TIMEOUT / 2);
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
     expect(get(store._openConnections)[peerA]?.connectionId).toBe('conn-2');
     expect(media.closeCalls).toHaveLength(0);
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
@@ -993,6 +1130,130 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(store._lastDisconnectTime[peerA]).toBeUndefined();
     expect(store._lastReconcileTime[peerA]).toBeUndefined();
   });
+
+  it('an elevated signals RTT: the FSM override sits at the raised 30s ceiling, and the tracked backstop is 2x that (review C1) (Task 9)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    // Seed _signalsRttEwma[peerA] = 2_000ms before the InitAccept arrives.
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 2_000));
+
+    await acceptVideo(started, 'init-1');
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+
+    // The FSM's own per-attempt timeout (sdpExchangeTimeoutMs, passed to
+    // ensureConnection): min(SDP_TIMEOUT_CEILING_MS, 20 * 2_000) = 30_000.
+    expect(lastSdpOverride(media)).toBe(SDP_TIMEOUT_CEILING_MS);
+
+    // The store's own tracked backstop is deliberately NOT the same value
+    // (review C1 — sharing it destroyed the FSM's in-place recovery retry
+    // mid-flight): min(SDP_BACKSTOP_CEILING_MS, 2 * 30_000) = 60_000.
+    clock.advance(2 * SDP_TIMEOUT_CEILING_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+  });
+
+  it('a low signals RTT: the FSM override is unaffected, and the tracked backstop is 2x it, not equal to it (review C1) (Task 9)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, transports } = started;
+    const media = transports.media!;
+    // Seed _signalsRttEwma[peerA] = 400ms: 20 * 400 = 8_000, well under
+    // both the old and new ceiling.
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 400));
+
+    await acceptVideo(started, 'init-1');
+
+    // FSM override: 20 * 400 = 8_000 — unaffected by review C1.
+    expect(lastSdpOverride(media)).toBe(8_000);
+
+    // Backstop: 2 * 8_000 = 16_000. Before review C1 this timer shared
+    // the override's value (8_000) and would already have fired by now.
+    clock.advance(15_999);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(
+      media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+    ).toBe(true);
+  });
+
+  it('invariant: the tracked backstop always arms strictly greater than the FSM per-attempt override, across RTTs (review C1)', async () => {
+    const cases: Array<{
+      rttMs: number | undefined;
+      expectedOverride: number | undefined;
+      expectedBackstop: number;
+    }> = [
+      // No sample: FSM falls back to its own default (undefined here);
+      // the backstop is 2x SDP_EXCHANGE_TIMEOUT.
+      { rttMs: undefined, expectedOverride: undefined, expectedBackstop: 30_000 },
+      // Below the floor multiplier: unaffected by either ceiling.
+      { rttMs: 400, expectedOverride: 8_000, expectedBackstop: 16_000 },
+      // Ceiling-bound override: the backstop's own doubling still clears
+      // its own ceiling comfortably (60_000 < SDP_BACKSTOP_CEILING_MS's
+      // cap point isn't hit until 2x would exceed it).
+      { rttMs: 2_000, expectedOverride: 30_000, expectedBackstop: 60_000 },
+      // Deep into the plausible RTT range: override still ceiling-bound,
+      // backstop still just the doubled ceiling.
+      { rttMs: 5_000, expectedOverride: 30_000, expectedBackstop: 60_000 },
+    ];
+
+    for (const { rttMs, expectedOverride, expectedBackstop } of cases) {
+      const started = makeStarted();
+      const { store, clock, bus, transports } = started;
+      const media = transports.media!;
+      if (rttMs !== undefined) {
+        await bus.deliver(pongEchoingRtt(peerAKey, clock, rttMs));
+      }
+
+      await acceptVideo(started, 'init-1');
+      expect(lastSdpOverride(media)).toBe(expectedOverride);
+      expect(expectedBackstop).toBeGreaterThan(
+        expectedOverride ?? SDP_EXCHANGE_TIMEOUT
+      );
+
+      clock.advance(expectedBackstop - 1);
+      expect(get(store._openConnections)[peerA]).toBeDefined();
+      clock.advance(1);
+      expect(get(store._openConnections)[peerA]).toBeUndefined();
+      expect(
+        media.closeCalls.some(c => c.reason === 'SDP exchange timeout')
+      ).toBe(true);
+    }
+  });
+});
+
+describe('diagnostic attempt timeout scales with signals RTT (Task 9)', () => {
+  it('an elevated signals RTT (5_000ms) scales the per-attempt timeout to 4x RTT (20_000ms)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    await bus.deliver(pongEchoingRtt(peerAKey, clock, 5_000));
+
+    await store.requestDiagnosticLogs(peerA);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+
+    // 4 * 5_000 = 20_000, under DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS (30_000).
+    clock.advance(19_999);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+    clock.advance(1);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(2);
+  });
+
+  it('no RTT sample keeps the per-attempt timeout at the unscaled 8_000ms default', async () => {
+    const started = makeStarted();
+    const { store, clock } = started;
+
+    await store.requestDiagnosticLogs(peerA);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+
+    clock.advance(7_999);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(1);
+    clock.advance(1);
+    expect(get(store._pendingDiagnosticRequests)[peerA]?.attempts).toBe(2);
+  });
 });
 
 describe('the RTCMessage send seam (§9 item 6)', () => {
@@ -1027,5 +1288,403 @@ describe('the RTCMessage send seam (§9 item 6)', () => {
       return parsed.type === 'action' && parsed.message === 'change-audio-input';
     });
     expect(frames.map(f => f.peer)).toEqual([peerB]);
+  });
+});
+
+describe('signals media cadence gates the senders (Task 7)', () => {
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** ModuleData sends for one module, envelope-parsed. */
+  function moduleData(bus: Started['bus'], moduleId: string) {
+    return bus
+      .sentOfType('ModuleData')
+      .map(m => JSON.parse(m.payload!) as { moduleId: string; chunk: string })
+      .filter(p => p.moduleId === moduleId);
+  }
+
+  /** Drive one encoded voice frame through the bound controller — the
+   *  real handleEncodedChunk send path, minus WebCodecs. */
+  function encodeVoiceFrame(ts = 0) {
+    (
+      voiceController as unknown as {
+        handleEncodedChunk(c: unknown): void;
+      }
+    ).handleEncodedChunk({
+      byteLength: 2,
+      timestamp: ts,
+      type: 'key',
+      copyTo: (_buf: Uint8Array) => {},
+    });
+  }
+
+  /** Drive one filmstrip clip through the bound controller's send site. */
+  function sendFilmstripClip() {
+    (
+      filmstripController as unknown as {
+        _handleClipFromWorker(m: unknown): void;
+      }
+    )._handleClipFromWorker({
+      bytes: new ArrayBuffer(2),
+      w: 1,
+      h: 1,
+      n: 1,
+      p: 1,
+      t0: 1,
+      capturedAt: 1,
+    });
+  }
+
+  /** A PongUi from peerA echoing a pingT0 `rttMs` in the past — the real
+   *  foldSignalsRtt input (first sample seeds the EWMA at the raw RTT).
+   *  Carries `moduleStatesAt` matching the capsDeclaration stamp so the
+   *  pong does not read as a legacy no-stamp pong, whose unconditional
+   *  sweep would wipe the caps declaration between sends. */
+  function pongEchoing(started: Started, rttMs: number): RoomSignal {
+    return message(
+      peerAKey,
+      'PongUi',
+      JSON.stringify({
+        formatVersion: 1,
+        data: {
+          connectionStatuses: {},
+          pingT0: started.clock.now() - rttMs,
+          moduleStatesAt: 1,
+        },
+      })
+    );
+  }
+
+  /** peerA's conversation payload declaring `caps`. */
+  function capsDeclaration(caps: string[]): RoomSignal {
+    return message(
+      peerAKey,
+      'ModuleState',
+      JSON.stringify({
+        moduleId: 'conversation',
+        active: true,
+        payload: JSON.stringify({ caps }),
+        updatedAt: 1,
+      })
+    );
+  }
+
+  it('paused cadence (collapsed RTT) stops ModuleData sends without tearing down capture', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    const stopSpy = vi.spyOn(voiceController, 'stopCapture');
+
+    // Baseline: full cadence, one legacy frame per encoded chunk.
+    expect(store.signalsCadence().mode).toBe('full');
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+
+    // Drive peerA's RTT EWMA above SIGNALS_RTT_COLLAPSED_MS through the
+    // fake bus (a pong echoing an old t0), then run the ping cycle the
+    // per-tick evaluation rides.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'rtt-collapsed',
+    });
+
+    // The gate holds for voice AND filmstrip…
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(0);
+    // …while capture is untouched: paused gates the send, not the
+    // pipeline — teardown stays owned by the reconcilers/_signalsTargets,
+    // and the peer is still a signals target.
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(get(store._signalsTargets).has(peerA)).toBe(true);
+  });
+
+  it('carrier-down pauses immediately (no pong from any peer for SIGNAL_CARRIER_DOWN_MS)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, logger } = started;
+    // peerA has ponged at least once (a lastSeen stamp) — never-ponged
+    // peers are excluded from decideSignalCarrier by declared design.
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+    expect(store.signalsCadence().mode).toBe('full');
+
+    // Three silent ticks: the forensics call inside pingAgents flips the
+    // carrier down and forces the cadence to paused in the same breath.
+    clock.advance(SIGNAL_CARRIER_DOWN_MS);
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+    expect(
+      logger.customMessages.some(m => m.startsWith('SignalCarrierDown'))
+    ).toBe(true);
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+  });
+
+  it('voice-only cadence (degraded RTT) drops filmstrip clips but keeps voice flowing', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(1);
+
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_DEGRADED_MS + 500));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'voice-only',
+      reason: 'rtt-degraded',
+    });
+
+    sendFilmstripClip();
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(1);
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+  });
+
+  it('voice batches VOICE_BATCH_FRAMES frames per signal when every target holds the cap; RED rides the batch primary', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(true);
+
+    // Two frames buffer; the third flushes ONE packed signal.
+    encodeVoiceFrame(0);
+    encodeVoiceFrame(20_000);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+    encodeVoiceFrame(40_000);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(1);
+    const batch1 = JSON.parse(sent[0].chunk) as {
+      v: number;
+      frames: Array<{ seq: number; red?: Array<{ seq: number }> }>;
+    };
+    expect(batch1.v).toBe(2);
+    expect(batch1.frames.map(f => f.seq)).toEqual([0, 1, 2]);
+    expect(batch1.frames).toHaveLength(VOICE_BATCH_FRAMES);
+    // Nothing preceded the first batch: no red anywhere.
+    expect(batch1.frames.every(f => f.red === undefined)).toBe(true);
+
+    // Second batch: RED (redundancy 2) rides the batch's FIRST frame and
+    // carries exactly the two frames preceding the batch; later members
+    // carry none (their predecessors travel in the same packet).
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    await flush();
+    const sent2 = moduleData(bus, 'voice');
+    expect(sent2).toHaveLength(2);
+    const batch2 = JSON.parse(sent2[1].chunk) as typeof batch1;
+    expect(batch2.frames.map(f => f.seq)).toEqual([3, 4, 5]);
+    expect(batch2.frames[0].red!.map(f => f.seq)).toEqual([1, 2]);
+    expect(batch2.frames[1].red).toBeUndefined();
+    expect(batch2.frames[2].red).toBeUndefined();
+  });
+
+  it('a mixed room (one target without the cap) falls back to legacy per-frame for everyone', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA, peerB));
+    // peerA declares the cap; peerB declares nothing (baseline caps only).
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(false);
+
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(3);
+    // Legacy single-frame shape (no v2 envelope), each one broadcast to
+    // BOTH targets — the one-broadcast constraint the cap rule exists for.
+    for (const s of sent) {
+      expect((JSON.parse(s.chunk) as { v?: number }).v).toBeUndefined();
+    }
+    const raw = bus.sentOfType('ModuleData');
+    expect(raw[0].to.slice().sort()).toEqual([peerA, peerB].sort());
+  });
+
+  it('stopCapture drops buffered batch frames instead of sending them (stale audio)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+
+    encodeVoiceFrame();
+    encodeVoiceFrame();
+    await voiceController.stopCapture();
+    encodeVoiceFrame(); // starts a NEW batch; must not flush the old one
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+  });
+
+  /** Walk the RTT EWMA back down with fresh pongs, one presence tick per
+   *  iteration, until the cadence leaves `stopAt` (bounded). Returns the
+   *  mode observed after each tick. */
+  async function walkRecovery(
+    started: Started,
+    stopWhile: (mode: string) => boolean
+  ): Promise<string[]> {
+    const { store, clock, bus } = started;
+    const modes: string[] = [];
+    for (let i = 0; i < 12 && stopWhile(store.signalsCadence().mode); i++) {
+      store._knownAgents.set(knownFresh(clock, peerA));
+      await bus.deliver(pongEchoing(started, 0));
+      clock.advance(PING_INTERVAL);
+      await store.pingAgents();
+      modes.push(store.signalsCadence().mode);
+    }
+    return modes;
+  }
+
+  it('a pause discards a partially-accumulated batch — the first post-resume flush carries only fresh frames (review I1)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+
+    // Two frames buffered pre-pause — stale audio by resume time.
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // Collapse the RTT → paused; a frame encoded while paused is dropped.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence().mode).toBe('paused');
+    encodeVoiceFrame(333);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // Recover past 'paused' (voice sends in 'voice-only' too).
+    await walkRecovery(started, mode => mode === 'paused');
+    expect(store.signalsCadence().mode).not.toBe('paused');
+
+    // The next flush contains ONLY post-resume frames: the pre-pause
+    // timestamps are gone, and their seqs are simply absent — they read
+    // as ordinary loss at the receiver (truthful accounting).
+    encodeVoiceFrame(444);
+    encodeVoiceFrame(555);
+    encodeVoiceFrame(666);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(1);
+    const batch = JSON.parse(sent[0].chunk) as {
+      frames: Array<{ seq: number; ts: number }>;
+    };
+    expect(batch.frames.map(f => f.ts)).toEqual([444, 555, 666]);
+    // seqs 0,1 (buffered pre-pause) never reached the wire; the frame
+    // encoded while paused never consumed a seq at all.
+    expect(batch.frames.map(f => f.seq)).toEqual([2, 3, 4]);
+  });
+
+  it('a cap flip mid-batch flushes the buffered frames per-frame, in seq order (review I2)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+
+    // Two frames buffer under the cap gate…
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // …then a caps-silent peer becomes a signals target (mixed room).
+    store._knownAgents.set(knownFresh(clock, peerA, peerB));
+    expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(false);
+
+    // The next frame flushes the buffered two per-frame FIRST, then
+    // itself: 3 legacy sends in seq order — nothing stranded, nothing
+    // reordered behind newer frames.
+    encodeVoiceFrame(333);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(3);
+    const parsed = sent.map(
+      s => JSON.parse(s.chunk) as { seq: number; ts: number; v?: number }
+    );
+    expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
+    expect(parsed.map(p => p.seq)).toEqual([0, 1, 2]);
+    expect(parsed.map(p => p.ts)).toEqual([111, 222, 333]);
+  });
+
+  it('recovery walks paused → voice-only → full via the per-tick re-evaluation, and sends resume (review I3)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+
+    // Collapse: sends stop.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'rtt-collapsed',
+    });
+    encodeVoiceFrame();
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(0);
+
+    // Fresh pongs walk the EWMA down; each ping cycle re-evaluates. The
+    // hysteresis recovers ONE level per evaluation — never paused → full
+    // in a single tick.
+    const modes = [
+      'paused',
+      ...(await walkRecovery(started, mode => mode !== 'full')),
+    ];
+    const transitions = modes.filter((m, i) => i === 0 || m !== modes[i - 1]);
+    expect(transitions).toEqual(['paused', 'voice-only', 'full']);
+
+    // Sends actually resume at full — voice AND filmstrip. This is the
+    // permanently-muted-audio pin: if the per-tick re-evaluation ever
+    // breaks, the walk above never reaches 'full' and this fails.
+    encodeVoiceFrame();
+    sendFilmstripClip();
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(1);
+  });
+
+  it("a rejoining peer does not inherit the departed session's collapsed RTT EWMA (review M5)", async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 1_000));
+    await store.pingAgents();
+    expect(store.signalsCadence().mode).toBe('paused');
+
+    // The peer LEAVES: the media peer-leave cleanup row deletes their
+    // _signalsRttEwma entry (closeCleanupPlan clearSignalsRttEwma).
+    await bus.deliver(message(peerAKey, 'LeaveUi', ''));
+
+    // They rejoin ping-fresh. With no sample, the very next evaluation is
+    // full/no-sample — not a ~5-tick hysteresis walk-back against the
+    // departed session's collapsed EWMA on a healthy network.
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'full',
+      reason: 'no-sample',
+    });
   });
 });

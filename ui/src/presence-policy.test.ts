@@ -3,6 +3,7 @@ import {
   computeActiveAgents,
   computePresentPeers,
   decidePresenceSoundEvents,
+  decideSignalCarrier,
   INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
   lastSeenBucket,
@@ -277,6 +278,74 @@ describe('computePresentPeers', () => {
   });
 });
 
+describe('carrier-hold', () => {
+  const noVoice = new Map<string, number>();
+  const noFilmstrip = new Map<string, number>();
+  const base = {
+    openConnections: {},
+    lastVoiceMs: noVoice,
+    lastFilmstripMs: noFilmstrip,
+    blocked: [] as string[],
+    myPubKey: 'me',
+    mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
+  };
+
+  it('holds previously-present peers while the carrier is down', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 20_000,
+      carrierDownSince: 15_000,
+      heldPresent: ['peerA', 'peerB'],
+    });
+    expect(r).toEqual(['peerA', 'peerB']);
+  });
+
+  it('does not hold past PRESENCE_CARRIER_HOLD_MAX_MS', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 50_001,
+      carrierDownSince: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+
+  it('the exact boundary (now - downSince === PRESENCE_CARRIER_HOLD_MAX_MS) is NOT held — the guard is a strict `<`', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 50_000,
+      carrierDownSince: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+
+  it('never holds blocked peers or self, and does not duplicate fresh peers', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: ['peerA'],
+      blocked: ['peerC'],
+      now: 20_000,
+      carrierDownSince: 15_000,
+      heldPresent: ['peerA', 'peerC', 'me'],
+    });
+    expect(r).toEqual(['peerA']);
+  });
+
+  it('carrier up: absent carrierDownSince changes nothing', () => {
+    const r = computePresentPeers({
+      ...base,
+      activeAgents: [],
+      now: 20_000,
+      heldPresent: ['peerA'],
+    });
+    expect(r).toEqual([]);
+  });
+});
+
 describe('decidePresenceSoundEvents', () => {
   const DWELL = PRESENCE_LEAVE_DWELL_MS;
 
@@ -348,5 +417,40 @@ describe('decidePresenceSoundEvents', () => {
 
   it('leave dwell is 2 ping ticks (the present predicate clock)', () => {
     expect(PRESENCE_LEAVE_DWELL_MS).toBe(2 * PING_INTERVAL);
+  });
+});
+
+describe('decideSignalCarrier', () => {
+  it('down when no known peer is fresh within SIGNAL_CARRIER_DOWN_MS', () => {
+    expect(decideSignalCarrier({ knownPeerLastSeen: [1000, 2000], prevDownSince: undefined, now: 10_000 }))
+      .toEqual({ down: true, downSince: 10_000 });
+  });
+  it('preserves downSince while still down', () => {
+    expect(decideSignalCarrier({ knownPeerLastSeen: [1000], prevDownSince: 8_000, now: 12_000 }))
+      .toEqual({ down: true, downSince: 8_000 });
+  });
+  it('up when any peer is fresh; up with zero known peers (no evidence is not channel death)', () => {
+    expect(decideSignalCarrier({ knownPeerLastSeen: [9_500], prevDownSince: 8_000, now: 10_000 })).toEqual({ down: false });
+    expect(decideSignalCarrier({ knownPeerLastSeen: [], prevDownSince: undefined, now: 10_000 })).toEqual({ down: false });
+  });
+  it('a nonempty roster where nobody has ever ponged is indistinguishable from an empty roster', () => {
+    // Mirrors the call site's filter (streams-store.ts _emitPresenceForensics):
+    // three known peers, none has a lastSeen stamp yet, so knownPeerLastSeen
+    // comes out empty even though the roster itself has three entries. The
+    // function only ever sees stamps, never roster size, so this input is
+    // bitwise identical to the zero-known-peers case above -- deliberately:
+    // "never ponged" and "not here" both read as "no evidence" here.
+    const neverPongedRoster: Array<number | undefined> = [
+      undefined,
+      undefined,
+      undefined,
+    ];
+    const knownPeerLastSeen = neverPongedRoster.filter(
+      (ls): ls is number => ls !== undefined
+    );
+    expect(knownPeerLastSeen).toEqual([]);
+    expect(
+      decideSignalCarrier({ knownPeerLastSeen, prevDownSince: undefined, now: 10_000 })
+    ).toEqual({ down: false });
   });
 });

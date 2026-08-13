@@ -129,6 +129,16 @@ export type CloseCleanupPlan = {
   clearLastDisconnectTime: boolean;
   /** Delete `_lastReconcileTime[peer]` — same rejoin-inheritance rule. */
   clearLastReconcileTime: boolean;
+  /**
+   * Delete the peer's `_signalsRttEwma` entry — same rejoin-inheritance
+   * rule (review M5, Task 7 round): since the EWMA feeds
+   * `decideSignalsMediaCadence`, a rejoining peer inheriting the departed
+   * session's collapsed value would pause signals media on a healthy
+   * network for the ~5 ticks the hysteresis needs to walk back. Peer-leave
+   * rows only; a plain close keeps the entry (the link's RTT history is
+   * still about THIS session).
+   */
+  clearSignalsRttEwma: boolean;
   /** Wipe `perceivedStreamInfo` in `_othersConnectionStatuses`. */
   clearPerceivedStreamInfo: boolean;
   removeAudioAnalyser: boolean;
@@ -164,6 +174,7 @@ const NONE: Omit<CloseCleanupPlan, 'reason'> = {
   recordLastDisconnect: false,
   clearLastDisconnectTime: false,
   clearLastReconcileTime: false,
+  clearSignalsRttEwma: false,
   clearPerceivedStreamInfo: false,
   removeAudioAnalyser: false,
   clearWebrtcStats: false,
@@ -250,6 +261,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 clearQualityBucket: true,
                 clearLastDisconnectTime: true,
                 clearLastReconcileTime: true,
+                clearSignalsRttEwma: true,
                 setDisconnectedStatus: 'media',
               };
             case 'no-slot':
@@ -262,6 +274,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 clearQualityBucket: true,
                 clearLastDisconnectTime: true,
                 clearLastReconcileTime: true,
+                clearSignalsRttEwma: true,
                 setDisconnectedStatus: 'media',
               };
             case 'superseded':
