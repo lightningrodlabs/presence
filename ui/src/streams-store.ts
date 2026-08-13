@@ -34,7 +34,10 @@ import {
   decideWebrtcEligibility,
 } from './transport/carrier-coverage';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
-import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
+import {
+  decideSignalsMediaCadence,
+  SIGNALS_RTT_DEGRADED_MS,
+} from './transport/signals-cadence-policy';
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
@@ -710,6 +713,20 @@ export class StreamsStore {
     // wiring tests — if store notification semantics ever get memoized,
     // those tests go red and the retry needs an explicit home.
     this._signalsTargetsUnsub = this._signalsTargets.subscribe(() => {
+      // Two-site invariant (final-review re-review N1): the target set can
+      // grow SYNCHRONOUSLY off this subscription — a peer's first pong adds
+      // it to _activeAgents/_presentPeers/_signalsTargets before the next
+      // presence tick. If `_voiceBatchCapAllTargets` were left stale-true
+      // from last tick, voice would broadcast a v2 batch to a peer who
+      // never declared the cap: every released build's decoder does a bare
+      // JSON.parse there, so an uncapped peer throws (seq undefined) on
+      // every payload until the next tick recomputed the boolean. The
+      // per-tick evaluation in pingAgents() stays — it is what catches a
+      // cap arriving (via ModuleState) for an ALREADY-present target, whose
+      // unsafe direction (stale-false, not stale-true) never breaks a
+      // decoder — but a target-set GROW must recompute here too, so the
+      // boolean is never stale-true across it.
+      this._voiceBatchCapAllTargets = this.signalsTargetsAllHaveCap(CAP_VOICE_BATCH);
       this._reconcileSignalsAudio();
       this._reconcileSignalsVideo();
     });
@@ -2675,8 +2692,9 @@ export class StreamsStore {
 
     // Voice batching eligibility: same once-per-tick cadence as the
     // cadence evaluation above (final-review wave F2) — see
-    // `_voiceBatchCapAllTargets` for why this moved out of the per-chunk
-    // send path.
+    // `_voiceBatchCapAllTargets` for the two-site invariant (this site
+    // plus the `_signalsTargets` subscription, re-review N1) and why this
+    // moved out of the per-chunk send path.
     this._voiceBatchCapAllTargets = this.signalsTargetsAllHaveCap(CAP_VOICE_BATCH);
   }
 
@@ -2769,19 +2787,24 @@ export class StreamsStore {
       this.logger.logCustomMessage(
         `SignalCarrierUp: pong path recovered after ${downMs}ms`,
       );
-      // Clear the RTT EWMA for current signals targets (final-review wave
-      // F5): a sample folded across the outage is evidence about the DEAD
-      // channel, not the one that just recovered — carrying it forward
-      // fed the cadence policy's one-level-per-tick hysteresis a stale
-      // collapsed reading and forced a ~20s walk-back
+      // Reset the RTT EWMA for current signals targets to
+      // SIGNALS_RTT_DEGRADED_MS, not delete it (final-review wave F5,
+      // amended per re-review N2): a sample folded across the outage is
+      // evidence about the DEAD channel, not the one that just recovered
+      // — carrying it forward fed the cadence policy's one-level-per-tick
+      // hysteresis a stale collapsed reading and forced a ~20s walk-back
       // (paused -> voice-only -> full) even once the link was fine again.
-      // No sample ⇒ `decideSignalsMediaCadence` reads 'full'/'no-sample'
-      // outright, and if the link is still actually bad the very next
-      // pong re-collapses the EWMA and the cadence re-escalates within
-      // one tick — so this trades a slow, wrong walk-back for an honest
-      // probe-and-react.
+      // A bare delete (no-sample) would have jumped straight to 'full' —
+      // resuming both voice AND filmstrip at full rate into a relay that
+      // JUST recovered, one tick ahead of any real evidence it can carry
+      // that load. Landing exactly at the degraded threshold instead
+      // means `decideSignalsMediaCadence` resumes at 'voice-only' on this
+      // tick (same one-tick honesty: no stale collapsed reading survives
+      // the flip), and the next real sample governs from there — a
+      // healthy pong decays the EWMA below half-degraded and walks it on
+      // to 'full' over the following ticks, same as any other recovery.
       for (const target of get(this._signalsTargets)) {
-        this._signalsRttEwma.delete(target);
+        this._signalsRttEwma.set(target, SIGNALS_RTT_DEGRADED_MS);
       }
     }
 
@@ -4427,19 +4450,33 @@ export class StreamsStore {
 
   /**
    * Whether EVERY current signals target advertises `CAP_VOICE_BATCH`
-   * (`voice-batch-v1`), re-evaluated once per presence tick in
-   * `pingAgents()` right beside `_signalsCadence` (final-review wave F2).
-   * Previously voice.ts called `signalsTargetsAllHaveCap` directly inside
-   * `handleEncodedChunk` — once per encoded chunk, 50/s, each call doing a
-   * per-target `conversationPayloadCaps` JSON.parse — which contradicted
-   * the cached-derived-value convention documented at voice.ts's
-   * `_signalsTargets` read. Hoisting to a once-per-tick boolean, read via
-   * `voiceBatchEligible()`, means a cap flip takes effect within one tick
-   * (≤ PING_INTERVAL, 2s) instead of immediately; the existing mid-batch
-   * flush path in `handleEncodedChunk` (the legacy-path buffered-frame
-   * flush) already handles that transition cleanly, so the coarser
-   * granularity costs nothing. `signalsTargetsAllHaveCap` remains the one
-   * evaluation authority — this field is just its once-per-tick cache.
+   * (`voice-batch-v1`) (final-review wave F2). `signalsTargetsAllHaveCap`
+   * remains the one evaluation authority — this field is its cache, kept
+   * fresh from TWO sites (re-review N1 — a single site left an unsafe
+   * window):
+   *
+   *  1. Once per presence tick in `pingAgents()`, right beside
+   *     `_signalsCadence`. Catches a cap arriving (via ModuleState) for an
+   *     ALREADY-present target — that direction (stale-false correcting to
+   *     true) is safe to lag a tick: it only costs a few frames of legacy
+   *     format on a peer who can already parse v2.
+   *  2. Synchronously inside the `_signalsTargets` subscription
+   *     (constructor, above) — required because the target SET can grow
+   *     synchronously off a peer's first pong (pong handler →
+   *     `_knownAgents` → `_activeAgents` → `_presentPeers` →
+   *     `_signalsTargets`), ahead of the next tick. Left stale-true across
+   *     a grow, a v2 batch would broadcast to a peer who never declared
+   *     the cap — every released build's decoder does a bare `JSON.parse`
+   *     there and throws per payload until the next tick recomputed this.
+   *
+   * Invariant: this boolean must never be stale-true across a target-set
+   * grow. Previously voice.ts called `signalsTargetsAllHaveCap` directly
+   * inside `handleEncodedChunk` — once per encoded chunk, 50/s, each call
+   * doing a per-target `conversationPayloadCaps` JSON.parse — which
+   * contradicted the cached-derived-value convention documented at
+   * voice.ts's `_signalsTargets` read; hoisting to this cache, read via
+   * `voiceBatchEligible()`, moves that off the per-chunk send path while
+   * the two sites above keep it correct on both directions of change.
    */
   private _voiceBatchCapAllTargets = false;
 

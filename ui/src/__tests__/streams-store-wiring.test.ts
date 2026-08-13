@@ -1438,7 +1438,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     expect(moduleData(bus, 'voice')).toHaveLength(0);
   });
 
-  it('carrier recovery clears the stale RTT EWMA — cadence returns to full on the recovery tick, not the ~12-tick walk (final-review wave F5)', async () => {
+  it('carrier recovery resets the stale RTT EWMA to the degraded threshold — cadence resumes at voice-only on the recovery tick, not the paused wait nor a bare full jump (final-review wave F5, amended per re-review N2)', async () => {
     const started = makeStarted();
     const { store, clock, bus, logger } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
@@ -1470,11 +1470,25 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       logger.customMessages.some(m => m.startsWith('SignalCarrierUp'))
     ).toBe(true);
 
-    // The up-flip clears the collapsed-era EWMA sample (F5): with no
-    // sample, decideSignalsMediaCadence reads 'full'/'no-sample' directly
-    // on THIS tick — not the paused -> voice-only -> full walk a carried-
-    // forward stale sample would otherwise force over many ticks.
-    expect(store.signalsCadence()).toEqual({ mode: 'full', reason: 'no-sample' });
+    // The up-flip resets the collapsed-era EWMA sample to
+    // SIGNALS_RTT_DEGRADED_MS, not delete (N2): no stale collapsed
+    // reading survives the flip, but the probe lands at voice-only, not a
+    // bare jump straight to full sending both voice and filmstrip into a
+    // relay that just recovered.
+    expect(store.signalsCadence()).toEqual({
+      mode: 'voice-only',
+      reason: 'rtt-degraded',
+    });
+    sendFilmstripClip();
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(0);
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+
+    // A fresh, healthy pong then walks the EWMA down and the cadence on
+    // to full, same as any other recovery from voice-only.
+    await walkRecovery(started, mode => mode === 'voice-only');
+    expect(store.signalsCadence().mode).toBe('full');
   });
 
   it('voice-only cadence (degraded RTT) drops filmstrip clips but keeps voice flowing', async () => {
@@ -1680,6 +1694,49 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
     expect(parsed.map(p => p.seq)).toEqual([0, 1, 2]);
     expect(parsed.map(p => p.ts)).toEqual([111, 222, 333]);
+  });
+
+  it('a caps-silent peer\'s first pong grows the target set synchronously — the batch gate closes within the same tick, not just at the next pingAgents (re-review N1)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    await store.pingAgents(); // batching gate active for peer A alone
+
+    // Two frames buffer under the cap gate.
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // A caps-silent peer B's FIRST pong arrives — no pingAgents() call
+    // anywhere in this test after this point. B enters _knownAgents ->
+    // _activeAgents -> _presentPeers -> _signalsTargets synchronously off
+    // the pong handler, inside this single bus.deliver.
+    await bus.deliver(
+      message(
+        peerBKey,
+        'PongUi',
+        JSON.stringify({
+          formatVersion: 1,
+          data: { connectionStatuses: {} },
+        })
+      )
+    );
+    expect(get(store._signalsTargets).has(peerB)).toBe(true);
+
+    // The next chunk, encoded in the SAME tick, must go out legacy
+    // per-frame to both targets — NOT a v2 batch, which every released
+    // build's decoder would throw on for B (bare JSON.parse, seq
+    // undefined). Before the fix, `_voiceBatchCapAllTargets` stayed
+    // stale-true from peer A's tick and this chunk (plus the 2 buffered)
+    // would have gone out as one v2 batch instead.
+    encodeVoiceFrame(333);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(3);
+    const parsed = sent.map(s => JSON.parse(s.chunk) as { v?: number });
+    expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
   });
 
   it("pumpEncoder's mute branch clears the batch buffer — a mute discards stale pre-mute frames (final-review wave F4)", async () => {
