@@ -140,6 +140,74 @@ export function isMediaLive(s: MediaLiveSnapshot): boolean {
   return false;
 }
 
+/**
+ * The **signal-carrier-down** predicate's window: if no known peer has
+ * ponged within this long, the bidirectional Holochain signal path is
+ * presumed down. 3 ticks of the presence clock, same reasoning as
+ * `PRESENT_STALENESS_MS` (absorb one lost ping/pong pair without a
+ * flap) — but this is a distinct predicate: carrier health, not peer
+ * presence. `_signalCarrierDownSince` (`streams-store.ts`) is the one
+ * store field it feeds, and `decideSignalsMediaCadence`
+ * (`transport/signals-cadence-policy.ts`) is the one downstream
+ * consumer of the resulting `down` flag.
+ */
+export const SIGNAL_CARRIER_DOWN_MS = 3 * PING_INTERVAL;
+
+export type SignalCarrierState =
+  | { down: false }
+  | { down: true; downSince: number };
+
+/**
+ * The **signal-carrier-down** predicate: down when at least one known
+ * peer has *ever* ponged, but none of those ponged-at-least-once peers
+ * is fresh within `SIGNAL_CARRIER_DOWN_MS`. This predicate runs only
+ * over peers who have a `lastSeen` stamp at all — a known peer with no
+ * stamp yet contributes no timestamp to `knownPeerLastSeen` and is
+ * therefore invisible to this function, indistinguishable from that
+ * peer not being in the roster. An all-unstamped roster is `down:
+ * false` for the same reason an empty roster is: this function cannot
+ * tell "nobody has answered yet" from "nobody is here", and refuses to
+ * call either one channel death. (Call sites that exclude unstamped
+ * peers before calling this, and what that forfeits, are documented at
+ * the call site — see `streams-store.ts`'s `_emitPresenceForensics`.)
+ *
+ * `downSince` is sticky across calls while still down (`prevDownSince`
+ * carries the stamp from the first down evaluation forward) so the
+ * duration reported at recovery is measured from the actual onset, not
+ * from whichever tick last happened to call this.
+ */
+export function decideSignalCarrier(inputs: {
+  /**
+   * lastSeen stamps for known, non-self, non-blocked peers who have
+   * ponged at least once. Peers with no stamp yet (`lastSeen ===
+   * undefined`) are excluded by the caller, not represented here as
+   * zero or omitted-but-counted — see the call-site note above.
+   */
+  knownPeerLastSeen: number[];
+  prevDownSince: number | undefined;
+  now: number;
+}): SignalCarrierState {
+  const { knownPeerLastSeen, prevDownSince, now } = inputs;
+  if (knownPeerLastSeen.length === 0) return { down: false };
+  const anyFresh = knownPeerLastSeen.some(
+    t => now - t < SIGNAL_CARRIER_DOWN_MS
+  );
+  if (anyFresh) return { down: false };
+  return { down: true, downSince: prevDownSince ?? now };
+}
+
+/**
+ * The **signal-carrier-outage hold** window: while `carrierDownSince` is
+ * set and within this many ms of `now`, `computePresentPeers` keeps the
+ * previous tick's present set alive even though pongs have gone silent
+ * — a dead relay is channel evidence, not peer evidence. Equals
+ * `LAST_SEEN_GONE_MS`: once a peer would read "gone" on the reachable
+ * ladder anyway, holding it present any longer buys nothing. Serves the
+ * **present** predicate on the presence clock, same family as
+ * `PRESENT_STALENESS_MS`.
+ */
+export const PRESENCE_CARRIER_HOLD_MAX_MS = 30_000;
+
 export interface PresentPeersSnapshot {
   /** Keys of the ping-fresh set (already excludes self and blocked). */
   activeAgents: AgentPubKeyB64[];
@@ -150,17 +218,23 @@ export interface PresentPeersSnapshot {
   myPubKey: AgentPubKeyB64;
   now: number;
   mediaLiveWindowMs: number;
+  /** `StreamsStore._signalCarrierDownSince` — set while `decideSignalCarrier` reports the channel down. */
+  carrierDownSince?: number;
+  /** The previous tick's `computePresentPeers` output — what the hold keeps alive. */
+  heldPresent?: AgentPubKeyB64[];
 }
 
 /**
  * The **present** predicate: ping-fresh OR media-flowing on either
- * carrier. THE authority for every join/leave-shaped effect — chimes,
+ * carrier, plus (while the signal carrier is down) whatever was present
+ * last tick. THE authority for every join/leave-shaped effect — chimes,
  * tiles, grid counts, phantom exclusion (Phase 2 item 5). A peer with
  * flowing media is present regardless of pong staleness; a signal-relay
  * hiccup must not remove (or re-announce) a peer we can still hear.
  *
  * Ordering: ping-fresh peers first in their given order, then media-only
- * peers sorted lexically, so tile order is stable across evaluations.
+ * peers sorted lexically, then (during a carrier outage) held-over peers
+ * in `heldPresent`'s order, so tile order is stable across evaluations.
  */
 export function computePresentPeers(s: PresentPeersSnapshot): AgentPubKeyB64[] {
   const out: AgentPubKeyB64[] = [...s.activeAgents];
@@ -188,7 +262,21 @@ export function computePresentPeers(s: PresentPeersSnapshot): AgentPubKeyB64[] {
     }
   }
   extras.sort();
-  return [...out, ...extras];
+  const result = [...out, ...extras];
+
+  if (
+    s.carrierDownSince !== undefined &&
+    s.now - s.carrierDownSince < PRESENCE_CARRIER_HOLD_MAX_MS
+  ) {
+    for (const key of s.heldPresent ?? []) {
+      if (key === s.myPubKey) continue;
+      if (s.blocked.includes(key)) continue;
+      if (result.includes(key)) continue;
+      result.push(key); // held peers appended after evidenced ones, input order
+    }
+  }
+
+  return result;
 }
 
 /**

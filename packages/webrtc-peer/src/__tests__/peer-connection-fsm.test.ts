@@ -310,19 +310,23 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('signaling');
     });
 
-    it('disconnected auto-retries with jitter (500-2000ms)', () => {
+    it('disconnected auto-retries with exponential backoff + jitter (attempt 0: 300-1299ms)', () => {
+      // Declared change: flat 500-2000ms jitter replaced by exponential
+      // backoff (base*2^attempt, capped, then jittered) — see the
+      // 'spaces disconnected retries exponentially' test in the
+      // 'reconnection' describe for the full attempt sequence.
       const ctx = createFSM();
       ctx.fsm.connect();
       // SDP timeout → disconnected
       vi.advanceTimersByTime(15_001);
       expect(ctx.fsm.state).toBe('disconnected');
 
-      // Jitter hasn't fired yet at 499ms
-      vi.advanceTimersByTime(499);
+      // Retry hasn't fired yet at 299ms (attempt 0 base delay alone is 300ms)
+      vi.advanceTimersByTime(299);
       expect(ctx.fsm.state).toBe('disconnected');
 
-      // By 2001ms the jitter must have fired (max jitter is 2000ms)
-      vi.advanceTimersByTime(1502);
+      // By 1300ms the retry must have fired (attempt 0 max = 300 base + 999 jitter)
+      vi.advanceTimersByTime(1001);
       expect(ctx.fsm.state).toBe('signaling');
     });
 
@@ -501,6 +505,26 @@ describe('PeerConnectionFSM', () => {
       expect(ctx.fsm.state).toBe('failed');
     });
 
+    it('gives up cleanly: retry limit reached in disconnected transitions to failed (not BLOCKED)', () => {
+      // maxAttempts: 0 means the very first entry to 'disconnected' already
+      // has _disconnectedRetryCount (0) >= maxAttempts (0), so the give-up
+      // guard fires immediately instead of scheduling a jittered retry.
+      const ctx = createFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 0 }),
+      });
+      ctx.fsm.connect();
+      expect(ctx.fsm.state).toBe('signaling');
+
+      // SDP exchange timeout: signaling → disconnected, which immediately
+      // hits the exhausted retry-limit guard.
+      vi.advanceTimersByTime(15_001);
+
+      // Entering disconnected with the limit already hit must reach failed,
+      // not get silently refused and left stuck in disconnected.
+      expect(ctx.fsm.state).toBe('failed');
+      expect(ctx.transitionLog.some(t => t.trigger.startsWith('BLOCKED:'))).toBe(false);
+    });
+
     it('a connected path that dies and never recovers reaches failed within maxAttempts (bounded, no infinite churn)', async () => {
       // The headline reconnection scenario: an established connection's transport
       // dies (e.g. network change with no usable path) and never comes back.
@@ -542,6 +566,36 @@ describe('PeerConnectionFSM', () => {
 
       expect(ctx.fsm.state).toBe('connected');
       expect(ctx.fsm.viewModel.retry).toBeNull();
+    });
+
+    it('spaces disconnected retries exponentially (base*2^n, capped, jittered)', () => {
+      // Deterministic jitter = 0 so only the exponential component is checked.
+      const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+      try {
+        const ctx = createFSM();
+        ctx.fsm.connect();
+
+        // Expected delay per disconnected entry: min(7000, 300*2^attempt).
+        const expectedDelays = [300, 600, 1200, 2400, 4800, 7000]; // attempt 5: 9600 -> capped
+
+        for (const delay of expectedDelays) {
+          // SDP exchange timeout (signaling → disconnected) arms the retry timer.
+          // Advance by exactly the timeout so no slop bleeds into the retry
+          // timer's own countdown checked immediately below.
+          vi.advanceTimersByTime(DEFAULT_CONFIG.sdpExchangeTimeoutMs);
+          expect(ctx.fsm.state).toBe('disconnected');
+
+          // Retry has not fired one tick before the expected delay.
+          vi.advanceTimersByTime(delay - 1);
+          expect(ctx.fsm.state).toBe('disconnected');
+
+          // Retry fires exactly at the expected delay, returning to signaling.
+          vi.advanceTimersByTime(1);
+          expect(ctx.fsm.state).toBe('signaling');
+        }
+      } finally {
+        randomSpy.mockRestore();
+      }
     });
   });
 
@@ -947,6 +1001,233 @@ describe('PeerConnectionFSM', () => {
         3,
       );
       expect(ctx.fsm.remotePeerSessionId).toBe(5);
+    });
+
+    it('re-latches when the remote FSM was recreated (non-offer with new remoteConnectionId and regressed session)', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      // Latch remote FSM "A" at a high session via an offer.
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-a' }, 'remote-A', 11);
+      expect(ctx.fsm.remotePeerSessionId).toBe(11);
+
+      // Remote side recreated its FSM at the same epoch: new id, counter restarted.
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-B',
+        1,
+      );
+
+      // Must NOT log a stale drop; the candidate must reach the peer.
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale'))
+      ).toBe(false);
+      expect(ctx.mockPc.addIceCandidate).toHaveBeenCalledTimes(1);
+      expect(ctx.fsm.remotePeerSessionId).toBe(1);
+    });
+
+    it('still drops non-offers from an abandoned (tombstoned) remote FSM', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-a' }, 'remote-A', 3);
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-b' }, 'remote-B', 1); // remote recreated; A is now abandoned
+
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-A',
+        3,
+      ); // resurrected dead burst
+
+      const dropEntry = ctx.transitionLog.slice(logBefore).find(
+        t => t.trigger.includes('Dropped stale candidate')
+      );
+      expect(dropEntry).toBeDefined();
+    });
+
+    it('drops a tombstoned remote connectionId even when the latch is null after a local retry (review F1)', async () => {
+      const ctx = createFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 10, iceRestartMaxAttempts: 0 }),
+      });
+      ctx.fsm.connect();
+
+      // Reach `connected` (ICE failure only escalates to `reconnecting` from
+      // `connected`, per VALID_TRANSITIONS — `connecting` goes to
+      // `disconnected` instead). Latch dead FSM "A" at a high session via
+      // the initial answer.
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer-a' }, 'remote-A', 11);
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+
+      // Relatch to live FSM "B" via a non-offer — this tombstones A.
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-B',
+        1,
+      );
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-B');
+
+      // A local full reconnect (our own ICE failure, unrelated to the
+      // remote) nulls the latch via `_newPeerSession()`.
+      ctx.mockPc.simulateIceConnectionState('failed');
+      expect(ctx.fsm.state).toBe('reconnecting');
+      vi.advanceTimersByTime(1); // attempt 0 fires as full-reconnect (iceRestartMaxAttempts: 0)
+      expect(ctx.fsm.remoteConnectionId).toBeNull();
+
+      const sessionBefore = ctx.fsm.remotePeerSessionId;
+      const logBefore = ctx.transitionLog.length;
+
+      // A resurrected answer from the DEAD, tombstoned session "A" arrives.
+      // Pre-fix: the differing-id/tombstone check requires a non-null latch,
+      // so with the latch null this fell through to the raw counter compare
+      // (11 >= sessionBefore) and was wrongly accepted/updated.
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'resurrected' }, 'remote-A', 11);
+
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale answer'))
+      ).toBe(true);
+      // Must not have updated the session counter from the dropped signal.
+      expect(ctx.fsm.remotePeerSessionId).toBe(sessionBefore);
+    });
+
+    it('resets the remote session counter when an offer adopts a new remote connectionId (review F2)', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      // Latch A at a high session.
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-a' }, 'remote-A', 11);
+      expect(ctx.fsm.remotePeerSessionId).toBe(11);
+
+      // Remote recreates: its first signal is a fresh offer at a low
+      // session, in a new namespace (different connectionId).
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-b' }, 'remote-B', 1);
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-B');
+      expect(ctx.fsm.remotePeerSessionId).toBe(1);
+
+      // B's subsequent candidate at session 1 (B's own namespace) must be
+      // accepted, not dropped as stale against A's leftover counter.
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-B',
+        1,
+      );
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale'))
+      ).toBe(false);
+      expect(ctx.mockPc.addIceCandidate).toHaveBeenCalledTimes(1);
+    });
+
+    it('a still-live remote FSM keeps sending after our own local full reconnect (no false tombstone)', async () => {
+      const ctx = createFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 10, iceRestartMaxAttempts: 0 }),
+      });
+      ctx.fsm.connect();
+
+      // Latch live remote FSM "B" and reach `connected`.
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer-b' }, 'remote-B', 1);
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-B');
+
+      // WE do a local full reconnect (our own ICE failure) — remote's FSM
+      // is untouched. `_newPeerSession()` only nulls the latch; it does not
+      // tombstone — tombstoning happens only at call sites that know the
+      // remote FSM was actually recreated.
+      ctx.mockPc.simulateIceConnectionState('failed');
+      expect(ctx.fsm.state).toBe('reconnecting');
+      vi.advanceTimersByTime(1);
+      expect(ctx.fsm.remoteConnectionId).toBeNull();
+
+      // B — the SAME still-alive remote FSM — answers our fresh offer.
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'still-alive' }, 'remote-B', 2);
+
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale'))
+      ).toBe(false);
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-B');
+    });
+
+    it('un-tombstones a remote connectionId when it is re-adopted (re-review N1)', async () => {
+      const ctx = createFSM();
+      ctx.fsm.connect();
+
+      // Latch live B.
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-b' }, 'remote-B', 1);
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-B');
+
+      // A resurrected candidate from a never-seen id "A" relatches onto A
+      // (the accepted F3 trade — an unseen id is trusted on first sight) and
+      // tombstones B, the id it displaced.
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:1 1 udp 1 10.0.0.1 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-A',
+        1,
+      );
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-A');
+
+      // B recovers the latch via a fresh offer — offers bypass the
+      // tombstone check entirely, so this must succeed even though B is
+      // currently tombstoned.
+      await ctx.fsm.handleRemoteSignal({ type: 'offer', sdp: 'mock-b-2' }, 'remote-B', 2);
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-B');
+
+      // B's subsequent candidates must be accepted — not dropped as
+      // "abandoned" — for the rest of the FSM's life, now that B has been
+      // un-tombstoned on re-adoption.
+      const logBefore = ctx.transitionLog.length;
+      const candidatesBefore = ctx.mockPc.addIceCandidate.mock.calls.length;
+      await ctx.fsm.handleRemoteSignal(
+        { candidate: 'candidate:2 1 udp 1 10.0.0.2 5000 typ host', sdpMLineIndex: 0 } as any,
+        'remote-B',
+        2,
+      );
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale'))
+      ).toBe(false);
+      expect(ctx.mockPc.addIceCandidate.mock.calls.length).toBe(candidatesBefore + 1);
+    });
+
+    it('adopts a fresh namespace when the latch is null and the id is unseen (re-review N2)', async () => {
+      const ctx = createFSM({
+        reconnectPolicy: new DefaultReconnectPolicy({ maxAttempts: 10, iceRestartMaxAttempts: 0 }),
+      });
+      ctx.fsm.connect();
+
+      // Latch A at a high session and reach `connected`.
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'mock-answer-a' }, 'remote-A', 11);
+      ctx.mockPc.simulateConnectionState('connected');
+      const dc = ctx.mockPc.createDataChannel.mock.results[0]?.value;
+      if (dc?.simulateOpen) dc.simulateOpen();
+      expect(ctx.fsm.state).toBe('connected');
+      expect(ctx.fsm.remotePeerSessionId).toBe(11);
+
+      // A local full reconnect nulls the latch. `_session.remote` (11) is
+      // untouched — it belongs to no namespace right now.
+      ctx.mockPc.simulateIceConnectionState('failed');
+      expect(ctx.fsm.state).toBe('reconnecting');
+      vi.advanceTimersByTime(1);
+      expect(ctx.fsm.remoteConnectionId).toBeNull();
+      expect(ctx.fsm.remotePeerSessionId).toBe(11);
+
+      // A fresh, never-seen id "C" answers at session 1. With the latch
+      // null, this is first contact of a new namespace — must be adopted,
+      // not dropped against A's leftover counter.
+      const logBefore = ctx.transitionLog.length;
+      await ctx.fsm.handleRemoteSignal({ type: 'answer', sdp: 'from-c' }, 'remote-C', 1);
+
+      expect(
+        ctx.transitionLog.slice(logBefore).some(t => t.trigger.includes('Dropped stale'))
+      ).toBe(false);
+      expect(ctx.fsm.remoteConnectionId).toBe('remote-C');
+      expect(ctx.fsm.remotePeerSessionId).toBe(1);
     });
   });
 

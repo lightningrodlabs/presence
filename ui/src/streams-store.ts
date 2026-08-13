@@ -9,6 +9,7 @@ import {
   computeActiveAgents,
   computePresentPeers,
   decidePresenceSoundEvents,
+  decideSignalCarrier,
   INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
   lastSeenBucket,
@@ -33,6 +34,8 @@ import {
   decideWebrtcEligibility,
 } from './transport/carrier-coverage';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
+import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
+import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
 import { closeCleanupPlan } from './transport/close-cleanup-policy';
@@ -107,8 +110,51 @@ declare const __APP_VERSION__: string;
  * Timeout in ms for the SDP exchange phase. If a connection does not progress
  * from SdpExchange to Connected within this duration, the stale peer is destroyed
  * and the connection is reset to Disconnected so the next ping/pong cycle can retry.
+ * Used as the no-RTT-sample fallback for `_computeSdpTimeout`.
  */
 export const SDP_EXCHANGE_TIMEOUT = 15000;
+
+/**
+ * Ceiling for the RTT-scaled SDP-exchange timeout (`_computeSdpTimeout`).
+ * Serves the SDP-exchange predicate: how long an initiator's own attempt
+ * may go unanswered before it is torn down and retried.
+ *
+ * Field observation (2026-08-11): 8 consecutive SDP timeouts sat at the
+ * former 15s ceiling while measured signals RTT was 20-58s. At K=20 that
+ * RTT range needs 400-1160s to clear on its own multiplier — the ceiling
+ * was always going to bind, so every attempt was pure teardown-and-reflood
+ * with no chance to succeed. Raised to 30s so links in the low end of
+ * that range get a timeout retrying can actually complete within.
+ */
+export const SDP_TIMEOUT_CEILING_MS = 30_000;
+
+/** RTT multiplier for the SDP-exchange timeout (`_computeSdpTimeout`). */
+export const SDP_TIMEOUT_RTT_MULTIPLIER = 20;
+
+/** Floor for the RTT-scaled SDP-exchange timeout (`_computeSdpTimeout`),
+ *  avoiding an over-tight timeout on very low-RTT links. */
+export const SDP_TIMEOUT_FLOOR_MS = 5000;
+
+/**
+ * Ceiling for the store's tracked SDP-exchange backstop timer
+ * (`_computeSdpBackstopTimeout`), NOT the same predicate as
+ * `SDP_TIMEOUT_CEILING_MS`. The backstop is second-line cleanup for an
+ * FSM that wedges without ever emitting a phase transition — it must
+ * always leave the FSM's own per-attempt timeout (`_computeSdpTimeout`,
+ * passed as `sdpExchangeTimeoutMs`) and that timeout's own first backoff
+ * retry undisturbed, so it is pinned strictly greater than the per-attempt
+ * timeout (2x) rather than sharing its value. Sharing the value was
+ * Task 9's original defect (review C1, 2026-08-11): the backstop fired in
+ * the same tick as the FSM's own timeout, destroying the FSM's in-place
+ * Task-4 recovery retry instead of letting it run.
+ */
+export const SDP_BACKSTOP_CEILING_MS = 60_000;
+
+/** Multiplier applied to the per-attempt SDP timeout to get the store's
+ *  tracked backstop timeout (`_computeSdpBackstopTimeout`) — kept at 2x
+ *  so the backstop can never fire before the FSM's own timeout has had a
+ *  chance to run its first in-place retry. */
+export const SDP_BACKSTOP_MULTIPLIER = 2;
 
 /**
  * How long an established peer may sit in iceConnectionState 'disconnected'
@@ -407,8 +453,11 @@ export class StreamsStore {
         Writable<Record<AgentPubKeyB64, OpenConnectionInfo>>,
         Writable<number>,
       ],
-      ([active, connections, _tick]) =>
-        computePresentPeers({
+      ([active, connections, _tick]) => {
+        // heldPresent is last tick's result, read before this tick
+        // overwrites it below — see the field comment on
+        // `_lastComputedPresent` for why that staleness is intentional.
+        const result = computePresentPeers({
           activeAgents: Object.keys(active),
           openConnections: connections,
           lastVoiceMs: voiceController.peerLastRecvMs,
@@ -417,7 +466,12 @@ export class StreamsStore {
           myPubKey: this.myPubKeyB64,
           now: this.clock.now(),
           mediaLiveWindowMs: MEDIA_LIVE_WINDOW_MS,
-        }),
+          carrierDownSince: this._signalCarrierDownSince,
+          heldPresent: this._lastComputedPresent,
+        });
+        this._lastComputedPresent = result;
+        return result;
+      },
     );
 
     // Signals is the complement of *WebRTC carrying media*, not of *a
@@ -469,9 +523,28 @@ export class StreamsStore {
 
     // Drive the presence tick from the store clock so _activeAgents
     // re-evaluates staleness once per ping cadence even when no store
-    // write happens (Phase 2 item 4).
+    // write happens (Phase 2 item 4). _emitPresenceForensics() runs
+    // FIRST, in the same breath, so _signalCarrierDownSince is current
+    // before the tick bump triggers _presentPeers' recompute: carrier-
+    // down (SIGNAL_CARRIER_DOWN_MS) and a lone surviving peer's own
+    // ping-staleness (PRESENT_STALENESS_MS) are the same 3-tick window
+    // by design, so they cross on the SAME tick, and pingAgents() (the
+    // only other _emitPresenceForensics call site) is not guaranteed to
+    // run before this interval fires — without this, the carrier-hold
+    // (Task 8) reads a stale `undefined` on exactly the tick it needs
+    // to catch, and _lastComputedPresent gets wiped before the hold can
+    // apply. decideSignalCarrier's stickiness makes calling this from
+    // both sites idempotent: whichever call notices the transition
+    // first logs it, the other sees it already applied and no-ops.
+    // pingAgents() has the matching guard internally (forensics runs
+    // before ITS OWN `_knownAgents.set()` write, review C1) — the two
+    // fixes are independent because either evaluator can be the first
+    // to observe a given crossing.
     this._presenceTickInterval = this.clock.setInterval(
-      () => this._presenceTick.update(n => n + 1),
+      () => {
+        this._emitPresenceForensics();
+        this._presenceTick.update(n => n + 1);
+      },
       PING_INTERVAL
     );
 
@@ -1376,6 +1449,10 @@ export class StreamsStore {
     // rejoining peer starts clean (§9 item 5).
     if (plan.clearLastDisconnectTime) delete this._lastDisconnectTime[pubKeyB64];
     if (plan.clearLastReconcileTime) delete this._lastReconcileTime[pubKeyB64];
+    // Rejoin-inheritance clear (review M5): the EWMA feeds the cadence
+    // decision, so a departed session's collapsed value must not pause a
+    // healthy rejoin. Peer-leave rows only, like the two deletes above.
+    if (plan.clearSignalsRttEwma) this._signalsRttEwma.delete(pubKeyB64);
     if (plan.clearVideoStreamSlot) delete this._videoStreams[pubKeyB64];
     // A closed connection's pending InitRequests are dead reservations:
     // clearing them lets the next pong cycle re-initiate immediately
@@ -2350,6 +2427,7 @@ export class StreamsStore {
     this._screenShareConnectionsIncoming.set({});
     this._screenShareStreams = {};
     this._pendingInits = {};
+    this._lastComputedPresent = [];
   }
 
   enableTrickleICE() {
@@ -2453,6 +2531,22 @@ export class StreamsStore {
   }
 
   async pingAgents() {
+    // Forensics FIRST, before the roster-merge write below: the merge
+    // only adds unstamped entries (new agents) or upgrades `type` for
+    // already-known agents while preserving their `lastSeen` — it never
+    // touches an existing `lastSeen` stamp, so `_emitPresenceForensics`
+    // reading the PRE-merge `_knownAgents` sees the identical
+    // `knownPeerLastSeen` input either way. Ordering here is NOT
+    // cosmetic: the merge's `_knownAgents.set()` below synchronously
+    // re-derives `_activeAgents` -> `_presentPeers` (Task 8's carrier
+    // hold reads `_signalCarrierDownSince` there), so if forensics ran
+    // after that write, the hold would see this cycle's carrier verdict
+    // one write too late on exactly the tick a lone surviving peer's
+    // own staleness crosses — review C1, reproduced with a mid-cycle
+    // crossing (pingAgents() as the FIRST evaluator after the flip,
+    // ahead of the next presence tick).
+    this._emitPresenceForensics();
+
     const knownAgents = get(this._knownAgents);
     this.allAgents
       .map(agent => encodeHashToBase64(agent))
@@ -2535,17 +2629,67 @@ export class StreamsStore {
     // Flush any SdpData bursts that ended without a follow-up event.
     this._flushStaleSdpAggregates();
 
-    // Forensics: signal-carrier liveness + presence-set membership.
-    this._emitPresenceForensics();
+    // Forensics (signal-carrier liveness + presence-set membership)
+    // already ran at the top of this function, before the roster-merge
+    // write — see the comment there. Not repeated here (review C1: a
+    // second call this late would just be dead weight, since nothing
+    // between the two spots can change `_knownAgents`' lastSeen stamps).
+
+    // Signals media cadence: one evaluation per ping cycle, reading
+    // `_signalCarrierDownSince` from this cycle's forensics call above.
+    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
+    // targets — the healthiest link bounds what the relay can still
+    // deliver; targets with no sample yet contribute nothing, and no
+    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
+    // policy's declared design).
+    let bestRttEwmaMs: number | undefined;
+    for (const target of get(this._signalsTargets)) {
+      const rtt = this._signalsRttEwma.get(target);
+      if (rtt !== undefined && (bestRttEwmaMs === undefined || rtt < bestRttEwmaMs)) {
+        bestRttEwmaMs = rtt;
+      }
+    }
+    this._signalsCadence = decideSignalsMediaCadence({
+      carrierDown: this._signalCarrierDownSince !== undefined,
+      bestRttEwmaMs,
+      prevMode: this._signalsCadence.mode,
+    });
+  }
+
+  /** The signals media cadence the voice/filmstrip senders must obey —
+   *  see `_signalsCadence` for who evaluates it and when. */
+  signalsCadence(): SignalsMediaCadence {
+    return this._signalsCadence;
   }
 
   /**
-   * Per-ping-cycle forensics (diagnostic only, no behaviour change):
+   * True when EVERY current signals target's build declares `cap`
+   * (`conversationPayloadCaps` — the one capability read). The voice
+   * batching gate: `sendModuleData` is one broadcast for the whole target
+   * set, so a payload-format upgrade applies only when every recipient
+   * can parse it — a mixed room falls back to the legacy format for
+   * everyone. False with no targets (nothing to send to; senders gate on
+   * the target set first).
+   */
+  signalsTargetsAllHaveCap(cap: string): boolean {
+    const targets = get(this._signalsTargets);
+    if (targets.size === 0) return false;
+    for (const target of targets) {
+      if (!this._peerCaps(target).has(cap)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Per-ping-cycle forensics and the signal-carrier-down authority:
    *
-   *  - SignalCarrierDown/Up — inferred from pong freshness. If we know
-   *    peers but none have ponged within 3*PING_INTERVAL, the bidirectional
-   *    Holochain signal path is presumed down. Makes signal-relay outages
-   *    visible in merged logs — without this they are invisible.
+   *  - SignalCarrierDown/Up — delegates to `decideSignalCarrier`
+   *    (`presence-policy.ts`), which is down when at least one known
+   *    peer has ponged before but none of those ponged-at-least-once
+   *    peers is fresh within `SIGNAL_CARRIER_DOWN_MS`. Makes signal-relay
+   *    outages visible in merged logs, and the resulting
+   *    `_signalCarrierDownSince` feeds `decideSignalsMediaCadence`
+   *    (Tasks 7-8) — this is no longer forensic-only.
    *  - PresenceAdd/PresenceRemove — diff of `globalPresenceSet()` with the
    *    reason a peer entered (media-live / ping-fresh / observer-reported),
    *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
@@ -2558,23 +2702,49 @@ export class StreamsStore {
     const knownPeers = Object.keys(known).filter(
       k => k !== this.myPubKeyB64 && !blocked.includes(k),
     );
-    if (knownPeers.length > 0) {
-      const anyFresh = knownPeers.some(k => {
-        const ls = known[k]?.lastSeen;
-        return ls !== undefined && now - ls < 3 * PING_INTERVAL;
-      });
-      if (!anyFresh && this._signalCarrierDownSince === undefined) {
-        this._signalCarrierDownSince = now;
-        this.logger.logCustomMessage(
-          `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
-        );
-      } else if (anyFresh && this._signalCarrierDownSince !== undefined) {
-        const downMs = now - this._signalCarrierDownSince;
-        this._signalCarrierDownSince = undefined;
-        this.logger.logCustomMessage(
-          `SignalCarrierUp: pong path recovered after ${downMs}ms`,
-        );
-      }
+    // Peers with no `lastSeen` yet are deliberately excluded here, not
+    // passed through as a value `decideSignalCarrier` could treat as
+    // "not fresh" — there are three paths that leave `lastSeen`
+    // undefined: initial roster seeding (`this._knownAgents.update` in
+    // the all-agents subscription, ~2474), a peer-leave clear
+    // (~5715), and a told-only agent we've never received a Pong from
+    // directly (~5877). Declared behavior change from the old inline
+    // predicate: it counted a known-but-never-ponged peer as
+    // "not fresh", so a relay that was dead from the very first tick
+    // (nobody had ponged yet) logged a spurious SignalCarrierDown on
+    // tick 1. `decideSignalCarrier` cannot distinguish "never ponged"
+    // from "not here" and refuses to call either one channel death, so
+    // that dead-from-start detection is forfeited on purpose — it survives
+    // as long as at least one peer has ponged at least once and then
+    // goes stale.
+    const knownPeerLastSeen = knownPeers
+      .map(k => known[k]?.lastSeen)
+      .filter((ls): ls is number => ls !== undefined);
+    const prevDownSince = this._signalCarrierDownSince;
+    const carrierState = decideSignalCarrier({
+      knownPeerLastSeen,
+      prevDownSince,
+      now,
+    });
+    this._signalCarrierDownSince = carrierState.down
+      ? carrierState.downSince
+      : undefined;
+    if (carrierState.down && prevDownSince === undefined) {
+      // Immediate back-off, in the same breath as the flip: the per-tick
+      // evaluation in pingAgents() would land on 'paused' anyway, but the
+      // senders must not get frames into a relay that just proved dead
+      // for however long a caller-ordering change could delay that
+      // evaluation. Recovery is NOT forced here — it rides the per-tick
+      // evaluation and the policy's one-level-per-tick hysteresis.
+      this._signalsCadence = { mode: 'paused', reason: 'carrier-down' };
+      this.logger.logCustomMessage(
+        `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
+      );
+    } else if (!carrierState.down && prevDownSince !== undefined) {
+      const downMs = now - prevDownSince;
+      this.logger.logCustomMessage(
+        `SignalCarrierUp: pong path recovered after ${downMs}ms`,
+      );
     }
 
     const current = this.globalPresenceSet();
@@ -2616,17 +2786,35 @@ export class StreamsStore {
    * ping/pong, so the signals-carrier RTT EWMA is the correct latency
    * proxy. K is kept generous to absorb signal-relay retransmits; the
    * floor avoids an over-tight timeout on very low-RTT links; the ceiling
-   * equals today's fixed default so the change can never make a
-   * no-improvement case worse. K/FLOOR are provisional — see
-   * docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
+   * (`SDP_TIMEOUT_CEILING_MS`) is raised past today's fixed default —
+   * see that constant's comment for the field rationale. K/FLOOR are
+   * provisional — see docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
    */
   private _computeSdpTimeout(peerB64: AgentPubKeyB64): number | undefined {
     const rtt = this._signalsRttEwma.get(peerB64);
     if (rtt === undefined || rtt <= 0) return undefined;
-    const K = 20;
-    const FLOOR_MS = 5000;
-    const CEILING_MS = 15000;
-    return Math.min(CEILING_MS, Math.max(FLOOR_MS, Math.round(rtt * K)));
+    return Math.min(
+      SDP_TIMEOUT_CEILING_MS,
+      Math.max(SDP_TIMEOUT_FLOOR_MS, Math.round(rtt * SDP_TIMEOUT_RTT_MULTIPLIER))
+    );
+  }
+
+  /**
+   * Timeout (ms) for the store's own tracked SDP-exchange backstop timer
+   * — second-line cleanup for an FSM that wedges without ever emitting a
+   * phase transition. Deliberately NOT the same value as
+   * `_computeSdpTimeout` (the FSM's own per-attempt timeout, passed as
+   * `sdpExchangeTimeoutMs`): the backstop must always leave that timeout
+   * and its first in-place backoff retry undisturbed, so it is pinned
+   * strictly greater — `SDP_BACKSTOP_MULTIPLIER` (2x) times the
+   * per-attempt timeout, capped at `SDP_BACKSTOP_CEILING_MS`. Sharing the
+   * per-attempt value was Task 9's original defect (review C1): the
+   * backstop fired in the same tick as the FSM's own timeout and
+   * destroyed its in-place recovery attempt instead of letting it run.
+   */
+  private _computeSdpBackstopTimeout(peerB64: AgentPubKeyB64): number {
+    const perAttempt = this._computeSdpTimeout(peerB64) ?? SDP_EXCHANGE_TIMEOUT;
+    return Math.min(SDP_BACKSTOP_CEILING_MS, perAttempt * SDP_BACKSTOP_MULTIPLIER);
   }
 
   async changeVideoInput(deviceId: string) {
@@ -3405,6 +3593,18 @@ export class StreamsStore {
    */
   _presentPeers!: Readable<AgentPubKeyB64[]>;
 
+  /**
+   * The previous tick's `computePresentPeers` output — what
+   * `PRESENCE_CARRIER_HOLD_MAX_MS` holds alive while
+   * `_signalCarrierDownSince` is set. Updated at the end of every
+   * `_presentPeers` re-evaluation, so it is always exactly one
+   * evaluation stale by construction: the tick that reads it as
+   * `heldPresent` is deciding this tick's set from last tick's, never
+   * its own. Reset on `disconnect()` so a stale held set from a prior
+   * session can't leak into the next one.
+   */
+  private _lastComputedPresent: AgentPubKeyB64[] = [];
+
   /** State of the join/leave sound decision; see decidePresenceSoundEvents. */
   private _presenceSoundState: PresenceSoundState = INITIAL_PRESENCE_SOUND_STATE;
 
@@ -4154,11 +4354,30 @@ export class StreamsStore {
   private _lastWebrtcExitReason = new Map<AgentPubKeyB64, string>();
 
   /**
-   * Wall-clock ms since the signal carrier was inferred down (no pong from
-   * any known peer), or undefined while it is up. Drives the
-   * SignalCarrierDown/Up forensic events emitted from `pingAgents`.
+   * The **signal-carrier-down** authority's state: `this.clock` timestamp
+   * since `decideSignalCarrier` (`presence-policy.ts`) found no known
+   * peer ponged within `SIGNAL_CARRIER_DOWN_MS`, or undefined while it is
+   * up. Set from `_emitPresenceForensics`, which also emits the
+   * SignalCarrierDown/Up log lines on the transition. No longer
+   * forensic-only: this is the one field Tasks 7-8 (signals media
+   * cadence) read to decide `carrierDown` for
+   * `decideSignalsMediaCadence` (`transport/signals-cadence-policy.ts`).
    */
   private _signalCarrierDownSince: number | undefined;
+
+  /**
+   * The signals-carried media cadence — how much media the voice/filmstrip
+   * senders may put on the signals carrier right now. ONE authority:
+   * `decideSignalsMediaCadence` (`transport/signals-cadence-policy.ts`),
+   * re-evaluated once per presence tick in `pingAgents()` AFTER
+   * `_emitPresenceForensics` (so it reads this tick's carrier verdict),
+   * and forced to `paused` in the same breath as a carrier-down flip.
+   * Senders read it via `signalsCadence()`: voice sends in `full` and
+   * `voice-only` and drops frames while `paused`; filmstrip sends only in
+   * `full`. The gate is on the SEND — capture ownership stays with the
+   * reconcilers/`_signalsTargets`, so recovery needs no re-arm.
+   */
+  _signalsCadence: SignalsMediaCadence = { mode: 'full', reason: 'no-sample' };
 
   /**
    * Last computed `globalPresenceSet()`, kept so the ping cycle can diff
@@ -4804,15 +5023,28 @@ export class StreamsStore {
 
   /** Maximum number of attempts before marking a diagnostic request failed. */
   private static readonly DIAGNOSTIC_MAX_ATTEMPTS = 3;
-  /** Per-attempt timeout (ms) before retrying or giving up. */
+  /** Per-attempt timeout (ms) before retrying or giving up — the no-RTT-
+   *  sample default, and the floor for the RTT-scaled timeout below.
+   *  Diagnostic attempt cadence, NOT a liveness predicate. */
   private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MS = 8_000;
+  /** Ceiling for the RTT-scaled diagnostic attempt timeout
+   *  (`_computeDiagnosticAttemptTimeout`). Diagnostic attempt cadence,
+   *  NOT a liveness predicate. Field observation (2026-08-11): diagnostic
+   *  requests failed 3x8s against the same 20-58s signals RTTs that were
+   *  blowing the SDP-exchange ceiling — the retries were noise, not
+   *  recovery attempts. */
+  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS = 30_000;
+  /** RTT multiplier for the diagnostic attempt timeout
+   *  (`_computeDiagnosticAttemptTimeout`). */
+  private static readonly DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER = 4;
 
   /**
    * Request diagnostic logs from a specific peer (or, with no argument,
    * every peer in this conversation) via Holochain signal. Retries up to
-   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within
-   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS per attempt. Peers that exhaust retries
-   * land in `_failedDiagnosticRequests`.
+   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within the
+   * per-attempt timeout (`_computeDiagnosticAttemptTimeout` — RTT-scaled,
+   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS with no RTT sample). Peers that exhaust
+   * retries land in `_failedDiagnosticRequests`.
    *
    * The room-level recipient set is the union of `_conversationParticipants`
    * (peers we have had a media connection with this session, incl. ones who
@@ -4846,6 +5078,29 @@ export class StreamsStore {
 
     this.logger.logCustomMessage(
       `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
+    );
+  }
+
+  /**
+   * RTT-scaled diagnostic-attempt timeout (ms) for `peerB64`. Reuses the
+   * same signals RTT EWMA that scales the SDP-exchange timeout
+   * (`_computeSdpTimeout`) — a slow signals path gets a diagnostic
+   * round-trip window it can actually clear instead of retrying blind.
+   * No RTT sample yet -> the fixed DIAGNOSTIC_ATTEMPT_TIMEOUT_MS default
+   * (unchanged behaviour). Diagnostic attempt cadence, NOT a liveness
+   * predicate.
+   */
+  private _computeDiagnosticAttemptTimeout(peerB64: AgentPubKeyB64): number {
+    const rtt = this._signalsRttEwma.get(peerB64);
+    if (rtt === undefined || rtt <= 0) {
+      return StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS;
+    }
+    return Math.min(
+      StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS,
+      Math.max(
+        StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS,
+        Math.round(rtt * StreamsStore.DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER)
+      )
     );
   }
 
@@ -4890,7 +5145,7 @@ export class StreamsStore {
         });
         this._failedDiagnosticRequests.update(curr => ({ ...curr, [peerB64]: true }));
       }
-    }, StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS);
+    }, this._computeDiagnosticAttemptTimeout(peerB64));
   }
 
   /**
@@ -6312,12 +6567,18 @@ export class StreamsStore {
 
           delete this._pendingInits[pubKey64];
 
-          // SDP exchange timeout: if still not connected after 15s, clean
-          // up and retry. The timer is ATTEMPT-scoped and TRACKED (§9
-          // item 5): it may only tear down the attempt that armed it — a
-          // successor attempt's slot must survive this timer firing — and
-          // a new attempt for the same peer disarms the previous timer,
-          // as does disconnect().
+          // Second-line backstop: if the FSM wedges without ever emitting
+          // a phase transition, this store-level timer cleans up and lets
+          // the next ping/pong cycle retry. Deliberately NOT the same
+          // window as the FSM's own per-attempt SDP timeout above
+          // (`sdpExchangeTimeoutMs: _computeSdpTimeout(...)`) — it is
+          // `_computeSdpBackstopTimeout`, pinned strictly greater (2x, own
+          // ceiling) so it never preempts the FSM's own timeout and first
+          // in-place backoff retry (review C1). The timer is
+          // ATTEMPT-scoped and TRACKED (§9 item 5): it may only tear down
+          // the attempt that armed it — a successor attempt's slot must
+          // survive this timer firing — and a new attempt for the same
+          // peer disarms the previous timer, as does disconnect().
           const priorSdpTimer = this._sdpTimeoutTimers[pubKey64];
           if (priorSdpTimer !== undefined) this.clock.clearTimeout(priorSdpTimer);
           this._sdpTimeoutTimers[pubKey64] = this.clock.setTimeout(() => {
@@ -6339,7 +6600,7 @@ export class StreamsStore {
               });
             }
             this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
-          }, SDP_EXCHANGE_TIMEOUT);
+          }, this._computeSdpBackstopTimeout(pubKey64));
         }
       }
     }

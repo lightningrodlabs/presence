@@ -71,17 +71,21 @@ export type DefaultReconnectPolicyOptions = {
 export class DefaultReconnectPolicy implements ReconnectPolicy {
   readonly maxAttempts: number;
   private _iceRestartMaxAttempts: number;
-  private _baseDelayMs: number;
-  private _maxDelayMs: number;
-  private _jitterMs: number;
+  /** Pacing fields — public so the FSM's disconnected-state auto-retry (a
+   *  separate backoff formula from `nextRetryDelayMs`, see `ReconnectPolicy`)
+   *  can read this instance's actual configured values instead of a second,
+   *  possibly-stale copy of the defaults. */
+  readonly baseDelayMs: number;
+  readonly maxDelayMs: number;
+  readonly jitterMs: number;
 
   constructor(options?: DefaultReconnectPolicyOptions) {
     this.maxAttempts = options?.maxAttempts ?? DEFAULT_RECONNECT_OPTIONS.maxAttempts;
     this._iceRestartMaxAttempts =
       options?.iceRestartMaxAttempts ?? DEFAULT_RECONNECT_OPTIONS.iceRestartMaxAttempts;
-    this._baseDelayMs = options?.baseDelayMs ?? DEFAULT_RECONNECT_OPTIONS.baseDelayMs;
-    this._maxDelayMs = options?.maxDelayMs ?? DEFAULT_RECONNECT_OPTIONS.maxDelayMs;
-    this._jitterMs = options?.jitterMs ?? DEFAULT_RECONNECT_OPTIONS.jitterMs;
+    this.baseDelayMs = options?.baseDelayMs ?? DEFAULT_RECONNECT_OPTIONS.baseDelayMs;
+    this.maxDelayMs = options?.maxDelayMs ?? DEFAULT_RECONNECT_OPTIONS.maxDelayMs;
+    this.jitterMs = options?.jitterMs ?? DEFAULT_RECONNECT_OPTIONS.jitterMs;
   }
 
   nextRetryDelayMs(context: ReconnectContext): number | null {
@@ -90,10 +94,10 @@ export class DefaultReconnectPolicy implements ReconnectPolicy {
     }
 
     const n = context.retryCount;
-    const baseDelay = Math.min(n * n * this._baseDelayMs, this._maxDelayMs);
+    const baseDelay = Math.min(n * n * this.baseDelayMs, this.maxDelayMs);
 
     // Add jitter after first attempt to prevent thundering herd
-    const jitter = n > 0 ? Math.floor(Math.random() * this._jitterMs) : 0;
+    const jitter = n > 0 ? Math.floor(Math.random() * this.jitterMs) : 0;
 
     return baseDelay + jitter;
   }

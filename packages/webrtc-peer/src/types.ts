@@ -56,7 +56,7 @@ export const VALID_TRANSITIONS: Record<ConnectionPhase, Set<ConnectionPhase>> = 
   connecting:    new Set(['connected', 'signaling', 'disconnected', 'closed']),
   connected:     new Set(['reconnecting', 'disconnected', 'failed', 'closed']),
   reconnecting:  new Set(['reconnecting', 'signaling', 'connected', 'disconnected', 'failed', 'closed']),
-  disconnected:  new Set(['signaling', 'idle', 'closed']),
+  disconnected:  new Set(['signaling', 'idle', 'failed', 'closed']),
   failed:        new Set(['idle', 'closed']),
   closed:        new Set([]),  // terminal — no transitions out
 };
@@ -429,6 +429,21 @@ export interface ReconnectPolicy {
 
   /** Maximum number of retry attempts */
   readonly maxAttempts: number;
+
+  /**
+   * Pacing fields for the FSM's `disconnected`-state auto-retry (distinct
+   * from `nextRetryDelayMs`, which paces `reconnecting`-state attempts):
+   * delay = `min(maxDelayMs, baseDelayMs * 2 ** attempt) + random(0, jitterMs)`.
+   * Optional so a minimal custom `ReconnectPolicy` (e.g. a test double
+   * supplying only `nextRetryDelayMs`/`strategy`/`maxAttempts`) still
+   * type-checks; the FSM falls back to `DEFAULT_RECONNECT_OPTIONS` when a
+   * policy omits them. `DefaultReconnectPolicy` exposes the exact values
+   * `nextRetryDelayMs` itself uses, so there is one source of truth per
+   * policy instance.
+   */
+  readonly baseDelayMs?: number;
+  readonly maxDelayMs?: number;
+  readonly jitterMs?: number;
 }
 
 // ---------------------------------------------------------------------------

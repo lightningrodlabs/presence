@@ -51,6 +51,7 @@ const OFF: Omit<CloseCleanupPlan, 'reason'> = {
   recordLastDisconnect: false,
   clearLastDisconnectTime: false,
   clearLastReconcileTime: false,
+  clearSignalsRttEwma: false,
   clearPerceivedStreamInfo: false,
   removeAudioAnalyser: false,
   clearWebrtcStats: false,
@@ -95,6 +96,9 @@ describe('closeCleanupPlan — the media full close set, pinned field-by-field',
     // stamp (retry-gap semantics), a leave wipes it (§9 item 5).
     clearLastDisconnectTime: false,
     clearLastReconcileTime: false,
+    // Same rule for the signals-RTT EWMA (review M5): a plain close keeps
+    // the entry (the peer's link is what it is), a leave wipes it.
+    clearSignalsRttEwma: false,
     clearPerceivedStreamInfo: true,
     removeAudioAnalyser: true,
     clearWebrtcStats: true,
@@ -228,6 +232,10 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
       // session's init-retry cooldown or reconcile throttle.
       clearLastDisconnectTime: true,
       clearLastReconcileTime: true,
+      // Review M5: nor its signals-RTT EWMA — a collapsed EWMA from the
+      // departed session would pause media on a healthy rejoin for ~5
+      // ticks of hysteresis walk-back.
+      clearSignalsRttEwma: true,
       setDisconnectedStatus: 'media',
     });
   });
@@ -243,6 +251,7 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
       clearQualityBucket: true,
       clearLastDisconnectTime: true,
       clearLastReconcileTime: true,
+      clearSignalsRttEwma: true,
       setDisconnectedStatus: 'media',
     });
   });
@@ -320,6 +329,12 @@ describe('closeCleanupPlan — cross-table invariants', () => {
         expect(plan.clearStaleCycles, JSON.stringify(ctx)).toBe(false);
         expect(plan.teardownOutgoingScreenShare, JSON.stringify(ctx)).toBe(false);
         expect(plan.fireEvent, JSON.stringify(ctx)).not.toBe('peer-disconnected');
+        expect(plan.clearSignalsRttEwma, JSON.stringify(ctx)).toBe(false);
+      }
+      // The signals-RTT EWMA delete is a rejoin-inheritance clear
+      // (review M5): peer-leave rows only, like the cooldown deletes.
+      if (ctx.via !== 'peer-leave') {
+        expect(plan.clearSignalsRttEwma, JSON.stringify(ctx)).toBe(false);
       }
       if (ctx.target !== 'screen-share-incoming') {
         expect(plan.clearScreenShareStream, JSON.stringify(ctx)).toBe(false);

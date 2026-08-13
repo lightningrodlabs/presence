@@ -63,7 +63,8 @@
   },
   "caps": [
     "sdp-fsm",
-    "sdp-fsm-screen"
+    "sdp-fsm-screen",
+    "voice-batch-v1"
   ],
   "conversationPayload": {
     "writes": [
