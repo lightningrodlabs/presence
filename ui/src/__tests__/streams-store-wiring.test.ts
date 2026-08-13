@@ -7,6 +7,7 @@ import {
   SDP_EXCHANGE_TIMEOUT,
   SDP_TIMEOUT_CEILING_MS,
   SDP_BACKSTOP_MULTIPLIER,
+  SDP_BACKSTOP_RETRY_HEADROOM_MS,
 } from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
@@ -1020,11 +1021,14 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
   }
 
   // The store's tracked SDP backstop with no RTT sample: SDP_EXCHANGE_TIMEOUT
-  // (the FSM's own no-sample default) * SDP_BACKSTOP_MULTIPLIER (review C1 —
-  // the backstop is pinned strictly greater than the FSM's per-attempt
-  // timeout, never equal to it; see _computeSdpBackstopTimeout). This is a
-  // declared change from the pre-review-C1 value of a flat SDP_EXCHANGE_TIMEOUT.
-  const NO_SAMPLE_BACKSTOP_MS = SDP_EXCHANGE_TIMEOUT * SDP_BACKSTOP_MULTIPLIER;
+  // (the FSM's own no-sample default) * SDP_BACKSTOP_MULTIPLIER, plus
+  // SDP_BACKSTOP_RETRY_HEADROOM_MS (review C1 — the backstop is pinned
+  // strictly greater than the FSM's per-attempt timeout AND its first
+  // in-place backoff retry, never equal to either; see
+  // _computeSdpBackstopTimeout). This is a declared change from the
+  // pre-review-C1 value of a flat SDP_EXCHANGE_TIMEOUT.
+  const NO_SAMPLE_BACKSTOP_MS =
+    SDP_EXCHANGE_TIMEOUT * SDP_BACKSTOP_MULTIPLIER + SDP_BACKSTOP_RETRY_HEADROOM_MS;
 
   it('the initiator slot install goes through the slot policy; the tracked SDP timer tears down its own attempt', async () => {
     const started = makeStarted();
@@ -1047,7 +1051,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(lastSdpOverride(media)).toBeUndefined();
 
     // The attempt never connects: ITS OWN backstop timer fires and tears
-    // it down, at NO_SAMPLE_BACKSTOP_MS (30_000) — NOT the plain
+    // it down, at NO_SAMPLE_BACKSTOP_MS (38_000) — NOT the plain
     // SDP_EXCHANGE_TIMEOUT (15_000) it used before review C1.
     clock.advance(NO_SAMPLE_BACKSTOP_MS - 1);
     expect(get(store._openConnections)[peerA]).toBeDefined();
@@ -1147,8 +1151,8 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
 
     // The store's own tracked backstop is deliberately NOT the same value
     // (review C1 — sharing it destroyed the FSM's in-place recovery retry
-    // mid-flight): min(SDP_BACKSTOP_CEILING_MS, 2 * 30_000) = 60_000.
-    clock.advance(2 * SDP_TIMEOUT_CEILING_MS - 1);
+    // mid-flight): min(SDP_BACKSTOP_CEILING_MS, 2 * 30_000 + 8_000) = 68_000.
+    clock.advance(2 * SDP_TIMEOUT_CEILING_MS + SDP_BACKSTOP_RETRY_HEADROOM_MS - 1);
     expect(get(store._openConnections)[peerA]).toBeDefined();
     clock.advance(1);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
@@ -1170,9 +1174,10 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     // FSM override: 20 * 400 = 8_000 — unaffected by review C1.
     expect(lastSdpOverride(media)).toBe(8_000);
 
-    // Backstop: 2 * 8_000 = 16_000. Before review C1 this timer shared
-    // the override's value (8_000) and would already have fired by now.
-    clock.advance(15_999);
+    // Backstop: 2 * 8_000 + 8_000 = 24_000. Before review C1 this timer
+    // shared the override's value (8_000) and would already have fired
+    // by now.
+    clock.advance(23_999);
     expect(get(store._openConnections)[peerA]).toBeDefined();
     clock.advance(1);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
@@ -1188,17 +1193,17 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
       expectedBackstop: number;
     }> = [
       // No sample: FSM falls back to its own default (undefined here);
-      // the backstop is 2x SDP_EXCHANGE_TIMEOUT.
-      { rttMs: undefined, expectedOverride: undefined, expectedBackstop: 30_000 },
+      // the backstop is 2x SDP_EXCHANGE_TIMEOUT plus the retry headroom.
+      { rttMs: undefined, expectedOverride: undefined, expectedBackstop: 38_000 },
       // Below the floor multiplier: unaffected by either ceiling.
-      { rttMs: 400, expectedOverride: 8_000, expectedBackstop: 16_000 },
-      // Ceiling-bound override: the backstop's own doubling still clears
-      // its own ceiling comfortably (60_000 < SDP_BACKSTOP_CEILING_MS's
-      // cap point isn't hit until 2x would exceed it).
-      { rttMs: 2_000, expectedOverride: 30_000, expectedBackstop: 60_000 },
+      { rttMs: 400, expectedOverride: 8_000, expectedBackstop: 24_000 },
+      // Ceiling-bound override: the backstop's own doubling plus headroom
+      // lands exactly at SDP_BACKSTOP_CEILING_MS (68_000), by construction
+      // (SDP_BACKSTOP_CEILING_MS = 2 * SDP_TIMEOUT_CEILING_MS + headroom).
+      { rttMs: 2_000, expectedOverride: 30_000, expectedBackstop: 68_000 },
       // Deep into the plausible RTT range: override still ceiling-bound,
-      // backstop still just the doubled ceiling.
-      { rttMs: 5_000, expectedOverride: 30_000, expectedBackstop: 60_000 },
+      // backstop still just the doubled ceiling plus headroom.
+      { rttMs: 5_000, expectedOverride: 30_000, expectedBackstop: 68_000 },
     ];
 
     for (const { rttMs, expectedOverride, expectedBackstop } of cases) {
@@ -1433,6 +1438,59 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     expect(moduleData(bus, 'voice')).toHaveLength(0);
   });
 
+  it('carrier recovery resets the stale RTT EWMA to the degraded threshold — cadence resumes at voice-only on the recovery tick, not the paused wait nor a bare full jump (final-review wave F5, amended per re-review N2)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, logger } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+
+    // Collapse the RTT EWMA well past SIGNALS_RTT_COLLAPSED_MS.
+    await bus.deliver(pongEchoing(started, SIGNALS_RTT_COLLAPSED_MS + 5_000));
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'rtt-collapsed',
+    });
+
+    // Silence pongs for SIGNAL_CARRIER_DOWN_MS: the carrier itself drops.
+    clock.advance(SIGNAL_CARRIER_DOWN_MS);
+    await store.pingAgents();
+    expect(store.signalsCadence()).toEqual({
+      mode: 'paused',
+      reason: 'carrier-down',
+    });
+    expect(
+      logger.customMessages.some(m => m.startsWith('SignalCarrierDown'))
+    ).toBe(true);
+
+    // Recovery: a fresh, healthy pong arrives and the carrier flips up.
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(pongEchoing(started, 0));
+    await store.pingAgents();
+    expect(
+      logger.customMessages.some(m => m.startsWith('SignalCarrierUp'))
+    ).toBe(true);
+
+    // The up-flip resets the collapsed-era EWMA sample to
+    // SIGNALS_RTT_DEGRADED_MS, not delete (N2): no stale collapsed
+    // reading survives the flip, but the probe lands at voice-only, not a
+    // bare jump straight to full sending both voice and filmstrip into a
+    // relay that just recovered.
+    expect(store.signalsCadence()).toEqual({
+      mode: 'voice-only',
+      reason: 'rtt-degraded',
+    });
+    sendFilmstripClip();
+    encodeVoiceFrame();
+    await flush();
+    expect(moduleData(bus, 'video-filmstrip')).toHaveLength(0);
+    expect(moduleData(bus, 'voice')).toHaveLength(1);
+
+    // A fresh, healthy pong then walks the EWMA down and the cadence on
+    // to full, same as any other recovery from voice-only.
+    await walkRecovery(started, mode => mode === 'voice-only');
+    expect(store.signalsCadence().mode).toBe('full');
+  });
+
   it('voice-only cadence (degraded RTT) drops filmstrip clips but keeps voice flowing', async () => {
     const started = makeStarted();
     const { store, clock, bus } = started;
@@ -1462,6 +1520,9 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     store._knownAgents.set(knownFresh(clock, peerA));
     await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
     expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(true);
+    // The batching gate (F2) is a once-per-tick cache read via
+    // voiceBatchEligible() — a tick must run before the sender sees it.
+    await store.pingAgents();
 
     // Two frames buffer; the third flushes ONE packed signal.
     encodeVoiceFrame(0);
@@ -1526,6 +1587,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     const { store, clock, bus } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
     await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    await store.pingAgents(); // F2: batching gate is a once-per-tick cache
 
     encodeVoiceFrame();
     encodeVoiceFrame();
@@ -1559,6 +1621,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     const { store, clock, bus } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
     await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    await store.pingAgents(); // F2: batching gate is a once-per-tick cache
 
     // Two frames buffered pre-pause — stale audio by resume time.
     encodeVoiceFrame(111);
@@ -1601,6 +1664,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     const { store, clock, bus } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
     await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    await store.pingAgents(); // F2: batching gate is a once-per-tick cache
 
     // Two frames buffer under the cap gate…
     encodeVoiceFrame(111);
@@ -1608,9 +1672,14 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     await flush();
     expect(moduleData(bus, 'voice')).toHaveLength(0);
 
-    // …then a caps-silent peer becomes a signals target (mixed room).
+    // …then a caps-silent peer becomes a signals target (mixed room). The
+    // flip is a raw-evaluation fact immediately, but the sender only sees
+    // it on the next tick (F2 — the flip now takes effect within one
+    // tick, not same-chunk; the mid-batch flush below is what makes that
+    // safe, so this is a declared cadence change, not a regression).
     store._knownAgents.set(knownFresh(clock, peerA, peerB));
     expect(store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)).toBe(false);
+    await store.pingAgents();
 
     // The next frame flushes the buffered two per-frame FIRST, then
     // itself: 3 legacy sends in seq order — nothing stranded, nothing
@@ -1625,6 +1694,107 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
     expect(parsed.map(p => p.seq)).toEqual([0, 1, 2]);
     expect(parsed.map(p => p.ts)).toEqual([111, 222, 333]);
+  });
+
+  it('a caps-silent peer\'s first pong grows the target set synchronously — the batch gate closes within the same tick, not just at the next pingAgents (re-review N1)', async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    await store.pingAgents(); // batching gate active for peer A alone
+
+    // Two frames buffer under the cap gate.
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // A caps-silent peer B's FIRST pong arrives — no pingAgents() call
+    // anywhere in this test after this point. B enters _knownAgents ->
+    // _activeAgents -> _presentPeers -> _signalsTargets synchronously off
+    // the pong handler, inside this single bus.deliver.
+    await bus.deliver(
+      message(
+        peerBKey,
+        'PongUi',
+        JSON.stringify({
+          formatVersion: 1,
+          data: { connectionStatuses: {} },
+        })
+      )
+    );
+    expect(get(store._signalsTargets).has(peerB)).toBe(true);
+
+    // The next chunk, encoded in the SAME tick, must go out legacy
+    // per-frame to both targets — NOT a v2 batch, which every released
+    // build's decoder would throw on for B (bare JSON.parse, seq
+    // undefined). Before the fix, `_voiceBatchCapAllTargets` stayed
+    // stale-true from peer A's tick and this chunk (plus the 2 buffered)
+    // would have gone out as one v2 batch instead.
+    encodeVoiceFrame(333);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(3);
+    const parsed = sent.map(s => JSON.parse(s.chunk) as { v?: number });
+    expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("pumpEncoder's mute branch clears the batch buffer — a mute discards stale pre-mute frames (final-review wave F4)", async () => {
+    const started = makeStarted();
+    const { store, clock, bus } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsDeclaration([CAP_VOICE_BATCH]));
+    await store.pingAgents(); // F2: batching gate is a once-per-tick cache
+
+    // Two frames buffer pre-mute — stale audio by unmute time.
+    encodeVoiceFrame(111);
+    encodeVoiceFrame(222);
+    await flush();
+    expect(moduleData(bus, 'voice')).toHaveLength(0);
+
+    // Drive pumpEncoder's mute branch directly against a disabled track,
+    // without standing up a full WebCodecs/MediaStreamTrackProcessor
+    // harness: one queued read, then done. If the mute check regressed
+    // and `encode()` ran anyway, the stub throws and fails the test loudly.
+    const controller = voiceController as unknown as {
+      micHandle: { track: { enabled: boolean } } | null;
+      pipelineGeneration: number;
+      encoder: { state: string; encode: (d: unknown) => void } | null;
+      encoderReader: {
+        read: () => Promise<{ done: boolean; value?: unknown }>;
+      } | null;
+      pumpEncoder(gen: number): Promise<void>;
+    };
+    controller.micHandle = { track: { enabled: false } };
+    controller.encoder = {
+      state: 'configured',
+      encode: () => {
+        throw new Error('must not encode while the track is disabled');
+      },
+    };
+    let reads = 0;
+    controller.encoderReader = {
+      read: async () => {
+        reads += 1;
+        return reads === 1 ? { done: false, value: {} } : { done: true };
+      },
+    };
+    controller.pipelineGeneration += 1;
+    await controller.pumpEncoder(controller.pipelineGeneration);
+
+    // Re-enable and encode fresh frames: the first post-unmute flush must
+    // carry only the fresh trio, not the stale pre-mute pair.
+    encodeVoiceFrame(444);
+    encodeVoiceFrame(555);
+    encodeVoiceFrame(666);
+    await flush();
+    const sent = moduleData(bus, 'voice');
+    expect(sent).toHaveLength(1);
+    const batch = JSON.parse(sent[0].chunk) as {
+      frames: Array<{ seq: number; ts: number }>;
+    };
+    expect(batch.frames.map(f => f.ts)).toEqual([444, 555, 666]);
+    expect(batch.frames.map(f => f.seq)).toEqual([2, 3, 4]);
   });
 
   it('recovery walks paused → voice-only → full via the per-tick re-evaluation, and sends resume (review I3)', async () => {

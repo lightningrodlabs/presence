@@ -7,7 +7,6 @@ import type { ModuleDefinition } from './types';
 import type { StreamsStore } from '../../streams-store';
 import type { MicAcquireResult } from '../../mic-source';
 import { Clock, systemClock } from '../../clock';
-import { CAP_VOICE_BATCH } from '../../transport/wire-contract';
 
 /**
  * How long a playout anchor stays projectable after it was set. NOT a
@@ -183,8 +182,9 @@ class VoiceController {
 
   /**
    * Frames accumulated toward the next batched send (see
-   * `handleEncodedChunk`). Non-empty only while every current signals
-   * target advertises `CAP_VOICE_BATCH`. Dropped — never sent — on
+   * `handleEncodedChunk`). Non-empty only while `store.voiceBatchEligible()`
+   * (every current signals target advertised `CAP_VOICE_BATCH` as of the
+   * last presence tick). Dropped — never sent — on
    * `stopCapture()`: by then the buffered audio is stale, and a trailing
    * send would race the reconciler teardown that stopped the capture.
    */
@@ -425,6 +425,12 @@ class VoiceController {
         // without voice having to subscribe to any separate mute event.
         const track = this.micHandle?.track;
         if (track && track.enabled === false) {
+          // Same rationale as the paused-cadence clear in
+          // handleEncodedChunk (review I1, final-review wave F4): frames
+          // buffered before a mute are stale by the whole mute duration —
+          // left in place they would lead the first post-unmute flush,
+          // resetting playout and poisoning av-sync on the receiver.
+          this.batchBuffer = [];
           continue;
         }
         if (this.encoder && this.encoder.state === 'configured') {
@@ -475,7 +481,7 @@ class VoiceController {
     // legacy). Batching adds ≤ VOICE_BATCH_FRAMES × 20 ms = 60 ms send
     // latency — inside the 80 ms jitter buffer. Receivers parse both
     // formats regardless of capability (`unpackVoicePayload`).
-    if (this.store.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)) {
+    if (this.store.voiceBatchEligible()) {
       // RED stays at `redundancy` (2) and rides the batch's PRIMARY —
       // its first frame: at this point `redBuffer` holds exactly the
       // frames preceding the batch, i.e. the ones a lost previous packet
