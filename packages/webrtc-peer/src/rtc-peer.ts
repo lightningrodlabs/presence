@@ -37,11 +37,20 @@ export type RTCPeerOptions = {
 };
 
 /**
- * Outbound trickle filter. Active-TCP candidates advertise the discard port
- * (9) and cannot be connected to by the remote; libwebrtc re-emits identical
- * candidates per m-section under bundle. Both classes only pad the signaling
- * channel — the 2026-08-11 field logs show ~35-candidate floods per retry,
- * roughly half of them tcp:9 repeats. End-of-candidates ('' ) always passes.
+ * Outbound trickle filter, two independent arms. Active-TCP candidates
+ * advertise the discard port (9) and cannot be connected to by the
+ * remote — the tcp-active arm drops them outright and does the bulk of
+ * the filtering by volume (the 2026-08-11 field logs show ~35-candidate
+ * floods per retry, roughly half of them tcp:9 repeats). The duplicate
+ * arm is keyed `${sdpMid}|${candidate}`, so it catches only an EXACT
+ * same-mid re-emission (the same candidate string handed to us again for
+ * a mid we already sent it on, e.g. a renegotiation re-firing the
+ * candidate callback) — a candidate string repeating across DIFFERENT
+ * mids under bundle is deliberately NOT deduped, since a non-bundled
+ * remote peer needs its own copy per m-section (corrected final-review
+ * wave F6, 2026-08-13 — a prior version of this comment attributed the
+ * duplicate arm to per-m-section repeats, which is exactly the case it
+ * lets through). End-of-candidates ('') always passes.
  */
 export function shouldTrickleCandidate(
   candidate: RTCIceCandidateInit,
@@ -260,9 +269,16 @@ export class RTCPeer {
   restartIce(): void {
     if (this._destroyed) return;
     // An ICE restart starts a new candidate generation on the same pc, so
-    // the dedupe namespace resets with it — otherwise a re-gathered
-    // byte-identical candidate (ufrag lives in separate SDP lines, not the
-    // candidate attribute) is wrongly suppressed as a stale duplicate.
+    // the dedupe namespace resets with it. Chromium's candidate attribute
+    // does carry ufrag/generation, so most re-gathered candidates already
+    // come out byte-different and would clear the dedupe on their own
+    // merits; this CLEAR is defense for agents whose candidate strings
+    // omit them (or repeat a generation), where a re-gathered candidate
+    // could otherwise be byte-identical to one from the restarted
+    // session and get wrongly suppressed as a stale duplicate (corrected
+    // final-review wave F6, 2026-08-13 — a prior version of this comment
+    // claimed ufrag never appears in the candidate attribute, which is
+    // wrong for Chromium).
     this._sentCandidateKeys.clear();
     this.pc.restartIce();
   }

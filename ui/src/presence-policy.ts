@@ -208,6 +208,41 @@ export function decideSignalCarrier(inputs: {
  */
 export const PRESENCE_CARRIER_HOLD_MAX_MS = 30_000;
 
+/**
+ * DECLARED GAP (final-review wave F3, 2026-08-13): the hold above keys
+ * strictly on `carrierDownSince` — the signals CARRIER being unreachable.
+ * It does not cover the signals-media cadence's `paused`/`rtt-collapsed`
+ * band (`decideSignalsMediaCadence`, `transport/signals-cadence-policy.ts`),
+ * where the carrier is up but every voice/filmstrip sender has stopped
+ * putting media on it. Before the connection-thrash round, voice frames
+ * flowing on signals were themselves media-live evidence
+ * (`isMediaLive`/`lastVoiceMs`); in the paused band that evidence goes
+ * dark by design, so a peer whose pongs are ALSO lost for
+ * `PRESENT_STALENESS_MS` in that band drops out of `_presentPeers` even
+ * though the underlying link may still be fine — a flap this hold does
+ * not smooth over.
+ *
+ * DECISION: declare, don't extend. `computePresentPeers` stays
+ * evidence-honest — while WE have chosen to stop sending, the only
+ * honest evidence of the peer's continued presence is pongs, and the
+ * hold's whole justification ("a dead relay is channel evidence, not
+ * peer evidence") does not hold here: the relay isn't dead, we chose
+ * silence. Extending the hold to cover a self-inflicted pause would let
+ * the present set outlive both forms of evidence at once. The exposure
+ * is bounded: nobody is sending media while paused, so there is no
+ * mutual-drop amplifier (contrast the carrier-down case, where an
+ * over-eager drop can itself suppress the pongs that would recover it);
+ * `decidePresenceSoundEvents`'s leave dwell (`PRESENCE_LEAVE_DWELL_MS`)
+ * still filters a flap shorter than 2 ticks from making a leave sound.
+ *
+ * What would change this: field evidence of visible flapping in rooms
+ * with a collapsed-but-still-alive relay (RTT bad enough to pause media,
+ * not bad enough to lose pongs) would justify adding a `pausedSince`
+ * input to `PresentPeersSnapshot` and a second hold term here — not
+ * reusing `carrierDownSince` for a condition it does not describe (working
+ * agreement 2: a new threshold names the predicate it serves).
+ */
+
 export interface PresentPeersSnapshot {
   /** Keys of the ping-fresh set (already excludes self and blocked). */
   activeAgents: AgentPubKeyB64[];

@@ -60,20 +60,27 @@ export function statsForPeer(snap: PeerStatsSnapshot): PeerStats {
 // ---------------------------------------------------------------------------
 
 /**
- * Plausibility bound on a single pong-echo RTT sample. Serves the
- * signals-STATS display predicate only — a sample at or above this is a
- * clock artifact (peer wall-clock step, machine resumed from sleep), not
- * a measurement, and is dropped rather than folded. This is NOT a
- * liveness window; liveness predicates live in `presence-policy.ts`.
+ * Plausibility bound on a single pong-echo RTT sample — a sample at or
+ * above this is a clock artifact (peer wall-clock step, machine resumed
+ * from sleep), not a measurement, and is dropped rather than folded.
+ * NOT-liveness (working agreement 2): this bounds a control/display
+ * input, never a presence or reachability predicate — those live in
+ * `presence-policy.ts`. Since the connection-thrash round the folded
+ * value (`_signalsRttEwma`) feeds more than display: it is
+ * `decideSignalsMediaCadence`'s `bestRttEwmaMs` input
+ * (`signals-cadence-policy.ts`) and both `_computeSdpTimeout` and
+ * `_computeSdpBackstopTimeout`'s RTT-scaled ceilings (`streams-store.ts`)
+ * — cadence/timeout control and display, not display alone.
  */
 export const SIGNALS_RTT_PLAUSIBLE_MAX_MS = 60_000;
 
 /**
- * EWMA smoothing factor for the signals-carrier RTT display. 0.3 gives a
+ * EWMA smoothing factor for the signals-carrier RTT. 0.3 gives a
  * ~3-sample effective window: enough to stop single-cycle jitter from
  * making the stats panel jump, small enough to track a real change
- * within a few ping cadences. Display smoothing only — same predicate
- * note as `SIGNALS_RTT_PLAUSIBLE_MAX_MS`.
+ * within a few ping cadences. NOT-liveness (working agreement 2) — same
+ * predicate note as `SIGNALS_RTT_PLAUSIBLE_MAX_MS`: cadence/timeout
+ * control and display, not display smoothing alone.
  */
 export const SIGNALS_RTT_EWMA_ALPHA = 0.3;
 

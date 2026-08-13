@@ -92,11 +92,14 @@ export const CAP_SDP_FSM_SCREEN = 'sdp-fsm-screen';
  *  (`{ v: 2, frames }` — `packVoiceFrames`, `room/modules/voice.ts`). NOT a
  *  signal-type gate: `ModuleData` itself stays baseline; this gates a
  *  payload *format* upgrade. The production gate is
- *  `StreamsStore.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)` in the voice
- *  sender — one broadcast serves the whole target set, so batches are
- *  emitted only when every current signals target declares this; a mixed
- *  room falls back to the legacy per-frame payload for everyone. Receivers
- *  parse both formats regardless (`unpackVoicePayload`). */
+ *  `StreamsStore.signalsTargetsAllHaveCap(CAP_VOICE_BATCH)`, evaluated
+ *  once per presence tick into `_voiceBatchCapAllTargets` and read by the
+ *  voice sender via `voiceBatchEligible()` (final-review wave F2 — moved
+ *  off the per-chunk send path) — one broadcast serves the whole target
+ *  set, so batches are emitted only when every current signals target
+ *  declares this; a mixed room falls back to the legacy per-frame payload
+ *  for everyone. Receivers parse both formats regardless
+ *  (`unpackVoicePayload`). */
 export const CAP_VOICE_BATCH = 'voice-batch-v1';
 
 export type WireCap =

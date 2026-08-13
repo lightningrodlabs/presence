@@ -90,6 +90,7 @@ import {
 import {
   CAP_SDP_FSM,
   CAP_SDP_FSM_SCREEN,
+  CAP_VOICE_BATCH,
   isSignalMsgType,
 } from './transport/wire-contract';
 import { RoomStore } from './room/room-store';
@@ -143,18 +144,35 @@ export const SDP_TIMEOUT_FLOOR_MS = 5000;
  * always leave the FSM's own per-attempt timeout (`_computeSdpTimeout`,
  * passed as `sdpExchangeTimeoutMs`) and that timeout's own first backoff
  * retry undisturbed, so it is pinned strictly greater than the per-attempt
- * timeout (2x) rather than sharing its value. Sharing the value was
- * Task 9's original defect (review C1, 2026-08-11): the backstop fired in
- * the same tick as the FSM's own timeout, destroying the FSM's in-place
- * Task-4 recovery retry instead of letting it run.
+ * timeout (2x, plus `SDP_BACKSTOP_RETRY_HEADROOM_MS`) rather than sharing
+ * its value. Sharing the value was Task 9's original defect (review C1,
+ * 2026-08-11): the backstop fired in the same tick as the FSM's own
+ * timeout, destroying the FSM's in-place Task-4 recovery retry instead of
+ * letting it run. Set to 2x `SDP_TIMEOUT_CEILING_MS` plus the same
+ * headroom, so the ceiling itself never re-introduces that preemption at
+ * the RTT-scaled per-attempt ceiling (final-review wave F1, 2026-08-13).
  */
-export const SDP_BACKSTOP_CEILING_MS = 60_000;
+export const SDP_BACKSTOP_CEILING_MS = 68_000;
 
 /** Multiplier applied to the per-attempt SDP timeout to get the store's
  *  tracked backstop timeout (`_computeSdpBackstopTimeout`) — kept at 2x
  *  so the backstop can never fire before the FSM's own timeout has had a
  *  chance to run its first in-place retry. */
 export const SDP_BACKSTOP_MULTIPLIER = 2;
+
+/**
+ * Headroom (ms) added on top of `SDP_BACKSTOP_MULTIPLIER * perAttempt` in
+ * `_computeSdpBackstopTimeout`. At exactly 2x the per-attempt timeout, the
+ * FSM's own attempt-2 deadline is `2 * perAttempt + retryDelay` (its first
+ * in-place backoff retry, not `2 * perAttempt`) — `retryDelay` can run up
+ * to `maxDelayMs` (7000) + `jitterMs` (1000) under the reconnect policy's
+ * default options (`packages/webrtc-peer/src/reconnect-policy.ts`,
+ * `DEFAULT_RECONNECT_OPTIONS`), so a bare 2x backstop could fire 0.3-1.3s
+ * before that retry completes (final-review wave F1, 2026-08-13). This
+ * headroom covers the full maxDelayMs + jitterMs budget so the backstop
+ * never preempts the FSM's first in-place retry.
+ */
+export const SDP_BACKSTOP_RETRY_HEADROOM_MS = 8_000;
 
 /**
  * How long an established peer may sit in iceConnectionState 'disconnected'
@@ -2654,6 +2672,12 @@ export class StreamsStore {
       bestRttEwmaMs,
       prevMode: this._signalsCadence.mode,
     });
+
+    // Voice batching eligibility: same once-per-tick cadence as the
+    // cadence evaluation above (final-review wave F2) — see
+    // `_voiceBatchCapAllTargets` for why this moved out of the per-chunk
+    // send path.
+    this._voiceBatchCapAllTargets = this.signalsTargetsAllHaveCap(CAP_VOICE_BATCH);
   }
 
   /** The signals media cadence the voice/filmstrip senders must obey —
@@ -2745,6 +2769,20 @@ export class StreamsStore {
       this.logger.logCustomMessage(
         `SignalCarrierUp: pong path recovered after ${downMs}ms`,
       );
+      // Clear the RTT EWMA for current signals targets (final-review wave
+      // F5): a sample folded across the outage is evidence about the DEAD
+      // channel, not the one that just recovered — carrying it forward
+      // fed the cadence policy's one-level-per-tick hysteresis a stale
+      // collapsed reading and forced a ~20s walk-back
+      // (paused -> voice-only -> full) even once the link was fine again.
+      // No sample ⇒ `decideSignalsMediaCadence` reads 'full'/'no-sample'
+      // outright, and if the link is still actually bad the very next
+      // pong re-collapses the EWMA and the cadence re-escalates within
+      // one tick — so this trades a slow, wrong walk-back for an honest
+      // probe-and-react.
+      for (const target of get(this._signalsTargets)) {
+        this._signalsRttEwma.delete(target);
+      }
     }
 
     const current = this.globalPresenceSet();
@@ -2807,14 +2845,22 @@ export class StreamsStore {
    * `sdpExchangeTimeoutMs`): the backstop must always leave that timeout
    * and its first in-place backoff retry undisturbed, so it is pinned
    * strictly greater — `SDP_BACKSTOP_MULTIPLIER` (2x) times the
-   * per-attempt timeout, capped at `SDP_BACKSTOP_CEILING_MS`. Sharing the
-   * per-attempt value was Task 9's original defect (review C1): the
-   * backstop fired in the same tick as the FSM's own timeout and
-   * destroyed its in-place recovery attempt instead of letting it run.
+   * per-attempt timeout plus `SDP_BACKSTOP_RETRY_HEADROOM_MS`, capped at
+   * `SDP_BACKSTOP_CEILING_MS`. Sharing the per-attempt value was Task 9's
+   * original defect (review C1): the backstop fired in the same tick as
+   * the FSM's own timeout and destroyed its in-place recovery attempt
+   * instead of letting it run. The bare 2x multiplier without headroom
+   * was a second, narrower instance of the same defect (final-review wave
+   * F1): the FSM's attempt-2 deadline is `2 * perAttempt + retryDelay`,
+   * not `2 * perAttempt`, so the headroom covers that retry's own delay
+   * budget (see `SDP_BACKSTOP_RETRY_HEADROOM_MS`).
    */
   private _computeSdpBackstopTimeout(peerB64: AgentPubKeyB64): number {
     const perAttempt = this._computeSdpTimeout(peerB64) ?? SDP_EXCHANGE_TIMEOUT;
-    return Math.min(SDP_BACKSTOP_CEILING_MS, perAttempt * SDP_BACKSTOP_MULTIPLIER);
+    return Math.min(
+      SDP_BACKSTOP_CEILING_MS,
+      perAttempt * SDP_BACKSTOP_MULTIPLIER + SDP_BACKSTOP_RETRY_HEADROOM_MS
+    );
   }
 
   async changeVideoInput(deviceId: string) {
@@ -4378,6 +4424,30 @@ export class StreamsStore {
    * reconcilers/`_signalsTargets`, so recovery needs no re-arm.
    */
   _signalsCadence: SignalsMediaCadence = { mode: 'full', reason: 'no-sample' };
+
+  /**
+   * Whether EVERY current signals target advertises `CAP_VOICE_BATCH`
+   * (`voice-batch-v1`), re-evaluated once per presence tick in
+   * `pingAgents()` right beside `_signalsCadence` (final-review wave F2).
+   * Previously voice.ts called `signalsTargetsAllHaveCap` directly inside
+   * `handleEncodedChunk` — once per encoded chunk, 50/s, each call doing a
+   * per-target `conversationPayloadCaps` JSON.parse — which contradicted
+   * the cached-derived-value convention documented at voice.ts's
+   * `_signalsTargets` read. Hoisting to a once-per-tick boolean, read via
+   * `voiceBatchEligible()`, means a cap flip takes effect within one tick
+   * (≤ PING_INTERVAL, 2s) instead of immediately; the existing mid-batch
+   * flush path in `handleEncodedChunk` (the legacy-path buffered-frame
+   * flush) already handles that transition cleanly, so the coarser
+   * granularity costs nothing. `signalsTargetsAllHaveCap` remains the one
+   * evaluation authority — this field is just its once-per-tick cache.
+   */
+  private _voiceBatchCapAllTargets = false;
+
+  /** The per-tick voice-batching eligibility — see
+   *  `_voiceBatchCapAllTargets` for the evaluation cadence and rationale. */
+  voiceBatchEligible(): boolean {
+    return this._voiceBatchCapAllTargets;
+  }
 
   /**
    * Last computed `globalPresenceSet()`, kept so the ping cycle can diff
@@ -6572,9 +6642,11 @@ export class StreamsStore {
           // the next ping/pong cycle retry. Deliberately NOT the same
           // window as the FSM's own per-attempt SDP timeout above
           // (`sdpExchangeTimeoutMs: _computeSdpTimeout(...)`) — it is
-          // `_computeSdpBackstopTimeout`, pinned strictly greater (2x, own
-          // ceiling) so it never preempts the FSM's own timeout and first
-          // in-place backoff retry (review C1). The timer is
+          // `_computeSdpBackstopTimeout`, pinned strictly greater (2x plus
+          // `SDP_BACKSTOP_RETRY_HEADROOM_MS`, own ceiling) so it never
+          // preempts the FSM's own timeout and first in-place backoff
+          // retry (review C1; the headroom term closed a narrower
+          // instance of the same defect — final-review wave F1). The timer is
           // ATTEMPT-scoped and TRACKED (§9 item 5): it may only tear down
           // the attempt that armed it — a successor attempt's slot must
           // survive this timer firing — and a new attempt for the same
