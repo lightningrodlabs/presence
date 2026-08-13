@@ -1,0 +1,42 @@
+{
+  "version": "0.15.1",
+  "source": "dumped from source by compat-corpus.test.ts at release 0.15.1 (046a478)",
+  "parses": [
+    "PingUi",
+    "PongUi",
+    "InitRequest",
+    "InitAccept",
+    "SdpFsm",
+    "SdpFsmScreen",
+    "LeaveUi",
+    "DiagnosticRequest",
+    "DiagnosticResponse",
+    "ModuleState",
+    "ModuleData"
+  ],
+  "emits": [
+    "PingUi",
+    "PongUi",
+    "InitRequest",
+    "InitAccept",
+    "SdpFsm",
+    "SdpFsmScreen",
+    "LeaveUi",
+    "DiagnosticRequest",
+    "DiagnosticResponse",
+    "ModuleState",
+    "ModuleData"
+  ],
+  "defaultConversationPayload": {
+    "micMuted": true,
+    "webrtcDisabled": false,
+    "disableWebrtcWith": [],
+    "webrtcImpl": "fsm",
+    "peerImpl": {},
+    "caps": [
+      "sdp-fsm",
+      "sdp-fsm-screen",
+      "voice-batch-v1"
+    ]
+  }
+}
