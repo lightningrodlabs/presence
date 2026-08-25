@@ -17,18 +17,30 @@ import type { DiagnosticSnapshot } from './types';
 
 /**
  * Character budget for the JSON payload of one DiagnosticResponse
- * signal. Serves the wire snapshot only (`buildDiagnosticSnapshot`);
- * comfortably under Holochain remote-signal limits. Not a liveness
- * threshold — it names a size, not a clock (working agreement 2 does
- * not apply).
+ * signal. Serves the wire snapshot only (`buildDiagnosticSnapshot`).
+ * Not a liveness threshold — it names a size, not a clock (working
+ * agreement 2 does not apply).
+ *
+ * Raised 60_000 → 300_000 after the 2026-08-25 field session: the old
+ * caps (200/100) left every remote seat's coverage starting ~3.5 min
+ * back, so the session's deliberate all-signals test window was
+ * observable from only the requesting seat, and senders declared
+ * 300–2,200 dropped entries. 300 KB is the same order as signal
+ * traffic the app already sends routinely (a 1 s filmstrip clip is
+ * ~50–90 KB base64) and keeps a multi-x margin under conductor signal
+ * limits. If field snapshots still truncate at this size, the next
+ * step is a windowed request (sender returns a caller-named time
+ * range), not a bigger blob.
  */
-export const DIAGNOSTIC_PAYLOAD_BUDGET_CHARS = 60_000;
+export const DIAGNOSTIC_PAYLOAD_BUDGET_CHARS = 300_000;
 
-/** Newest agent events kept when the payload exceeds the budget. */
-export const DIAGNOSTIC_TRUNCATED_EVENTS_KEPT = 200;
+/** Newest agent events kept when the payload exceeds the budget.
+ *  Sized with the budget: ~1000 × ~200-char entries ≈ 200 KB. */
+export const DIAGNOSTIC_TRUNCATED_EVENTS_KEPT = 1_000;
 
-/** Newest custom logs kept when the payload exceeds the budget. */
-export const DIAGNOSTIC_TRUNCATED_CUSTOM_LOGS_KEPT = 100;
+/** Newest custom logs kept when the payload exceeds the budget.
+ *  Sized with the budget: ~500 × ~200-char entries ≈ 100 KB. */
+export const DIAGNOSTIC_TRUNCATED_CUSTOM_LOGS_KEPT = 500;
 
 export type DiagnosticSnapshotInput = {
   fromAgent: string;
