@@ -86,7 +86,10 @@ export class AvatarWithNickname extends LitElement {
 
   renderProfile(profile: EntryRecord<Profile> | undefined) {
     if (!profile) return this.renderIdenticon();
-    const avatar = profile.entry.fields.avatar
+    const showImage =
+      profile.entry.fields.avatar &&
+      this.store?.config.avatarMode !== 'identicon';
+    const avatar = showImage
       ? html`<img
           style="${this.hideNickname
             ? 'width: 100%; height: auto;'
@@ -108,8 +111,9 @@ export class AvatarWithNickname extends LitElement {
   }
 
   render() {
-    if (this.store.config.avatarMode === 'identicon')
-      return this.renderIdenticon();
+    // No early identicon-mode return: the nickname comes from the profile,
+    // so identicon mode routes through renderProfile too (which drops the
+    // image in that mode) — review finding 1 of fix/nickname-without-avatar.
     switch (this._agentProfile.value.status) {
       case 'pending':
         return html`<sl-skeleton
