@@ -23,12 +23,19 @@ import { AvatarWithNickname } from '../room/elements/avatar-with-nickname';
 const AGENT = new Uint8Array(39).fill(7);
 
 function renderedProfile(
-  opts: { avatar?: string; hideAvatar?: boolean; hideNickname?: boolean } = {}
+  opts: {
+    avatar?: string;
+    hideAvatar?: boolean;
+    hideNickname?: boolean;
+    avatarMode?: string;
+  } = {}
 ): HTMLElement {
   const el = new AvatarWithNickname();
   el.agentPubKey = AGENT;
   el.hideAvatar = opts.hideAvatar ?? false;
   el.hideNickname = opts.hideNickname ?? false;
+  if (opts.avatarMode)
+    el.store = { config: { avatarMode: opts.avatarMode } } as any;
   const profile = {
     entry: { nickname: 'Alice', fields: opts.avatar ? { avatar: opts.avatar } : {} },
   } as any;
@@ -75,6 +82,18 @@ describe('avatar-with-nickname renderProfile', () => {
     const c = renderedProfile({ hideNickname: true });
     expect(visible(c.querySelector('holo-identicon'))).toBe(true);
     expect(visible(c.querySelector('span'))).toBe(false);
+  });
+
+  it('identicon avatarMode drops the image but keeps the nickname', () => {
+    // Review finding 1: the render() early return for identicon mode had
+    // the same bug shape (bare identicon, nickname dropped, flags ignored).
+    const c = renderedProfile({
+      avatar: 'data:image/png;base64,xyz',
+      avatarMode: 'identicon',
+    });
+    expect(c.querySelector('img')).toBeNull();
+    expect(visible(c.querySelector('holo-identicon'))).toBe(true);
+    expect(c.textContent).toContain('Alice');
   });
 
   it('missing profile still renders the bare identicon', () => {
