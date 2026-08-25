@@ -1,0 +1,32 @@
+[
+  {
+    "version": "0.14.8",
+    "url": "https://github.com/lightningrodlabs/presence/releases/download/v0.14.8/presence.webhapp",
+    "hashes": {
+      "happSha256": "ae12f5923442acfe498243d5a74333a7f018609d514231f43b8ec0c471743ea8",
+      "webhappSha256": "7fb64e01dee9557d85780a4985bb0ed89f63b864347ff26380f9940dfd9e1368",
+      "uiSha256": "847252e589cd252c60e39ff80448e57890ef567e27af58288b76b929f1948880"
+    },
+    "releasedAt": 1781569309900
+  },
+  {
+    "version": "0.14.9",
+    "url": "https://github.com/lightningrodlabs/presence/releases/download/v0.14.9/presence.webhapp",
+    "hashes": {
+      "happSha256": "ae12f5923442acfe498243d5a74333a7f018609d514231f43b8ec0c471743ea8",
+      "webhappSha256": "0f586782bf310e540826181d9aeb8198409f66c7e485290dae79818b2f09ac95",
+      "uiSha256": "99c6ed2261149c07f06493eecdd0c35d889d8c2e9f81d5795a21d71f993b5df1"
+    },
+    "releasedAt": 1786044323997
+  },
+  {
+    "version": "0.14.10",
+    "url": "https://github.com/lightningrodlabs/presence/releases/download/v0.14.10/presence.webhapp",
+    "hashes": {
+      "happSha256": "ae12f5923442acfe498243d5a74333a7f018609d514231f43b8ec0c471743ea8",
+      "webhappSha256": "2b8f2ddefd1567576acd87b0090d26932ae519915a4ae275ff80e6988866e729",
+      "uiSha256": "75ea8dcc0a5dd785c80be0069634af5c5d84734a355f52cbacae21b41e9bb6ff"
+    },
+    "releasedAt": 1786650670681
+  }
+]

@@ -1,0 +1,65 @@
+# Releasing
+
+The ceremony, previously carried only in release commit messages ("Ceremony
+per 0c47477"), written down after the v0.15.2 asset incident (2026-08-25).
+The gate is `scripts/check-release-artifacts.mjs` (`npm run release:check`);
+this document explains when to run it and why it exists — when this prose
+and that script disagree, the script wins.
+
+## The invariant that has teeth
+
+**A point release packages the byte-identical previous happ.** Moss offers a
+curated version as an *in-place update* only when its happ bundle bytes are
+unchanged from the installed version; a changed happ shows up as a separate
+install. The happ bytes were stable from 0.14.8 through 0.15.1 by convention;
+v0.15.2's first asset broke it (a full `npm run package` recompiled the zomes —
+different coordinator wasm, same DNA hash, different happ bytes) and appeared
+in Moss as a new app until the asset was replaced. Consequence: **build point
+releases with `npm run package:ui`**, which repacks the existing
+`workdir/presence.happ` / `dnas/presence/workdir/presence.dna` with the new
+UI. If those on-disk artifacts are not the shipped ones (fresh clone, or a
+full build ran), recover the happ from the previous release asset
+(`hc web-app unpack`) before packing.
+
+A deliberate happ/DNA release sets `HAPP_CHANGE=1` for the gate, forfeits
+in-place updates, and — if integrity zomes changed — splits the network
+(`hc dna hash` on old vs new is the check); both consequences go in the
+release notes.
+
+## Ceremony
+
+1. Branch `release/X.Y.Z` off the trunk. Bump `ui/package.json` version;
+   `npm install` to sync the lockfile.
+2. Generate the wire-surface fixture:
+   `UPDATE_COMPAT_FIXTURE=1 npx vitest run src/transport/__tests__/compat-corpus.test.ts`
+   (from `ui/`). Diff the new `fixtures/compat/X.Y.Z.json` against the
+   previous release's — any delta beyond version/provenance must be a
+   declared wire change.
+3. `nix develop -c npm run verify` — green, then commit the ceremony
+   (version + lockfile + fixture), merge `--no-ff` into the trunk, tag
+   `vX.Y.Z`.
+4. Build: `npm run package:ui` (point release) or
+   `HAPP_CHANGE=1` + `npm run package` (declared happ change).
+5. **`npm run release:check`** — the artifact gate (see above). It compares
+   `workdir/presence.happ` against `fixtures/releases.json`.
+6. `npm run hash` (needs `ELECTRON_RUN_AS_NODE` unset — the weave CLI is
+   Electron and that variable makes it run as plain node) → the
+   happ/webhapp/ui sha256 triple.
+7. Push trunk + tag. `gh release create vX.Y.Z workdir/presence.webhapp`
+   with notes (Compatibility section first — DNA/network and interop
+   claims, each backed by a check actually run). Re-download the asset and
+   `sha256sum` it against `webhappSha256`.
+8. Append the release's entry (version, url, hash triple, releasedAt from
+   the `npm run hash` output) to `fixtures/releases.json` and commit — this
+   is what arms the gate for the next release.
+9. Curation: in `weave-tool-curation`, add the version entry (same hash
+   triple, user-facing changelog) to the line's lists — for the 0.14.x /
+   Holochain 0.6 line that is `0.15/lists/tool-list-0.15.json` AND
+   `0.15/modify/tool-list-0.15.ts` — on a branch, as a PR.
+
+## Interop claims checklist for the notes
+
+- Same network: `hc dna hash` equal on old vs new (not "the dnas/ diff was
+  empty" — the wasm is a build artifact).
+- In-place update: `happSha256` equal to the previous entry (the gate).
+- Wire surface: the compat fixture diff from step 2.
