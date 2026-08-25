@@ -85,16 +85,24 @@ export class AvatarWithNickname extends LitElement {
   timeout: any;
 
   renderProfile(profile: EntryRecord<Profile> | undefined) {
-    if (!profile || !profile.entry.fields.avatar) return this.renderIdenticon();
-    return html`
-      <div class="row" style="align-items: center; margin: 0; padding: 0;">
-        <img
+    if (!profile) return this.renderIdenticon();
+    const showImage =
+      profile.entry.fields.avatar &&
+      this.store?.config.avatarMode !== 'identicon';
+    const avatar = showImage
+      ? html`<img
           style="${this.hideNickname
             ? 'width: 100%; height: auto;'
             : `height: ${this.size}px; width: ${this.size}px;`} border-radius: 50%;${this.hideAvatar ? ' display: none;' : ''}"
           src=${profile.entry.fields.avatar}
           alt="${profile.entry.nickname}'s avatar"
-        />
+        />`
+      : html`<div style="line-height: 0;${this.hideAvatar ? ' display: none;' : ''}">
+          ${this.renderIdenticon()}
+        </div>`;
+    return html`
+      <div class="row" style="align-items: center; margin: 0; padding: 0;">
+        ${avatar}
         <span style="margin-left: 10px; font-size: 23px; color: #cd9f9f;${this.hideNickname ? ' display: none;' : ''}"
           >${profile.entry.nickname}</span
         >
@@ -103,8 +111,9 @@ export class AvatarWithNickname extends LitElement {
   }
 
   render() {
-    if (this.store.config.avatarMode === 'identicon')
-      return this.renderIdenticon();
+    // No early identicon-mode return: the nickname comes from the profile,
+    // so identicon mode routes through renderProfile too (which drops the
+    // image in that mode) — review finding 1 of fix/nickname-without-avatar.
     switch (this._agentProfile.value.status) {
       case 'pending':
         return html`<sl-skeleton
