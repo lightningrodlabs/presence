@@ -116,6 +116,18 @@ type FilmstripPayload = FilmstripClipPayload | FilmstripStopPayload;
  */
 const RECEIVE_INACTIVITY_TTL_MS = 5000;
 
+/**
+ * How often (at most) the receive side writes one `FilmstripRx` stats
+ * line per peer into the PresenceLogger. A reporting cadence, NOT a
+ * liveness window (working agreement 2 — the media-flowing predicate is
+ * `MEDIA_LIVE_WINDOW_MS` in presence-policy.ts): it exists purely to
+ * bound log volume, the same role as VoicePlayoutReset's 2 s throttle
+ * in voice.ts. Motivating gap (2026-08-25 field diagnosis): the rx
+ * stats were console.log-only, so exported logs could not answer "was
+ * video still flowing from this peer?" during an audio outage.
+ */
+export const FILMSTRIP_RX_LOG_INTERVAL_MS = 30_000;
+
 export interface FilmstripFrame {
   /** Blob URL of the JPEG filmstrip. Revoked ~1 s after replacement. */
   url: string;
@@ -246,6 +258,13 @@ class FilmstripController {
   peerLastRecvMs = new Map<string, number>();
 
   /**
+   * Wall-clock ms of the last `FilmstripRx` logger line per peer —
+   * throttle state for `FILMSTRIP_RX_LOG_INTERVAL_MS`. Wall-clock like
+   * the stats windows it summarizes, not the store clock.
+   */
+  private lastRxLogMs = new Map<string, number>();
+
+  /**
    * Per-peer signals-video stats. Updated by `receiveFrame` on a ~1 s
    * rolling window. The stats panel reads this map; peer-filmstrip
    * elements publish their buffer depth here via `setBufferDepth`.
@@ -305,6 +324,7 @@ class FilmstripController {
     this.subscribers.clear();
     this.peerLastSentMs.clear();
     this.peerLastRecvMs.clear();
+    this.lastRxLogMs.clear();
     this.signalsVideoStats.clear();
     this.store = null;
     this._clock = systemClock;
@@ -659,6 +679,22 @@ class FilmstripController {
         `buf=${stats.bufferDepth ?? '-'} ` +
         `avSkew=${stats.avSkewMs ?? '-'}ms`
       );
+      // Also write a throttled line into the PresenceLogger so exported
+      // diagnostics can answer "was signals video flowing from this
+      // peer?" directly — the console line above never leaves DevTools.
+      const lastRxLog = this.lastRxLogMs.get(agentPubKeyB64);
+      if (
+        lastRxLog === undefined ||
+        now - lastRxLog >= FILMSTRIP_RX_LOG_INTERVAL_MS
+      ) {
+        this.lastRxLogMs.set(agentPubKeyB64, now);
+        this.store.logger.logCustomMessage(
+          `FilmstripRx [${agentPubKeyB64.slice(0, 8)}] ` +
+          `fps=${stats.fpsActual} bw=${stats.kbps}kbps ` +
+          `loss=${stats.lossPercent}% jitter=${stats.jitterMs}ms ` +
+          `transit=${stats.transitMs}ms`,
+        );
+      }
       state.bytesReceived = 0;
       state.clipsReceived = 0;
       state.clipsLost = 0;
