@@ -85,16 +85,21 @@ export class AvatarWithNickname extends LitElement {
   timeout: any;
 
   renderProfile(profile: EntryRecord<Profile> | undefined) {
-    if (!profile || !profile.entry.fields.avatar) return this.renderIdenticon();
-    return html`
-      <div class="row" style="align-items: center; margin: 0; padding: 0;">
-        <img
+    if (!profile) return this.renderIdenticon();
+    const avatar = profile.entry.fields.avatar
+      ? html`<img
           style="${this.hideNickname
             ? 'width: 100%; height: auto;'
             : `height: ${this.size}px; width: ${this.size}px;`} border-radius: 50%;${this.hideAvatar ? ' display: none;' : ''}"
           src=${profile.entry.fields.avatar}
           alt="${profile.entry.nickname}'s avatar"
-        />
+        />`
+      : html`<div style="line-height: 0;${this.hideAvatar ? ' display: none;' : ''}">
+          ${this.renderIdenticon()}
+        </div>`;
+    return html`
+      <div class="row" style="align-items: center; margin: 0; padding: 0;">
+        ${avatar}
         <span style="margin-left: 10px; font-size: 23px; color: #cd9f9f;${this.hideNickname ? ' display: none;' : ''}"
           >${profile.entry.nickname}</span
         >
