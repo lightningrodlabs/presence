@@ -72,10 +72,10 @@ describe('buildDiagnosticSnapshot', () => {
   });
 
   it('an oversized payload keeps the newest tail and declares the drops', () => {
-    const nEvents = 1_000; // ~70 chars each -> far over budget
-    const nLogs = 150;
+    const nEvents = 4_000; // ~220 chars each -> far over budget
+    const nLogs = 800;
     const { snapshot, payload } = buildDiagnosticSnapshot(
-      input({ agentEvents: events(nEvents), customLogs: customLogs(nLogs) }),
+      input({ agentEvents: events(nEvents, 150), customLogs: customLogs(nLogs) }),
     );
     expect(snapshot.agentEvents).toHaveLength(DIAGNOSTIC_TRUNCATED_EVENTS_KEPT);
     expect(snapshot.customLogs).toHaveLength(DIAGNOSTIC_TRUNCATED_CUSTOM_LOGS_KEPT);
@@ -96,10 +96,10 @@ describe('buildDiagnosticSnapshot', () => {
 
   it('oversized with few custom logs declares zero drops for that collection', () => {
     const { snapshot } = buildDiagnosticSnapshot(
-      input({ agentEvents: events(1_000), customLogs: customLogs(2) }),
+      input({ agentEvents: events(2_000, 150), customLogs: customLogs(2) }),
     );
     expect(snapshot.truncated).toEqual({
-      events: 1_000 - DIAGNOSTIC_TRUNCATED_EVENTS_KEPT,
+      events: 2_000 - DIAGNOSTIC_TRUNCATED_EVENTS_KEPT,
       customLogs: 0,
     });
     expect(snapshot.customLogs).toHaveLength(2);
@@ -108,7 +108,7 @@ describe('buildDiagnosticSnapshot', () => {
   it('truncation drops by timestamp, not input position (review F1: cross-agent interleave)', () => {
     // The real caller flattens per-agent groupings in agent-insertion
     // order. Model the failure scenario: agent B's 100 NEWEST events
-    // arrive first in the array, agent A's 900 older events after.
+    // arrive first in the array, agent A's older events after.
     // A position-based tail slice would drop every one of B's fresh
     // events while the truncated field declares an oldest-first drop —
     // a fabricated hole in the evidence.
@@ -117,7 +117,8 @@ describe('buildDiagnosticSnapshot', () => {
       timestamp: 50_000 + i, // newest
       event: 'Connected' as const,
     }));
-    const agentA = Array.from({ length: 1_900 }, (_, i) => ({
+    const nOlder = 7_900; // ~60 chars each -> total far over budget
+    const agentA = Array.from({ length: nOlder }, (_, i) => ({
       agent: 'agent-A',
       timestamp: 10_000 + i, // older
       event: 'Connected' as const,
@@ -125,14 +126,21 @@ describe('buildDiagnosticSnapshot', () => {
     const { snapshot } = buildDiagnosticSnapshot(
       input({ agentEvents: [...agentB, ...agentA] }),
     );
-    expect(snapshot.truncated).toEqual({ events: 1_800, customLogs: 0 });
+    expect(snapshot.truncated).toEqual({
+      events: 100 + nOlder - DIAGNOSTIC_TRUNCATED_EVENTS_KEPT,
+      customLogs: 0,
+    });
     expect(snapshot.agentEvents).toHaveLength(DIAGNOSTIC_TRUNCATED_EVENTS_KEPT);
     // All 100 of B's newest events survive; the kept set is exactly the
-    // 200 newest by timestamp, in chronological order.
+    // DIAGNOSTIC_TRUNCATED_EVENTS_KEPT newest by timestamp, in
+    // chronological order.
     expect(
       snapshot.agentEvents.filter(e => e.agent === 'agent-B'),
     ).toHaveLength(100);
-    expect(snapshot.agentEvents[0].timestamp).toBe(11_800); // 100 newest of A start here
+    // The newest (KEPT - 100) of A start here.
+    expect(snapshot.agentEvents[0].timestamp).toBe(
+      10_000 + nOlder - (DIAGNOSTIC_TRUNCATED_EVENTS_KEPT - 100),
+    );
     expect(
       snapshot.agentEvents[snapshot.agentEvents.length - 1].timestamp,
     ).toBe(50_099);
@@ -169,5 +177,34 @@ describe('buildDiagnosticSnapshot', () => {
     );
     expect(snapshot.truncated).toEqual({ events: 0, customLogs: 0 });
     expect(payload.length).toBeGreaterThan(DIAGNOSTIC_PAYLOAD_BUDGET_CHARS);
+  });
+});
+
+describe('field-derived floor (2026-08-25 forensics)', () => {
+  // In the 2026-08-25 8-peer session, the 200/100 caps left remote
+  // coverage starting ~3.5 min back — the deliberate all-signals test
+  // window (10:56–11:01) was observable from only ONE seat, and senders
+  // declared 300–2,200 dropped entries. A session of that shape
+  // (~1,650 events + ~2,150 custom logs, ~150-char details) must keep a
+  // tail of at least 1000 events and 500 custom logs. The app already
+  // routinely sends larger signals than this budget implies (a 1 s
+  // filmstrip clip is ~50–90 KB base64), so the raised budget stays in
+  // the same order as existing signal traffic.
+  it('keeps at least 1000 events and 500 custom logs from a field-shaped session', () => {
+    const fieldEvents: SimpleEvent[] = Array.from({ length: 1_650 }, (_, i) => ({
+      agent: AGENT,
+      timestamp: 1_000 + i,
+      event: 'Connected' as const,
+      detail: 'x'.repeat(150),
+    }));
+    const fieldLogs: CustomLog[] = Array.from({ length: 2_150 }, (_, i) => ({
+      timestamp: 2_000 + i,
+      log: 'y'.repeat(150),
+    }));
+    const { snapshot } = buildDiagnosticSnapshot(
+      input({ agentEvents: fieldEvents, customLogs: fieldLogs }),
+    );
+    expect(snapshot.agentEvents.length).toBeGreaterThanOrEqual(1_000);
+    expect(snapshot.customLogs.length).toBeGreaterThanOrEqual(500);
   });
 });
