@@ -14,12 +14,19 @@ unchanged from the installed version; a changed happ shows up as a separate
 install. The happ bytes were stable from 0.14.8 through 0.15.1 by convention;
 v0.15.2's first asset broke it (a full `npm run package` recompiled the zomes —
 different coordinator wasm, same DNA hash, different happ bytes) and appeared
-in Moss as a new app until the asset was replaced. Consequence: **build point
-releases with `npm run package:ui`**, which repacks the existing
-`workdir/presence.happ` / `dnas/presence/workdir/presence.dna` with the new
-UI. If those on-disk artifacts are not the shipped ones (fresh clone, or a
-full build ran), recover the happ from the previous release asset
-(`hc web-app unpack`) before packing.
+in Moss as a new app until the asset was replaced. Consequence: a point
+release must ship the previous happ bytes — and **`npm run package:ui` does
+not guarantee that by itself**: its `hc web-app pack workdir --recursive`
+re-packs the dna and happ from the on-disk wasm, so its happ matches the
+shipped one only while the wasm does. The shipped happ has lagged source
+since 0.15.1, so today it never does — the v0.15.3 build reproduced the
+incident with a byte-correct happ already on disk (the gate caught it).
+Recovery when `release:check` fails on a point release: recover the shipped
+happ from the previous release asset (`hc web-app unpack`), copy it over
+`workdir/presence.happ` (and its dna over
+`dnas/presence/workdir/presence.dna` via `hc app unpack`), then re-pack with
+`hc web-app pack workdir` — no `--recursive` — so the happ bytes are reused
+as-is with the freshly built UI zip.
 
 A deliberate happ/DNA release sets `HAPP_CHANGE=1` for the gate, forfeits
 in-place updates, and — if integrity zomes changed — splits the network
