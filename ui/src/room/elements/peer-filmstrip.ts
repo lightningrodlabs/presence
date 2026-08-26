@@ -98,6 +98,17 @@ export class PeerFilmstrip extends LitElement {
   private _lastFrameWidth = 0;
   /** Track active state to fire onActiveChange only on transitions. */
   private _active = false;
+  /**
+   * Display epoch, bumped by every clear (null frame or teardown). A
+   * clip whose pre-decode await was in flight when a clear ran belongs
+   * to the previous epoch and must be dropped, not queued: the sender's
+   * courtesy stop arrives right behind the final clip of a
+   * signals->webrtc handover (stopCapture in video-filmstrip.ts), and
+   * without this guard the resolved decode re-queues the stale clip and
+   * repaints a frame no future signal will ever clear — the
+   * controller's inactivity TTL is armed only on clip arrival.
+   */
+  private _clearEpoch = 0;
 
   private _setActive(active: boolean): void {
     if (active === this._active) return;
@@ -229,6 +240,7 @@ export class PeerFilmstrip extends LitElement {
   }
 
   private _teardown(): void {
+    this._clearEpoch++;
     if (this._unsubscribe) {
       this._unsubscribe();
       this._unsubscribe = null;
@@ -255,6 +267,7 @@ export class PeerFilmstrip extends LitElement {
     // Drain the queue, stop animation, clear bg-image so the avatar
     // shows through, hide the size slider.
     if (frame === null) {
+      this._clearEpoch++;
       if (this._animTimer !== null) {
         window.clearTimeout(this._animTimer);
         this._animTimer = null;
@@ -274,6 +287,7 @@ export class PeerFilmstrip extends LitElement {
     // already has the pixel data ready and the swap is atomic. Without
     // this, the swap can paint an empty bg for one frame while the new
     // image decodes (visible as an avatar-flash through the host).
+    const epoch = this._clearEpoch;
     try {
       const probe = new Image();
       probe.src = frame.url;
@@ -283,6 +297,9 @@ export class PeerFilmstrip extends LitElement {
     }
     // The element may have been unmounted while we awaited decode.
     if (!this._unsubscribe) return;
+    // A clear (stop payload, inactivity TTL, or teardown) ran while the
+    // decode was in flight — this clip predates it and must not repaint.
+    if (epoch !== this._clearEpoch) return;
 
     // Push N entries (one per frame) into the queue. The setTimeout
     // chain consumes them at periodMs intervals.
