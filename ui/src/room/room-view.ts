@@ -3161,9 +3161,13 @@ export class RoomView extends LitElement {
               ></peer-filmstrip>
 
               <!--
-                Conditional content is layered on top of the always-mounted
-                avatar+filmstrip in DOM order. WebRTC video (when active)
-                covers the filmstrip; replace-module covers everything via
+                Layering over the always-mounted avatar+filmstrip: the
+                avatar is in-flow, so every positioned sibling paints
+                above it; among the positioned siblings document order
+                decides. WebRTC video (.video-el is position: relative —
+                pinned by video-el-paint-order.test.ts) is rendered after
+                the filmstrip host, so an active video covers it;
+                replace-module covers everything via
                 .module-replace-content's z-index.
               -->
               ${activeReplaceModule
@@ -3962,6 +3966,14 @@ export class RoomView extends LitElement {
         width: 100%;
         height: 100%;
         object-fit: cover;
+        /* Positioned (z-index auto) so the video joins the positioned
+           paint group, where document order applies: it then covers the
+           earlier peer-filmstrip host (position: absolute) instead of
+           sitting below it — un-positioned content paints under ALL
+           positioned siblings regardless of document order. z-index
+           stays auto so .module-replace-content (z-index: 1) still
+           covers it. Pinned by video-el-paint-order.test.ts. */
+        position: relative;
       }
 
       .identicon canvas {
