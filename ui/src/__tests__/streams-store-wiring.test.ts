@@ -1538,7 +1538,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       frames: Array<{ seq: number; red?: Array<{ seq: number }> }>;
     };
     expect(batch1.v).toBe(2);
-    expect(batch1.frames.map(f => f.seq)).toEqual([0, 1, 2]);
+    expect(batch1.frames.map(f => f.seq)).toEqual([1, 2, 3]);
     expect(batch1.frames).toHaveLength(VOICE_BATCH_FRAMES);
     // Nothing preceded the first batch: no red anywhere.
     expect(batch1.frames.every(f => f.red === undefined)).toBe(true);
@@ -1553,8 +1553,8 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     const sent2 = moduleData(bus, 'voice');
     expect(sent2).toHaveLength(2);
     const batch2 = JSON.parse(sent2[1].chunk) as typeof batch1;
-    expect(batch2.frames.map(f => f.seq)).toEqual([3, 4, 5]);
-    expect(batch2.frames[0].red!.map(f => f.seq)).toEqual([1, 2]);
+    expect(batch2.frames.map(f => f.seq)).toEqual([4, 5, 6]);
+    expect(batch2.frames[0].red!.map(f => f.seq)).toEqual([2, 3]);
     expect(batch2.frames[1].red).toBeUndefined();
     expect(batch2.frames[2].red).toBeUndefined();
   });
@@ -1654,9 +1654,9 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       frames: Array<{ seq: number; ts: number }>;
     };
     expect(batch.frames.map(f => f.ts)).toEqual([444, 555, 666]);
-    // seqs 0,1 (buffered pre-pause) never reached the wire; the frame
+    // seqs 1,2 (buffered pre-pause) never reached the wire; the frame
     // encoded while paused never consumed a seq at all.
-    expect(batch.frames.map(f => f.seq)).toEqual([2, 3, 4]);
+    expect(batch.frames.map(f => f.seq)).toEqual([3, 4, 5]);
   });
 
   it('a cap flip mid-batch flushes the buffered frames per-frame, in seq order (review I2)', async () => {
@@ -1692,7 +1692,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       s => JSON.parse(s.chunk) as { seq: number; ts: number; v?: number }
     );
     expect(parsed.map(p => p.v)).toEqual([undefined, undefined, undefined]);
-    expect(parsed.map(p => p.seq)).toEqual([0, 1, 2]);
+    expect(parsed.map(p => p.seq)).toEqual([1, 2, 3]);
     expect(parsed.map(p => p.ts)).toEqual([111, 222, 333]);
   });
 
@@ -1794,7 +1794,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       frames: Array<{ seq: number; ts: number }>;
     };
     expect(batch.frames.map(f => f.ts)).toEqual([444, 555, 666]);
-    expect(batch.frames.map(f => f.seq)).toEqual([2, 3, 4]);
+    expect(batch.frames.map(f => f.seq)).toEqual([3, 4, 5]);
   });
 
   it('recovery walks paused → voice-only → full via the per-tick re-evaluation, and sends resume (review I3)', async () => {
