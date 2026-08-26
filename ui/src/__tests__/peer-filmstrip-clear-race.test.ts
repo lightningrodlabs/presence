@@ -110,6 +110,38 @@ describe('peer-filmstrip stop/decode race', () => {
     el.remove();
   });
 
+  it('reassigning agentPubKeyB64 while a decode is pending must not paint the old peer into the new pane', async () => {
+    // Pins the _teardown() epoch bump specifically (review F1): on
+    // reassignment, willUpdate runs _teardown() then _subscribe()
+    // synchronously, so by the time peer A's parked decode resolves,
+    // _unsubscribe is non-null again — it is peer B's subscription, and
+    // the !_unsubscribe guard passes. Only the teardown epoch bump
+    // drops A's stale clip. If B never streams filmstrip clips, nothing
+    // would ever overwrite the mispaint: A's controller TTL clear goes
+    // to A-subscribers only, which this element no longer is.
+    const peerA = 'filmstrip-reassign-peer-a';
+    const peerB = 'filmstrip-reassign-peer-b';
+    const { el, strip, slider, activeCalls } = await mountFilmstrip(peerA);
+
+    // Peer A's clip parks at the decode await.
+    filmstripController.receiveFrame(peerA, JSON.stringify(clipPayload(1)));
+    expect(decodeResolvers.length).toBe(1);
+
+    // The element is reassigned to peer B (teardown + resubscribe).
+    el.agentPubKeyB64 = peerB;
+    await el.updateComplete;
+
+    // A's stale decode resolves after the reassignment.
+    decodeResolvers[0]();
+    await tick();
+
+    expect(strip().style.backgroundImage).toBe('');
+    expect(slider().style.display).toBe('none');
+    expect(activeCalls).toEqual([]);
+
+    el.remove();
+  });
+
   it('a stop delivered while a clip decode is pending must not repaint after the clear', async () => {
     const peer = 'filmstrip-race-peer';
     const { el, strip, slider, activeCalls } = await mountFilmstrip(peer);
