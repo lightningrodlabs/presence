@@ -1,6 +1,7 @@
 import { mdiBroadcast } from '@mdi/js';
 import { get } from '@holochain-open-dev/stores';
 import { decidePlayout } from './voice-playout';
+import { decideVoiceAdmission, nextVoiceEpoch } from './voice-admission';
 import { estimatePlayoutSenderTimeMs, type PlayoutAnchor } from './av-sync';
 import { registerModule } from './registry';
 import type { ModuleDefinition } from './types';
@@ -69,6 +70,15 @@ interface VoiceFrame {
    * out of skew deltas. Absent on legacy senders.
    */
   wts?: number;
+  /**
+   * Capture-session epoch: `nextVoiceEpoch` per `startCapture`
+   * (voice-admission.ts). `seq` restarts at 1 for every capture session
+   * (stopCapture resets it), so the receiver needs the session identity
+   * to admit a restarted sender instead of dropping it against the old
+   * high-water — the 2026-08-26 deafness. Absent on legacy senders,
+   * which keep the pre-epoch dedupe (declared limitation).
+   */
+  ep?: number;
 }
 
 export interface VoiceFramePayload extends VoiceFrame {
@@ -94,8 +104,15 @@ interface PeerVoiceState {
   decoder: any; // AudioDecoder
   /** audioContext.currentTime at which the next decoded chunk should start */
   nextPlaybackTime: number;
-  /** highest seq seen from this peer (for drop-old-packets) */
+  /** highest seq seen from this peer WITHIN the adopted session (for
+   *  drop-old-packets; reset to 0 on session adoption) */
   lastSeq: number;
+  /** Adopted capture-session epoch (frame `ep`); null before any
+   *  epoch-bearing frame from this peer. */
+  epoch: number | null;
+  /** Store-clock ms of the last ACCEPTED frame — the quiet-window input
+   *  to `decideVoiceAdmission`'s stale-epoch fallback arm. 0 = none. */
+  lastAcceptedMs: number;
   /** wall-clock ms at which we received the previous frame (for jitter calc) */
   lastArrivalMs: number;
   /** EWMA of inter-arrival deviation from the 20ms Opus nominal period */
@@ -171,6 +188,14 @@ class VoiceController {
    */
   private pipelineGeneration = 0;
   private seq = 0;
+  /**
+   * Capture-session epoch stamped on every outgoing frame (`ep`).
+   * Assigned per startCapture via `nextVoiceEpoch` — wall clock forced
+   * strictly past the previous value, so it is unique across app
+   * restarts and ordered within one. Deliberately NOT reset in
+   * stopCapture (monotonicity is the property; `seq` is what resets).
+   */
+  private epoch = 0;
   /**
    * Number of preceding frames to carry redundantly on each packet (RED-style
    * loss recovery for the lossy signals carrier). 2 recovers any single, and
@@ -305,6 +330,14 @@ class VoiceController {
       console.error('voice: WebCodecs / MediaStreamTrackProcessor not available');
       return false;
     }
+
+    // New capture session, new epoch — assigned before acquisition so a
+    // failed attempt burns an epoch harmlessly (the receiver never saw
+    // it) rather than ever reusing one. Device-change rebuilds
+    // (onMicTrackChanged) deliberately do NOT come through here: the
+    // encoder and seq continue uninterrupted, so the session identity
+    // must too.
+    this.epoch = nextVoiceEpoch(Date.now(), this.epoch);
 
     // Acquire the mic from MicSource. If WebRTC is already holding it, the
     // underlying device is not reopened — both consumers share the same
@@ -468,11 +501,15 @@ class VoiceController {
     const buf = new Uint8Array(chunk.byteLength);
     chunk.copyTo(buf);
     const frame: VoiceFrame = {
-      seq: this.seq++,
+      // Pre-increment: session seqs start at 1, keeping seq 0 free as the
+      // receiver's "nothing accepted yet" sentinel (which session adoption
+      // resets lastSeq to).
+      seq: ++this.seq,
       ts: chunk.timestamp,
       type: chunk.type,
       data: bytesToBase64(buf),
       wts: Date.now(),
+      ep: this.epoch,
     };
 
     // Batching applies only when EVERY current signals target advertises
@@ -601,19 +638,58 @@ class VoiceController {
       state = created;
     }
     const st = state;
-    // Per-payload dedupe against the playhead — a primary already played
-    // means every redundant copy it carries is older still; a batch member
-    // is judged on its own seq, exactly as its legacy single-frame
-    // equivalent was. Also drops non-frame JSON a legacy parse accepted.
-    const fresh = payloads.filter(
-      p =>
-        p != null &&
-        typeof p.seq === 'number' &&
-        !(st.lastSeq !== 0 && p.seq <= st.lastSeq)
-    );
+    // Per-payload admission (`decideVoiceAdmission`) — session-epoch
+    // routing wrapped around the old playhead dedupe: a primary already
+    // played means every redundant copy it carries is older still; a
+    // batch member is judged on its own seq, exactly as its legacy
+    // single-frame equivalent was. Also drops non-frame JSON a legacy
+    // parse accepted. Adoption mutates the session state in payload
+    // order, so later members of the adopting packet admit as
+    // in-session.
+    const nowClockMs = this._clock.now();
+    const fresh: VoiceFramePayload[] = [];
+    for (const p of payloads) {
+      if (p == null || typeof p.seq !== 'number') continue;
+      const admission = decideVoiceAdmission({
+        epoch: typeof p.ep === 'number' ? p.ep : null,
+        seq: p.seq,
+        lastEpoch: st.epoch,
+        lastSeq: st.lastSeq,
+        msSinceAccepted:
+          st.lastAcceptedMs === 0 ? null : nowClockMs - st.lastAcceptedMs,
+      });
+      switch (admission.action) {
+        case 'adopt-session': {
+          const prev = st.epoch;
+          st.epoch = p.ep as number;
+          st.lastSeq = 0;
+          // Per-session playout mappings: the new encoder session restarts
+          // its µs timestamps, so projecting through the old anchor/wts
+          // entries would mis-anchor A/V sync until they aged out.
+          st.playoutAnchor = null;
+          st.wtsByTs.clear();
+          this.store?.logger.logCustomMessage(
+            `VoiceSessionAdopt [${agentPubKeyB64.slice(0, 8)}] ` +
+            `epoch=${p.ep} prev=${prev ?? 'none'} seq=${p.seq} reason=${admission.reason}`,
+          );
+          fresh.push(p);
+          break;
+        }
+        case 'accept':
+          fresh.push(p);
+          break;
+        case 'drop':
+          break;
+        default: {
+          const exhaustive: never = admission;
+          void exhaustive;
+        }
+      }
+    }
     if (fresh.length === 0) return;
 
-    this.peerLastRecvMs.set(agentPubKeyB64, this._clock.now());
+    st.lastAcceptedMs = nowClockMs;
+    this.peerLastRecvMs.set(agentPubKeyB64, nowClockMs);
 
     // --- jitter: EWMA of absolute deviation of packet inter-arrival from
     // the nominal period. Measured per PACKET (one signal arrival), not per
@@ -738,6 +814,8 @@ class VoiceController {
       decoder: null,
       nextPlaybackTime: 0,
       lastSeq: 0,
+      epoch: null,
+      lastAcceptedMs: 0,
       lastArrivalMs: 0,
       jitterEwma: 0,
       lostCount: 0,
