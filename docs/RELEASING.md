@@ -49,9 +49,29 @@ release notes.
    `HAPP_CHANGE=1` + `npm run package` (declared happ change).
 5. **`npm run release:check`** — the artifact gate (see above). It compares
    `workdir/presence.happ` against `fixtures/releases.json`.
-6. `npm run hash` (needs `ELECTRON_RUN_AS_NODE` unset — the weave CLI is
-   Electron and that variable makes it run as plain node) → the
-   happ/webhapp/ui sha256 triple.
+6. The hash triple. `npm run hash` (needs `ELECTRON_RUN_AS_NODE` unset —
+   the weave CLI is Electron and that variable makes it run as plain
+   node) prints one, but **do not copy its `happSha256` blindly: the
+   value is weave-CLI-version-dependent.** Observed on the v0.14.11
+   build: CLI 0.15.21 reported `a06213aa…` for the *shipped, unmodified*
+   v0.14.10 asset, whose recorded (and curated) `happSha256` is
+   `ae12f592…`; CLI 0.16.0-dev.5 on the 0.15.x line agrees with the
+   recorded values. The `webhappSha256` and `uiSha256` agree across both
+   CLIs.
+
+   The line's records use **raw sha256 of the artifact and of the members
+   extracted from it** — verify (and, on a disagreement, derive) that way:
+
+       sha256sum workdir/presence.webhapp            # webhappSha256
+       hc web-app unpack workdir/presence.webhapp -o /tmp/wh
+       sha256sum /tmp/wh/presence.happ               # happSha256
+       sha256sum /tmp/wh/dist.zip                    # uiSha256
+
+   Consistency of basis WITHIN a line is what preserves in-place updates:
+   Moss compares the candidate entry's `happSha256` against the installed
+   version's entry, so recording a same-bytes happ under a different
+   hashing basis fabricates a mismatch and splits the install exactly as a
+   real happ change would.
 7. Push trunk + tag. `gh release create vX.Y.Z workdir/presence.webhapp`
    with notes (Compatibility section first — DNA/network and interop
    claims, each backed by a check actually run). Re-download the asset and
@@ -68,5 +88,9 @@ release notes.
 
 - Same network: `hc dna hash` equal on old vs new (not "the dnas/ diff was
   empty" — the wasm is a build artifact).
-- In-place update: `happSha256` equal to the previous entry (the gate).
+- In-place update: `happSha256` equal to the previous entry (the gate),
+  on the same hashing basis — see step 6. The gate compares the
+  standalone `workdir/presence.happ`; what Moss sees is the happ INSIDE
+  the webhapp, so on any doubt extract and compare that (`hc web-app
+  unpack` on the new artifact and on the previous release asset).
 - Wire surface: the compat fixture diff from step 2.
