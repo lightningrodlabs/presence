@@ -1387,6 +1387,47 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
       started.logger.customMessages.some(m => m.includes('refreshed via transport'))
     ).toBe(false);
   });
+
+  it('(f) videoOn whose first acquire fails still reaches peers + fires my-video-on when a later tick acquires', async () => {
+    // Review finding #1: the camera peer attach and `my-video-on` must be
+    // reachable from a RECONCILER-driven fresh acquire, not only from
+    // videoOn. If videoOn's first acquire fails transiently (camera busy —
+    // the exact class this reconciler handles), intent stays wanted and a
+    // later bare tick acquires; the track must still reach RTCRtpSenders
+    // and my-video-on must fire, else WebRTC peers see no video until a
+    // manual off/on.
+    const camTrack = new FakeTrack('video');
+    let call = 0;
+    installNavigator(async () => {
+      call += 1;
+      if (call === 1) throw new Error('NotReadableError: camera busy');
+      return new FakeStream([camTrack]);
+    });
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+
+    // First videoOn: acquire fails. No handle, but intent stays wanted.
+    await started.store.videoOn();
+    await flush();
+    expect(started.store.cameraSource.lifecycle.state).not.toBe('live');
+    expect(get(started.store.localIntent).camera.wanted).toBe(true);
+    expect(started.events.some(e => e.type === 'my-video-on')).toBe(false);
+    media.addTrackCalls.length = 0;
+
+    // A later bare presence tick (paced) — the reconciler acquires.
+    started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+    await presenceTick(started);
+
+    expect(started.store.cameraSource.track).toBe(camTrack as unknown as MediaStreamTrack);
+    // The freshly-acquired track reached the peer transport (addTrack: no
+    // prior video sender existed) — not stranded on mainStream.
+    expect(
+      media.addTrackCalls.some(t => t === (camTrack as unknown as MediaStreamTrack))
+    ).toBe(true);
+    expect(started.events.some(e => e.type === 'my-video-on')).toBe(true);
+  });
 });
 
 describe('InitAccept lifecycle (§9 item 5)', () => {

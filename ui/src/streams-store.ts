@@ -726,6 +726,7 @@ export class StreamsStore {
       camera: this.cameraSource,
       onError: message => this.eventCallback({ type: 'error', error: message }),
       log: message => this.logger.logCustomMessage(message),
+      onCameraAcquired: () => this._attachCameraToPeers(),
     });
 
     // Bind controllers permanently so the receive side (decoders /
@@ -765,7 +766,7 @@ export class StreamsStore {
       // Load-bearing per-tick cadence: the correctness backstop that
       // reopens a device whose ended/failed edge was missed. Pinned by the
       // capture-reconciler wiring tests (mutation-check ii).
-      this.captureReconciler.tick();
+      this.captureReconciler.tick().catch(() => {});
       this._reconcileSignalsAudio();
       this._reconcileSignalsVideo();
     });
@@ -2936,35 +2937,13 @@ export class StreamsStore {
 
   async videoOn() {
     this._applyIntent({ type: 'video-on' });
-    // Reconciler acquires the camera (Task 3 replacement #2). The
-    // keepalive-aware peer attach STAYS here (store fanout tied to the
-    // WebRTC handle, not the device) and runs only on a fresh open —
-    // not-held -> held — matching the old `if (!_webrtcCameraHandle)` guard.
-    const wasHeld = this.captureReconciler.cameraHandleHeld;
+    // Reconciler acquires the camera (Task 3 replacement #2); on a fresh
+    // acquire it calls back into `_attachCameraToPeers` (below), so the
+    // peer attach + my-video-on happen on WHICHEVER tick actually acquires
+    // — this gesture's, or a later bare tick if this one's first acquire
+    // failed transiently. No inline attach here (would double-fire).
     this.captureReconciler.noteGesture('camera');
     await this.captureReconciler.tick();
-
-    if (!wasHeld && this.captureReconciler.cameraHandleHeld) {
-      // Swap a keepalive sender (left by videoOff) for the real track via
-      // replaceTrack, else addTrack a new sender (renegotiation).
-      const keepalive = this._videoKeepaliveTrack;
-      const videoTrack = this.cameraSource.track;
-      if (videoTrack) {
-        for (const t of this._allMediaTransports()) {
-          try {
-            if (keepalive) {
-              t.replaceTrack(keepalive, videoTrack, this.mainStream!);
-            } else {
-              t.addTrack(videoTrack, this.mainStream!);
-            }
-          } catch (e: any) {
-            console.error(`Failed to attach video track: ${e.toString()}`);
-          }
-        }
-        if (keepalive) this._releaseVideoKeepalive();
-      }
-      this.eventCallback({ type: 'my-video-on' });
-    }
 
     // Start the filmstrip encoder if peers need signals-carried video.
     this._reconcileSignalsVideo();
@@ -2977,6 +2956,37 @@ export class StreamsStore {
 
     // Send 'video-on' signal to peers
     this._broadcastRtcAction('video-on');
+  }
+
+  /**
+   * Attach the freshly-acquired camera track to every peer and fire
+   * `my-video-on`. Called by the capture reconciler's fresh-acquire arm
+   * (no-handle → held) — from `videoOn`'s tick OR a later bare presence
+   * tick if `videoOn`'s first acquire failed transiently. This peer fanout
+   * stays in the store (not the source binding) because it is tied to the
+   * WebRTC handle coming up, not to the device open: a keepalive sender
+   * left by `videoOff` is swapped for the real track via `replaceTrack`
+   * (no renegotiation, same RTCRtpSender / m-line); with no prior sender,
+   * `addTrack` creates one.
+   */
+  private _attachCameraToPeers(): void {
+    const keepalive = this._videoKeepaliveTrack;
+    const videoTrack = this.cameraSource.track;
+    if (videoTrack) {
+      for (const t of this._allMediaTransports()) {
+        try {
+          if (keepalive) {
+            t.replaceTrack(keepalive, videoTrack, this.mainStream!);
+          } else {
+            t.addTrack(videoTrack, this.mainStream!);
+          }
+        } catch (e: any) {
+          console.error(`Failed to attach video track: ${e.toString()}`);
+        }
+      }
+      if (keepalive) this._releaseVideoKeepalive();
+    }
+    this.eventCallback({ type: 'my-video-on' });
   }
 
   /**
