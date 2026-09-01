@@ -1,6 +1,6 @@
 # Intent Record & Reconciliation Implementation Plan (2026-09-01)
 
-**Status: PROPOSED.** No tasks executed. Do not update `CLAUDE.md` fact bullets from this document until the closing doc-sync task runs.
+**Status: LANDED on `docs/2026-09-01-intent-reconciliation`.** All seven tasks executed; each merged `--no-ff` into that integration branch (`11ae105`..`3f3928c`, plus this doc-sync commit for Task 7). Merging that branch into `main-0.6` is a pending human step — this document describes the integration branch, not `main-0.6`, until that merge lands. The corresponding `CLAUDE.md` "True today" bullet was added by the Task 7 doc-sync (see the "Intent-reconciliation round facts" bullet).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -60,6 +60,8 @@ When executing both plans, update the field plan's task statuses to point here (
 ---
 
 ### Task 1: the `LocalIntent` record and its one writer
+
+**Landed:** merge `11ae105` into `docs/2026-09-01-intent-reconciliation`.
 
 **Branch:** `feat/local-intent-record`
 
@@ -217,15 +219,17 @@ Each gesture method gains a `this._applyIntent(...)` call as its FIRST statement
 
 The write-sites pin (`intent-write-sites.test.ts`) follows the `no-ambient-clock.test.ts` grep-pin pattern: read `streams-store.ts` as text and assert (a) `_localIntent.update` / `_localIntent.set` appear only inside `_applyIntent`, and (b) `this._applyIntent(` appears only inside the enumerated gesture methods. Enumerate by slicing the source between method-header markers (the same technique no-ambient-clock uses); keep the allowed-method list in the test as the authority.
 
-- [ ] **Step 1: Write the failing reducer tests** (`ui/src/__tests__/intent.test.ts`) — table-driven, no mocks. Rows: each gesture from the initial state; `audio-mute` on a never-wanted mic keeps `wanted: false`; `audio-mute` after `audio-on` keeps `wanted: true`; `session-end` drops all wants but preserves `webrtc.enabled`; `peer-webrtc` add/remove round-trip; `initialLocalIntent` with `disableAllWebrtc = 'true'` yields `enabled: false`, with `null` yields `true`.
-- [ ] **Step 2: Run to verify failure.** `nix develop -c npm run test --workspace ui -- intent.test` — expect module-not-found.
-- [ ] **Step 3: Implement `ui/src/intent.ts`** as specified above. Run the reducer tests; expect green.
-- [ ] **Step 4: Write the failing write-sites pin** (`intent-write-sites.test.ts`) as specified. It must fail now (no `_applyIntent` exists yet — assert the method exists as part of the pin, so the test is red before Step 5).
-- [ ] **Step 5: Wire the store**: field, getter, `_applyIntent`, and the gesture-method calls listed above. Run the pin; expect green.
-- [ ] **Step 6: Negative control for the pin** — temporarily add `this._localIntent.set(...)` inside a non-gesture method (e.g. `handlePongUi`), confirm the pin goes red, revert. Record the check in the commit message.
-- [ ] **Step 7:** `nix develop -c npm run verify`; commit (`feat: LocalIntent record with gesture-only writers`).
+- [x] **Step 1: Write the failing reducer tests** (`ui/src/__tests__/intent.test.ts`) — table-driven, no mocks. Rows: each gesture from the initial state; `audio-mute` on a never-wanted mic keeps `wanted: false`; `audio-mute` after `audio-on` keeps `wanted: true`; `session-end` drops all wants but preserves `webrtc.enabled`; `peer-webrtc` add/remove round-trip; `initialLocalIntent` with `disableAllWebrtc = 'true'` yields `enabled: false`, with `null` yields `true`.
+- [x] **Step 2: Run to verify failure.** `nix develop -c npm run test --workspace ui -- intent.test` — expect module-not-found.
+- [x] **Step 3: Implement `ui/src/intent.ts`** as specified above. Run the reducer tests; expect green.
+- [x] **Step 4: Write the failing write-sites pin** (`intent-write-sites.test.ts`) as specified. It must fail now (no `_applyIntent` exists yet — assert the method exists as part of the pin, so the test is red before Step 5).
+- [x] **Step 5: Wire the store**: field, getter, `_applyIntent`, and the gesture-method calls listed above. Run the pin; expect green.
+- [x] **Step 6: Negative control for the pin** — temporarily add `this._localIntent.set(...)` inside a non-gesture method (e.g. `handlePongUi`), confirm the pin goes red, revert. Record the check in the commit message.
+- [x] **Step 7:** `nix develop -c npm run verify`; commit (`feat: LocalIntent record with gesture-only writers`).
 
 ### Task 2: capture lifecycle unions in `MicSource`/`CameraSource`
+
+**Landed:** merge `2620e80` into `docs/2026-09-01-intent-reconciliation`.
 
 **Branch:** `feat/capture-lifecycle-state`
 
@@ -263,16 +267,18 @@ Screen share (no source class; acquired inline): in `screenShareOn`, after acqui
 
 **Declared:** replaces the null-check track model inside both source classes; no store-visible behavior changes yet beyond the screen-share ended handling, which today does not exist at all (the pane currently stays open on an externally-stopped share — this task closes that as a declared change).
 
-- [ ] **Step 1: Write the failing tests** (`capture-lifecycle.test.ts`) with a fake `getUserMedia` (inject via a constructor seam or module the sources already use — follow how existing tests fake media; the wiring fakes in `store-deps.testing.ts` show the house style). Cases: (a) acquire → `live`; (b) fake track fires `ended` → lifecycle `ended`, `onLifecycleChange` observed; (c) acquire after `ended` returns a NEW live track, not the corpse; (d) `getUserMedia` rejection → `failed` with the error text; (e) `changeDevice` attaches the ended-watch to the new track (end the *new* track, observe `ended`).
-- [ ] **Step 2: Negative control** — a test that fails unless the fake track can transition to `ended` and fire its handler (the `MockRTCPeerConnection`-cannot-throw lesson; field plan Task 1 required the same control — absorbed here).
-- [ ] **Step 3: Run to verify failure.**
-- [ ] **Step 4: Implement in `mic-source.ts`** (items 1–6 above). Run; expect the mic rows green.
-- [ ] **Step 5: Mirror in `camera-source.ts`.** If the shapes are close enough to share, extract a common helper; if not, state why in the commit message rather than leaving two silent copies.
-- [ ] **Step 6: Screen-share ended watch** in `screenShareOn` + a wiring test in `streams-store-wiring.test.ts`: end the display track, assert the share tears down (module deactivated, `my-screen-share-off` event) and `localIntent.screenShare.wanted` is false.
-- [ ] **Step 7: Mutation-verify** — invert the `readyState === 'live'` predicate, confirm red; restore.
-- [ ] **Step 8:** `nix develop -c npm run verify`; commit.
+- [x] **Step 1: Write the failing tests** (`capture-lifecycle.test.ts`) with a fake `getUserMedia` (inject via a constructor seam or module the sources already use — follow how existing tests fake media; the wiring fakes in `store-deps.testing.ts` show the house style). Cases: (a) acquire → `live`; (b) fake track fires `ended` → lifecycle `ended`, `onLifecycleChange` observed; (c) acquire after `ended` returns a NEW live track, not the corpse; (d) `getUserMedia` rejection → `failed` with the error text; (e) `changeDevice` attaches the ended-watch to the new track (end the *new* track, observe `ended`).
+- [x] **Step 2: Negative control** — a test that fails unless the fake track can transition to `ended` and fire its handler (the `MockRTCPeerConnection`-cannot-throw lesson; field plan Task 1 required the same control — absorbed here).
+- [x] **Step 3: Run to verify failure.**
+- [x] **Step 4: Implement in `mic-source.ts`** (items 1–6 above). Run; expect the mic rows green.
+- [x] **Step 5: Mirror in `camera-source.ts`.** If the shapes are close enough to share, extract a common helper; if not, state why in the commit message rather than leaving two silent copies.
+- [x] **Step 6: Screen-share ended watch** in `screenShareOn` + a wiring test in `streams-store-wiring.test.ts`: end the display track, assert the share tears down (module deactivated, `my-screen-share-off` event) and `localIntent.screenShare.wanted` is false.
+- [x] **Step 7: Mutation-verify** — invert the `readyState === 'live'` predicate, confirm red; restore.
+- [x] **Step 8:** `nix develop -c npm run verify`; commit.
 
 ### Task 3: the capture reconciler
+
+**Landed:** merge `102ed1c` into `docs/2026-09-01-intent-reconciliation`.
 
 **Branch:** `feat/capture-reconciler`
 
@@ -362,14 +368,16 @@ Trigger sites: (1) the `_signalsTargets` subscription in `start()` (the per-tick
 4. `refreshTracksForPeer` (~:5109): when the source lifecycle is not `live`, do **not** call `refreshMediaForPeer` and do not log `replaceTrack` — log `Track refresh [x]: source dead, deferring to capture reconciler` and return false so `_cloneStreamRecovery` stays available. *(Field plan Task 2, absorbed; the dishonest success log is the line that hid Incident B for a minute.)*
 5. The de-facto "quit the room and rejoin" recovery path for a dead device is **replaced** by this reconciler.
 
-- [ ] **Step 1: Failing policy tests** — the full table above as rows, plus: pacing boundary (`now - lastAttemptAt` exactly at the constant), attempts at the ceiling → `report-failure` exactly once then `already-reported`, gesture reset (attempts back to 0 → `open` again).
-- [ ] **Step 2: Implement the policy.** Table green.
-- [ ] **Step 3: Failing wiring tests** (extend `streams-store-wiring.test.ts`, fakes per Task 2): (a) `audioOn(true)` → mic acquired via reconciler, mute applied; (b) kill the track → next tick reopens → `onTrackChange` fanout reaches `mediaTransport.refreshMediaForPeer`/`replaceTrack` for an open connection (assert on the fake transport); (c) reopen failure × `CAPTURE_REOPEN_MAX_ATTEMPTS` → exactly one store `error` event, no further `getUserMedia` calls; (d) `audioOn` → track dies → `audioOn(true)` again (gesture) → immediate reopen attempt (pacing reset); (e) inbound `request-track-refresh` with a dead source → no `refreshMediaForPeer`, the deferring log line. (e) is Incident B's exact wedge.
-- [ ] **Step 4: Implement the wiring** and the five named replacements.
-- [ ] **Step 5: Mutation checks** — (i) make `_reconcileSignalsAudio` read the old handle observation again instead of intent: wiring test (b') "track dead but wanted → voice encoder still gated on" must catch the difference (add b' if it does not); (ii) remove the tick-site `captureReconciler.tick()` call: test (b) must go red (the tick is load-bearing, same pin philosophy as the encoder-retry tests).
-- [ ] **Step 6:** `nix develop -c npm run verify`; commit (message: closes field-plan D3; supersedes the quit/rejoin recovery; absorbs field-plan Tasks 1–2).
+- [x] **Step 1: Failing policy tests** — the full table above as rows, plus: pacing boundary (`now - lastAttemptAt` exactly at the constant), attempts at the ceiling → `report-failure` exactly once then `already-reported`, gesture reset (attempts back to 0 → `open` again).
+- [x] **Step 2: Implement the policy.** Table green.
+- [x] **Step 3: Failing wiring tests** (extend `streams-store-wiring.test.ts`, fakes per Task 2): (a) `audioOn(true)` → mic acquired via reconciler, mute applied; (b) kill the track → next tick reopens → `onTrackChange` fanout reaches `mediaTransport.refreshMediaForPeer`/`replaceTrack` for an open connection (assert on the fake transport); (c) reopen failure × `CAPTURE_REOPEN_MAX_ATTEMPTS` → exactly one store `error` event, no further `getUserMedia` calls; (d) `audioOn` → track dies → `audioOn(true)` again (gesture) → immediate reopen attempt (pacing reset); (e) inbound `request-track-refresh` with a dead source → no `refreshMediaForPeer`, the deferring log line. (e) is Incident B's exact wedge.
+- [x] **Step 4: Implement the wiring** and the five named replacements.
+- [x] **Step 5: Mutation checks** — (i) make `_reconcileSignalsAudio` read the old handle observation again instead of intent: wiring test (b') "track dead but wanted → voice encoder still gated on" must catch the difference (add b' if it does not); (ii) remove the tick-site `captureReconciler.tick()` call: test (b) must go red (the tick is load-bearing, same pin philosophy as the encoder-retry tests).
+- [x] **Step 6:** `nix develop -c npm run verify`; commit (message: closes field-plan D3; supersedes the quit/rejoin recovery; absorbs field-plan Tasks 1–2).
 
 ### Task 4: `caps-unknown` is not `lacks-cap`, and eligibility reads intent
+
+**Landed:** merge `332489c` into `docs/2026-09-01-intent-reconciliation`.
 
 **Branch:** `fix/eligibility-caps-unknown-and-intent`
 
@@ -387,14 +395,16 @@ Trigger sites: (1) the `_signalsTargets` subscription in `start()` (the per-tick
 1. **The caps race (field-plan D2/Task 8, superseding its option debate).** `decideWebrtcEligibility` gains `peerCapsKnown` (call sites compute it as: the peer's `conversation` module payload has been received — `get(this._peerModuleStates)[peerB64]?.['conversation'] !== undefined`). Unknown caps → `{ eligible: false, reason: 'peer-caps-unknown' }`. **No parking machinery is needed**: the initiator drive is already level-triggered per pong (`decideInitRetry`, `streams-store.ts:6364`), so the pong after the payload arrives drives the init — the field plan's option 1 (park + re-drive trigger + TTL) was solving a problem the existing reconciler already absorbs; state this in the commit message. On the acceptor arm (`handleInitRequest`), a `peer-caps-unknown` drop logs `Dropped video InitRequest from X: peer caps not yet received` — distinct from the `peer lacks sdp-fsm capability` line, so field logs can tell a race from an old build (the field plan's option 2, kept because it costs one string). Do NOT answer an InitRequest on unknown caps (the lure warning at `streams-store.ts:6523-6527` stands).
 2. **Eligibility inputs come from intent.** `webrtcGloballyDisabled` becomes a getter over the record: `get webrtcGloballyDisabled() { return !get(this._localIntent).webrtc.enabled; }` (the storage write stays in `setCarrierMode`; `initialLocalIntent` already reads it back — delete the now-shadowed field initialization). The per-peer `peerWebrtcDisabled` conjunct reads `webrtc.disabledWith`. **Replaced mechanism:** the standalone `webrtcGloballyDisabled` boolean field and wherever the per-peer disable list is read from today (find it beside the setter at ~:4252–4291) — one authority, the record.
 
-- [ ] **Step 1: Failing table rows** in `carrier-coverage.test.ts` — `peerCapsKnown: false` → ineligible/`peer-caps-unknown` for both roles; `peerCapsKnown: true, peerHasSdpFsmCap: false` → `peer-lacks-sdp-fsm-cap` (unchanged); all existing rows get `peerCapsKnown: true` (regression guard).
-- [ ] **Step 2: Implement the predicate.**
-- [ ] **Step 3: Failing wiring test** — peer ponged but no conversation payload yet: InitRequest arrives → dropped with the caps-not-yet-received log; payload lands; next pong → init drives (assert `InitRequest` on the fake bus). This is the D2 join sequence end-to-end.
-- [ ] **Step 4: Implement both call ends + the intent-backed getter;** delete the replaced field/reads.
-- [ ] **Step 5:** confirm the carrier-icon/eligibility view tests still pass (`decideWebrtcEligibility` is read at both video handshake ends and by room-view's payload parse — the Round 3 facts bullet lists the surfaces).
-- [ ] **Step 6:** `nix develop -c npm run verify`; commit (supersedes field-plan Task 8; closes D2).
+- [x] **Step 1: Failing table rows** in `carrier-coverage.test.ts` — `peerCapsKnown: false` → ineligible/`peer-caps-unknown` for both roles; `peerCapsKnown: true, peerHasSdpFsmCap: false` → `peer-lacks-sdp-fsm-cap` (unchanged); all existing rows get `peerCapsKnown: true` (regression guard).
+- [x] **Step 2: Implement the predicate.**
+- [x] **Step 3: Failing wiring test** — peer ponged but no conversation payload yet: InitRequest arrives → dropped with the caps-not-yet-received log; payload lands; next pong → init drives (assert `InitRequest` on the fake bus). This is the D2 join sequence end-to-end.
+- [x] **Step 4: Implement both call ends + the intent-backed getter;** delete the replaced field/reads.
+- [x] **Step 5:** confirm the carrier-icon/eligibility view tests still pass (`decideWebrtcEligibility` is read at both video handshake ends and by room-view's payload parse — the Round 3 facts bullet lists the surfaces).
+- [x] **Step 6:** `nix develop -c npm run verify`; commit (supersedes field-plan Task 8; closes D2).
 
 ### Task 5: the intent-diff policy
+
+**Landed:** merge `423a8fc` into `docs/2026-09-01-intent-reconciliation`.
 
 **Branch:** `feat/intent-diff-policy`
 
@@ -465,11 +475,13 @@ The distinction gives the user the reason not to press the reconnect button duri
 
 **Declared:** `describeIntentDiffs` is a new surface. `describeLinkEstablishment` **replaces** the inline tile literal (Task 6 moves the render site onto it; leaving both would be the parallel-copy drift this repo bans).
 
-- [ ] **Step 1: Failing table tests** — every arm above; grace boundary exact; a satisfied intent (wanted + live) yields `[]`; `carrier` + `mic` diffs coexist (Incident B vs C were confusable precisely because only one of these had any surface — assert both appear when both hold); copy strings asserted verbatim.
-- [ ] **Step 2: Implement.** Green.
-- [ ] **Step 3:** `nix develop -c npm run verify`; commit.
+- [x] **Step 1: Failing table tests** — every arm above; grace boundary exact; a satisfied intent (wanted + live) yields `[]`; `carrier` + `mic` diffs coexist (Incident B vs C were confusable precisely because only one of these had any surface — assert both appear when both hold); copy strings asserted verbatim.
+- [x] **Step 2: Implement.** Green.
+- [x] **Step 3:** `nix develop -c npm run verify`; commit.
 
 ### Task 6: render the diffs — buttons, tiles, banner
+
+**Landed:** merge `3f3928c` into `docs/2026-09-01-intent-reconciliation`.
 
 **Branch:** `feat/intent-diff-surfaces`
 
@@ -488,20 +500,22 @@ The distinction gives the user the reason not to press the reconnect button duri
 2. **Tile establishment copy** routes through `describeLinkEstablishment` — the render arm at ~:3186 passes `reconnecting: store._lastDisconnectTime has the peer` (expose the minimal read the view needs; do not hand the view the raw record). The inline literal is deleted.
 3. **The carrier banner** (absorbs field-plan Task 9): a room-level banner rendered when a `carrier` diff exists, text = the diff's `copy`, plus elapsed time from `since` ("… 45s"). Purely local, no wire change. This is the surface that would have ended Incident C's guessing, and — combined with the mic badge — would have let Incident B's users distinguish "my mic is dead" from "my network is gone" in one glance.
 
-- [ ] **Step 1: Store plumbing + failing wiring test** — drive the fake clock past the grace with a dead-but-wanted mic; assert `intentDiffs` contains the mic `pending` diff; let attempts exhaust; assert `failed`.
-- [ ] **Step 2: Failing view tests** (jsdom): (a) mic diff present → button carries the badge class and `title` equals the pinned copy; (b) no diff → no badge; (c) carrier diff → banner rendered with copy + elapsed seconds, absent otherwise; (d) tile shows `connection lost — reconnecting…` when `reconnecting`, `establishing WebRTC carrier…` on first establishment (copy via the Task 5 authority — assert the view imports it rather than duplicating strings, by asserting the literal appears in exactly one source file, grep-pin style).
-- [ ] **Step 3: Implement all three surfaces + the mirror-field deletion.**
-- [ ] **Step 4:** run the full view suite — `view-teardown-symmetry`, `screen-share-maximize-key`, `settings-path`, `agent-avatar-registration` pins must stay green; add the new subscription to the teardown-symmetry coverage.
-- [ ] **Step 5:** `nix develop -c npm run verify`; commit (absorbs field-plan Task 9 and Task 6's UI half — name both in the message).
+- [x] **Step 1: Store plumbing + failing wiring test** — drive the fake clock past the grace with a dead-but-wanted mic; assert `intentDiffs` contains the mic `pending` diff; let attempts exhaust; assert `failed`.
+- [x] **Step 2: Failing view tests** (jsdom): (a) mic diff present → button carries the badge class and `title` equals the pinned copy; (b) no diff → no badge; (c) carrier diff → banner rendered with copy + elapsed seconds, absent otherwise; (d) tile shows `connection lost — reconnecting…` when `reconnecting`, `establishing WebRTC carrier…` on first establishment (copy via the Task 5 authority — assert the view imports it rather than duplicating strings, by asserting the literal appears in exactly one source file, grep-pin style).
+- [x] **Step 3: Implement all three surfaces + the mirror-field deletion.**
+- [x] **Step 4:** run the full view suite — `view-teardown-symmetry`, `screen-share-maximize-key`, `settings-path`, `agent-avatar-registration` pins must stay green; add the new subscription to the teardown-symmetry coverage.
+- [x] **Step 5:** `nix develop -c npm run verify`; commit (absorbs field-plan Task 9 and Task 6's UI half — name both in the message).
 
 ### Task 7: doc-sync
 
+**Landed:** this commit, on `docs/2026-09-01-intent-reconciliation`.
+
 **Branch:** `docs/2026-09-01-intent-reconciliation`
 
-- [ ] **Step 1:** Mark each task in THIS document landed / not-landed (working agreement 3); update the Status header.
-- [ ] **Step 2:** Update `2026-09-01-field-incident-fixes.md`: its Tasks 1, 2, 8, 9 and Task 6's UI half get pointers to the superseding tasks here (or, if that plan has meanwhile landed some of them, record the actual sequence — whichever plan lands second reconciles the statuses).
-- [ ] **Step 3:** Add a `CLAUDE.md` "True today" bullet for the round: records of landed changes anchored to the merges; present-tense claims only where they name the enforcing file or test (`intent-write-sites.test.ts` is the load-bearing one to name); no test counts, no repo-state snapshots, no unanchored negations.
-- [ ] **Step 4:** `nix develop -c npm run verify` (includes `claude-md-drift.test.ts`); commit.
+- [x] **Step 1:** Mark each task in THIS document landed / not-landed (working agreement 3); update the Status header.
+- [x] **Step 2:** Update `2026-09-01-field-incident-fixes.md`: its Tasks 1, 2, 8, 9 and Task 6's UI half get pointers to the superseding tasks here (or, if that plan has meanwhile landed some of them, record the actual sequence — whichever plan lands second reconciles the statuses).
+- [x] **Step 3:** Add a `CLAUDE.md` "True today" bullet for the round: records of landed changes anchored to the merges; present-tense claims only where they name the enforcing file or test (`intent-write-sites.test.ts` is the load-bearing one to name); no test counts, no repo-state snapshots, no unanchored negations.
+- [x] **Step 4:** `nix develop -c npm run verify` (includes `claude-md-drift.test.ts`); commit.
 
 ---
 
