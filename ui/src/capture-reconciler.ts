@@ -24,8 +24,9 @@ import type { CaptureReconcileInput } from './capture-reconcile-policy';
  * Fanout note: the reconciler triggers reopen/acquire, it does NOT own
  * peer fanout. Reopen swaps the dead track on peers through the source's
  * `onTrackChange` device-change branch; the camera's keepalive-aware
- * peer attach on a fresh open stays in `videoOn`/`videoOff` (store
- * fanout), because it is tied to the WebRTC handle, not the device close.
+ * peer attach on a fresh open lives in `StreamsStore._attachCameraToPeers()`
+ * (store fanout, reached via the `onCameraAcquired` binding below), because
+ * it is tied to the WebRTC handle, not the device close.
  */
 export type CaptureReconcilerBindings = {
   clock: { now(): number };
