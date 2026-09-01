@@ -618,6 +618,74 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
   });
 });
 
+describe('screen-share track-ended watch (Task 2): the display-capture gesture-equivalent', () => {
+  /** A display-capture track ending is a user/platform action (the
+   *  browser's native "Stop sharing" bar, the OS revoking capture) — there
+   *  is no picker-less way to re-acquire it, so `ended` here is the ONE
+   *  documented gesture-equivalent (intent.ts, IntentGesture). This pins
+   *  that `screenShareOn` wires `track.onended` to write intent AND tear
+   *  the share down, closing what was previously a real gap: before this
+   *  task, stopping a share from outside the app UI left the pane open. */
+  class FakeScreenTrack {
+    readyState: 'live' | 'ended' = 'live';
+
+    onended: (() => void) | null = null;
+
+    stop(): void {
+      if (this.readyState === 'ended') return;
+      this.readyState = 'ended';
+      this.onended?.();
+    }
+  }
+
+  class FakeScreenStream {
+    constructor(private tracks: FakeScreenTrack[]) {}
+
+    getTracks(): FakeScreenTrack[] {
+      return this.tracks;
+    }
+
+    getVideoTracks(): FakeScreenTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeScreenTrack[] {
+      return [];
+    }
+  }
+
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  afterEach(() => {
+    delete (globalThis as any).navigator;
+  });
+
+  it('ending the display track tears the share down and clears screenShare intent', async () => {
+    const track = new FakeScreenTrack();
+    (globalThis as any).navigator = {
+      mediaDevices: {
+        getUserMedia: async () => new FakeScreenStream([track]),
+      },
+    };
+    const { store, events } = makeStarted();
+
+    await store.screenShareOn();
+
+    // Sanity: the share is actually up before we end it, so the
+    // assertions below prove teardown rather than a no-op.
+    expect(get(store._myModuleStates)['screen-share']?.active).toBe(true);
+    expect(get(store.localIntent).screenShare.wanted).toBe(true);
+
+    track.stop(); // the platform/browser ends the share, not the app
+    await flush();
+    await flush();
+
+    expect(get(store._myModuleStates)['screen-share']).toBeUndefined();
+    expect(get(store.localIntent).screenShare.wanted).toBe(false);
+    expect(events.some(e => e.type === 'my-screen-share-off')).toBe(true);
+  });
+});
+
 describe('acceptor eligibility through the started store (Round 3 item 2)', () => {
   const conversationEnvelope = (clock: ManualClock, payload: object) => ({
     moduleId: 'conversation',

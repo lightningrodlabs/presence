@@ -712,6 +712,11 @@ export class StreamsStore {
           });
         });
       },
+      // Nothing consumes mic lifecycle yet — Task 3's reconciler reads
+      // `micSource.lifecycle` directly on the presence tick rather than
+      // subscribing here. Wire this if a push-driven consumer arrives.
+      onLifecycleChange: () => {},
+      now: () => this.clock.now(),
     });
 
     this.cameraSource = new CameraSource({
@@ -720,6 +725,9 @@ export class StreamsStore {
       onTrackChange: (newTrack, oldTrack) => {
         this._onCameraTrackChange(newTrack, oldTrack);
       },
+      // See MicSource's onLifecycleChange comment above.
+      onLifecycleChange: () => {},
+      now: () => this.clock.now(),
     });
 
     // Bind controllers permanently so the receive side (decoders /
@@ -3299,6 +3307,17 @@ export class StreamsStore {
         } catch (_e) {
           // duplicate-track adds are silently ignored
         }
+        // A display-capture track ending is a user/platform action (the
+        // browser's native "Stop sharing" bar, the OS revoking capture) —
+        // there is no picker-less way to re-acquire it, so `ended` here
+        // *is* the user ending the share. This is the ONE documented
+        // gesture-equivalent (intent.ts, IntentGesture): writing intent
+        // from a track event is banned everywhere else (mic/camera `ended`
+        // is Task 3's reconciler's concern, not a gesture).
+        track.onended = () => {
+          this._applyIntent({ type: 'screen-share-track-ended' });
+          this.stopScreenShare();
+        };
       }
     }
     // Activate the module only after a source has been picked, so the share

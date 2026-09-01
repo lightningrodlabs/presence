@@ -27,6 +27,9 @@
  *      rebuild on the new track.
  */
 
+import type { CaptureLifecycle } from './mic-source';
+import { isLiveTrack } from './mic-source';
+
 export type CameraConsumerId = string;
 
 export interface CameraConsumerOptions {
@@ -65,6 +68,13 @@ export interface CameraSourceBindings {
     newTrack: MediaStreamTrack | null,
     oldTrack: MediaStreamTrack | null,
   ) => void;
+  /** Fired on every `_setLifecycle` transition (wrapped in try/catch,
+   *  mirroring `MicSource`). Task 3's reconciler and Task 5's diff policy
+   *  are the intended consumers. */
+  onLifecycleChange: (lifecycle: CaptureLifecycle) => void;
+  /** Clock read for lifecycle timestamps — routed from `StreamsStore.clock`
+   *  so this file carries no ambient time (see `no-ambient-clock.test.ts`). */
+  now: () => number;
 }
 
 export class CameraSource {
@@ -81,6 +91,8 @@ export class CameraSource {
 
   private consumers = new Map<CameraConsumerId, CameraConsumerOptions>();
 
+  private _lifecycle: CaptureLifecycle = { state: 'idle' };
+
   /**
    * Guards against concurrent open attempts from multiple parallel
    * `acquire()` callers. If the device is being opened, later callers
@@ -94,6 +106,10 @@ export class CameraSource {
 
   get track(): MediaStreamTrack | null {
     return this._track;
+  }
+
+  get lifecycle(): CaptureLifecycle {
+    return this._lifecycle;
   }
 
   get consumerCount(): number {
@@ -115,7 +131,7 @@ export class CameraSource {
       return null;
     }
 
-    if (!this._track) {
+    if (!isLiveTrack(this._track)) {
       const ok = await this._ensureOpen();
       if (!ok || !this._track) return null;
     }
@@ -168,8 +184,11 @@ export class CameraSource {
       return;
     }
 
+    newTrack.onended = () => this._onTrackEnded(newTrack);
+
     this._track = newTrack;
     this._rawStream = newStream;
+    this._setLifecycle({ state: 'live', track: newTrack });
 
     // Store-level fanout first (mainStream + peer add/removeTrack).
     try {
@@ -206,11 +225,27 @@ export class CameraSource {
   }
 
   private async _ensureOpen(): Promise<boolean> {
-    if (this._track) return true;
+    if (isLiveTrack(this._track)) return true;
     if (this._openingPromise) return this._openingPromise;
 
     this._openingPromise = (async () => {
+      this._setLifecycle({ state: 'acquiring', since: this.bindings.now() });
       try {
+        // A stale (ended) track can still be sitting here — the last
+        // consumer never released it, the device just died underneath
+        // them. Stop its stream before opening a replacement so it
+        // doesn't leak.
+        if (this._track) {
+          const staleStream = this._rawStream;
+          if (staleStream) {
+            try { staleStream.getTracks().forEach(t => t.stop()); } catch {}
+          } else {
+            try { this._track.stop(); } catch {}
+          }
+          this._track = null;
+          this._rawStream = null;
+        }
+
         const deviceId = this.bindings.getDeviceId();
         let stream: MediaStream;
         try {
@@ -219,16 +254,20 @@ export class CameraSource {
           });
         } catch (e) {
           console.error('CameraSource: getUserMedia failed', e);
+          this._setLifecycle({ state: 'failed', error: String(e), failedAt: this.bindings.now() });
           return false;
         }
         const track = stream.getVideoTracks()[0];
         if (!track) {
           console.error('CameraSource: getUserMedia returned no video track');
           try { stream.getTracks().forEach(t => t.stop()); } catch {}
+          this._setLifecycle({ state: 'failed', error: 'no video track', failedAt: this.bindings.now() });
           return false;
         }
+        track.onended = () => this._onTrackEnded(track);
         this._rawStream = stream;
         this._track = track;
+        this._setLifecycle({ state: 'live', track });
         try {
           this.bindings.onTrackChange(track, null);
         } catch (e) {
@@ -243,11 +282,32 @@ export class CameraSource {
     return this._openingPromise;
   }
 
+  /**
+   * The `ended` event on the currently-installed track. Observation only
+   * — it writes the lifecycle and stops there. Reopening the device is
+   * Task 3's reconciler's job, which polls `lifecycle` on the presence
+   * tick as the correctness backstop if this edge is ever missed.
+   */
+  private _onTrackEnded(track: MediaStreamTrack): void {
+    if (this._track !== track) return; // stale event from a superseded track
+    this._setLifecycle({ state: 'ended', endedAt: this.bindings.now() });
+  }
+
+  private _setLifecycle(next: CaptureLifecycle): void {
+    this._lifecycle = next;
+    try {
+      this.bindings.onLifecycleChange(next);
+    } catch (e) {
+      console.warn('CameraSource: onLifecycleChange handler threw', e);
+    }
+  }
+
   private _closeDevice(): void {
     const old = this._track;
     const oldStream = this._rawStream;
     this._track = null;
     this._rawStream = null;
+    this._setLifecycle({ state: 'idle' });
     if (oldStream) {
       try { oldStream.getTracks().forEach(t => t.stop()); } catch {}
     } else if (old) {
