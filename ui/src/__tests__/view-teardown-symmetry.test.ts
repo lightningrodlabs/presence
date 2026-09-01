@@ -86,6 +86,37 @@ describe('RoomView.disconnectedCallback (leaks 1–3)', () => {
   });
 });
 
+describe('RoomView intent-diff subscription (Task 6)', () => {
+  it('the intentDiffs StoreSubscriber is released on disconnect', () => {
+    // Task 6 adds `_intentDiffs`/`_localIntent` StoreSubscribers for the
+    // diff surfaces; like every other StoreSubscriber they must ride the
+    // super.disconnectedCallback() teardown. This drives a REAL subscribe
+    // (hostUpdate) over a counting store and asserts the disconnect
+    // releases it — not a no-op, so an orphaned subscription fails here.
+    const el = makeRoomView();
+    let active = 0;
+    let subscribeCalls = 0;
+    (el.streamsStore as any).intentDiffs = {
+      subscribe(cb: (v: unknown) => void) {
+        subscribeCalls += 1;
+        active += 1;
+        cb([]);
+        return () => {
+          active -= 1;
+        };
+      },
+    };
+
+    // hostUpdate is what Lit calls to (re)subscribe; drive it directly.
+    el._intentDiffs.hostUpdate();
+    expect(subscribeCalls).toBe(1);
+    expect(active).toBe(1);
+
+    el.disconnectedCallback();
+    expect(active).toBe(0);
+  });
+});
+
 describe('PresenceApp.disconnectedCallback (leak 3, second copy)', () => {
   it('reaches super.disconnectedCallback so controllers get hostDisconnected', () => {
     const el = document.createElement('presence-app') as any;

@@ -102,6 +102,8 @@ import {
   GRID_TOOLBAR_RESERVE,
 } from './layout';
 import { countAudiblePeers } from '../peer-link-policy';
+import { describeLinkEstablishment } from '../intent-diff-policy';
+import type { IntentDiff } from '../intent-diff-policy';
 import {
   bindVideoStream,
   MAXIMIZE_REAPPLY_DELAY_MS,
@@ -283,11 +285,26 @@ export class RoomView extends LitElement {
     () => [this.streamsStore]
   );
 
-  @state()
-  _microphone = false;
+  // The durable local intent (Task 1) — the mic/camera toggle buttons
+  // render what the user ASKED for, sourced here, not from an event
+  // mirror. Replaces the deleted `_microphone`/`_camera` @state fields and
+  // their my-audio-*/my-video-* update arms: a wrong button state is now
+  // self-correcting, because the button is in front of the user and their
+  // click is the corrective intent write.
+  _localIntent = new StoreSubscriber(
+    this,
+    () => this.streamsStore.localIntent,
+    () => [this.streamsStore]
+  );
 
-  @state()
-  _camera = false;
+  // The unfulfilled-intent diffs (Task 6) — the badge on a toggle button
+  // and the carrier banner both read this ONE store source, so a surfaced
+  // warning always tracks a reconciliation the store is actually running.
+  _intentDiffs = new StoreSubscriber(
+    this,
+    () => this.streamsStore.intentDiffs,
+    () => [this.streamsStore]
+  );
 
   @state()
   _selfViewHidden = readLocalStorage<boolean>('presence:selfViewHidden', false);
@@ -435,6 +452,70 @@ export class RoomView extends LitElement {
     );
   }
 
+  // --- Task 6: intent-derived toggle state and the diff surfaces --------
+  // These are the authorities the render() consumes; they are unit-driven
+  // directly (intent-diff-surfaces.test.ts) rather than through a full
+  // room-view mount, which does not exist under jsdom.
+
+  /** Mic button on/off — the user's intent, not an event mirror. On means
+   *  the device is wanted AND not muted. */
+  private get _micOn(): boolean {
+    const i = this._localIntent.value;
+    return !!i && i.mic.wanted && !i.mic.muted;
+  }
+
+  /** Camera button on/off — the user's intent (camera wanted). */
+  private get _cameraOn(): boolean {
+    const i = this._localIntent.value;
+    return !!i && i.camera.wanted;
+  }
+
+  /** The open intent diff for a scope, or undefined when the intent is met. */
+  private _intentDiff(
+    scope: 'mic' | 'camera' | 'carrier'
+  ): IntentDiff | undefined {
+    return (this._intentDiffs.value ?? []).find(d => d.scope === scope);
+  }
+
+  /** Warning-badge class for a capture toggle: '' when met, amber-pulsing
+   *  while the reconciler is still trying (`pending`), static red once it
+   *  has given up (`failed`). The button's `title` is the diff's copy. */
+  private _badgeClassFor(scope: 'mic' | 'camera'): string {
+    const diff = this._intentDiff(scope);
+    if (!diff) return '';
+    return diff.severity === 'failed'
+      ? 'intent-badge intent-badge-failed'
+      : 'intent-badge intent-badge-pending';
+  }
+
+  /** The room-level carrier banner text — the carrier diff's copy plus
+   *  whole seconds since it opened — or undefined while the carrier is up.
+   *  The per-tick re-render (intentDiffs changes each tick) advances the
+   *  elapsed seconds; no separate timer is needed. */
+  private _carrierBannerText(): string | undefined {
+    const diff = this._intentDiff('carrier');
+    if (!diff) return undefined;
+    const elapsedS = Math.max(
+      0,
+      Math.floor((this.streamsStore.clock.now() - diff.since) / 1000)
+    );
+    return `${diff.copy} ${elapsedS}s`;
+  }
+
+  /** Per-tile link-establishment copy via the Task 5 authority — the copy
+   *  distinguishes a first attempt from a reconnection so the user knows
+   *  not to tear the link down mid-recovery. Returns undefined once the
+   *  link is connected. */
+  private _tileEstablishmentCopy(
+    pubkeyB64: AgentPubKeyB64,
+    connected: boolean
+  ): string | undefined {
+    return describeLinkEstablishment({
+      connected,
+      reconnecting: this.streamsStore.peerReconnecting(pubkeyB64),
+    })?.copy;
+  }
+
   /**
    * The store-event handler, extracted from the firstUpdated closure so
    * the event arms are drivable under jsdom (Round 3 item 4a — the
@@ -446,24 +527,15 @@ export class RoomView extends LitElement {
           this.notifyError(event.error);
           break;
         }
-        case 'my-audio-off': {
-          this._microphone = false;
-          break;
-        }
-        case 'my-audio-on': {
-          this._microphone = true;
-          break;
-        }
+        // my-audio-on/off and my-video-off carried only the deleted
+        // `_microphone`/`_camera` event mirrors; the buttons now render
+        // `localIntent` directly, so those arms are gone. `my-video-on`
+        // remains solely for its bindVideoStream side effect.
         case 'my-video-on': {
           const myVideo = this.shadowRoot?.getElementById(
             'my-own-stream'
           ) as HTMLVideoElement | null;
           bindVideoStream(myVideo, this.streamsStore.mainStream, 'ensure');
-          this._camera = true;
-          break;
-        }
-        case 'my-video-off': {
-          this._camera = false;
           break;
         }
         case 'my-screen-share-on': {
@@ -1566,16 +1638,19 @@ export class RoomView extends LitElement {
             })()
           : html``}
         <sl-tooltip
-          content="${this._microphone
+          content="${this._micOn
             ? msg('Turn Audio Off')
             : msg('Turn Audio On')}"
           hoist
         >
           <div
-            class="toggle-btn ${this._microphone ? '' : 'btn-off'}"
+            class="toggle-btn ${this._micOn ? '' : 'btn-off'} ${this._badgeClassFor(
+              'mic'
+            )}"
+            title="${this._intentDiff('mic')?.copy ?? ''}"
             tabindex="0"
             @click=${async () => {
-              if (this._microphone) {
+              if (this._micOn) {
                 await this.streamsStore.audioOff();
               } else {
                 await this.streamsStore.audioOn(true);
@@ -1583,7 +1658,7 @@ export class RoomView extends LitElement {
             }}
             @keypress=${async (e: KeyboardEvent) => {
               if (e.key === 'Enter') {
-                if (this._microphone) {
+                if (this._micOn) {
                   await this.streamsStore.audioOff();
                 } else {
                   await this.streamsStore.audioOn(true);
@@ -1592,8 +1667,8 @@ export class RoomView extends LitElement {
             }}
           >
             <sl-icon
-              class="toggle-btn-icon ${this._microphone ? '' : 'btn-icon-off'}"
-              .src=${this._microphone
+              class="toggle-btn-icon ${this._micOn ? '' : 'btn-icon-off'}"
+              .src=${this._micOn
                 ? wrapPathInSvg(mdiMicrophone)
                 : wrapPathInSvg(mdiMicrophoneOff)}
             ></sl-icon>
@@ -1693,16 +1768,19 @@ export class RoomView extends LitElement {
         </sl-tooltip>
 
         <sl-tooltip
-          content="${this._camera
+          content="${this._cameraOn
             ? msg('Turn Camera Off')
             : msg('Turn Camera On')}"
           hoist
         >
           <div
-            class="toggle-btn ${this._camera ? '' : 'btn-off'}"
+            class="toggle-btn ${this._cameraOn ? '' : 'btn-off'} ${this._badgeClassFor(
+              'camera'
+            )}"
+            title="${this._intentDiff('camera')?.copy ?? ''}"
             tabindex="0"
             @click=${async () => {
-              if (this._camera) {
+              if (this._cameraOn) {
                 await this.streamsStore.videoOff();
               } else {
                 await this.streamsStore.videoOn();
@@ -1710,7 +1788,7 @@ export class RoomView extends LitElement {
             }}
             @keypress=${async (e: KeyboardEvent) => {
               if (e.key === 'Enter') {
-                if (this._camera) {
+                if (this._cameraOn) {
                   await this.streamsStore.videoOff();
                 } else {
                   await this.streamsStore.videoOn();
@@ -1719,8 +1797,8 @@ export class RoomView extends LitElement {
             }}
           >
             <sl-icon
-              class="toggle-btn-icon ${this._camera ? '' : 'btn-icon-off'}"
-              .src=${this._camera
+              class="toggle-btn-icon ${this._cameraOn ? '' : 'btn-icon-off'}"
+              .src=${this._cameraOn
                 ? wrapPathInSvg(mdiVideo)
                 : wrapPathInSvg(mdiVideoOff)}
             ></sl-icon>
@@ -2941,6 +3019,16 @@ export class RoomView extends LitElement {
           : html``}
         ${this.roomName()}
       </div>
+      ${(() => {
+        // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
+        // carrier banner while the signal carrier is down. Copy + elapsed
+        // seconds live in _carrierBannerText, sourced from the ONE
+        // intentDiffs store; purely local, no wire change.
+        const banner = this._carrierBannerText();
+        return banner
+          ? html`<div class="carrier-banner">${banner}</div>`
+          : html``;
+      })()}
       <div
         class="videos-container${splitMode ? ' split-mode' : ''}${autoGrid
           ? ' auto-grid'
@@ -3000,7 +3088,7 @@ export class RoomView extends LitElement {
             : html`
               <video
                 muted
-                style="${this._camera
+                style="${this._cameraOn
                   ? ''
                   : 'display: none;'}; transform: scaleX(-1);"
                 id="my-own-stream"
@@ -3009,7 +3097,7 @@ export class RoomView extends LitElement {
               <avatar-with-nickname
                 .hideNickname=${true}
                 .agentPubKey=${this.roomStore.client.client.myPubKey}
-                style="width: 35%;${this._camera ? ' display: none;' : ''}"
+                style="width: 35%;${this._cameraOn ? ' display: none;' : ''}"
               ></avatar-with-nickname>
             `}
 
@@ -3056,7 +3144,7 @@ export class RoomView extends LitElement {
                   <div class="row" style="align-items: center;">
                     <avatar-with-nickname
                       .size=${36}
-                      .hideAvatar=${!this._camera}
+                      .hideAvatar=${!this._cameraOn}
                       .agentPubKey=${this.roomStore.client.client.myPubKey}
                       style="height: 36px;"
                     ></avatar-with-nickname>
@@ -3180,11 +3268,22 @@ export class RoomView extends LitElement {
                       id="${videoElId}"
                       class="video-el"
                     ></video>
-                    <div
-                      style="color: #b9a884; font-size: 0.8em; ${conn.connected ? 'display: none' : ''}"
-                    >
-                      establishing WebRTC carrier...
-                    </div>
+                    ${(() => {
+                      // Copy lives ONLY in intent-diff-policy.ts
+                      // (describeLinkEstablishment) — first-establishment
+                      // vs reconnection is decided there, not inline here.
+                      const est = this._tileEstablishmentCopy(
+                        pubkeyB64,
+                        !!conn.connected
+                      );
+                      return est
+                        ? html`<div
+                            style="color: #b9a884; font-size: 0.8em;"
+                          >
+                            ${est}
+                          </div>`
+                        : html``;
+                    })()}
                     <div
                       style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
                     >
@@ -4295,6 +4394,53 @@ export class RoomView extends LitElement {
 
       .btn-off {
         background: #22365c;
+      }
+
+      /* Task 6 surface 1: unfulfilled-intent badge on a toggle button.
+         The button already shows what the user ASKED for; the badge shows
+         reality lags — amber-pulsing while the reconciler is still trying
+         (pending), static red once it has given up (failed). */
+      .intent-badge::after {
+        content: '';
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid #0e142c;
+        box-sizing: border-box;
+      }
+
+      .intent-badge-pending::after {
+        background: #f0a500;
+        animation: intent-badge-pulse 1.2s ease-in-out infinite;
+      }
+
+      .intent-badge-failed::after {
+        background: #d0342c;
+      }
+
+      @keyframes intent-badge-pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.3;
+        }
+      }
+
+      /* Task 6 surface 3: room-level carrier banner (signal carrier down). */
+      .carrier-banner {
+        margin: 4px auto 0;
+        padding: 4px 12px;
+        border-radius: 6px;
+        background: #5a3a00;
+        color: #ffd27f;
+        font-size: 14px;
+        text-align: center;
+        max-width: 90%;
       }
 
       .audio-input-sources {

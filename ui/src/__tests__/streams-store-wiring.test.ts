@@ -1623,6 +1623,57 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
     ).toBe(true);
     expect(started.events.some(e => e.type === 'my-video-on')).toBe(true);
   });
+
+  // Task 6: the store recomputes `intentDiffs` at the SAME presence-tick
+  // site where the reconciler runs, so the UI can never show a diff the
+  // reconciler is not acting on. These pin that wiring — the pure
+  // `describeIntentDiffs` decision is table-tested in intent-diff-policy.
+  it('(e) a dead-but-wanted mic surfaces a pending mic diff on the tick', async () => {
+    installNavigator(async () => {
+      throw new Error('NotAllowedError: mic denied');
+    });
+    const started = makeStarted();
+
+    // Gesture: mic wanted; the reconciler's acquire fails (no live device).
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.lifecycle.state).toBe('failed');
+
+    // Recompute happens in the presence-tick subscription, not in audioOn.
+    await presenceTick(started);
+
+    const diffs = get(started.store.intentDiffs);
+    const mic = diffs.find(d => d.scope === 'mic');
+    expect(mic?.severity).toBe('pending');
+    expect(mic?.copy).toBe('Microphone unavailable — retrying…');
+  });
+
+  it('(f) once the reconciler exhausts its attempts the mic diff goes failed', async () => {
+    installNavigator(async () => {
+      throw new Error('NotAllowedError: mic denied');
+    });
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    // Drive paced ticks past the ceiling; report-failure bumps the count
+    // past the max so the diff's severity flips to 'failed'.
+    for (let i = 0; i < CAPTURE_REOPEN_MAX_ATTEMPTS + 2; i += 1) {
+      started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+      await started.store.captureReconciler.tick();
+      await flush();
+    }
+    expect(
+      started.store.captureReconciler.micAttemptState.attemptsSinceGesture
+    ).toBeGreaterThanOrEqual(CAPTURE_REOPEN_MAX_ATTEMPTS);
+
+    // A recompute tick reflects the exhausted state.
+    await presenceTick(started);
+
+    const mic = get(started.store.intentDiffs).find(d => d.scope === 'mic');
+    expect(mic?.severity).toBe('failed');
+    expect(mic?.copy).toBe('Microphone unavailable');
+  });
 });
 
 describe('InitAccept lifecycle (§9 item 5)', () => {
