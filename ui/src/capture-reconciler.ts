@@ -35,6 +35,14 @@ export type CaptureReconcilerBindings = {
   /** store error-event emitter, for the report-failure arm */
   onError: (message: string) => void;
   log: (message: string) => void;
+  /** Fired when the camera handle is FRESHLY acquired (no-handle → held).
+   *  The camera's peer attach is keepalive-aware store fanout that can't
+   *  live in the source binding (it must not run on a device close while
+   *  the filmstrip still holds the camera), so the store runs it here — and
+   *  a fresh acquire can happen on a bare presence tick after `videoOn`'s
+   *  first acquire failed, not only inside `videoOn`. Not fired on reopen:
+   *  reopen swaps the corpse on peers through the device-change fanout. */
+  onCameraAcquired: () => void;
 };
 
 type DeviceState = {
@@ -195,13 +203,18 @@ export class CaptureReconciler {
         try {
           if (this.cameraHandle) {
             // Dead-but-held: reopen swaps the corpse on peers via the
-            // source's device-change fanout. A fresh open (no handle) is
-            // acquired here; its keepalive-aware peer attach is `videoOn`'s
-            // job (tied to the WebRTC handle, not the device).
+            // source's device-change fanout — no keepalive attach needed.
             await this.bindings.camera.reopen();
           } else {
             const handle = await this.bindings.camera.acquire({ id: CONSUMER_ID });
-            if (handle) this.cameraHandle = handle;
+            if (handle) {
+              this.cameraHandle = handle;
+              // Fresh acquire (no-handle → held): the store runs the
+              // keepalive-aware peer attach + my-video-on. Reachable here
+              // (a bare tick after videoOn's first acquire failed), not
+              // only from videoOn.
+              this.bindings.onCameraAcquired();
+            }
           }
         } finally {
           state.inFlight = false;
