@@ -99,8 +99,9 @@ import {
 import { RoomStore } from './room/room-store';
 import type { StreamsStoreDeps } from './store-deps';
 import { PresenceLogger } from './logging';
-import { MicSource, MicAcquireResult } from './mic-source';
-import { CameraSource, CameraAcquireResult } from './camera-source';
+import { MicSource } from './mic-source';
+import { CameraSource } from './camera-source';
+import { CaptureReconciler } from './capture-reconciler';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -424,23 +425,9 @@ export class StreamsStore {
   /** Unsubscribe from the _signalsTargets subscription. */
   private _signalsTargetsUnsub: (() => void) | null = null;
 
-  /**
-   * Release handle held by the WebRTC audio path. Populated on `audioOn`,
-   * cleared on full release. `audioOff` does NOT release — it just calls
-   * `micSource.setMuted(true)` so the track stays alive for fast
-   * re-enable without WebRTC renegotiation.
-   */
-  private _webrtcMicHandle: MicAcquireResult | null = null;
-
-  /**
-   * Release handle held by the WebRTC video path. Populated on `videoOn`,
-   * cleared on `videoOff`. Unlike audio, video off IS the release path —
-   * the existing semantics stop the camera (LED off when refcount hits
-   * 0), so there's no mute-vs-off split. Held alongside the keepalive
-   * track on the senders, which stays put across videoOff/videoOn cycles
-   * to preserve the m-line / RTCRtpSender.
-   */
-  private _webrtcCameraHandle: CameraAcquireResult | null = null;
+  /** The ONE owner of the WebRTC mic/camera acquire handles and their
+   *  retry state (Task 3; see capture-reconciler.ts). Assigned in start(). */
+  captureReconciler!: CaptureReconciler;
 
   /**
    * WebRTC transports. Three instances by purpose:
@@ -730,6 +717,18 @@ export class StreamsStore {
       now: () => this.clock.now(),
     });
 
+    // Polls the sources' lifecycle on the tick (onLifecycleChange stays a
+    // no-op above); acquire/reopen/release live here, not in the store.
+    this.captureReconciler = new CaptureReconciler({
+      clock: this.clock,
+      getIntent: () => get(this._localIntent),
+      mic: this.micSource,
+      camera: this.cameraSource,
+      onError: message => this.eventCallback({ type: 'error', error: message }),
+      log: message => this.logger.logCustomMessage(message),
+      onCameraAcquired: () => this._attachCameraToPeers(),
+    });
+
     // Bind controllers permanently so the receive side (decoders /
     // playback) works regardless of whether the local mic / camera is
     // on. Send sides are gated by the reconcilers. Unbind happens in
@@ -764,6 +763,10 @@ export class StreamsStore {
       // decoder — but a target-set GROW must recompute here too, so the
       // boolean is never stale-true across it.
       this._voiceBatchCapAllTargets = this.signalsTargetsAllHaveCap(CAP_VOICE_BATCH);
+      // Load-bearing per-tick cadence: the correctness backstop that
+      // reopens a device whose ended/failed edge was missed. Pinned by the
+      // capture-reconciler wiring tests (mutation-check ii).
+      this.captureReconciler.tick().catch(() => {});
       this._reconcileSignalsAudio();
       this._reconcileSignalsVideo();
     });
@@ -2100,9 +2103,11 @@ export class StreamsStore {
    * _signalsTargets subscription and from audioOn/audioOff.
    */
   private _reconcileSignalsAudio(): void {
-    const micHeld = !!this._webrtcMicHandle || this.micSource.consumerCount > 0;
+    // Gate on INTENT, not a held-handle observation (Task 3 replacement #3
+    // — the conflation this round kills). Mutation-check (i) / test (b').
+    const micWanted = get(this._localIntent).mic.wanted;
     const hasTargets = get(this._signalsTargets).size > 0;
-    const shouldRun = micHeld && hasTargets;
+    const shouldRun = micWanted && hasTargets;
 
     if (shouldRun && !this._voiceEncoderRunning) {
       // Only start the encoder (send side). The controller is already
@@ -2140,15 +2145,14 @@ export class StreamsStore {
    * held AND at least one peer needs video via signals. Mirrors
    * `_reconcileSignalsAudio`. Called from the _signalsTargets
    * subscription and from videoOn/videoOff.
-   *
-   * Trigger uses `_webrtcCameraHandle` (not `cameraSource.consumerCount`)
-   * to avoid the trivial cycle where the filmstrip controller's own
-   * acquire would keep the gate true forever.
    */
   private _reconcileSignalsVideo(): void {
-    const cameraHeld = !!this._webrtcCameraHandle;
+    // Gate on INTENT (Task 3 replacement #3): set by the video-on/off
+    // gesture, so the filmstrip's own camera acquire can't hold the gate
+    // true — retiring the consumer-count cycle the old gate dodged.
+    const cameraWanted = get(this._localIntent).camera.wanted;
     const hasTargets = get(this._signalsTargets).size > 0;
-    const shouldRun = cameraHeld && hasTargets;
+    const shouldRun = cameraWanted && hasTargets;
 
     if (shouldRun && !this._filmstripEncoderRunning) {
       // Failure handling mirrors `_reconcileSignalsAudio`: both failure
@@ -2480,17 +2484,10 @@ export class StreamsStore {
       this._presentPeersUnsub();
       this._presentPeersUnsub = null;
     }
-    // Release the WebRTC mic handle and force-close the MicSource (which
-    // stops the underlying track and closes the shared AudioContext).
-    if (this._webrtcMicHandle) {
-      try { this._webrtcMicHandle.release(); } catch {}
-      this._webrtcMicHandle = null;
-    }
+    // Release both WebRTC acquire handles (Task 3: reconciler-owned;
+    // releaseAll is disconnect-only cleanup), then force-close the sources.
+    this.captureReconciler.releaseAll();
     this.micSource.dispose();
-    if (this._webrtcCameraHandle) {
-      try { this._webrtcCameraHandle.release(); } catch {}
-      this._webrtcCameraHandle = null;
-    }
     this.cameraSource.dispose();
     this.screenShareOff();
     this.mainStream = null;
@@ -2940,42 +2937,13 @@ export class StreamsStore {
 
   async videoOn() {
     this._applyIntent({ type: 'video-on' });
-    // Acquire the camera via CameraSource. The acquire call triggers
-    // _onCameraTrackChange's open branch, which adds the track to
-    // mainStream (lazily creating it) and calls setLocalStream on each
-    // transport. Peer-side track attachment is done here, with the
-    // keepalive-aware replaceTrack-vs-addTrack decision.
-    if (!this._webrtcCameraHandle) {
-      const handle = await this.cameraSource.acquire({ id: 'webrtc' });
-      if (!handle) {
-        const error = 'Failed to acquire camera for WebRTC video';
-        console.error(error);
-        this.eventCallback({ type: 'error', error });
-        return;
-      }
-      this._webrtcCameraHandle = handle;
-
-      // If there's a keepalive sender on each peer (left there by
-      // videoOff), swap it for the real camera track via replaceTrack
-      // — preserves the existing RTCRtpSender / m-line and avoids a
-      // renegotiation. Otherwise (no prior video sender) addTrack creates
-      // a new one with the standard renegotiation flow.
-      const keepalive = this._videoKeepaliveTrack;
-      const videoTrack = handle.track;
-      for (const t of this._allMediaTransports()) {
-        try {
-          if (keepalive) {
-            t.replaceTrack(keepalive, videoTrack, this.mainStream!);
-          } else {
-            t.addTrack(videoTrack, this.mainStream!);
-          }
-        } catch (e: any) {
-          console.error(`Failed to attach video track: ${e.toString()}`);
-        }
-      }
-      if (keepalive) this._releaseVideoKeepalive();
-      this.eventCallback({ type: 'my-video-on' });
-    }
+    // Reconciler acquires the camera (Task 3 replacement #2); on a fresh
+    // acquire it calls back into `_attachCameraToPeers` (below), so the
+    // peer attach + my-video-on happen on WHICHEVER tick actually acquires
+    // — this gesture's, or a later bare tick if this one's first acquire
+    // failed transiently. No inline attach here (would double-fire).
+    this.captureReconciler.noteGesture('camera');
+    await this.captureReconciler.tick();
 
     // Start the filmstrip encoder if peers need signals-carried video.
     this._reconcileSignalsVideo();
@@ -2988,6 +2956,37 @@ export class StreamsStore {
 
     // Send 'video-on' signal to peers
     this._broadcastRtcAction('video-on');
+  }
+
+  /**
+   * Attach the freshly-acquired camera track to every peer and fire
+   * `my-video-on`. Called by the capture reconciler's fresh-acquire arm
+   * (no-handle → held) — from `videoOn`'s tick OR a later bare presence
+   * tick if `videoOn`'s first acquire failed transiently. This peer fanout
+   * stays in the store (not the source binding) because it is tied to the
+   * WebRTC handle coming up, not to the device open: a keepalive sender
+   * left by `videoOff` is swapped for the real track via `replaceTrack`
+   * (no renegotiation, same RTCRtpSender / m-line); with no prior sender,
+   * `addTrack` creates one.
+   */
+  private _attachCameraToPeers(): void {
+    const keepalive = this._videoKeepaliveTrack;
+    const videoTrack = this.cameraSource.track;
+    if (videoTrack) {
+      for (const t of this._allMediaTransports()) {
+        try {
+          if (keepalive) {
+            t.replaceTrack(keepalive, videoTrack, this.mainStream!);
+          } else {
+            t.addTrack(videoTrack, this.mainStream!);
+          }
+        } catch (e: any) {
+          console.error(`Failed to attach video track: ${e.toString()}`);
+        }
+      }
+      if (keepalive) this._releaseVideoKeepalive();
+    }
+    this.eventCallback({ type: 'my-video-on' });
   }
 
   /**
@@ -3046,60 +3045,51 @@ export class StreamsStore {
 
   videoOff() {
     this._applyIntent({ type: 'video-off' });
-    if (!this._webrtcCameraHandle) return;
-    if (!this.mainStream) return;
-    const videoTracks = this.mainStream.getVideoTracks();
+    if (!this.captureReconciler.cameraHandleHeld) return;
 
-    // Build a black-frame keepalive track and swap it onto every peer's
-    // existing video sender via replaceTrack (no renegotiation, same
-    // RTCRtpSender, same SDP m-line). This is the fix for the NAT
-    // cooldown failure mode: with audio also muted, dropping the video
-    // sender entirely (the previous behaviour) starved RTP egress, the
-    // remote NAT aged out the candidate-pair mapping, and ICE went
-    // disconnected -> failed.
-    const keepaliveTrack = this._ensureVideoKeepaliveTrack();
-    const stream = this.mainStream;
-
-    if (keepaliveTrack) {
-      for (const cameraTrack of videoTracks) {
-        for (const t of this._allMediaTransports()) {
-          try {
-            t.replaceTrack(cameraTrack, keepaliveTrack, stream);
-          } catch (e) {
-            console.warn('videoOff: replaceTrack failed:', e);
+    // Swap the keepalive onto every peer's video sender while the camera
+    // track is still live (Task 3 replacement #2: this peer fanout stays in
+    // the store — tied to the WebRTC handle going off, not the device
+    // closing, so the filmstrip keeping the device open must not stop it).
+    // A black-frame keepalive keeps RTP flowing so the NAT mapping stays
+    // warm (dropping the sender entirely was the NAT-cooldown ICE failure).
+    if (this.mainStream) {
+      const videoTracks = this.mainStream.getVideoTracks();
+      const keepaliveTrack = this._ensureVideoKeepaliveTrack();
+      const stream = this.mainStream;
+      if (keepaliveTrack) {
+        for (const cameraTrack of videoTracks) {
+          for (const t of this._allMediaTransports()) {
+            try {
+              t.replaceTrack(cameraTrack, keepaliveTrack, stream);
+            } catch (e) {
+              console.warn('videoOff: replaceTrack failed:', e);
+            }
           }
         }
-      }
-    } else {
-      // No keepalive available (canvas / captureStream unsupported) —
-      // fall back to the old behaviour of dropping the sender. This
-      // path is the source of the NAT cooldown bug; in supported
-      // browsers the keepalive path above is taken.
-      for (const t of this._allMediaTransports()) {
-        try {
-          videoTracks.forEach(track => {
-            t.removeTrack(track, stream);
-          });
-        } catch (e) {
-          console.warn('Could not remove video track from peers: ', e);
+      } else {
+        // No keepalive available (canvas / captureStream unsupported) —
+        // fall back to dropping the sender. This path is the source of the
+        // NAT cooldown bug; supported browsers take the keepalive path.
+        for (const t of this._allMediaTransports()) {
+          try {
+            videoTracks.forEach(track => {
+              t.removeTrack(track, stream);
+            });
+          } catch (e) {
+            console.warn('Could not remove video track from peers: ', e);
+          }
         }
       }
     }
 
-    // Release the WebRTC camera handle. If the filmstrip encoder is also
-    // holding the camera, the device stays open until the reconciler
-    // below releases that handle too. Otherwise CameraSource refcount
-    // hits 0 and the device closes (LED off). _onCameraTrackChange's
-    // close branch removes the (now-stopped) camera track from
-    // mainStream — by then the keepalive sender is already in place on
-    // every peer, so the close branch does no peer fanout.
-    try { this._webrtcCameraHandle.release(); } catch {}
-    this._webrtcCameraHandle = null;
+    // Intent now says camera unwanted, so the reconciler's `close` arm
+    // releases the handle (Task 3 replacement #2). The device closes only
+    // if no other consumer (filmstrip) still holds it.
+    this.captureReconciler.noteGesture('camera');
+    this.captureReconciler.tick();
 
-    // Stop the filmstrip encoder. Clicking videoOff means the user
-    // doesn't want video flowing in any carrier. Without this, the
-    // filmstrip handle would keep the camera open and the LED on after
-    // a "video off" click.
+    // Stop the filmstrip encoder — videoOff means no video in any carrier.
     this._reconcileSignalsVideo();
 
     this._broadcastRtcAction('video-off');
@@ -3138,26 +3128,13 @@ export class StreamsStore {
       event: 'MyAudioOn',
     });
 
-    // Acquire the mic via MicSource on the first audioOn. Subsequent calls
-    // just flip the mute flag — we hold the handle until disconnect, or
-    // until a future explicit release path wants it back.
-    if (!this._webrtcMicHandle) {
-      const handle = await this.micSource.acquire({ id: 'webrtc' });
-      if (!handle) {
-        const error = 'Failed to acquire mic for WebRTC audio';
-        console.error(error);
-        this.eventCallback({ type: 'error', error });
-        return;
-      }
-      this._webrtcMicHandle = handle;
-      // The acquire call triggered _onMicTrackChange → mainStream.addTrack
-      // and peer.addTrack for every open connection. Nothing more to do on
-      // the stream-attachment side here.
-    }
+    // Reconciler acquires the mic (Task 3 replacement #1); a transient
+    // failure no longer aborts here — it retries and reports once.
+    this.captureReconciler.noteGesture('mic');
+    await this.captureReconciler.tick();
 
-    // Apply the requested mute state. MicSource.setMuted is a no-op if the
-    // state already matches, so calling audioOn(true) while already
-    // unmuted is cheap.
+    // Apply mute for the already-live case (a toggle with no (re)open,
+    // where the reconciler's own setMuted did not run). No-op if unchanged.
     this.micSource.setMuted(!enabled);
 
     // Activate or update the `mic` module so peers' icon strips render the
@@ -5170,14 +5147,28 @@ export class StreamsStore {
    * Public method for manual track recovery. Tries replaceTrack first,
    * falls back to clone approach. Does not tear down the WebRTC connection.
    */
-  refreshTracksForPeer(pubKeyB64: AgentPubKeyB64) {
+  refreshTracksForPeer(pubKeyB64: AgentPubKeyB64): boolean {
     const connInfo = get(this._openConnections)[pubKeyB64];
     if (!connInfo || !this.mainStream) {
       console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no connection or stream`);
-      return;
+      return false;
     }
     const myAudioTrack = this.mainStream.getAudioTracks()[0];
     const myVideoTrack = this.mainStream.getVideoTracks()[0];
+
+    // Task 3 replacement #4 (Incident B): refuse to push a track whose
+    // source is not live — replaceTrack'ing a dead track and logging
+    // "refreshed via transport" was the dishonest success that hid the
+    // wedge. Defer to the reconciler's reopen fanout; return false so a
+    // later real recovery (`_cloneStreamRecovery`) stays available.
+    const audioDead = !!myAudioTrack && this.micSource.lifecycle.state !== 'live';
+    const videoDead = !!myVideoTrack && this.cameraSource.lifecycle.state !== 'live';
+    if (audioDead || videoDead) {
+      this.logger.logCustomMessage(
+        `Track refresh [${pubKeyB64.slice(0, 8)}]: source dead, deferring to capture reconciler`
+      );
+      return false;
+    }
 
     this.logger.logCustomMessage(
       `Track refresh [${pubKeyB64.slice(0, 8)}]: audio=${myAudioTrack ? `${myAudioTrack.enabled ? 'enabled' : 'disabled'},${myAudioTrack.muted ? 'muted' : 'unmuted'},${myAudioTrack.readyState}` : 'none'} video=${myVideoTrack ? `${myVideoTrack.enabled ? 'enabled' : 'disabled'},${myVideoTrack.muted ? 'muted' : 'unmuted'},${myVideoTrack.readyState}` : 'none'}`
@@ -5190,6 +5181,7 @@ export class StreamsStore {
     this.logger.logCustomMessage(
       `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
     );
+    return success;
   }
 
   /** Maximum number of attempts before marking a diagnostic request failed. */
