@@ -107,6 +107,8 @@ import { getStreamInfo } from './utils';
 import { parseSignalPayload } from './signal-payload';
 import { decodeRtcMessage, encodeRtcAction } from './rtc-message-policy';
 import type { ActionMessage } from './rtc-message-policy';
+import { applyIntentGesture, initialLocalIntent } from './intent';
+import type { IntentGesture, LocalIntent } from './intent';
 
 declare const __APP_VERSION__: string;
 
@@ -337,6 +339,32 @@ export class StreamsStore {
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
 
   /**
+   * The durable record of what the user last asked for — see intent.ts
+   * for the type and the write-discipline invariant it documents.
+   * Constructed in the constructor from
+   * `initialLocalIntent(this.deps.storage.local)`. Declared a parallel
+   * authority (working agreement 1): nothing reads it yet.
+   */
+  _localIntent: Writable<LocalIntent>;
+
+  get localIntent(): Readable<LocalIntent> {
+    return this._localIntent;
+  }
+
+  /**
+   * The ONE intent writer (pinned by intent-write-sites.test.ts). Called
+   * only from user-gesture entry points — see intent.ts's header for the
+   * one documented gesture-equivalent exception.
+   */
+  private _applyIntent(gesture: IntentGesture): void {
+    this._localIntent.update(prev => {
+      const next = applyIntentGesture(prev, gesture);
+      this.logger.logCustomMessage(`IntentChange: ${gesture.type}`);
+      return next;
+    });
+  }
+
+  /**
    * Global WebRTC kill switch. When true, no WebRTC connections are
    * initiated or accepted for any peer. Audio flows via signals only.
    * Independent of the conversation module's active state — you can
@@ -446,6 +474,7 @@ export class StreamsStore {
     this.logger = logger;
     this.clock = deps.clock;
     this.myPubKeyB64 = encodeHashToBase64(deps.bus.myPubKey);
+    this._localIntent = writable(initialLocalIntent(this.deps.storage.local));
 
     this._activeAgents = derived(
       [this._knownAgents, this.blockedAgents, this._presenceTick] as [
@@ -2372,6 +2401,7 @@ export class StreamsStore {
   }
 
   disconnect(reason: string = 'unknown') {
+    this._applyIntent({ type: 'session-end' });
     // Forensics: capture WHO called disconnect (button vs. Lit lifecycle
     // unmount) so we can tell user-initiated leaves from DOM-remount leaves.
     // Stack is best-effort — useful when reason='unknown' to find a new caller.
@@ -2901,6 +2931,7 @@ export class StreamsStore {
   }
 
   async videoOn() {
+    this._applyIntent({ type: 'video-on' });
     // Acquire the camera via CameraSource. The acquire call triggers
     // _onCameraTrackChange's open branch, which adds the track to
     // mainStream (lazily creating it) and calls setLocalStream on each
@@ -3006,6 +3037,7 @@ export class StreamsStore {
   }
 
   videoOff() {
+    this._applyIntent({ type: 'video-off' });
     if (!this._webrtcCameraHandle) return;
     if (!this.mainStream) return;
     const videoTracks = this.mainStream.getVideoTracks();
@@ -3091,6 +3123,7 @@ export class StreamsStore {
   }
 
   async audioOn(enabled: boolean) {
+    this._applyIntent({ type: enabled ? 'audio-on' : 'audio-mute' });
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
@@ -3157,6 +3190,7 @@ export class StreamsStore {
   }
 
   async audioOff() {
+    this._applyIntent({ type: 'audio-mute' });
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
       timestamp: this.clock.now(),
@@ -3271,6 +3305,10 @@ export class StreamsStore {
     // pane opens on remote peers (and locally) only once sharing actually
     // starts. The activation must precede 'my-screen-share-on' so the local
     // video element is rendered when room-view sets its srcObject.
+    //
+    // Intent is applied here too, not as the method's first statement: a
+    // canceled picker expressed no intent (brief, Task 1).
+    this._applyIntent({ type: 'screen-share-on' });
     await this.activateModule('screen-share');
     this.eventCallback({
       type: 'my-screen-share-on',
@@ -3281,6 +3319,7 @@ export class StreamsStore {
    * Turning screen sharing off is equivalent to closing the corresponding peer connection
    */
   screenShareOff() {
+    this._applyIntent({ type: 'screen-share-off' });
     if (this.screenShareStream) {
       this.screenShareStream.getVideoTracks().forEach(track => {
         // eslint-disable-next-line no-param-reassign
@@ -4192,6 +4231,7 @@ export class StreamsStore {
    * the change in one broadcast.
    */
   async setCarrierMode(mode: 'webrtc' | 'signals'): Promise<void> {
+    this._applyIntent({ type: 'carrier-mode', mode });
     const previous = this.carrierMode();
     if (previous === mode) return;
 
@@ -4260,6 +4300,11 @@ export class StreamsStore {
     peerB64: AgentPubKeyB64,
     carrier: 'inherit' | 'signals',
   ): Promise<void> {
+    this._applyIntent({
+      type: 'peer-webrtc',
+      peer: peerB64,
+      disabled: carrier === 'signals',
+    });
     const previous = this.myPeerCarrier(peerB64);
     if (previous === carrier) return;
 
