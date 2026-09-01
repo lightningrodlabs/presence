@@ -52,10 +52,18 @@ import type { RoomSignal, StoreEventPayload } from '../types';
  */
 
 const myPubKey = new Uint8Array(39).fill(1);
+const myPubKeyB64 = encodeHashToBase64(myPubKey as unknown as AgentPubKey);
 const peerAKey = new Uint8Array(39).fill(2) as AgentPubKey;
 const peerA = encodeHashToBase64(peerAKey);
 const peerBKey = new Uint8Array(39).fill(3) as AgentPubKey;
 const peerB = encodeHashToBase64(peerBKey);
+/** Alphabetically LOWER than `myPubKey` (fill(1)) — the initiator arm's
+ *  ordering condition (`handlePongUi` only initiates toward a lower
+ *  peer key; see the acceptor arm's `pubKey64 > this.myPubKeyB64` gate
+ *  for the converse). Used by the D2 caps-race wiring test below, where
+ *  the store itself must be the initiator. */
+const peerLowerKey = new Uint8Array(39).fill(0) as AgentPubKey;
+const peerLower = encodeHashToBase64(peerLowerKey);
 
 type Started = FakeDeps & {
   store: StreamsStore;
@@ -759,6 +767,193 @@ describe('acceptor eligibility through the started store (Round 3 item 2)', () =
     expect(
       logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
     ).toBe(true);
+  });
+});
+
+describe('caps-unknown vs lacks-cap — the D2 join-race fix (Task 4)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  // `moduleStatesAt` is required for a non-legacy pong: without it, an
+  // empty `moduleStates` reads as "legacy pong, no stamp" and
+  // unconditionally sweeps every held peer module entry
+  // (`decideModuleStateMerge`'s `legacy-pong-unconditional-sweep` row) —
+  // which would delete the very conversation entry the ModuleState push
+  // just set. A same-build peer's pong always carries this stamp.
+  const bareSignalsPong = (clock: ManualClock) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStatesAt: clock.now() },
+    });
+
+  it('acceptor: an InitRequest from a peer whose conversation payload has not arrived is dropped with a distinct "caps not yet received" log, never "lacks sdp-fsm capability"', async () => {
+    const { store, clock, bus, logger } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // No entry at all for peerA in _peerModuleStates — their conversation
+    // payload (and therefore their declared caps) has not arrived yet.
+    // This is the D2 shape: distinct from the "declared empty caps"
+    // scenario above, which IS a known, capability-less peer.
+    expect(get(store._peerModuleStates)[peerA]).toBeUndefined();
+
+    await bus.deliver(
+      message(
+        peerAKey,
+        'InitRequest',
+        JSON.stringify({ connection_id: 'ir-caps-unknown', connection_type: 'video' })
+      )
+    );
+
+    expect(bus.sentOfType('InitAccept')).toHaveLength(0);
+    expect(
+      logger.customMessages.some(m => m.includes('caps not yet received'))
+    ).toBe(true);
+    expect(
+      logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
+    ).toBe(false);
+  });
+
+  it('initiator: the join-race end to end — no InitRequest while the peer\'s payload is unknown, and the very next pong after it lands drives the init with no parking machinery needed', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+
+    // Peer pongs immediately after joining — their conversation payload
+    // (and caps) has not arrived yet. Pre-fix, `webrtcAvailableFor`
+    // reported no caps here and `decideWebrtcEligibility` returned
+    // `peer-lacks-sdp-fsm-cap`, indistinguishable from a genuinely old
+    // build — dropping this join's first InitRequest.
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+
+    // The payload lands (a real 'ModuleState' push, exercising the same
+    // wiring a late module-state broadcast uses).
+    await bus.deliver(
+      message(
+        peerLowerKey,
+        'ModuleState',
+        JSON.stringify(conversationEnvelope(clock, { caps: ['sdp-fsm'] }))
+      )
+    );
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+
+    // No parking/re-drive trigger is needed: the initiator drive is
+    // already level-triggered per pong (`decideInitRetry`), so the very
+    // next pong re-evaluates eligibility with caps now known and drives
+    // the init on its own.
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    const inits = bus.sentOfType('InitRequest');
+    expect(inits).toHaveLength(1);
+    expect(inits[0].to).toEqual([peerLower]);
+  });
+});
+
+describe('per-peer WebRTC disable is a union of our intent and the peer\'s broadcast (Task 4 review finding B)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  const bareSignalsPong = (clock: ManualClock) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStatesAt: clock.now() },
+    });
+
+  it('a peer who has broadcast a per-peer disable-with-us is never sent an InitRequest, even though our own intent never disabled them', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // The peer (lower key — we are the key-designated initiator) declares
+    // sdp-fsm capability AND has disabled WebRTC specifically with us on
+    // their end. Our own intent never touched `disabledWith` for this
+    // peer — `_localIntent.webrtc.disabledWith` is empty throughout this
+    // test. If the eligibility conjunct only read our own intent (the
+    // bug this test catches), we would wrongly attempt to initiate every
+    // pong cycle, and the peer would silently refuse each one (their own
+    // eligibility check, evaluated with their own intent) — continuous
+    // one-sided churn.
+    store._peerModuleStates.set({
+      [peerLower]: {
+        conversation: conversationEnvelope(clock, {
+          caps: ['sdp-fsm'],
+          disableWebrtcWith: [myPubKeyB64],
+        }),
+      },
+    });
+    expect(get(store._localIntent).webrtc.disabledWith.has(peerLower)).toBe(false);
+
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+    // The union is honored in both directions: webrtcDisabled itself
+    // reports the link disabled, sourced from the peer's broadcast half.
+    expect(store.webrtcDisabled(peerLower)).toBe(true);
+  });
+
+  it('a peer who has broadcast a GLOBAL webrtc disable is never sent an InitRequest', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    store._peerModuleStates.set({
+      [peerLower]: {
+        conversation: conversationEnvelope(clock, {
+          caps: ['sdp-fsm'],
+          webrtcDisabled: true,
+        }),
+      },
+    });
+
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+    expect(store.webrtcDisabled(peerLower)).toBe(true);
+  });
+});
+
+describe("setCarrierMode teardown — regression pin for the previous/_applyIntent ordering bug (Task 4 review finding A)", () => {
+  it('switching to signals tears down an open WebRTC connection', async () => {
+    const { store, transports } = makeStarted();
+    const media = transports.media!;
+
+    // Get a connected slot up via the real transport-event routing —
+    // `setCarrierMode` must find it in `_openConnections` for the
+    // teardown branch to do anything observable.
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'signaling');
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+
+    // `carrierMode()` starts at 'webrtc' (default), so this actually
+    // flips the mode and must run the teardown branch, not the
+    // previous-equals-mode early return. `setCarrierMode` read
+    // `previous = this.carrierMode()` AFTER calling `_applyIntent` at one
+    // point in development; since `carrierMode()` now reads the
+    // `webrtcGloballyDisabled` getter (sourced from `_localIntent`, the
+    // same record `_applyIntent` had just updated), `previous` came back
+    // already equal to `mode` and the teardown below never ran. This test
+    // is the regression pin for that ordering bug — see the fix report
+    // for the RED-under-bad-ordering / GREEN-under-the-fix reproduction.
+    await store.setCarrierMode('signals');
+
+    expect(
+      media.closeCalls.some(
+        c => c.peer === peerA && c.reason === 'disconnectFromPeerVideo'
+      )
+    ).toBe(true);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(store.webrtcGloballyDisabled).toBe(true);
   });
 });
 
