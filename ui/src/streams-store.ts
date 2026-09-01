@@ -4237,52 +4237,6 @@ export class StreamsStore {
   }
 
   /**
-   * Toggle a peer in/out of our `disableWebrtcWith` list and broadcast
-   * the updated conversation module payload. When a peer is added, the
-   * retry loop stops initiating WebRTC for them and the conversation
-   * module's `onModulePayloadChange` on the remote side tears down the
-   * existing connection. When removed, the next pong cycle restarts
-   * WebRTC.
-   *
-   * Also tears down the local WebRTC connection immediately when adding
-   * (we don't wait for the next pong cycle).
-   */
-  async toggleDisableWebrtc(peerB64: AgentPubKeyB64): Promise<void> {
-    const existing = get(this._myModuleStates)['conversation'];
-    const payload: ConversationPayload = existing
-      ? (parseConversationPayload(existing) ?? { ...DEFAULT_CONVERSATION_PAYLOAD })
-      : { ...DEFAULT_CONVERSATION_PAYLOAD };
-
-    const idx = payload.disableWebrtcWith.indexOf(peerB64);
-    if (idx >= 0) {
-      payload.disableWebrtcWith = payload.disableWebrtcWith.filter(p => p !== peerB64);
-      console.log(`toggleDisableWebrtc: re-enabled WebRTC for ${peerB64.slice(0, 8)}`);
-      this.logger.logAgentEvent({
-        agent: peerB64,
-        timestamp: this.clock.now(),
-        event: 'MyWebrtcEnable',
-        detail: 'per-peer',
-      });
-    } else {
-      payload.disableWebrtcWith = [...payload.disableWebrtcWith, peerB64];
-      console.log(`toggleDisableWebrtc: disabled WebRTC for ${peerB64.slice(0, 8)}`);
-      this.logger.logAgentEvent({
-        agent: peerB64,
-        timestamp: this.clock.now(),
-        event: 'MyWebrtcDisable',
-        detail: 'per-peer',
-      });
-    }
-
-    await this._syncConversationPayload(payload);
-
-    if (idx < 0) {
-      this.disconnectFromPeerVideo(peerB64);
-      this._clearPendingWebrtcStatus(peerB64);
-    }
-  }
-
-  /**
    * Unified carrier selection. Since Phase 3 deleted SimplePeer there is
    * exactly one WebRTC implementation, so the model collapses to the two
    * honest axes (the shape Phase 4 asks for):
