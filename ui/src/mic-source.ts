@@ -33,6 +33,30 @@
  * autoplay-gesture prompts.
  */
 
+/**
+ * Capture lifecycle for a device-owning source (`MicSource`/`CameraSource`).
+ * Replaces the old two-state `_track` null/non-null model: `ended` is the
+ * state whose absence made a dead mic unrecoverable in the field (the
+ * track went stale but `_track` stayed non-null, so every predicate that
+ * checked "is there a track" kept answering yes). `_setLifecycle` is the
+ * one place either source writes this; `_onTrackEnded` observes but never
+ * reopens — recovery is Task 3's reconciler's job.
+ */
+export type CaptureLifecycle =
+  | { state: 'idle' }
+  | { state: 'acquiring'; since: number }
+  | { state: 'live'; track: MediaStreamTrack }
+  | { state: 'ended'; endedAt: number }
+  | { state: 'failed'; error: string; failedAt: number };
+
+/** True iff `track` is non-null and not yet ended. The one predicate both
+ *  `acquire()` and `_ensureOpen()` use to decide whether a device needs
+ *  (re)opening — replaces the old `!this._track` check, which read a
+ *  stale (externally-ended) track as still usable. */
+export function isLiveTrack(track: MediaStreamTrack | null): track is MediaStreamTrack {
+  return !!track && track.readyState === 'live';
+}
+
 export type MicConsumerId = string;
 
 export interface MicConsumerOptions {
@@ -79,6 +103,13 @@ export interface MicSourceBindings {
    * issue #606 for why clones need their own enable/disable passes.
    */
   onMutedChange: (muted: boolean) => void;
+  /** Fired on every `_setLifecycle` transition (wrapped in try/catch like
+   *  `onMutedChange`). Task 3's reconciler and Task 5's diff policy are
+   *  the intended consumers. */
+  onLifecycleChange: (lifecycle: CaptureLifecycle) => void;
+  /** Clock read for lifecycle timestamps — routed from `StreamsStore.clock`
+   *  so this file carries no ambient time (see `no-ambient-clock.test.ts`). */
+  now: () => number;
 }
 
 export class MicSource {
@@ -96,6 +127,8 @@ export class MicSource {
   private consumers = new Map<MicConsumerId, MicConsumerOptions>();
 
   private _muted = false;
+
+  private _lifecycle: CaptureLifecycle = { state: 'idle' };
 
   private _audioContext: AudioContext | null = null;
 
@@ -118,6 +151,10 @@ export class MicSource {
     return this._muted;
   }
 
+  get lifecycle(): CaptureLifecycle {
+    return this._lifecycle;
+  }
+
   get consumerCount(): number {
     return this.consumers.size;
   }
@@ -136,7 +173,7 @@ export class MicSource {
       return null;
     }
 
-    if (!this._track) {
+    if (!isLiveTrack(this._track)) {
       const ok = await this._ensureOpen();
       if (!ok || !this._track) return null;
     }
@@ -212,9 +249,11 @@ export class MicSource {
       return;
     }
     if (this._muted) newTrack.enabled = false;
+    newTrack.onended = () => this._onTrackEnded(newTrack);
 
     this._track = newTrack;
     this._rawStream = newStream;
+    this._setLifecycle({ state: 'live', track: newTrack });
 
     // Store-level fanout first (replaceTrack on peers, update mainStream).
     try {
@@ -277,11 +316,27 @@ export class MicSource {
   }
 
   private async _ensureOpen(): Promise<boolean> {
-    if (this._track) return true;
+    if (isLiveTrack(this._track)) return true;
     if (this._openingPromise) return this._openingPromise;
 
     this._openingPromise = (async () => {
+      this._setLifecycle({ state: 'acquiring', since: this.bindings.now() });
       try {
+        // A stale (ended) track can still be sitting here — the last
+        // consumer never released it, the device just died underneath
+        // them. Stop its stream before opening a replacement so it
+        // doesn't leak.
+        if (this._track) {
+          const staleStream = this._rawStream;
+          if (staleStream) {
+            try { staleStream.getTracks().forEach(t => t.stop()); } catch {}
+          } else {
+            try { this._track.stop(); } catch {}
+          }
+          this._track = null;
+          this._rawStream = null;
+        }
+
         const deviceId = this.bindings.getDeviceId();
         let stream: MediaStream;
         try {
@@ -290,17 +345,21 @@ export class MicSource {
           });
         } catch (e) {
           console.error('MicSource: getUserMedia failed', e);
+          this._setLifecycle({ state: 'failed', error: String(e), failedAt: this.bindings.now() });
           return false;
         }
         const track = stream.getAudioTracks()[0];
         if (!track) {
           console.error('MicSource: getUserMedia returned no audio track');
           try { stream.getTracks().forEach(t => t.stop()); } catch {}
+          this._setLifecycle({ state: 'failed', error: 'no audio track', failedAt: this.bindings.now() });
           return false;
         }
         if (this._muted) track.enabled = false;
+        track.onended = () => this._onTrackEnded(track);
         this._rawStream = stream;
         this._track = track;
+        this._setLifecycle({ state: 'live', track });
         try {
           this.bindings.onTrackChange(track, null);
         } catch (e) {
@@ -315,11 +374,33 @@ export class MicSource {
     return this._openingPromise;
   }
 
+  /**
+   * The `ended` event on the currently-installed track. Observation only
+   * — it writes the lifecycle and stops there. Reopening the device is
+   * Task 3's reconciler's job, which polls `lifecycle` on the presence
+   * tick as the correctness backstop if this edge is ever missed (a
+   * suspended tab, a browser that doesn't fire `ended` reliably).
+   */
+  private _onTrackEnded(track: MediaStreamTrack): void {
+    if (this._track !== track) return; // stale event from a superseded track
+    this._setLifecycle({ state: 'ended', endedAt: this.bindings.now() });
+  }
+
+  private _setLifecycle(next: CaptureLifecycle): void {
+    this._lifecycle = next;
+    try {
+      this.bindings.onLifecycleChange(next);
+    } catch (e) {
+      console.warn('MicSource: onLifecycleChange handler threw', e);
+    }
+  }
+
   private _closeDevice(): void {
     const old = this._track;
     const oldStream = this._rawStream;
     this._track = null;
     this._rawStream = null;
+    this._setLifecycle({ state: 'idle' });
     if (oldStream) {
       try { oldStream.getTracks().forEach(t => t.stop()); } catch {}
     } else if (old) {
