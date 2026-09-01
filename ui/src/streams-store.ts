@@ -3894,22 +3894,29 @@ export class StreamsStore {
 
   /**
    * Returns true iff WebRTC is disabled for the link between us and
-   * `peerB64`. Symmetric union semantics: either side having the other
-   * in their `disableWebrtcWith` list is sufficient.
+   * `peerB64`. Union semantics: OUR OWN per-peer disable (read from
+   * `localIntent.webrtc.disabledWith` — Task 4 makes intent the one
+   * authority for what WE have declared) OR the PEER'S broadcast state
+   * (their global kill switch, or their own per-peer disable naming us —
+   * an observation about the peer, not something intent can carry, so it
+   * still reads their conversation payload). Either half being true is
+   * sufficient — this is the ONE composition, read by both the
+   * eligibility conjunct (`handlePongUi`/`handleInitRequest`) and
+   * room-view's display (`_renderCarrierToggle`).
    *
-   * Reads synchronously from the module state stores so it can gate the
-   * retry loop in `handlePongUi` without making that path async.
+   * Reads synchronously from the intent/module-state stores so it can
+   * gate the retry loop in `handlePongUi` without making that path async.
    */
   webrtcDisabled(peerB64: AgentPubKeyB64): boolean {
-    // Check my per-peer override
-    const myConv = get(this._myModuleStates)['conversation'];
-    if (myConv) {
-      const myPayload = parseConversationPayload(myConv);
-      if (myPayload && myPayload.disableWebrtcWith.includes(peerB64)) {
-        return true;
-      }
+    // My own per-peer override — intent, not a re-parse of my broadcast
+    // payload (they are written together in `setPeerCarrier`, but intent
+    // is the declared authority).
+    if (get(this._localIntent).webrtc.disabledWith.has(peerB64)) {
+      return true;
     }
-    // Check peer's broadcast state: both per-peer and global
+    // Check peer's broadcast state: both per-peer and global. This is an
+    // observation about the peer — not ours to declare via intent — so it
+    // stays sourced from their conversation payload.
     const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
     if (peerConv) {
       const peerPayload = parseConversationPayload(peerConv);
@@ -6373,12 +6380,12 @@ export class StreamsStore {
      */
     const conversationActive = !!get(this._myModuleStates)['conversation'];
 
-    // Per-peer WebRTC override: our own declared intent only (Task 4) —
-    // see `WebrtcEligibilityInputs.peerWebrtcDisabled`'s docblock for why
-    // the peer's own broadcast disable does not need a second check here.
-    // Skips the entire init/retry path; audio flows over Holochain remote
-    // signals automatically (Step 3 carrier routing).
-    const peerWebrtcDisabled = get(this._localIntent).webrtc.disabledWith.has(pubkeyB64);
+    // Per-peer WebRTC override: `webrtcDisabled` unions our own
+    // intent-sourced disable with the peer's broadcast disable (Task 4 —
+    // see its docblock for the composition). Skips the entire init/retry
+    // path; audio flows over Holochain remote signals automatically
+    // (Step 3 carrier routing).
+    const peerWebrtcDisabled = this.webrtcDisabled(pubkeyB64);
     // Has the peer's conversation payload (and therefore their declared
     // caps) arrived at all? Distinct from `peerHasSdpFsmCap` below — see
     // `peerCapsKnown`'s docblock in carrier-coverage.ts (field incident D2).
@@ -6581,9 +6588,9 @@ export class StreamsStore {
       const eligibility = decideWebrtcEligibility({
         role: 'acceptor',
         conversationActive: !!get(this._myModuleStates)['conversation'],
-        // Our own declared intent only — see the initiator arm's comment
-        // and `WebrtcEligibilityInputs.peerWebrtcDisabled`'s docblock.
-        peerWebrtcDisabled: get(this._localIntent).webrtc.disabledWith.has(pubKey64),
+        // `webrtcDisabled` unions our own intent-sourced disable with the
+        // peer's broadcast disable — see the initiator arm's comment.
+        peerWebrtcDisabled: this.webrtcDisabled(pubKey64),
         webrtcGloballyDisabled: this.webrtcGloballyDisabled,
         peerCapsKnown: get(this._peerModuleStates)[pubKey64]?.['conversation'] !== undefined,
         peerHasSdpFsmCap: this.webrtcAvailableFor(pubKey64),

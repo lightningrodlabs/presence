@@ -98,12 +98,17 @@ export type WebrtcEligibilityInputs = {
   /** Is our own conversation module active (`_myModuleStates['conversation']`)? */
   conversationActive: boolean;
   /**
-   * Have WE disabled WebRTC with this peer (`localIntent.webrtc.disabledWith`)?
-   * Deliberately our own declared intent only — not the peer's broadcast
-   * state. If the peer has disabled the link on their end, their own
-   * eligibility check (same predicate, evaluated with their own intent)
-   * refuses the handshake on their side; this conjunct does not need to
-   * duplicate that.
+   * Has either side disabled WebRTC for this link (`webrtcDisabled(peer)`)?
+   * A union: OUR OWN per-peer disable comes from
+   * `localIntent.webrtc.disabledWith` (Task 4 — the one authority for
+   * what we have declared), OR'd with the PEER's broadcast disable (their
+   * global kill switch, or their own per-peer disable naming us) — an
+   * observation about the peer that intent cannot carry, so it is read
+   * from their conversation payload as before. Dropping the peer-
+   * broadcast half here would let a peer who has disabled the link keep
+   * receiving InitRequests from us every pong cycle, each silently
+   * refused on their end — continuous one-sided churn (review finding,
+   * the connection-thrash failure mode).
    */
   peerWebrtcDisabled: boolean;
   /** The `disableAllWebrtc` kill switch (`localIntent.webrtc.enabled`). */
