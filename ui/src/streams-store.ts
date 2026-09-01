@@ -110,6 +110,8 @@ import { decodeRtcMessage, encodeRtcAction } from './rtc-message-policy';
 import type { ActionMessage } from './rtc-message-policy';
 import { applyIntentGesture, initialLocalIntent } from './intent';
 import type { IntentGesture, LocalIntent } from './intent';
+import { describeIntentDiffs } from './intent-diff-policy';
+import type { IntentDiff } from './intent-diff-policy';
 
 declare const __APP_VERSION__: string;
 
@@ -351,6 +353,56 @@ export class StreamsStore {
 
   get localIntent(): Readable<LocalIntent> {
     return this._localIntent;
+  }
+
+  /**
+   * The user-facing list of unfulfilled-intent diffs (mic/camera/carrier)
+   * — Task 6's ONE source for the toggle-button badges, the tile
+   * establishment copy, and the carrier banner. Recomputed by
+   * `_recomputeIntentDiffs` INSIDE the presence-tick subscription in
+   * `start()`, the same site the capture reconciler and signals-encoder
+   * reconcilers fire, so the UI can never show a diff the reconciler is
+   * not acting on. The list content is decided by the pure
+   * `describeIntentDiffs` (intent-diff-policy.ts); this field is only its
+   * cache. Empty until `start()` runs.
+   */
+  private _intentDiffs: Writable<IntentDiff[]> = writable([]);
+
+  get intentDiffs(): Readable<IntentDiff[]> {
+    return this._intentDiffs;
+  }
+
+  /**
+   * Recompute the intent diffs from the current durable intent, both
+   * capture-source lifecycles, both reconciler attempt counts, and the
+   * signal-carrier-down stamp. Pure decision in `describeIntentDiffs`;
+   * this reads the live inputs and publishes the result. Called once per
+   * presence tick from the `_signalsTargets` subscription.
+   */
+  private _recomputeIntentDiffs(): void {
+    this._intentDiffs.set(
+      describeIntentDiffs({
+        intent: get(this._localIntent),
+        micLifecycle: this.micSource.lifecycle,
+        micAttempts: this.captureReconciler.micAttemptState.attemptsSinceGesture,
+        cameraLifecycle: this.cameraSource.lifecycle,
+        cameraAttempts:
+          this.captureReconciler.cameraAttemptState.attemptsSinceGesture,
+        carrierDownSince: this._signalCarrierDownSince,
+        now: this.clock.now(),
+      }),
+    );
+  }
+
+  /**
+   * Minimal read for the tile establishment copy (Task 6, surface 2): has
+   * this peer had a prior connected session this room-session, i.e. is a
+   * fresh WebRTC attempt actually a reconnection? Exposes the boolean the
+   * view needs for `describeLinkEstablishment` without handing it the raw
+   * `_lastDisconnectTime` record.
+   */
+  peerReconnecting(peerB64: AgentPubKeyB64): boolean {
+    return this._lastDisconnectTime[peerB64] !== undefined;
   }
 
   /**
@@ -780,6 +832,10 @@ export class StreamsStore {
       this.captureReconciler.tick().catch(() => {});
       this._reconcileSignalsAudio();
       this._reconcileSignalsVideo();
+      // Task 6: recompute the user-facing intent diffs at the SAME tick
+      // the reconcilers act on, so a surfaced diff always tracks a
+      // reconciliation attempt in flight (never a stale phantom warning).
+      this._recomputeIntentDiffs();
     });
   }
 
