@@ -94,6 +94,9 @@ const PINNED_FILES: Array<{
   // for ambient time.
   { relPath: '../mic-source.ts', patterns: FULL_PATTERNS },
   { relPath: '../camera-source.ts', patterns: FULL_PATTERNS },
+  // Task 3 (capture reconciler): takes `clock` via bindings and stamps
+  // every retry attempt through it — no ambient time.
+  { relPath: '../capture-reconciler.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {

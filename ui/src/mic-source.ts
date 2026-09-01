@@ -229,6 +229,35 @@ export class MicSource {
 
     if (!this._track) return;
 
+    // A device switch keeps the old track live if the new one fails to
+    // open — `markFailed: false` leaves the lifecycle untouched on error.
+    await this._openAndSwap(deviceId, { markFailed: false });
+  }
+
+  /**
+   * Reopen a dead-but-held device — Task 3's capture reconciler `open`
+   * arm for a handle whose track has `ended`/`failed` underneath it. Opens
+   * a fresh track on the current device and swaps it in through the SAME
+   * store-level `onTrackChange` fanout `changeDevice` uses (device-change
+   * branch → `replaceTrack` on peers, no renegotiation), so the fanout is
+   * stated once. Unlike `changeDevice`, a reopen failure IS a lifecycle
+   * `failed` — the reconciler's pacing/ceiling arms act on it. Returns
+   * whether a live track is now installed.
+   */
+  async reopen(): Promise<boolean> {
+    return this._openAndSwap(this.bindings.getDeviceId(), { markFailed: true });
+  }
+
+  /**
+   * Open a fresh track and swap it in via the device-change fanout. Shared
+   * by `changeDevice` (keeps the old track on failure) and `reopen`
+   * (records `failed` on failure). Returns true iff a new live track is
+   * installed.
+   */
+  private async _openAndSwap(
+    deviceId: string | undefined,
+    opts: { markFailed: boolean },
+  ): Promise<boolean> {
     const old = this._track;
     const oldStream = this._rawStream;
 
@@ -238,15 +267,21 @@ export class MicSource {
         audio: this._audioConstraints(deviceId),
       });
     } catch (e) {
-      console.error('MicSource: changeDevice getUserMedia failed', e);
-      return;
+      console.error('MicSource: _openAndSwap getUserMedia failed', e);
+      if (opts.markFailed) {
+        this._setLifecycle({ state: 'failed', error: String(e), failedAt: this.bindings.now() });
+      }
+      return false;
     }
 
     const newTrack = newStream.getAudioTracks()[0];
     if (!newTrack) {
-      console.error('MicSource: changeDevice got no audio track');
+      console.error('MicSource: _openAndSwap got no audio track');
       try { newStream.getTracks().forEach(t => t.stop()); } catch {}
-      return;
+      if (opts.markFailed) {
+        this._setLifecycle({ state: 'failed', error: 'no audio track', failedAt: this.bindings.now() });
+      }
+      return false;
     }
     if (this._muted) newTrack.enabled = false;
     newTrack.onended = () => this._onTrackEnded(newTrack);
@@ -259,7 +294,7 @@ export class MicSource {
     try {
       this.bindings.onTrackChange(newTrack, old);
     } catch (e) {
-      console.warn('MicSource: onTrackChange threw on device change', e);
+      console.warn('MicSource: onTrackChange threw on swap', e);
     }
 
     // Then per-consumer callbacks for consumers that bind to track identity.
@@ -275,9 +310,10 @@ export class MicSource {
     // a live track.
     if (oldStream) {
       try { oldStream.getTracks().forEach(t => t.stop()); } catch {}
-    } else {
+    } else if (old) {
       try { old.stop(); } catch {}
     }
+    return true;
   }
 
   /**
