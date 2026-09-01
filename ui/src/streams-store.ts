@@ -343,8 +343,9 @@ export class StreamsStore {
    * The durable record of what the user last asked for — see intent.ts
    * for the type and the write-discipline invariant it documents.
    * Constructed in the constructor from
-   * `initialLocalIntent(this.deps.storage.local)`. Declared a parallel
-   * authority (working agreement 1): nothing reads it yet.
+   * `initialLocalIntent(this.deps.storage.local)`. Read by the capture
+   * reconciler (mic/camera wants), `webrtcGloballyDisabled`, and the
+   * per-peer WebRTC eligibility conjunct (Task 4).
    */
   _localIntent: Writable<LocalIntent>;
 
@@ -371,8 +372,16 @@ export class StreamsStore {
    * Independent of the conversation module's active state — you can
    * still talk (mic on, signals carrier) with WebRTC globally disabled.
    * Persisted in localStorage as 'disableAllWebrtc'.
+   *
+   * ONE authority: `localIntent.webrtc.enabled` (Task 4). This is a
+   * getter, not a field — `setCarrierMode` writes intent via
+   * `_applyIntent` and keeps the `disableAllWebrtc` storage write
+   * alongside it (`initialLocalIntent` reads that key back at
+   * construction), but there is no second place this flips.
    */
-  webrtcGloballyDisabled = false;
+  get webrtcGloballyDisabled(): boolean {
+    return !get(this._localIntent).webrtc.enabled;
+  }
 
   /**
    * Max random delay in ms to add before processing each incoming signal.
@@ -591,7 +600,9 @@ export class StreamsStore {
     );
     // trickleICE / turnUrl / turnUsername / turnCredential are read live from
     // storage.local via getters, so there is nothing to snapshot here.
-    this.webrtcGloballyDisabled = this.deps.storage.local.getItem('disableAllWebrtc') === 'true';
+    // webrtcGloballyDisabled used to be re-read from 'disableAllWebrtc'
+    // here; it is now a getter over `_localIntent`, which the constructor
+    // already seeded from the same storage key via `initialLocalIntent`.
     const signalDelay = this.deps.storage.local.getItem('signalDelayMs');
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
@@ -4227,12 +4238,16 @@ export class StreamsStore {
    * the change in one broadcast.
    */
   async setCarrierMode(mode: 'webrtc' | 'signals'): Promise<void> {
-    this._applyIntent({ type: 'carrier-mode', mode });
+    // `previous` MUST be read before `_applyIntent`: `carrierMode()`
+    // reads the `webrtcGloballyDisabled` getter, which is now sourced
+    // from `_localIntent` — the same record `_applyIntent` is about to
+    // update. Reading it after would make `previous === mode` always,
+    // short-circuiting the teardown below on every call.
     const previous = this.carrierMode();
+    this._applyIntent({ type: 'carrier-mode', mode });
     if (previous === mode) return;
 
     if (mode === 'signals') {
-      this.webrtcGloballyDisabled = true;
       this.deps.storage.local.setItem('disableAllWebrtc', 'true');
       this.logger.logAgentEvent({
         agent: this.myPubKeyB64,
@@ -4255,7 +4270,6 @@ export class StreamsStore {
     }
 
     // mode === 'webrtc'
-    this.webrtcGloballyDisabled = false;
     this.deps.storage.local.removeItem('disableAllWebrtc');
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
@@ -6359,10 +6373,16 @@ export class StreamsStore {
      */
     const conversationActive = !!get(this._myModuleStates)['conversation'];
 
-    // Per-peer WebRTC override: if either side has disabled WebRTC for
-    // this link, skip the entire init/retry path. Audio will flow over
-    // Holochain remote signals automatically (Step 3 carrier routing).
-    const peerWebrtcDisabled = this.webrtcDisabled(pubkeyB64);
+    // Per-peer WebRTC override: our own declared intent only (Task 4) —
+    // see `WebrtcEligibilityInputs.peerWebrtcDisabled`'s docblock for why
+    // the peer's own broadcast disable does not need a second check here.
+    // Skips the entire init/retry path; audio flows over Holochain remote
+    // signals automatically (Step 3 carrier routing).
+    const peerWebrtcDisabled = get(this._localIntent).webrtc.disabledWith.has(pubkeyB64);
+    // Has the peer's conversation payload (and therefore their declared
+    // caps) arrived at all? Distinct from `peerHasSdpFsmCap` below — see
+    // `peerCapsKnown`'s docblock in carrier-coverage.ts (field incident D2).
+    const peerCapsKnown = get(this._peerModuleStates)[pubkeyB64]?.['conversation'] !== undefined;
 
     // Clean up stale video connection if the underlying WebRTC is dead.
     // This allows the normal initiation flow to proceed for a re-joining peer.
@@ -6413,6 +6433,7 @@ export class StreamsStore {
         conversationActive,
         peerWebrtcDisabled,
         webrtcGloballyDisabled: this.webrtcGloballyDisabled,
+        peerCapsKnown,
         peerHasSdpFsmCap: this.webrtcAvailableFor(pubkeyB64),
       }).eligible
     ) {
@@ -6560,8 +6581,11 @@ export class StreamsStore {
       const eligibility = decideWebrtcEligibility({
         role: 'acceptor',
         conversationActive: !!get(this._myModuleStates)['conversation'],
-        peerWebrtcDisabled: this.webrtcDisabled(pubKey64),
+        // Our own declared intent only — see the initiator arm's comment
+        // and `WebrtcEligibilityInputs.peerWebrtcDisabled`'s docblock.
+        peerWebrtcDisabled: get(this._localIntent).webrtc.disabledWith.has(pubKey64),
         webrtcGloballyDisabled: this.webrtcGloballyDisabled,
+        peerCapsKnown: get(this._peerModuleStates)[pubKey64]?.['conversation'] !== undefined,
         peerHasSdpFsmCap: this.webrtcAvailableFor(pubKey64),
       });
       if (!eligibility.eligible) {
@@ -6574,6 +6598,18 @@ export class StreamsStore {
             break;
           case 'webrtc-globally-disabled':
           case 'peer-webrtc-disabled':
+            break;
+          case 'peer-caps-unknown':
+            // The peer's conversation payload (and therefore their
+            // declared caps) has not arrived yet — distinct from actually
+            // lacking the capability (field incident D2). Never answer:
+            // the lure-warning below applies just as much to a peer we
+            // cannot yet confirm holds sdp-fsm. No parking is needed —
+            // this join's next pong re-evaluates eligibility once the
+            // payload lands (`decideInitRetry` is level-triggered).
+            this.logger.logCustomMessage(
+              `Dropped video InitRequest from ${pubKey64.slice(0, 8)}: peer caps not yet received`
+            );
             break;
           case 'peer-lacks-sdp-fsm-cap':
             // A peer whose build cannot parse SdpFsm has no WebRTC path

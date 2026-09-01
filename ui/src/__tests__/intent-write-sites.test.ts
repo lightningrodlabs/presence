@@ -8,9 +8,11 @@ import { fileURLToPath } from 'node:url';
  * is written from exactly one place, `StreamsStore._applyIntent`, and
  * that method is called only from the enumerated user-gesture entry
  * points below — never from an event handler, timer, transport callback,
- * or reconciler. Declared (working agreement 1): this record is a
- * parallel authority added by Task 1; nothing reads it yet, and this
- * pin is what stops the parallel period from growing a second writer.
+ * or reconciler. Declared (working agreement 1): this record started as
+ * a parallel authority added by Task 1 with no readers; the capture
+ * reconciler (Task 3) and WebRTC eligibility (Task 4) now read it, and
+ * this pin is what stops the write side from growing a second writer as
+ * readers accumulate.
  *
  * Method-slicing technique borrowed from no-ambient-clock.test.ts: the
  * source is sliced between successive method-header markers so each
