@@ -149,6 +149,20 @@ export class FakeTransport implements PeerTransport {
 
   readonly sentData: Array<{ peer: AgentPubKeyB64; data: unknown }> = [];
 
+  /** replaceTrack calls (Task 3: the capture reconciler's reopen fanout
+   *  reaches peers through the source's onTrackChange device-change
+   *  branch, which calls this). */
+  readonly replaceCalls: Array<{
+    oldTrack: MediaStreamTrack | null;
+    newTrack: MediaStreamTrack | null;
+  }> = [];
+
+  readonly addTrackCalls: MediaStreamTrack[] = [];
+
+  /** refreshMediaForPeer calls (Task 3 replacement #4 pins that a dead
+   *  source defers instead of reaching this). */
+  readonly refreshMediaCalls: AgentPubKeyB64[] = [];
+
   private phases = new Map<AgentPubKeyB64, ConnectionPhase>();
 
   private connectionIds = new Map<AgentPubKeyB64, ConnectionId>();
@@ -249,15 +263,19 @@ export class FakeTransport implements PeerTransport {
 
   setLocalStream(_stream: MediaStream | null): void {}
 
-  addTrack(_track: MediaStreamTrack, _stream: MediaStream): void {}
+  addTrack(track: MediaStreamTrack, _stream: MediaStream): void {
+    this.addTrackCalls.push(track);
+  }
 
   removeTrack(_track: MediaStreamTrack, _stream: MediaStream): void {}
 
   replaceTrack(
-    _oldTrack: MediaStreamTrack | null,
-    _newTrack: MediaStreamTrack | null,
+    oldTrack: MediaStreamTrack | null,
+    newTrack: MediaStreamTrack | null,
     _stream: MediaStream
-  ): void {}
+  ): void {
+    this.replaceCalls.push({ oldTrack, newTrack });
+  }
 
   send(peer: AgentPubKeyB64, data: string | ArrayBuffer | Uint8Array): void {
     this.sentData.push({ peer, data });
@@ -278,8 +296,12 @@ export class FakeTransport implements PeerTransport {
     return [];
   }
 
-  refreshMediaForPeer(_peer: AgentPubKeyB64, _stream: MediaStream): boolean {
-    return false;
+  refreshMediaForPeer(peer: AgentPubKeyB64, _stream: MediaStream): boolean {
+    this.refreshMediaCalls.push(peer);
+    // Report a live connection so the store logs a successful replaceTrack
+    // — the dishonest-success path Task 3 replacement #4 guards against
+    // when the source is dead.
+    return true;
   }
 
   processIncomingSignal(signal: IncomingSignal): void {

@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach, vi } from 'vitest';
+import { describe, expect, it, afterEach, beforeEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
@@ -23,6 +23,11 @@ import {
   SIGNALS_RTT_DEGRADED_MS,
 } from '../transport/signals-cadence-policy';
 import { CAP_VOICE_BATCH } from '../transport/wire-contract';
+import { encodeRtcAction } from '../rtc-message-policy';
+import {
+  CAPTURE_REOPEN_MIN_INTERVAL_MS,
+  CAPTURE_REOPEN_MAX_ATTEMPTS,
+} from '../capture-reconcile-policy';
 import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
@@ -987,13 +992,13 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
   // go red.
   const flush = () => new Promise<void>(r => setTimeout(r, 0));
 
-  /** Arm the voice gate: a present signals target + a held mic. */
+  /** Arm the voice gate: a present signals target + mic WANTED (intent).
+   *  Task 3 replacement #3 gates the signals encoders on intent, not on a
+   *  held handle, so the arm is an intent write. */
   function armVoice(started: Started) {
     const { store, clock } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
-    (store as unknown as { _webrtcMicHandle: unknown })._webrtcMicHandle = {
-      release: () => {},
-    };
+    store._localIntent.update(i => ({ ...i, mic: { wanted: true, muted: false } }));
   }
 
   /** One presence tick with the target peer kept ping-fresh. */
@@ -1062,14 +1067,325 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
       .mockRejectedValue(new Error('camera busy'));
     const started = makeStarted();
     started.store._knownAgents.set(knownFresh(started.clock, peerA));
-    (
-      started.store as unknown as { _webrtcCameraHandle: unknown }
-    )._webrtcCameraHandle = { release: () => {} };
+    started.store._localIntent.update(i => ({ ...i, camera: { wanted: true } }));
 
     await tick(started);
     expect(spy).toHaveBeenCalledTimes(1);
     await tick(started);
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('the capture reconciler (Task 3): intent reconciled against capture lifecycle', () => {
+  // The round's highest-risk seam: the store no longer acquires the mic /
+  // camera inline nor gates the signals encoders on "is a handle held".
+  // The reconciler owns the acquire handles and reconciles them against
+  // `localIntent` on the presence tick; the signals reconcilers read
+  // `intent.mic.wanted` / `intent.camera.wanted`. These tests drive the
+  // real started store over fake capture devices.
+  class FakeTrack {
+    readyState: 'live' | 'ended' = 'live';
+
+    enabled = true;
+
+    onended: (() => void) | null = null;
+
+    onmute: (() => void) | null = null;
+
+    onunmute: (() => void) | null = null;
+
+    muted = false;
+
+    constructor(public kind: 'audio' | 'video') {}
+
+    stop(): void {
+      if (this.readyState === 'ended') return;
+      this.readyState = 'ended';
+      this.onended?.();
+    }
+  }
+
+  class FakeStream {
+    constructor(private tracks: FakeTrack[]) {}
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  /** Minimal MediaStream stand-in — node has none, and the store's mic /
+   *  camera open branch does `new MediaStream()` + add/get/removeTrack. */
+  class FakeMediaStream {
+    private tracks: FakeTrack[] = [];
+
+    addTrack(t: FakeTrack): void {
+      this.tracks.push(t);
+    }
+
+    removeTrack(t: FakeTrack): void {
+      this.tracks = this.tracks.filter(x => x !== t);
+    }
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  beforeEach(() => {
+    (globalThis as any).MediaStream = FakeMediaStream;
+  });
+
+  /** Record every getUserMedia call and hand back a scripted stream. */
+  function installNavigator(
+    respond: (constraints: unknown) => Promise<FakeStream>
+  ): { calls: unknown[] } {
+    const calls: unknown[] = [];
+    (globalThis as any).navigator = {
+      mediaDevices: {
+        getUserMedia: async (constraints: unknown) => {
+          calls.push(constraints);
+          return respond(constraints);
+        },
+      },
+    };
+    return { calls };
+  }
+
+  /** Fire the presence-tick site: the `_signalsTargets` subscription runs
+   *  captureReconciler.tick() once per tick, the same cadence and pin as
+   *  the encoder reconcilers. Kept ping-fresh so a target stays present. */
+  async function presenceTick(started: Started) {
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    started.clock.advance(PING_INTERVAL);
+    await flush();
+    await flush();
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).navigator;
+    delete (globalThis as any).MediaStream;
+  });
+
+  it('(a) audioOn(true) acquires the mic through the reconciler and applies mute', async () => {
+    const track = new FakeTrack('audio');
+    installNavigator(async () => new FakeStream([track]));
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+
+    expect(started.store.micSource.lifecycle.state).toBe('live');
+    expect(started.store.micSource.track).toBe(track as unknown as MediaStreamTrack);
+    expect(started.store.micSource.muted).toBe(false);
+  });
+
+  it('(a2) audioOff after audioOn(true) mutes but keeps the device live', async () => {
+    // audioOff is `audio-mute`: the mic stays WANTED (fast re-enable, no
+    // renegotiation), so the reconciler keeps the handle and only the mute
+    // flips. (audioOn(false) from scratch never acquires — a never-wanted
+    // mic stays unwanted, intent.ts — and is not a production path.)
+    const track = new FakeTrack('audio');
+    installNavigator(async () => new FakeStream([track]));
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.muted).toBe(false);
+
+    await started.store.audioOff();
+    await flush();
+
+    expect(started.store.micSource.lifecycle.state).toBe('live');
+    expect(started.store.micSource.muted).toBe(true);
+    expect(get(started.store.localIntent).mic.wanted).toBe(true);
+  });
+
+  it('(b) a killed track is reopened on the next tick and the new track reaches peers via replaceTrack', async () => {
+    const trackA = new FakeTrack('audio');
+    const trackB = new FakeTrack('audio');
+    const nav = installNavigator(
+      (() => {
+        let n = 0;
+        return async () => new FakeStream([[trackA, trackB][n++]!]);
+      })()
+    );
+    const started = makeStarted();
+    const media = started.transports.media!;
+
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.track).toBe(trackA as unknown as MediaStreamTrack);
+    media.replaceCalls.length = 0;
+
+    // The device dies underneath the held handle (Incident B / D3).
+    trackA.stop();
+    expect(started.store.micSource.lifecycle.state).toBe('ended');
+
+    // Tick site drives the reopen. Two ticks clear the reopen pacing
+    // interval (PING_INTERVAL < CAPTURE_REOPEN_MIN_INTERVAL_MS).
+    await presenceTick(started);
+    await presenceTick(started);
+
+    expect(nav.calls.length).toBe(2); // opened a fresh device
+    expect(started.store.micSource.track).toBe(trackB as unknown as MediaStreamTrack);
+    // The reopen swaps the corpse for the new track on every peer transport.
+    expect(
+      media.replaceCalls.some(
+        c => c.newTrack === (trackB as unknown as MediaStreamTrack)
+      )
+    ).toBe(true);
+  });
+
+  it("(b') the signals-audio gate reads intent, not device observation: wanted mic with a dead device still runs the encoder", async () => {
+    // Mutation guard (Step 5 i): if `_reconcileSignalsAudio` reverts to a
+    // device-held observation, this goes red — intent says wanted, but no
+    // handle is held / no live track exists.
+    const spy = vi.spyOn(voiceController, 'startCapture').mockResolvedValue(true);
+    const started = makeStarted();
+    // Intent: mic wanted. No fake navigator installed, so the reconciler's
+    // acquire fails and no live track ever exists — the dead-device case.
+    started.store._localIntent.update(i => ({
+      ...i,
+      mic: { wanted: true, muted: false },
+    }));
+
+    await presenceTick(started);
+
+    expect(started.store.micSource.lifecycle.state).not.toBe('live');
+    expect(spy).toHaveBeenCalled();
+    expect(started.store.voiceEncoderRunning).toBe(true);
+  });
+
+  it('(c) a device that keeps failing is retried to the ceiling then reported exactly once', async () => {
+    installNavigator(async () => {
+      throw new Error('NotAllowedError: mic denied');
+    });
+    const started = makeStarted();
+    const errors: string[] = [];
+    started.store.onEvent(e => {
+      if (e.type === 'error') errors.push(e.error);
+    });
+
+    // Gesture: attempt 1 (audioOn ticks once).
+    await started.store.audioOn(true);
+    await flush();
+
+    // Drive further paced ticks well past the ceiling.
+    for (let i = 0; i < 10; i += 1) {
+      started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+      await started.store.captureReconciler.tick();
+      await flush();
+    }
+
+    expect(started.store.captureReconciler.micAttemptState.attemptsSinceGesture).toBe(
+      CAPTURE_REOPEN_MAX_ATTEMPTS + 1
+    );
+    expect(errors.filter(e => e.includes('Microphone'))).toHaveLength(1);
+  });
+
+  it('(c2) getUserMedia is called exactly CAPTURE_REOPEN_MAX_ATTEMPTS times then stops', async () => {
+    const nav = installNavigator(async () => {
+      throw new Error('mic denied');
+    });
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    for (let i = 0; i < 10; i += 1) {
+      started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+      await started.store.captureReconciler.tick();
+      await flush();
+    }
+
+    expect(nav.calls.length).toBe(CAPTURE_REOPEN_MAX_ATTEMPTS);
+  });
+
+  it('(d) a fresh gesture resets the retry pacing and reopens immediately', async () => {
+    const trackA = new FakeTrack('audio');
+    const trackB = new FakeTrack('audio');
+    const nav = installNavigator(
+      (() => {
+        let n = 0;
+        return async () => new FakeStream([[trackA, trackB][n++]!]);
+      })()
+    );
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    expect(nav.calls.length).toBe(1);
+
+    trackA.stop(); // device dies
+    // No clock advance: the reopen interval has NOT elapsed. A bare tick
+    // would hold (paced). The gesture must reset pacing and reopen now.
+    await started.store.captureReconciler.tick();
+    await flush();
+    expect(nav.calls.length).toBe(1); // confirm: paced, no reopen yet
+
+    await started.store.audioOn(true); // the gesture
+    await flush();
+
+    expect(nav.calls.length).toBe(2); // reopened immediately despite pacing
+    expect(started.store.micSource.track).toBe(trackB as unknown as MediaStreamTrack);
+  });
+
+  it('(e) inbound request-track-refresh with a dead source defers instead of pushing a dead track', async () => {
+    // Incident B's exact wedge: a peer asks us to refresh tracks, our mic
+    // died, and the old code replaceTrack'd the corpse and logged success.
+    const track = new FakeTrack('audio');
+    installNavigator(async () => new FakeStream([track]));
+    const started = makeStarted();
+    const media = started.transports.media!;
+
+    // Bring up mic + an open connection to peerA.
+    await started.store.audioOn(true);
+    await flush();
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.refreshMediaCalls.length = 0;
+
+    // The mic dies underneath us.
+    track.stop();
+    expect(started.store.micSource.lifecycle.state).toBe('ended');
+
+    // Inbound request-track-refresh over the real data-channel glue.
+    media.emit({
+      type: 'data-channel-message',
+      peer: peerA,
+      connectionId: 'conn-1',
+      data: encodeRtcAction('request-track-refresh'),
+    });
+
+    expect(media.refreshMediaCalls).toHaveLength(0);
+    expect(
+      started.logger.customMessages.some(m =>
+        m.includes('source dead, deferring to capture reconciler')
+      )
+    ).toBe(true);
+    // The dishonest "replaceTrack: refreshed via transport" success line
+    // must NOT appear for this dead-source refresh.
+    expect(
+      started.logger.customMessages.some(m => m.includes('refreshed via transport'))
+    ).toBe(false);
   });
 });
 
