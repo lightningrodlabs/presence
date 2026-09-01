@@ -52,6 +52,7 @@ import type { RoomSignal, StoreEventPayload } from '../types';
  */
 
 const myPubKey = new Uint8Array(39).fill(1);
+const myPubKeyB64 = encodeHashToBase64(myPubKey as unknown as AgentPubKey);
 const peerAKey = new Uint8Array(39).fill(2) as AgentPubKey;
 const peerA = encodeHashToBase64(peerAKey);
 const peerBKey = new Uint8Array(39).fill(3) as AgentPubKey;
@@ -850,6 +851,109 @@ describe('caps-unknown vs lacks-cap — the D2 join-race fix (Task 4)', () => {
     const inits = bus.sentOfType('InitRequest');
     expect(inits).toHaveLength(1);
     expect(inits[0].to).toEqual([peerLower]);
+  });
+});
+
+describe('per-peer WebRTC disable is a union of our intent and the peer\'s broadcast (Task 4 review finding B)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  const bareSignalsPong = (clock: ManualClock) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStatesAt: clock.now() },
+    });
+
+  it('a peer who has broadcast a per-peer disable-with-us is never sent an InitRequest, even though our own intent never disabled them', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // The peer (lower key — we are the key-designated initiator) declares
+    // sdp-fsm capability AND has disabled WebRTC specifically with us on
+    // their end. Our own intent never touched `disabledWith` for this
+    // peer — `_localIntent.webrtc.disabledWith` is empty throughout this
+    // test. If the eligibility conjunct only read our own intent (the
+    // bug this test catches), we would wrongly attempt to initiate every
+    // pong cycle, and the peer would silently refuse each one (their own
+    // eligibility check, evaluated with their own intent) — continuous
+    // one-sided churn.
+    store._peerModuleStates.set({
+      [peerLower]: {
+        conversation: conversationEnvelope(clock, {
+          caps: ['sdp-fsm'],
+          disableWebrtcWith: [myPubKeyB64],
+        }),
+      },
+    });
+    expect(get(store._localIntent).webrtc.disabledWith.has(peerLower)).toBe(false);
+
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+    // The union is honored in both directions: webrtcDisabled itself
+    // reports the link disabled, sourced from the peer's broadcast half.
+    expect(store.webrtcDisabled(peerLower)).toBe(true);
+  });
+
+  it('a peer who has broadcast a GLOBAL webrtc disable is never sent an InitRequest', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    store._peerModuleStates.set({
+      [peerLower]: {
+        conversation: conversationEnvelope(clock, {
+          caps: ['sdp-fsm'],
+          webrtcDisabled: true,
+        }),
+      },
+    });
+
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+    expect(store.webrtcDisabled(peerLower)).toBe(true);
+  });
+});
+
+describe("setCarrierMode teardown — regression pin for the previous/_applyIntent ordering bug (Task 4 review finding A)", () => {
+  it('switching to signals tears down an open WebRTC connection', async () => {
+    const { store, transports } = makeStarted();
+    const media = transports.media!;
+
+    // Get a connected slot up via the real transport-event routing —
+    // `setCarrierMode` must find it in `_openConnections` for the
+    // teardown branch to do anything observable.
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'signaling');
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+
+    // `carrierMode()` starts at 'webrtc' (default), so this actually
+    // flips the mode and must run the teardown branch, not the
+    // previous-equals-mode early return. `setCarrierMode` read
+    // `previous = this.carrierMode()` AFTER calling `_applyIntent` at one
+    // point in development; since `carrierMode()` now reads the
+    // `webrtcGloballyDisabled` getter (sourced from `_localIntent`, the
+    // same record `_applyIntent` had just updated), `previous` came back
+    // already equal to `mode` and the teardown below never ran. This test
+    // is the regression pin for that ordering bug — see the fix report
+    // for the RED-under-bad-ordering / GREEN-under-the-fix reproduction.
+    await store.setCarrierMode('signals');
+
+    expect(
+      media.closeCalls.some(
+        c => c.peer === peerA && c.reason === 'disconnectFromPeerVideo'
+      )
+    ).toBe(true);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(store.webrtcGloballyDisabled).toBe(true);
   });
 });
 
