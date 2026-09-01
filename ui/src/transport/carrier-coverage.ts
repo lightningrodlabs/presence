@@ -97,10 +97,28 @@ export type WebrtcEligibilityInputs = {
   role: 'initiator' | 'acceptor';
   /** Is our own conversation module active (`_myModuleStates['conversation']`)? */
   conversationActive: boolean;
-  /** Has either side disabled WebRTC for this link (`webrtcDisabled(peer)`)? */
+  /**
+   * Have WE disabled WebRTC with this peer (`localIntent.webrtc.disabledWith`)?
+   * Deliberately our own declared intent only — not the peer's broadcast
+   * state. If the peer has disabled the link on their end, their own
+   * eligibility check (same predicate, evaluated with their own intent)
+   * refuses the handshake on their side; this conjunct does not need to
+   * duplicate that.
+   */
   peerWebrtcDisabled: boolean;
-  /** The `disableAllWebrtc` kill switch. */
+  /** The `disableAllWebrtc` kill switch (`localIntent.webrtc.enabled`). */
   webrtcGloballyDisabled: boolean;
+  /**
+   * Has the peer's `conversation` module payload been received at all
+   * (`_peerModuleStates[peer]?.['conversation'] !== undefined`)? False
+   * right after a peer joins, before their first module-state push or
+   * pong-carried module state arrives — distinct from `peerHasSdpFsmCap`,
+   * which answers "capable" only once the payload is known. Conflating
+   * the two was field incident D2: the first pong after a join has no
+   * conversation payload yet, so treating unknown as incapable dropped
+   * every join's first InitRequest as if the peer were a pre-caps build.
+   */
+  peerCapsKnown: boolean;
   /** Does the peer hold the `sdp-fsm` capability (`webrtcAvailableFor(peer)`)? */
   peerHasSdpFsmCap: boolean;
 };
@@ -113,6 +131,7 @@ export type WebrtcEligibility =
         | 'conversation-inactive'
         | 'webrtc-globally-disabled'
         | 'peer-webrtc-disabled'
+        | 'peer-caps-unknown'
         | 'peer-lacks-sdp-fsm-cap';
     };
 
@@ -139,7 +158,10 @@ export type WebrtcEligibility =
  *
  * Conjunct order fixes which reason wins when several fail; it mirrors
  * the old initiator order (conversation, kill switch, per-peer, then
- * capability).
+ * capability) with `peerCapsKnown` inserted just before the capability
+ * check itself — an unknown-caps peer is reported as unknown, not as
+ * incapable, even when it also happens to fail the (not-yet-meaningful)
+ * capability read.
  *
  * Constrains `streams-store.ts:handlePongUi` (initiator arm) and
  * `streams-store.ts:handleInitRequest` (acceptor arm) — grep for these
@@ -156,6 +178,9 @@ export function decideWebrtcEligibility(
   }
   if (input.peerWebrtcDisabled) {
     return { eligible: false, reason: 'peer-webrtc-disabled' };
+  }
+  if (!input.peerCapsKnown) {
+    return { eligible: false, reason: 'peer-caps-unknown' };
   }
   if (!input.peerHasSdpFsmCap) {
     return { eligible: false, reason: 'peer-lacks-sdp-fsm-cap' };

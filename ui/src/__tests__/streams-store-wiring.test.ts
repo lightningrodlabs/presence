@@ -56,6 +56,13 @@ const peerAKey = new Uint8Array(39).fill(2) as AgentPubKey;
 const peerA = encodeHashToBase64(peerAKey);
 const peerBKey = new Uint8Array(39).fill(3) as AgentPubKey;
 const peerB = encodeHashToBase64(peerBKey);
+/** Alphabetically LOWER than `myPubKey` (fill(1)) — the initiator arm's
+ *  ordering condition (`handlePongUi` only initiates toward a lower
+ *  peer key; see the acceptor arm's `pubKey64 > this.myPubKeyB64` gate
+ *  for the converse). Used by the D2 caps-race wiring test below, where
+ *  the store itself must be the initiator. */
+const peerLowerKey = new Uint8Array(39).fill(0) as AgentPubKey;
+const peerLower = encodeHashToBase64(peerLowerKey);
 
 type Started = FakeDeps & {
   store: StreamsStore;
@@ -759,6 +766,90 @@ describe('acceptor eligibility through the started store (Round 3 item 2)', () =
     expect(
       logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
     ).toBe(true);
+  });
+});
+
+describe('caps-unknown vs lacks-cap — the D2 join-race fix (Task 4)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  // `moduleStatesAt` is required for a non-legacy pong: without it, an
+  // empty `moduleStates` reads as "legacy pong, no stamp" and
+  // unconditionally sweeps every held peer module entry
+  // (`decideModuleStateMerge`'s `legacy-pong-unconditional-sweep` row) —
+  // which would delete the very conversation entry the ModuleState push
+  // just set. A same-build peer's pong always carries this stamp.
+  const bareSignalsPong = (clock: ManualClock) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStatesAt: clock.now() },
+    });
+
+  it('acceptor: an InitRequest from a peer whose conversation payload has not arrived is dropped with a distinct "caps not yet received" log, never "lacks sdp-fsm capability"', async () => {
+    const { store, clock, bus, logger } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // No entry at all for peerA in _peerModuleStates — their conversation
+    // payload (and therefore their declared caps) has not arrived yet.
+    // This is the D2 shape: distinct from the "declared empty caps"
+    // scenario above, which IS a known, capability-less peer.
+    expect(get(store._peerModuleStates)[peerA]).toBeUndefined();
+
+    await bus.deliver(
+      message(
+        peerAKey,
+        'InitRequest',
+        JSON.stringify({ connection_id: 'ir-caps-unknown', connection_type: 'video' })
+      )
+    );
+
+    expect(bus.sentOfType('InitAccept')).toHaveLength(0);
+    expect(
+      logger.customMessages.some(m => m.includes('caps not yet received'))
+    ).toBe(true);
+    expect(
+      logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
+    ).toBe(false);
+  });
+
+  it('initiator: the join-race end to end — no InitRequest while the peer\'s payload is unknown, and the very next pong after it lands drives the init with no parking machinery needed', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+
+    // Peer pongs immediately after joining — their conversation payload
+    // (and caps) has not arrived yet. Pre-fix, `webrtcAvailableFor`
+    // reported no caps here and `decideWebrtcEligibility` returned
+    // `peer-lacks-sdp-fsm-cap`, indistinguishable from a genuinely old
+    // build — dropping this join's first InitRequest.
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+
+    // The payload lands (a real 'ModuleState' push, exercising the same
+    // wiring a late module-state broadcast uses).
+    await bus.deliver(
+      message(
+        peerLowerKey,
+        'ModuleState',
+        JSON.stringify(conversationEnvelope(clock, { caps: ['sdp-fsm'] }))
+      )
+    );
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+
+    // No parking/re-drive trigger is needed: the initiator drive is
+    // already level-triggered per pong (`decideInitRetry`), so the very
+    // next pong re-evaluates eligibility with caps now known and drives
+    // the init on its own.
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    const inits = bus.sentOfType('InitRequest');
+    expect(inits).toHaveLength(1);
+    expect(inits[0].to).toEqual([peerLower]);
   });
 });
 

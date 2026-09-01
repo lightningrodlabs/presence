@@ -98,9 +98,10 @@ export function applyIntentGesture(
 }
 
 /** Initial intent at store construction. Carrier selection is persisted
- *  ('disableAllWebrtc' in local storage — the same key the store's
- *  webrtcGloballyDisabled init reads today; keep them side by side until
- *  Task 4 makes intent the authority). Media wants start false. */
+ *  ('disableAllWebrtc' in local storage). `StreamsStore.webrtcGloballyDisabled`
+ *  is a getter over this record's `webrtc.enabled` (Task 4) — this is the
+ *  only place that key is read back into a running value. Media wants
+ *  start false. */
 export function initialLocalIntent(local: {
   getItem(key: string): string | null;
 }): LocalIntent {
