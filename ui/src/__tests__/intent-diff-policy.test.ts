@@ -242,6 +242,62 @@ describe('describeIntentDiffs — camera arms (symmetric with mic)', () => {
       describeIntentDiffs(input({ intent: wantCamera, cameraLifecycle: live }))
     ).toEqual([]);
   });
+
+  // The following rows mirror the mic block's acquiring/boundary/suppression
+  // rows above, proving `describeCaptureDiff` behaves symmetrically for
+  // camera rather than relying on shared implementation to imply it
+  // (review finding, Task 5 fix round).
+
+  it('acquiring, exactly at grace boundary → camera/pending (mirrors mic\'s "acquiring, exactly at grace boundary" row)', () => {
+    const diffs = describeIntentDiffs(
+      input({ intent: wantCamera, cameraLifecycle: acquiringPastGrace, cameraAttempts: 0 })
+    );
+    expect(diffs).toEqual([
+      {
+        scope: 'camera',
+        severity: 'pending',
+        since: ACQUIRING_PAST_GRACE_SINCE,
+        reason: 'camera-acquiring-slow',
+        copy: 'Camera unavailable — retrying…',
+      },
+    ]);
+  });
+
+  it('acquiring one ms under grace boundary → [] (mirrors mic\'s "acquiring one ms under grace boundary" row)', () => {
+    expect(
+      describeIntentDiffs(input({ intent: wantCamera, cameraLifecycle: acquiringJustUnderGrace }))
+    ).toEqual([]);
+  });
+
+  it('acquiring past grace, attempts >= max → camera/failed (mirrors mic\'s "acquiring past grace, attempts >= max" row)', () => {
+    const diffs = describeIntentDiffs(
+      input({
+        intent: wantCamera,
+        cameraLifecycle: acquiringPastGrace,
+        cameraAttempts: CAPTURE_REOPEN_MAX_ATTEMPTS,
+      })
+    );
+    expect(diffs).toEqual([
+      {
+        scope: 'camera',
+        severity: 'failed',
+        since: ACQUIRING_PAST_GRACE_SINCE,
+        reason: 'camera-attempts-exhausted',
+        copy: 'Camera unavailable',
+      },
+    ]);
+  });
+
+  it('acquiring fresh (since = now), even if wanted → [] (mirrors mic\'s "acquiring fresh" suppression row)', () => {
+    expect(
+      describeIntentDiffs(input({ intent: wantCamera, cameraLifecycle: acquiringFresh }))
+    ).toEqual([]);
+  });
+
+  it('not wanted, even if ended/failed → [] (mirrors mic\'s "not wanted" suppression row)', () => {
+    expect(describeIntentDiffs(input({ cameraLifecycle: ended, cameraAttempts: 99 }))).toEqual([]);
+    expect(describeIntentDiffs(input({ cameraLifecycle: failed, cameraAttempts: 99 }))).toEqual([]);
+  });
 });
 
 describe('describeIntentDiffs — carrier arm', () => {
