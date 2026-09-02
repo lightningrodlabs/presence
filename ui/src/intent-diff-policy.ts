@@ -149,7 +149,7 @@ export function describeIntentDiffs(input: IntentDiffInput): IntentDiff[] {
 export function describeLinkEstablishment(input: {
   connected: boolean;
   /** the peer had a previous connected session this room-session
-   *  (store's _lastDisconnectTime[peer] !== undefined) */
+   *  (the peer record's `lastDisconnectTime !== undefined`) */
   reconnecting: boolean;
 }): { copy: string } | null {
   if (input.connected) return null;

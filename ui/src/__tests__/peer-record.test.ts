@@ -26,42 +26,46 @@ function fullRecord(): PeerRecord {
 }
 
 describe('resetPeerRecord', () => {
+  // Each arm test asserts the FULL resulting record against fullRecord()
+  // overridden only by the fields that arm wipes — so an arm that clears
+  // (or fails to clear) a field outside its declared set fails the test.
+  // `toEqual` treats `{k: undefined}` and a missing `k` as equal, which is
+  // exactly the semantics resetPeerRecord's spread-and-undefine style relies on.
   it('media-close-full wipes the media session, keeps survivors, screen state, timer, outage, epoch', () => {
-    const r = resetPeerRecord(fullRecord(), 'media-close-full');
-    for (const f of ['iceDisconnectedAt','lastBytesReceived','staleCycles','reconcileAttemptCount','qualityBucket','webrtcExitReason','videoStream','pendingInits','analyser'] as const)
-      expect(r[f], f).toBeUndefined();
-    expect(r.sdpTimeoutTimer).toBe(8);       // executor-owned, not arm-owned
-    expect(r.outageState).toEqual({ startedAt: 9, emitted: true }); // sweep-owned
-    expect(r.screenShareStream).toBeDefined();
-    expect(r.screenShareIceDisconnectedAt).toBe(10);
-    expect(r.lastDisconnectTime).toBe(11);   // close survivor
-    expect(r.lastReconcileTime).toBe(12);
-    expect(r.signalsRttEwma).toBe(13);
-    expect(r.connectionEpoch).toBe(14);      // session survivor
+    expect(resetPeerRecord(fullRecord(), 'media-close-full')).toEqual({
+      ...fullRecord(),
+      iceDisconnectedAt: undefined, lastBytesReceived: undefined,
+      staleCycles: undefined, reconcileAttemptCount: undefined,
+      qualityBucket: undefined, webrtcExitReason: undefined,
+      videoStream: undefined, pendingInits: undefined, analyser: undefined,
+      // sdpTimeoutTimer, outageState, screen state, close survivors, and
+      // connectionEpoch are inherited unchanged from fullRecord() below.
+    });
   });
   it('media-stale-residue wipes only videoStream + pendingInits', () => {
-    const r = resetPeerRecord(fullRecord(), 'media-stale-residue');
-    expect(r.videoStream).toBeUndefined();
-    expect(r.pendingInits).toBeUndefined();
-    expect(r.staleCycles).toBeDefined();
-    expect(r.lastDisconnectTime).toBe(11);
+    expect(resetPeerRecord(fullRecord(), 'media-stale-residue')).toEqual({
+      ...fullRecord(), videoStream: undefined, pendingInits: undefined,
+    });
   });
   it('media-leave-residue additionally wipes qualityBucket and the three close-survivors, never epoch', () => {
-    const r = resetPeerRecord(fullRecord(), 'media-leave-residue');
-    for (const f of ['videoStream','pendingInits','qualityBucket','lastDisconnectTime','lastReconcileTime','signalsRttEwma'] as const)
-      expect(r[f], f).toBeUndefined();
-    expect(r.iceDisconnectedAt).toBe(1);     // outer leave row's residue only; nested close row did the rest
-    expect(r.connectionEpoch).toBe(14);
+    expect(resetPeerRecord(fullRecord(), 'media-leave-residue')).toEqual({
+      ...fullRecord(),
+      videoStream: undefined, pendingInits: undefined,
+      qualityBucket: undefined, lastDisconnectTime: undefined,
+      lastReconcileTime: undefined, signalsRttEwma: undefined,
+      // iceDisconnectedAt survives this row alone — the nested close row
+      // (media-close-full, applied first by the executor) did the rest.
+    });
   });
   it('screen-out-close wipes only screenShareIceDisconnectedAt', () => {
-    const r = resetPeerRecord(fullRecord(), 'screen-out-close');
-    expect(r.screenShareIceDisconnectedAt).toBeUndefined();
-    expect(r.screenShareStream).toBeDefined();
+    expect(resetPeerRecord(fullRecord(), 'screen-out-close')).toEqual({
+      ...fullRecord(), screenShareIceDisconnectedAt: undefined,
+    });
   });
   it('screen-in-close wipes only screenShareStream', () => {
-    const r = resetPeerRecord(fullRecord(), 'screen-in-close');
-    expect(r.screenShareStream).toBeUndefined();
-    expect(r.screenShareIceDisconnectedAt).toBe(10);
+    expect(resetPeerRecord(fullRecord(), 'screen-in-close')).toEqual({
+      ...fullRecord(), screenShareStream: undefined,
+    });
   });
   it('does not mutate its input', () => {
     const input = fullRecord();

@@ -66,7 +66,7 @@ export function statsForPeer(snap: PeerStatsSnapshot): PeerStats {
  * NOT-liveness (working agreement 2): this bounds a control/display
  * input, never a presence or reachability predicate — those live in
  * `presence-policy.ts`. Since the connection-thrash round the folded
- * value (`_signalsRttEwma`) feeds more than display: it is
+ * value (the peer record's `signalsRttEwma`) feeds more than display: it is
  * `decideSignalsMediaCadence`'s `bestRttEwmaMs` input
  * (`signals-cadence-policy.ts`) and both `_computeSdpTimeout` and
  * `_computeSdpBackstopTimeout`'s RTT-scaled ceilings (`streams-store.ts`)
@@ -89,7 +89,7 @@ export type SignalsRttFoldInputs = {
   pingT0: number | undefined;
   /** Receive stamp, on the store clock (same clock that stamped t0). */
   now: number;
-  /** Previous EWMA value for this peer, if any (`_signalsRttEwma`). */
+  /** Previous EWMA value for this peer, if any (the peer record's `signalsRttEwma`). */
   prevEwmaMs: number | undefined;
   /** The peer's `_openConnections` entry — carrier via `carrierFor`. */
   slot: WebrtcSlot | undefined;
@@ -118,7 +118,7 @@ export type SignalsRttFold =
  * The pong-echo RTT fold, extracted from `handlePongUi`'s inline block
  * (§9 item 4): sample plausibility, EWMA smoothing, and the
  * map-write/emit-gate interleave as one pure decision. The caller owns
- * the writes (`_signalsRttEwma`, `signalsStats`) and the
+ * the writes (the peer record's `signalsRttEwma`, `signalsStats`) and the
  * `_maybeEmitQualityChange` call; this function owns every number.
  *
  * Constrains `StreamsStore.handlePongUi`.

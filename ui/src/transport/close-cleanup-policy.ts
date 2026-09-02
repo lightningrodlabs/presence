@@ -132,13 +132,13 @@ export type CloseCleanupPlan = {
    * `'none'`. Replaces the 14 field-level clear booleans this table used
    * to carry directly — see the Task 4 header note above. Field-level
    * survivor semantics (what a close keeps vs. what a leave wipes,
-   * including `recordLastDisconnect`/`clearLastReconcileTime`/
+   * including `clearLastDisconnectTime`/`clearLastReconcileTime`/
    * `clearSignalsRttEwma`'s old rejoin-inheritance rule, and the analyser
    * reference-drop) are documented on `resetPeerRecord` and its arm
    * tests in `../__tests__/peer-record.test.ts`.
    */
   recordReset: PeerRecordResetArm | 'none';
-  /** Stamp `_lastDisconnectTime[peer] = now` (init-retry cooldown input).
+  /** Stamp the peer record's `lastDisconnectTime` (init-retry cooldown input).
    *  On `media-leave`/live the nested close-event row stamps this first
    *  (transport closes before the clears); the executor then applies
    *  `recordReset`'s `'media-leave-residue'` arm, which wipes

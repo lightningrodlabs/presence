@@ -4485,14 +4485,6 @@ export class StreamsStore {
   }
 
   /**
-   * Remove the AnalyserNode for a peer. Called on disconnect/leave.
-   */
-  removePeerAudioAnalyser(pubKeyB64: string): void {
-    const r = this._peerRecords.get(pubKeyB64);
-    if (r) r.analyser = undefined;
-  }
-
-  /**
    * Read the current peak audio level for a peer from the WebRTC
    * AnalyserNode. Returns 0.0–1.0, or 0 if no analyser exists.
    * Called by the audio-level-meter element at 10fps.

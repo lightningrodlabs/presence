@@ -106,8 +106,8 @@ function message(
   return { type: 'Message', from_agent: from, msg_type: msgType, payload };
 }
 
-/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds
- *  `_signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
+/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds the
+ *  peer record's `signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
  *  first-sample-seeds-raw). Carries `moduleStatesAt` so it doesn't read
  *  as a legacy no-stamp pong (same shape as the Task 7 `pongEchoing`
  *  fixture in the cadence describe below). */
