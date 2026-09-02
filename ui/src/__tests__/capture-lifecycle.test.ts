@@ -55,16 +55,20 @@ class FakeStream {
   }
 }
 
-/** Install a fake `navigator.mediaDevices.getUserMedia`. The node test
- *  environment has no ambient `navigator` at all (confirmed: `typeof
- *  navigator === 'undefined'` under this repo's node version), so this
- *  assigns the whole object rather than patching an existing one. */
+/** Install a fake `navigator.mediaDevices.getUserMedia`. node 22 (the 0.7
+ *  devshell) defines `navigator` as a getter-only global, so a plain
+ *  assignment throws "Cannot set property navigator … which has only a
+ *  getter"; `defineProperty` with `configurable: true` replaces it and
+ *  keeps the `delete` in teardown working. Also correct on node 20, where
+ *  there is no ambient `navigator`. */
 function installFakeNavigator(
   getUserMedia: (constraints: unknown) => Promise<FakeStream>
 ): void {
-  (globalThis as any).navigator = {
-    mediaDevices: { getUserMedia },
-  };
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { mediaDevices: { getUserMedia } },
+    configurable: true,
+    writable: true,
+  });
 }
 
 function sequentialStreams(...streams: FakeStream[]): (c: unknown) => Promise<FakeStream> {
