@@ -21,7 +21,7 @@ import {
   type PresenceSoundState,
 } from './presence-policy';
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
-import { initialPeerRecord, type PeerRecord } from './peer-record';
+import { initialPeerRecord, prunePendingInits, type PeerRecord } from './peer-record';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import {
@@ -73,7 +73,6 @@ import {
   DiagnosticSnapshot,
   InitPayload,
   OpenConnectionInfo,
-  PendingInit,
   PongMetaData,
   PongMetaDataV1,
   RoomSignal,
@@ -211,7 +210,7 @@ const INIT_RETRY_THRESHOLD = 5000;
 
 /**
  * TTL for pending handshake reservations — InitRequests we sent
- * (`_pendingInits`, keyed by `t0`). (`_pendingAccepts` and the
+ * (`PeerRecord.pendingInits`, keyed by `t0`). (`_pendingAccepts` and the
  * screen-share twins were retired in Phase 3: the FSM acceptor creates
  * state lazily from the incoming offer, so nothing needs reserving.)
  * Serves the connection-establishment predicate: an entry older
@@ -220,7 +219,7 @@ const INIT_RETRY_THRESHOLD = 5000;
  * INIT_RETRY_THRESHOLD, which this deliberately exceeds by 4x so a live
  * retry cycle is never truncated. Swept from `pingAgents` on the ping
  * cadence. (Phase 2 item 7: previously only the accepts had this;
- * `_pendingInits` grew unboundedly against an unresponsive peer.)
+ * pendingInits grew unboundedly against an unresponsive peer.)
  */
 const PENDING_HANDSHAKE_TTL_MS = 20000;
 
@@ -238,24 +237,6 @@ function closeGuardOutcome(
   if (write.write === 'clear') return 'live';
   if (write.write === 'none' && write.reason === 'superseded') return 'superseded';
   return 'no-slot';
-}
-
-/**
- * Drop entries older than `ttlMs` from a pending-handshake map,
- * deleting agents whose lists empty out. Pure; exported for tests.
- */
-export function pruneExpiredPending<T>(
-  map: Record<string, T[]>,
-  timeOf: (entry: T) => number,
-  now: number,
-  ttlMs: number
-): Record<string, T[]> {
-  const out: Record<string, T[]> = {};
-  for (const [agent, entries] of Object.entries(map)) {
-    const remaining = entries.filter(e => now - timeOf(e) <= ttlMs);
-    if (remaining.length > 0) out[agent] = remaining;
-  }
-  return out;
 }
 
 /**
@@ -1289,7 +1270,7 @@ export class StreamsStore {
 
   /**
    * `ice-diagnostic` bookkeeping for the outgoing screen-share transport:
-   * maintains the invariant on `_screenShareIceDisconnectedAt` — an entry
+   * maintains the invariant on `screenShareIceDisconnectedAt` — an entry
    * exists iff the share's iceState is currently 'disconnected' — which
    * the stale-connection net reads for its grace window. No log lines:
    * the media transport is the forensic subject; the share only needs
@@ -1301,9 +1282,9 @@ export class StreamsStore {
   ): void {
     if (diag.kind !== 'ice-state') return;
     if (diag.state === 'disconnected') {
-      this._screenShareIceDisconnectedAt[pubKeyB64] = this.clock.now();
+      this._ensurePeerRecord(pubKeyB64).screenShareIceDisconnectedAt = this.clock.now();
     } else {
-      delete this._screenShareIceDisconnectedAt[pubKeyB64];
+      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareIceDisconnectedAt = undefined; }
     }
   }
 
@@ -1441,7 +1422,7 @@ export class StreamsStore {
     });
     { const r = this._peerRecords.get(pubKeyB64); if (r) r.qualityBucket = undefined; }
 
-    delete this._pendingInits[pubKeyB64];
+    { const r = this._peerRecords.get(pubKeyB64); if (r) r.pendingInits = undefined; }
 
     this._openConnections.update(currentValue => {
       const conn = currentValue[pubKeyB64];
@@ -1596,12 +1577,12 @@ export class StreamsStore {
     // decision, so a departed session's collapsed value must not pause a
     // healthy rejoin. Peer-leave rows only, like the two deletes above.
     if (plan.clearSignalsRttEwma) this._signalsRttEwma.delete(pubKeyB64);
-    if (plan.clearVideoStreamSlot) delete this._videoStreams[pubKeyB64];
+    if (plan.clearVideoStreamSlot) { const r = this._peerRecords.get(pubKeyB64); if (r) r.videoStream = undefined; }
     // A closed connection's pending InitRequests are dead reservations:
     // clearing them lets the next pong cycle re-initiate immediately
     // instead of waiting out INIT_RETRY_THRESHOLD against a stale t0
     // (Phase 2 item 7 — inits get close-path cleanup like accepts).
-    if (plan.clearPendingInits) delete this._pendingInits[pubKeyB64];
+    if (plan.clearPendingInits) { const r = this._peerRecords.get(pubKeyB64); if (r) r.pendingInits = undefined; }
 
     if (plan.clearSlot) {
       slotStore.update(currentValue => {
@@ -1629,13 +1610,13 @@ export class StreamsStore {
     if (plan.clearReconcileAttemptCount) { const r = this._peerRecords.get(pubKeyB64); if (r) r.reconcileAttemptCount = undefined; }
     if (plan.clearIceDisconnectedAt) { const r = this._peerRecords.get(pubKeyB64); if (r) r.iceDisconnectedAt = undefined; }
     if (plan.clearScreenShareIceDisconnectedAt) {
-      delete this._screenShareIceDisconnectedAt[pubKeyB64];
+      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareIceDisconnectedAt = undefined; }
     }
     if (plan.clearScreenShareStream) {
       // The incoming share's stream slot dies with its connection —
       // room-view's paint-restore path reads this map and must not
       // resurrect a dead share.
-      delete this._screenShareStreams[pubKeyB64];
+      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareStream = undefined; }
     }
 
     // Capture failure-side latency before _clearIceTiming wipes the
@@ -1756,7 +1737,7 @@ export class StreamsStore {
       event: 'StreamReceived',
       connectionId,
     });
-    this._videoStreams[pubKeyB64] = stream;
+    this._ensurePeerRecord(pubKeyB64).videoStream = stream;
 
     const audioTracks = stream.getAudioTracks();
     const videoTracks = stream.getVideoTracks();
@@ -2039,9 +2020,9 @@ export class StreamsStore {
     stream: MediaStream,
   ): void {
     // Keep the stream reachable for room-view's paint-restore path
-    // (`_screenShareStreams` was declared for exactly this and written
+    // (`screenShareStream` was declared for exactly this and written
     // nowhere — the unscheduled-defects table; wired here by Phase 3).
-    this._screenShareStreams[pubKeyB64] = stream;
+    this._ensurePeerRecord(pubKeyB64).screenShareStream = stream;
     this._screenShareConnectionsIncoming.update(currentValue => {
       const relevantConnection = currentValue[pubKeyB64];
       if (relevantConnection) {
@@ -2507,10 +2488,12 @@ export class StreamsStore {
       this.clock.clearInterval(this._presenceTickInterval);
       this._presenceTickInterval = undefined;
     }
-    for (const handle of Object.values(this._sdpTimeoutTimers)) {
-      this.clock.clearTimeout(handle);
+    for (const r of this._peerRecords.values()) {
+      if (r.sdpTimeoutTimer !== undefined) this.clock.clearTimeout(r.sdpTimeoutTimer);
+      r.sdpTimeoutTimer = undefined;
+      r.screenShareStream = undefined;
+      r.pendingInits = undefined;
     }
-    this._sdpTimeoutTimers = {};
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -2563,8 +2546,6 @@ export class StreamsStore {
     this._openConnections.set({});
     this._screenShareConnectionsOutgoing.set({});
     this._screenShareConnectionsIncoming.set({});
-    this._screenShareStreams = {};
-    this._pendingInits = {};
     this._lastComputedPresent = [];
   }
 
@@ -2755,8 +2736,9 @@ export class StreamsStore {
     // our sent-InitRequest records; without the sweep they grow one entry
     // per 5s retry for as long as a peer stays unresponsive.
     const now = this.clock.now();
-    this._pendingInits = pruneExpiredPending(
-      this._pendingInits, i => i.t0, now, PENDING_HANDSHAKE_TTL_MS);
+    for (const r of this._peerRecords.values()) {
+      if (r.pendingInits) r.pendingInits = prunePendingInits(r.pendingInits, now, PENDING_HANDSHAKE_TTL_MS);
+    }
 
     // Health check for dead tracks (bytesReceived stall detection)
     await this._checkTrackHealth();
@@ -3574,15 +3556,6 @@ export class StreamsStore {
   }
 
   /**
-   * Pending SDP-exchange timeout handles, one per peer, armed by
-   * `handleInitAccept`. Tracked so a successor attempt (or `disconnect()`)
-   * disarms the predecessor's timer instead of leaving it to fire against
-   * state it no longer owns (§9 item 5); the timer body is additionally
-   * attempt-scoped on its connectionId.
-   */
-  private _sdpTimeoutTimers: Record<AgentPubKeyB64, number> = {};
-
-  /**
    * Tracks the last time reconcileVideoStreamState was triggered per agent,
    * to avoid firing more than once per 30s interval.
    */
@@ -3635,14 +3608,6 @@ export class StreamsStore {
   }> = {};
 
   /**
-   * As PeerRecord.iceDisconnectedAt, but for outgoing screen-share peers. Kept
-   * separate because a single agent can have both a video connection and
-   * an outgoing screen-share connection in flight with independent ICE
-   * states; one going 'disconnected' must not affect the other's grace.
-   */
-  _screenShareIceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
-
-  /**
    * The set of **present** peers whose media is NOT currently flowing
    * over WebRTC. Audio and filmstrip video for these peers are carried
    * over Holochain remote signals. Precomputed as a derived store so the
@@ -3668,25 +3633,9 @@ export class StreamsStore {
    */
   screenShareStream: MediaStream | undefined | null;
 
-  /**
-   * Streams of others
-   */
-  _videoStreams: Record<AgentPubKeyB64, MediaStream> = {};
-
-  /**
-   * Screen share streams of others
-   */
-  _screenShareStreams: Record<AgentPubKeyB64, MediaStream> = {};
-
   // ===========================================================================================
   // CONNECTION ESTABLISHMENT
   // ===========================================================================================
-
-  /**
-   * Pending Init requests
-   */
-  _pendingInits: Record<AgentPubKeyB64, PendingInit[]> = {};
-
 
   // ********************************************************************************************
   //
@@ -4393,11 +4342,12 @@ export class StreamsStore {
       }
       return curr;
     });
-    this._pendingInits = peerB64
-      ? Object.fromEntries(
-          Object.entries(this._pendingInits).filter(([k]) => k !== peerB64),
-        )
-      : {};
+    if (peerB64) {
+      const r = this._peerRecords.get(peerB64);
+      if (r) r.pendingInits = undefined;
+    } else {
+      for (const r of this._peerRecords.values()) r.pendingInits = undefined;
+    }
   }
 
   /**
@@ -4904,7 +4854,7 @@ export class StreamsStore {
       .filter(agent => agent !== this.myPubKeyB64 && !get(this.blockedAgents).includes(agent));
 
     for (const agentB64 of agentsToPong) {
-      const streamInfo = getStreamInfo(this._videoStreams[agentB64]);
+      const streamInfo = getStreamInfo(this._peerRecords.get(agentB64)?.videoStream);
       const metaData: PongMetaData<PongMetaDataV1> = {
         formatVersion: 1,
         data: {
@@ -6018,7 +5968,7 @@ export class StreamsStore {
     if (get(this.blockedAgents).includes(pubkeyB64)) return;
     // console.log(`Got PingUi from ${pubkeyB64}: `, signal);
 
-    const streamInfo = getStreamInfo(this._videoStreams[pubkeyB64]);
+    const streamInfo = getStreamInfo(this._peerRecords.get(pubkeyB64)?.videoStream);
 
     // Extract the sender's ping timestamp so we can echo it back for RTT.
     // Old peers send an empty payload — pingT0 stays undefined in that case.
@@ -6080,7 +6030,7 @@ export class StreamsStore {
             carrierOwnsRecovery:
               this.screenShareOutTransport.ownsTransportRecovery,
             iceState,
-            disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
+            disconnectedAt: this._peerRecords.get(pubkeyB64)?.screenShareIceDisconnectedAt,
             now: this.clock.now(),
             graceMs: ICE_DISCONNECTED_GRACE_MS,
           });
@@ -6431,7 +6381,7 @@ export class StreamsStore {
         peerHasSdpFsmCap: this.webrtcAvailableFor(pubkeyB64),
       }).eligible
     ) {
-      const pendingInits = this._pendingInits[pubkeyB64];
+      const pendingInits = this._peerRecords.get(pubkeyB64)?.pendingInits;
       const decision = decideInitRetry({
         alreadyOpen: !!alreadyOpen,
         myPubKeyB64: this.myPubKeyB64,
@@ -6452,7 +6402,7 @@ export class StreamsStore {
             }
           }
           const newConnectionId = uuidv4();
-          this._pendingInits[pubkeyB64] = [
+          this._ensurePeerRecord(pubkeyB64).pendingInits = [
             ...(pendingInits ?? []),
             { connectionId: newConnectionId, t0: now },
           ];
@@ -6511,7 +6461,7 @@ export class StreamsStore {
         slotClaimsConnected: !!outgoingScreenShare.connected,
         carrierOwnsRecovery: this.screenShareOutTransport.ownsTransportRecovery,
         iceState,
-        disconnectedAt: this._screenShareIceDisconnectedAt[pubkeyB64],
+        disconnectedAt: this._peerRecords.get(pubkeyB64)?.screenShareIceDisconnectedAt,
         now,
         graceMs: ICE_DISCONNECTED_GRACE_MS,
       });
@@ -6679,7 +6629,7 @@ export class StreamsStore {
      *
      */
     if (connection_type === 'video') {
-      const agentPendingInits = this._pendingInits[pubKey64];
+      const agentPendingInits = this._peerRecords.get(pubKey64)?.pendingInits;
       if (!Object.keys(get(this._openConnections)).includes(pubKey64)) {
         if (!agentPendingInits) {
           console.warn(
@@ -6758,7 +6708,7 @@ export class StreamsStore {
             );
           }
 
-          delete this._pendingInits[pubKey64];
+          { const r = this._peerRecords.get(pubKey64); if (r) r.pendingInits = undefined; }
 
           // Second-line backstop: if the FSM wedges without ever emitting
           // a phase transition, this store-level timer cleans up and lets
@@ -6774,10 +6724,10 @@ export class StreamsStore {
           // the attempt that armed it — a successor attempt's slot must
           // survive this timer firing — and a new attempt for the same
           // peer disarms the previous timer, as does disconnect().
-          const priorSdpTimer = this._sdpTimeoutTimers[pubKey64];
+          const priorSdpTimer = this._peerRecords.get(pubKey64)?.sdpTimeoutTimer;
           if (priorSdpTimer !== undefined) this.clock.clearTimeout(priorSdpTimer);
-          this._sdpTimeoutTimers[pubKey64] = this.clock.setTimeout(() => {
-            delete this._sdpTimeoutTimers[pubKey64];
+          this._ensurePeerRecord(pubKey64).sdpTimeoutTimer = this.clock.setTimeout(() => {
+            { const r = this._peerRecords.get(pubKey64); if (r) r.sdpTimeoutTimer = undefined; }
             const conn = get(this._openConnections)[pubKey64];
             // A successor attempt owns the slot now: its own timer owns
             // its deadline. (Pinned by the successor-survival wiring test.)

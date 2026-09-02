@@ -768,7 +768,7 @@ export class RoomView extends LitElement {
         this.shadowRoot?.getElementById(
           `video-${pubkeyB64}`
         ) as HTMLVideoElement | null,
-        this.streamsStore._videoStreams[pubkeyB64],
+        this.streamsStore._peerRecord(pubkeyB64)?.videoStream,
         'ensure'
       );
     }
@@ -876,7 +876,7 @@ export class RoomView extends LitElement {
     for (const [pubkeyB64] of Object.entries(this._screenShareConnectionsIncoming.value)) {
       restoreVideo(
         this.shadowRoot?.getElementById(peerScreenVideoId(pubkeyB64)) as HTMLVideoElement | null,
-        this.streamsStore._screenShareStreams[pubkeyB64],
+        this.streamsStore._peerRecord(pubkeyB64)?.screenShareStream,
       );
     }
 
@@ -884,7 +884,7 @@ export class RoomView extends LitElement {
     for (const [pubkeyB64] of Object.entries(this._openConnections.value)) {
       restoreVideo(
         this.shadowRoot?.getElementById(`video-${pubkeyB64}`) as HTMLVideoElement | null,
-        this.streamsStore._videoStreams[pubkeyB64],
+        this.streamsStore._peerRecord(pubkeyB64)?.videoStream,
       );
     }
   }

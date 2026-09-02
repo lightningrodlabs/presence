@@ -148,10 +148,10 @@ export type CloseCleanupPlan = {
   emitCarrierSwitch: boolean;
   /** Media rows: also tear down the peer's outgoing screen share. */
   teardownOutgoingScreenShare: boolean;
-  /** Incoming screen rows: drop `_screenShareStreams[peer]` so
+  /** Incoming screen rows: drop the peer record's `screenShareStream` so
    *  paint-restore cannot resurrect a dead share. */
   clearScreenShareStream: boolean;
-  /** Outgoing screen rows: drop `_screenShareIceDisconnectedAt[peer]`. */
+  /** Outgoing screen rows: drop the peer record's `screenShareIceDisconnectedAt`. */
   clearScreenShareIceDisconnectedAt: boolean;
   fireEvent: 'peer-disconnected' | 'peer-screen-share-disconnected' | 'none';
   setDisconnectedStatus: 'media' | 'screen-share' | 'none';

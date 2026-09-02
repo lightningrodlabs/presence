@@ -11,7 +11,6 @@
  * peer (the leave reset keeps `connectionEpoch` — monotonic for the
  * session, see docs/WEBRTC_RECONNECT_IDENTITY.md).
  */
-import type { AgentPubKeyB64 } from '@holochain/client';
 import type { PendingInit } from './types';
 
 export type PeerRecord = {
@@ -69,6 +68,16 @@ export function initialPeerRecord(): PeerRecord {
   return { connectionEpoch: 0 };
 }
 
-// AgentPubKeyB64 re-exported so streams-store's helper signatures can
-// reference it without a second import line.
-export type { AgentPubKeyB64 };
+/**
+ * Prune expired pending-init entries (PENDING_HANDSHAKE_TTL_MS sweep).
+ * Returns undefined when none survive — the field-level equivalent of
+ * the pre-fold pruneExpiredPending dropping empty rows.
+ */
+export function prunePendingInits(
+  entries: PendingInit[],
+  now: number,
+  ttlMs: number,
+): PendingInit[] | undefined {
+  const remaining = entries.filter(e => now - e.t0 <= ttlMs);
+  return remaining.length > 0 ? remaining : undefined;
+}
