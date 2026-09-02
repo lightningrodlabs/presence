@@ -132,6 +132,7 @@ describe('decideWebrtcEligibility — one predicate for both handshake ends (Rou
     conversationActive: true,
     peerWebrtcDisabled: false,
     webrtcGloballyDisabled: false,
+    peerCapsKnown: true,
     peerHasSdpFsmCap: true,
   });
 
@@ -139,12 +140,18 @@ describe('decideWebrtcEligibility — one predicate for both handshake ends (Rou
   // ineligible with that conjunct's reason, identically for both roles.
   // Inverting a conjunct inside the policy fails the corresponding row —
   // the reviewer's mutation check.
+  //
+  // `peerCapsKnown: true` on every other row is the regression guard for
+  // the caps race (D2): a genuinely old peer (`peerHasSdpFsmCap: false`
+  // with `peerCapsKnown: true`) must still resolve to
+  // `peer-lacks-sdp-fsm-cap`, not the new caps-unknown reason.
   const conjunctRows: Array<
     [Partial<WebrtcEligibilityInputs>, string]
   > = [
     [{ conversationActive: false }, 'conversation-inactive'],
     [{ webrtcGloballyDisabled: true }, 'webrtc-globally-disabled'],
     [{ peerWebrtcDisabled: true }, 'peer-webrtc-disabled'],
+    [{ peerCapsKnown: false }, 'peer-caps-unknown'],
     [{ peerHasSdpFsmCap: false }, 'peer-lacks-sdp-fsm-cap'],
   ];
 
@@ -189,13 +196,14 @@ describe('decideWebrtcEligibility — one predicate for both handshake ends (Rou
     }
   });
 
-  it('reason precedence: conversation, then kill switch, then per-peer, then capability', () => {
+  it('reason precedence: conversation, then kill switch, then per-peer, then caps-known, then capability', () => {
     expect(
       decideWebrtcEligibility({
         role: 'initiator',
         conversationActive: false,
         webrtcGloballyDisabled: true,
         peerWebrtcDisabled: true,
+        peerCapsKnown: false,
         peerHasSdpFsmCap: false,
       }).reason,
     ).toBe('conversation-inactive');
@@ -205,6 +213,7 @@ describe('decideWebrtcEligibility — one predicate for both handshake ends (Rou
         conversationActive: true,
         webrtcGloballyDisabled: true,
         peerWebrtcDisabled: true,
+        peerCapsKnown: false,
         peerHasSdpFsmCap: false,
       }).reason,
     ).toBe('webrtc-globally-disabled');
@@ -214,8 +223,22 @@ describe('decideWebrtcEligibility — one predicate for both handshake ends (Rou
         conversationActive: true,
         webrtcGloballyDisabled: false,
         peerWebrtcDisabled: true,
+        peerCapsKnown: false,
         peerHasSdpFsmCap: false,
       }).reason,
     ).toBe('peer-webrtc-disabled');
+    // Unknown caps (the D2 race) outranks a stale "lacks the capability"
+    // reading: until the payload arrives we cannot tell a race from a
+    // genuinely old build, so caps-unknown wins the precedence.
+    expect(
+      decideWebrtcEligibility({
+        role: 'initiator',
+        conversationActive: true,
+        webrtcGloballyDisabled: false,
+        peerWebrtcDisabled: false,
+        peerCapsKnown: false,
+        peerHasSdpFsmCap: false,
+      }).reason,
+    ).toBe('peer-caps-unknown');
   });
 });
