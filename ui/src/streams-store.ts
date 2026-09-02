@@ -381,10 +381,10 @@ export class StreamsStore {
    * this peer had a prior connected session this room-session, i.e. is a
    * fresh WebRTC attempt actually a reconnection? Exposes the boolean the
    * view needs for `describeLinkEstablishment` without handing it the raw
-   * `_lastDisconnectTime` record.
+   * `lastDisconnectTime` field.
    */
   peerReconnecting(peerB64: AgentPubKeyB64): boolean {
-    return this._lastDisconnectTime[peerB64] !== undefined;
+    return this._peerRecords.get(peerB64)?.lastDisconnectTime !== undefined;
   }
 
   /**
@@ -1564,19 +1564,19 @@ export class StreamsStore {
     if (plan.clearWebrtcExitReason) { const r = this._peerRecords.get(pubKeyB64); if (r) r.webrtcExitReason = undefined; }
     if (plan.clearQualityBucket) { const r = this._peerRecords.get(pubKeyB64); if (r) r.qualityBucket = undefined; }
     if (plan.recordLastDisconnect) {
-      this._lastDisconnectTime[pubKeyB64] = this.clock.now();
+      this._ensurePeerRecord(pubKeyB64).lastDisconnectTime = this.clock.now();
     }
     // The clears run AFTER recordLastDisconnect on purpose: on the
     // peer-leave/live path the nested close-event row (via the
     // synchronous `closed` from closeTransport above) has already
     // stamped the cooldown, and the leave row's delete must win — a
     // rejoining peer starts clean (§9 item 5).
-    if (plan.clearLastDisconnectTime) delete this._lastDisconnectTime[pubKeyB64];
-    if (plan.clearLastReconcileTime) delete this._lastReconcileTime[pubKeyB64];
+    if (plan.clearLastDisconnectTime) { const r = this._peerRecords.get(pubKeyB64); if (r) r.lastDisconnectTime = undefined; }
+    if (plan.clearLastReconcileTime) { const r = this._peerRecords.get(pubKeyB64); if (r) r.lastReconcileTime = undefined; }
     // Rejoin-inheritance clear (review M5): the EWMA feeds the cadence
     // decision, so a departed session's collapsed value must not pause a
     // healthy rejoin. Peer-leave rows only, like the two deletes above.
-    if (plan.clearSignalsRttEwma) this._signalsRttEwma.delete(pubKeyB64);
+    if (plan.clearSignalsRttEwma) { const r = this._peerRecords.get(pubKeyB64); if (r) r.signalsRttEwma = undefined; }
     if (plan.clearVideoStreamSlot) { const r = this._peerRecords.get(pubKeyB64); if (r) r.videoStream = undefined; }
     // A closed connection's pending InitRequests are dead reservations:
     // clearing them lets the next pong cycle re-initiate immediately
@@ -1782,7 +1782,7 @@ export class StreamsStore {
     // whose first track was video (analyser-setup early-returns on no audio)
     // never gets a second pass when the audio track arrives later. Hook it
     // here as well: idempotent if the analyser already exists.
-    if (track.kind === 'audio' && stream && !this._peerAnalysers.has(pubKeyB64)) {
+    if (track.kind === 'audio' && stream && !this._peerRecords.get(pubKeyB64)?.analyser) {
       this.setupPeerAudioAnalyser(pubKeyB64, stream);
     }
 
@@ -2764,7 +2764,7 @@ export class StreamsStore {
     // policy's declared design).
     let bestRttEwmaMs: number | undefined;
     for (const target of get(this._signalsTargets)) {
-      const rtt = this._signalsRttEwma.get(target);
+      const rtt = this._peerRecords.get(target)?.signalsRttEwma;
       if (rtt !== undefined && (bestRttEwmaMs === undefined || rtt < bestRttEwmaMs)) {
         bestRttEwmaMs = rtt;
       }
@@ -2889,7 +2889,7 @@ export class StreamsStore {
       // healthy pong decays the EWMA below half-degraded and walks it on
       // to 'full' over the following ticks, same as any other recovery.
       for (const target of get(this._signalsTargets)) {
-        this._signalsRttEwma.set(target, SIGNALS_RTT_DEGRADED_MS);
+        this._ensurePeerRecord(target).signalsRttEwma = SIGNALS_RTT_DEGRADED_MS;
       }
     }
 
@@ -2937,7 +2937,7 @@ export class StreamsStore {
    * provisional — see docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
    */
   private _computeSdpTimeout(peerB64: AgentPubKeyB64): number | undefined {
-    const rtt = this._signalsRttEwma.get(peerB64);
+    const rtt = this._peerRecords.get(peerB64)?.signalsRttEwma;
     if (rtt === undefined || rtt <= 0) return undefined;
     return Math.min(
       SDP_TIMEOUT_CEILING_MS,
@@ -3555,36 +3555,11 @@ export class StreamsStore {
     return r;
   }
 
-  /**
-   * Tracks the last time reconcileVideoStreamState was triggered per agent,
-   * to avoid firing more than once per 30s interval.
-   */
-  _lastReconcileTime: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Tracks the timestamp of the last connection close/error per agent,
-   * used to log the retry gap when a new InitRequest is created.
-   */
-  _lastDisconnectTime: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Monotonic per-peer connection generation ("epoch"). Allocated by the
-   * initiator on each new connection attempt and passed into the FSM transport,
-   * which stamps it on outgoing signals and uses it for cross-attempt
-   * "newest-wins" ordering. Because it lives on the store (which outlives any
-   * FSM), it does NOT reset when an FSM is torn down and recreated — unlike the
-   * FSM's own `peerSessionId`, which resets to 0 per instance and so cannot
-   * order signals across a reconnect. Never reset for the session (a rejoining
-   * peer gets a strictly higher epoch, so in-flight stale signals stay older).
-   * See docs/WEBRTC_RECONNECT_IDENTITY.md.
-   */
-  private _connectionEpoch: Record<AgentPubKeyB64, number> = {};
-
   /** Allocate the next connection epoch for `peer` (monotonic, per session). */
   private _nextConnectionEpoch(peer: AgentPubKeyB64): number {
-    const next = (this._connectionEpoch[peer] ?? 0) + 1;
-    this._connectionEpoch[peer] = next;
-    return next;
+    const r = this._ensurePeerRecord(peer);
+    r.connectionEpoch += 1;
+    return r.connectionEpoch;
   }
 
   /**
@@ -4395,14 +4370,6 @@ export class StreamsStore {
   }
 
   /**
-   * Per-peer WebRTC AnalyserNodes for reading incoming audio levels.
-   * Created when a peer stream arrives, removed on disconnect.
-   * The audio-level-meter element polls these at 10fps.
-   */
-  private _peerAnalysers = new Map<string, AnalyserNode>();
-  private _peerAnalyserBuffers = new Map<string, Uint8Array>();
-
-  /**
    * Per-peer latency/quality stats for the signals carrier. Updated on
    * each pong receive (RTT) and by VoiceController (jitter, loss).
    * Plain Map — read by the peer-stats-panel element at its own poll rate.
@@ -4414,12 +4381,6 @@ export class StreamsStore {
    * the periodic getStats() poll. Plain Map — not reactive.
    */
   webrtcStats = new Map<string, import('./types').CarrierStats>();
-
-  /**
-   * Rolling EWMA of signals-carrier RTT per peer. Smooths out noise
-   * from jitter on individual ping/pong round trips.
-   */
-  private _signalsRttEwma = new Map<string, number>();
 
   /**
    * The **signal-carrier-down** authority's state: `this.clock` timestamp
@@ -4492,17 +4453,6 @@ export class StreamsStore {
   private _lastPresenceSet = new Set<AgentPubKeyB64>();
 
   /**
-   * Per-peer audibility-outage tracking. When our audioLink to this peer
-   * has been 'down' or 'negotiating' for ≥ OUTAGE_THRESHOLD_MS, *and* some
-   * third peer reports being audible to that target, we emit an
-   * AudibilityOutageStart event. The `emitted` flag guards against
-   * multiple Starts per outage and tells the End side whether to fire on
-   * recovery. Populated / drained by `_checkAudibilityOutages` on the
-   * 2s ping tick.
-   */
-  private _outageStates = new Map<string, { startedAt: number; emitted: boolean }>();
-
-  /**
    * Aggregation state for SdpData events, keyed by `${peer}:${connId}:${sdpType}`.
    * FSM Perfect-Negotiation glare can fire hundreds of offer/answer pairs
    * per second on the same connection; ICE trickle on simplepeer fires
@@ -4531,8 +4481,7 @@ export class StreamsStore {
    */
   setupPeerAudioAnalyser(pubKeyB64: string, stream: MediaStream): void {
     // Clean up any existing analyser for this peer
-    this._peerAnalysers.delete(pubKeyB64);
-    this._peerAnalyserBuffers.delete(pubKeyB64);
+    { const r = this._peerRecords.get(pubKeyB64); if (r) r.analyser = undefined; }
 
     const audioTracks = stream.getAudioTracks();
     if (audioTracks.length === 0) return;
@@ -4554,8 +4503,7 @@ export class StreamsStore {
       analyser.fftSize = 256;
       source.connect(analyser);
       // Do NOT connect analyser to destination — <video> handles playback
-      this._peerAnalysers.set(pubKeyB64, analyser);
-      this._peerAnalyserBuffers.set(pubKeyB64, new Uint8Array(analyser.fftSize));
+      this._ensurePeerRecord(pubKeyB64).analyser = { node: analyser, buffer: new Uint8Array(analyser.fftSize) };
     } catch (e) {
       console.warn('Failed to create audio analyser for peer:', e);
     }
@@ -4565,8 +4513,8 @@ export class StreamsStore {
    * Remove the AnalyserNode for a peer. Called on disconnect/leave.
    */
   removePeerAudioAnalyser(pubKeyB64: string): void {
-    this._peerAnalysers.delete(pubKeyB64);
-    this._peerAnalyserBuffers.delete(pubKeyB64);
+    const r = this._peerRecords.get(pubKeyB64);
+    if (r) r.analyser = undefined;
   }
 
   /**
@@ -4575,15 +4523,14 @@ export class StreamsStore {
    * Called by the audio-level-meter element at 10fps.
    */
   getWebrtcAudioLevel(pubKeyB64: string): number {
-    const analyser = this._peerAnalysers.get(pubKeyB64);
-    const buffer = this._peerAnalyserBuffers.get(pubKeyB64);
-    if (!analyser || !buffer) return 0;
+    const a = this._peerRecords.get(pubKeyB64)?.analyser;
+    if (!a) return 0;
 
-    analyser.getByteTimeDomainData(buffer);
+    a.node.getByteTimeDomainData(a.buffer);
     let peak = 0;
-    for (let i = 0; i < buffer.length; i += 4) {
+    for (let i = 0; i < a.buffer.length; i += 4) {
       // Byte domain data is 0–255 centered at 128
-      const v = Math.abs(buffer[i] - 128) / 128;
+      const v = Math.abs(a.buffer[i] - 128) / 128;
       if (v > peak) peak = v;
     }
     return peak;
@@ -4948,7 +4895,7 @@ export class StreamsStore {
     const BASE_COOLDOWN_MS = 10_000;
     const reconcileCount = this._peerRecords.get(pubkey)?.reconcileAttemptCount || 0;
     const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
-    const lastReconcile = this._lastReconcileTime[pubkey] || 0;
+    const lastReconcile = this._peerRecords.get(pubkey)?.lastReconcileTime || 0;
     if (this.clock.now() - lastReconcile < cooldown) return;
 
     if (!this.mainStream) return;
@@ -4991,7 +4938,7 @@ export class StreamsStore {
           for (const track of this.mainStream.getTracks()) {
             transport.addTrack(track, this.mainStream);
           }
-          this._lastReconcileTime[pubkey] = this.clock.now();
+          this._ensurePeerRecord(pubkey).lastReconcileTime = this.clock.now();
           this._ensurePeerRecord(pubkey).reconcileAttemptCount = reconcileCount + 1;
         } catch (e: any) {
           console.warn('Failed to re-add stream during reconcile:', e.message);
@@ -5042,7 +4989,7 @@ export class StreamsStore {
       this._cloneStreamRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
     }
 
-    this._lastReconcileTime[pubkey] = this.clock.now();
+    this._ensurePeerRecord(pubkey).lastReconcileTime = this.clock.now();
     this._ensurePeerRecord(pubkey).reconcileAttemptCount = reconcileCount + 1;
   }
 
@@ -5212,7 +5159,7 @@ export class StreamsStore {
    * predicate.
    */
   private _computeDiagnosticAttemptTimeout(peerB64: AgentPubKeyB64): number {
-    const rtt = this._signalsRttEwma.get(peerB64);
+    const rtt = this._peerRecords.get(peerB64)?.signalsRttEwma;
     if (rtt === undefined || rtt <= 0) {
       return StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS;
     }
@@ -5669,11 +5616,11 @@ export class StreamsStore {
 
       const link = this.audioLinkFor(peerB64);
       const isOutage = link === 'down' || link === 'negotiating';
-      const state = this._outageStates.get(peerB64);
+      const state = this._peerRecords.get(peerB64)?.outageState;
 
       if (isOutage) {
         if (!state) {
-          this._outageStates.set(peerB64, { startedAt: now, emitted: false });
+          this._ensurePeerRecord(peerB64).outageState = { startedAt: now, emitted: false };
           continue;
         }
         if (state.emitted) continue;
@@ -5718,7 +5665,7 @@ export class StreamsStore {
             detail: `${durationSec}s; recovered via ${link}`,
           });
         }
-        this._outageStates.delete(peerB64);
+        { const r = this._peerRecords.get(peerB64); if (r) r.outageState = undefined; }
       }
     }
   }
@@ -6059,7 +6006,7 @@ export class StreamsStore {
     // If we were mid-outage for this peer, close it out — the peer is
     // gone, not silently unreachable. Wouldn't fire via _checkAudibilityOutages
     // because peer drops from the presence set on next tick.
-    const outage = this._outageStates.get(pubkeyB64);
+    const outage = this._peerRecords.get(pubkeyB64)?.outageState;
     if (outage?.emitted) {
       const durationSec = Math.floor((this.clock.now() - outage.startedAt) / 1000);
       this.logger.logAgentEvent({
@@ -6069,7 +6016,7 @@ export class StreamsStore {
         detail: `${durationSec}s; peer left`,
       });
     }
-    this._outageStates.delete(pubkeyB64);
+    { const r = this._peerRecords.get(pubkeyB64); if (r) r.outageState = undefined; }
 
     // Clear lastSeen so agent immediately drops from _activeAgents (pane
     // removal). Same observable as "never joined" — both surface as
@@ -6168,7 +6115,7 @@ export class StreamsStore {
             ? metaData.data.pingT0
             : undefined,
         now: this.clock.now(),
-        prevEwmaMs: this._signalsRttEwma.get(pubkeyB64),
+        prevEwmaMs: this._peerRecords.get(pubkeyB64)?.signalsRttEwma,
         slot: get(this._openConnections)[pubkeyB64],
       });
       switch (rttFold.action) {
@@ -6181,7 +6128,7 @@ export class StreamsStore {
         case 'drop':
           break;
         case 'fold': {
-          this._signalsRttEwma.set(pubkeyB64, rttFold.ewmaMs);
+          this._ensurePeerRecord(pubkeyB64).signalsRttEwma = rttFold.ewmaMs;
           const existing = this.signalsStats.get(pubkeyB64) ?? {
             rttMs: null, jitterMs: null, lossPercent: null,
           };
@@ -6393,7 +6340,7 @@ export class StreamsStore {
       switch (decision.action) {
         case 'send-init': {
           if (decision.reason === 'no-pending-init') {
-            const lastDisconnect = this._lastDisconnectTime[pubkeyB64];
+            const lastDisconnect = this._peerRecords.get(pubkeyB64)?.lastDisconnectTime;
             if (lastDisconnect) {
               const gap = this.clock.now() - lastDisconnect;
               this.logger.logCustomMessage(
@@ -6501,7 +6448,7 @@ export class StreamsStore {
     });
 
     // Log retry gap if this is a reconnection attempt
-    const lastDisconnect = this._lastDisconnectTime[pubKey64];
+    const lastDisconnect = this._peerRecords.get(pubKey64)?.lastDisconnectTime;
     if (lastDisconnect) {
       const gap = this.clock.now() - lastDisconnect;
       this.logger.logCustomMessage(

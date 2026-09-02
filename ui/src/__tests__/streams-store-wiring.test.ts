@@ -533,7 +533,7 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
     expect(media.closeCalls).toHaveLength(0);
     expect(store._peerRecord(peerA)?.pendingInits).toHaveLength(1);
     expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeDefined();
-    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeUndefined();
     expect(events.filter(e => e.type === 'peer-disconnected')).toHaveLength(0);
     expect(
       logger
@@ -1791,13 +1791,13 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
 
     media.emitPhase(peerA, 'conn-1', 'signaling');
     media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
-    store._lastReconcileTime[peerA] = clock.now();
+    store._ensurePeerRecord(peerA).lastReconcileTime = clock.now();
 
     // A close STAMPS the cooldown and leaves the throttle alone — the
     // retry-gap semantics, unchanged.
     media.emitPhase(peerA, 'conn-1', 'failed', 'connected');
-    expect(store._lastDisconnectTime[peerA]).toBeDefined();
-    expect(store._lastReconcileTime[peerA]).toBeDefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeDefined();
+    expect(store._peerRecord(peerA)?.lastReconcileTime).toBeDefined();
 
     // The peer LEAVES mid-connection: the leave row's deletes must win
     // even though the nested close (transport closes first) re-stamps
@@ -1805,23 +1805,23 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     media.emitPhase(peerA, 'conn-2', 'signaling');
     media.emitPhase(peerA, 'conn-2', 'connected', 'connecting');
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
-    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
-    expect(store._lastReconcileTime[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastReconcileTime).toBeUndefined();
 
     // And the no-slot leave clears them too (the clears are
     // unconditional per leave, as they always were on this path).
-    store._lastDisconnectTime[peerA] = clock.now();
-    store._lastReconcileTime[peerA] = clock.now();
+    store._ensurePeerRecord(peerA).lastDisconnectTime = clock.now();
+    store._ensurePeerRecord(peerA).lastReconcileTime = clock.now();
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
-    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
-    expect(store._lastReconcileTime[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastReconcileTime).toBeUndefined();
   });
 
   it('an elevated signals RTT: the FSM override sits at the raised 30s ceiling, and the tracked backstop is 2x that (review C1) (Task 9)', async () => {
     const started = makeStarted();
     const { store, clock, bus, transports } = started;
     const media = transports.media!;
-    // Seed _signalsRttEwma[peerA] = 2_000ms before the InitAccept arrives.
+    // Seed peerA's signalsRttEwma = 2_000ms before the InitAccept arrives.
     await bus.deliver(pongEchoingRtt(peerAKey, clock, 2_000));
 
     await acceptVideo(started, 'init-1');
@@ -1847,7 +1847,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     const started = makeStarted();
     const { store, clock, bus, transports } = started;
     const media = transports.media!;
-    // Seed _signalsRttEwma[peerA] = 400ms: 20 * 400 = 8_000, well under
+    // Seed peerA's signalsRttEwma = 400ms: 20 * 400 = 8_000, well under
     // both the old and new ceiling.
     await bus.deliver(pongEchoingRtt(peerAKey, clock, 400));
 

@@ -265,9 +265,7 @@ function start(): void {
   // standing in for a sharer that re-initiates WITHIN a session, which is
   // what drives the manager's supersede route on the viewer.
   if (EPOCH0 > 0) {
-    (store as unknown as { _connectionEpoch: Record<string, number> })._connectionEpoch[
-      PEER_B64
-    ] = EPOCH0;
+    store._ensurePeerRecord(PEER_B64).connectionEpoch = EPOCH0;
   }
 
   // static connect's glue, reproduced: roster + ping cadence. The

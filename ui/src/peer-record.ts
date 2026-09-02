@@ -50,8 +50,22 @@ export type PeerRecord = {
   pendingInits?: PendingInit[];
   /** clock.setTimeout handle; the executor disarms before dropping. */
   sdpTimeoutTimer?: number;
+  /**
+   * WebRTC AnalyserNode for reading this peer's incoming audio level.
+   * Created when a peer stream arrives, removed on disconnect. The
+   * audio-level-meter element polls it at 10fps.
+   */
   analyser?: { node: AnalyserNode; buffer: Uint8Array };
-  /** Managed solely by the outage sweep — no reset arm touches it. */
+  /**
+   * Audibility-outage tracking. When our audioLink to this peer has been
+   * 'down' or 'negotiating' for ≥ OUTAGE_THRESHOLD_MS, *and* some third
+   * peer reports being audible to that target, we emit an
+   * AudibilityOutageStart event. The `emitted` flag guards against
+   * multiple Starts per outage and tells the End side whether to fire on
+   * recovery. Populated / drained by `_checkAudibilityOutages` on the 2s
+   * ping tick. Managed solely by the outage sweep — no reset arm
+   * touches it.
+   */
   outageState?: { startedAt: number; emitted: boolean };
   // — screen-share session: reset on the screen-share close rows
   screenShareStream?: MediaStream; // incoming
@@ -63,10 +77,34 @@ export type PeerRecord = {
    */
   screenShareIceDisconnectedAt?: number; // outgoing
   // — close survivors: reset only on peer-leave
+  /**
+   * Timestamp of the last connection close/error for this peer, used to
+   * log the retry gap when a new InitRequest is created.
+   */
   lastDisconnectTime?: number;
+  /**
+   * Last time reconcileVideoStreamState was triggered for this peer, to
+   * avoid firing more than once per 30s interval.
+   */
   lastReconcileTime?: number;
+  /**
+   * Rolling EWMA of signals-carrier RTT for this peer. Smooths out noise
+   * from jitter on individual ping/pong round trips.
+   */
   signalsRttEwma?: number;
   // — session survivor: never reset
+  /**
+   * Monotonic per-peer connection generation ("epoch"). Allocated by the
+   * initiator on each new connection attempt and passed into the FSM
+   * transport, which stamps it on outgoing signals and uses it for
+   * cross-attempt "newest-wins" ordering. Because it lives on the store
+   * (which outlives any FSM), it does NOT reset when an FSM is torn down
+   * and recreated — unlike the FSM's own `peerSessionId`, which resets to
+   * 0 per instance and so cannot order signals across a reconnect. Never
+   * reset for the session (a rejoining peer gets a strictly higher epoch,
+   * so in-flight stale signals stay older). See
+   * docs/WEBRTC_RECONNECT_IDENTITY.md.
+   */
   connectionEpoch: number;
 };
 
