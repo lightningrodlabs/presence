@@ -163,9 +163,12 @@ Two mapping rules, because this is a prove-nothing-changed refactor:
    proven no-ops on that path. No behavior change smuggled in as
    "surely harmless".
 2. **Side effects stay in the executor**, ordered as today: disarm
-   `sdpTimeoutTimer` handles and tear down analyser state before the
-   reset drops the references; `emitIceNeverConnected` before
-   `clearIceTiming`, unchanged.
+   `sdpTimeoutTimer` handles before a reset drops them; forensic reads
+   (the CarrierSwitch emit reads `webrtcExitReason`) before the reset
+   wipes the field; `emitIceNeverConnected` before `clearIceTiming`,
+   unchanged. Analyser removal is pure reference-dropping today (no
+   `AudioNode` teardown — verified at `removePeerAudioAnalyser`) and
+   stays so.
 
 ## Store integration
 
@@ -177,8 +180,18 @@ creates) and `_ensurePeerRecord(k)` (get-or-create via
 because today's `record[k] = v` sites create rows implicitly and a
 get-or-create used on a read path would turn reads into writes.
 
-`disconnect()` disarms every timer handle held in records, then
-`_peerRecords.clear()` — mirroring today's per-collection wipes.
+`disconnect()` follows today's wipes exactly (verified 2026-09-02
+during plan-writing): the current `disconnect()` clears only
+`_sdpTimeoutTimers` (disarming each handle), `_screenShareStreams`, and
+`_pendingInits` — every other per-peer collection survives it. So
+`disconnect()` iterates the records, disarms each `sdpTimeoutTimer`,
+and clears only those three fields; it does NOT `_peerRecords.clear()`
+(strict-fidelity rule — a full wipe would be a behavior change).
+
+The map and both helpers are underscore-internal (not `private`),
+matching the store's existing convention for wiring-test-visible fields
+(`_lastReconcileTime` et al.): the wiring suite seeds and asserts
+per-peer state directly.
 
 ## Task plan
 
@@ -236,9 +249,10 @@ handoff brief records why).
 - **Arm-mapping infidelity** — the strict-fidelity rule is where a
   behavior change would sneak in; each mapping is reviewed against the
   current row's exact clear set.
-- **Handle lifetimes** — timer and `AnalyserNode` handles move into the
-  record; disarm-before-drop ordering is executor-owned and covered by
-  the existing disconnect-symmetry wiring assertions.
+- **Handle lifetimes** — timer handles move into the record;
+  disarm-before-drop ordering is executor-owned and covered by the
+  existing disconnect-symmetry wiring assertions. (`AnalyserNode`
+  removal needs no teardown call — verified, reference-dropping only.)
 
 ## Deliberately out of scope (this round)
 
