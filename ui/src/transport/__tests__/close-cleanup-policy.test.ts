@@ -15,6 +15,14 @@ import type {
  * expected objects are written out, not derived from the policy's own
  * helpers, so a dropped cleanup entry is a failing row, not a shared
  * constant silently agreeing with itself.
+ *
+ * Task 4 (peer-record-consolidation round): the table used to carry 14
+ * per-peer clear booleans directly; they are now the one `recordReset`
+ * field naming a `PeerRecordResetArm`. This file pins WHICH arm each row
+ * selects; the field-level survivor semantics of each arm (what a close
+ * keeps vs. what a leave wipes) are pinned once in
+ * `../../__tests__/peer-record.test.ts` and cross-referenced below rather
+ * than duplicated.
  */
 
 const TARGETS: CloseCleanupTarget[] = [
@@ -40,25 +48,12 @@ const OFF: Omit<CloseCleanupPlan, 'reason'> = {
   clearSlot: false,
   clearIceTiming: false,
   emitIceNeverConnected: false,
-  clearVideoStreamSlot: false,
-  clearPendingInits: false,
-  clearLastBytesReceived: false,
-  clearStaleCycles: false,
-  clearReconcileAttemptCount: false,
-  clearIceDisconnectedAt: false,
-  clearQualityBucket: false,
-  clearWebrtcExitReason: false,
+  recordReset: 'none',
   recordLastDisconnect: false,
-  clearLastDisconnectTime: false,
-  clearLastReconcileTime: false,
-  clearSignalsRttEwma: false,
   clearPerceivedStreamInfo: false,
-  removeAudioAnalyser: false,
   clearWebrtcStats: false,
   emitCarrierSwitch: false,
   teardownOutgoingScreenShare: false,
-  clearScreenShareStream: false,
-  clearScreenShareIceDisconnectedAt: false,
   fireEvent: 'none',
   setDisconnectedStatus: 'none',
 };
@@ -72,40 +67,25 @@ describe('closeCleanupPlan — every cell of the table answers', () => {
 });
 
 describe('closeCleanupPlan — the media full close set, pinned field-by-field', () => {
-  // THE cleanup set item 1 exists to state once. §8's seven-entry skip
-  // list (`_lastQualityBucket`, `_lastWebrtcExitReason`, `_pendingInits`,
-  // `_lastBytesReceived`, `_staleCycles`, `_reconcileAttemptCount`,
-  // `_iceDisconnectedAt`) plus `_lastDisconnectTime` and CarrierSwitch
-  // are each an explicit true below — re-dropping any one is a failing
-  // equality, which is the reviewer's mutation check.
+  // THE cleanup set item 1 exists to state once. The nine PeerRecord
+  // fields the 'media-close-full' arm wipes (iceDisconnectedAt,
+  // lastBytesReceived, staleCycles, reconcileAttemptCount, qualityBucket,
+  // webrtcExitReason, videoStream, pendingInits, analyser) are pinned
+  // field-by-field in peer-record.test.ts's 'media-close-full' case, not
+  // duplicated here; this row pins that `recordReset` selects that arm,
+  // plus `recordLastDisconnect` and CarrierSwitch. Re-dropping any one is
+  // a failing equality, which is the reviewer's mutation check.
   const MEDIA_FULL_EXPECTED: Omit<CloseCleanupPlan, 'reason' | 'closeTransport'> = {
     logSuperseded: false,
     clearSlot: true,
     clearIceTiming: true,
     emitIceNeverConnected: true,
-    clearVideoStreamSlot: true,
-    clearPendingInits: true,
-    clearLastBytesReceived: true,
-    clearStaleCycles: true,
-    clearReconcileAttemptCount: true,
-    clearIceDisconnectedAt: true,
-    clearQualityBucket: true,
-    clearWebrtcExitReason: true,
+    recordReset: 'media-close-full',
     recordLastDisconnect: true,
-    // The cooldown DELETES belong to peer-leave only: a close keeps the
-    // stamp (retry-gap semantics), a leave wipes it (§9 item 5).
-    clearLastDisconnectTime: false,
-    clearLastReconcileTime: false,
-    // Same rule for the signals-RTT EWMA (review M5): a plain close keeps
-    // the entry (the peer's link is what it is), a leave wipes it.
-    clearSignalsRttEwma: false,
     clearPerceivedStreamInfo: true,
-    removeAudioAnalyser: true,
     clearWebrtcStats: true,
     emitCarrierSwitch: true,
     teardownOutgoingScreenShare: true,
-    clearScreenShareStream: false,
-    clearScreenShareIceDisconnectedAt: false,
     fireEvent: 'peer-disconnected',
     setDisconnectedStatus: 'media',
   };
@@ -152,26 +132,26 @@ describe('closeCleanupPlan — the guard rows', () => {
 });
 
 describe('closeCleanupPlan — the screen-share live rows', () => {
-  it('outgoing close clears the slot and the screen ICE bookkeeping', () => {
+  it('outgoing close clears the slot and selects the screen-out-close reset arm', () => {
     expect(
       closeCleanupPlan({ target: 'screen-share-outgoing', via: 'close-event', outcome: 'live' }),
     ).toEqual({
       reason: 'screen-out-close',
       ...OFF,
       clearSlot: true,
-      clearScreenShareIceDisconnectedAt: true,
+      recordReset: 'screen-out-close',
       setDisconnectedStatus: 'screen-share',
     });
   });
 
-  it('incoming close clears the slot and the stream mirror and fires the view event', () => {
+  it('incoming close clears the slot, selects the screen-in-close reset arm, and fires the view event', () => {
     expect(
       closeCleanupPlan({ target: 'screen-share-incoming', via: 'close-event', outcome: 'live' }),
     ).toEqual({
       reason: 'screen-in-close',
       ...OFF,
       clearSlot: true,
-      clearScreenShareStream: true,
+      recordReset: 'screen-in-close',
       fireEvent: 'peer-screen-share-disconnected',
       setDisconnectedStatus: 'screen-share',
     });
@@ -180,7 +160,7 @@ describe('closeCleanupPlan — the screen-share live rows', () => {
 });
 
 describe('closeCleanupPlan — the stale rows (former staleTeardownPlan, preserved)', () => {
-  it('media stale closes first (delegating the full set to the nested close) and clears slot + pending inits + stream slot as the vanished-pc residue', () => {
+  it('media stale closes first (delegating the full set to the nested close) and selects the media-stale-residue reset arm as the vanished-pc residue', () => {
     expect(
       closeCleanupPlan({ target: 'media', via: 'stale-teardown', outcome: 'live' }),
     ).toEqual({
@@ -188,12 +168,11 @@ describe('closeCleanupPlan — the stale rows (former staleTeardownPlan, preserv
       ...OFF,
       closeTransport: 'before-slot-clear',
       clearSlot: true,
-      clearPendingInits: true,
-      clearVideoStreamSlot: true,
+      recordReset: 'media-stale-residue',
     });
   });
 
-  it('outgoing screen stale clears the slot only — no pending map (Phase 3), no stream slot', () => {
+  it('outgoing screen stale clears the slot only — no pending map (Phase 3), no reset arm', () => {
     expect(
       closeCleanupPlan({ target: 'screen-share-outgoing', via: 'stale-teardown', outcome: 'live' }),
     ).toEqual({
@@ -217,7 +196,7 @@ describe('closeCleanupPlan — the stale rows (former staleTeardownPlan, preserv
 });
 
 describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, preserved)', () => {
-  it('media leave: close-first, slot + streams + pending inits + quality bucket, status Disconnected', () => {
+  it('media leave: close-first, the media-leave-residue reset arm, status Disconnected', () => {
     expect(
       closeCleanupPlan({ target: 'media', via: 'peer-leave', outcome: 'live' }),
     ).toEqual({
@@ -225,33 +204,23 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
       ...OFF,
       closeTransport: 'before-slot-clear',
       clearSlot: true,
-      clearVideoStreamSlot: true,
-      clearPendingInits: true,
-      clearQualityBucket: true,
-      // §9 item 5: a rejoining peer must not inherit the departed
-      // session's init-retry cooldown or reconcile throttle.
-      clearLastDisconnectTime: true,
-      clearLastReconcileTime: true,
-      // Review M5: nor its signals-RTT EWMA — a collapsed EWMA from the
-      // departed session would pause media on a healthy rejoin for ~5
-      // ticks of hysteresis walk-back.
-      clearSignalsRttEwma: true,
+      // §9 item 5 / review M5: the 'media-leave-residue' arm additionally
+      // wipes lastDisconnectTime/lastReconcileTime/signalsRttEwma versus
+      // 'media-close-full' — a rejoining peer must not inherit the
+      // departed session's cooldowns. Field-by-field pin:
+      // peer-record.test.ts's 'media-leave-residue' case.
+      recordReset: 'media-leave-residue',
       setDisconnectedStatus: 'media',
     });
   });
 
-  it('media leave with no slot still clears the per-peer maps (the clears were unconditional)', () => {
+  it('media leave with no slot still selects the media-leave-residue reset arm (the clears were unconditional)', () => {
     expect(
       closeCleanupPlan({ target: 'media', via: 'peer-leave', outcome: 'no-slot' }),
     ).toEqual({
       reason: 'media-leave-no-slot',
       ...OFF,
-      clearVideoStreamSlot: true,
-      clearPendingInits: true,
-      clearQualityBucket: true,
-      clearLastDisconnectTime: true,
-      clearLastReconcileTime: true,
-      clearSignalsRttEwma: true,
+      recordReset: 'media-leave-residue',
       setDisconnectedStatus: 'media',
     });
   });
@@ -270,7 +239,7 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
     }
   });
 
-  it('incoming leave drops the stream mirror whether or not a slot exists', () => {
+  it('incoming leave selects the screen-in-close reset arm whether or not a slot exists', () => {
     expect(
       closeCleanupPlan({ target: 'screen-share-incoming', via: 'peer-leave', outcome: 'live' }),
     ).toEqual({
@@ -278,14 +247,14 @@ describe('closeCleanupPlan — the peer-leave rows (handleLeaveUi semantics, pre
       ...OFF,
       closeTransport: 'before-slot-clear',
       clearSlot: true,
-      clearScreenShareStream: true,
+      recordReset: 'screen-in-close',
     });
     expect(
       closeCleanupPlan({ target: 'screen-share-incoming', via: 'peer-leave', outcome: 'no-slot' }),
     ).toEqual({
       reason: 'screen-in-leave-no-slot',
       ...OFF,
-      clearScreenShareStream: true,
+      recordReset: 'screen-in-close',
     });
   });
 });
@@ -322,28 +291,28 @@ describe('closeCleanupPlan — cross-table invariants', () => {
   });
 
   it('media-only cleanups never appear on screen rows, and vice versa', () => {
+    const MEDIA_ARMS = ['media-close-full', 'media-stale-residue', 'media-leave-residue'];
     for (const ctx of allCells) {
       const plan = closeCleanupPlan(ctx);
       if (ctx.target !== 'media') {
-        expect(plan.clearVideoStreamSlot, JSON.stringify(ctx)).toBe(false);
-        expect(plan.clearStaleCycles, JSON.stringify(ctx)).toBe(false);
+        expect(MEDIA_ARMS, JSON.stringify(ctx)).not.toContain(plan.recordReset);
         expect(plan.teardownOutgoingScreenShare, JSON.stringify(ctx)).toBe(false);
         expect(plan.fireEvent, JSON.stringify(ctx)).not.toBe('peer-disconnected');
-        expect(plan.clearSignalsRttEwma, JSON.stringify(ctx)).toBe(false);
       }
-      // The signals-RTT EWMA delete is a rejoin-inheritance clear
-      // (review M5): peer-leave rows only, like the cooldown deletes.
+      // The 'media-leave-residue' arm (which wipes the signals-RTT EWMA
+      // among other rejoin-inheritance fields — review M5) is a
+      // peer-leave-only arm.
       if (ctx.via !== 'peer-leave') {
-        expect(plan.clearSignalsRttEwma, JSON.stringify(ctx)).toBe(false);
+        expect(plan.recordReset, JSON.stringify(ctx)).not.toBe('media-leave-residue');
       }
       if (ctx.target !== 'screen-share-incoming') {
-        expect(plan.clearScreenShareStream, JSON.stringify(ctx)).toBe(false);
+        expect(plan.recordReset, JSON.stringify(ctx)).not.toBe('screen-in-close');
         expect(plan.fireEvent, JSON.stringify(ctx)).not.toBe(
           'peer-screen-share-disconnected',
         );
       }
       if (ctx.target !== 'screen-share-outgoing') {
-        expect(plan.clearScreenShareIceDisconnectedAt, JSON.stringify(ctx)).toBe(false);
+        expect(plan.recordReset, JSON.stringify(ctx)).not.toBe('screen-out-close');
       }
     }
   });

@@ -2526,7 +2526,8 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     expect(store.signalsCadence().mode).toBe('paused');
 
     // The peer LEAVES: the media peer-leave cleanup row deletes their
-    // _signalsRttEwma entry (closeCleanupPlan clearSignalsRttEwma).
+    // signalsRttEwma entry (closeCleanupPlan recordReset:
+    // 'media-leave-residue', via resetPeerRecord).
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
 
     // They rejoin ping-fresh. With no sample, the very next evaluation is

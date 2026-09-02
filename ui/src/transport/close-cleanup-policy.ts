@@ -11,6 +11,25 @@
  * (deleted — one authority per concept): its two rows are the
  * `stale-teardown` cells below.
  *
+ * ## Task 4 (peer-record-consolidation round): field-level clears moved out
+ *
+ * This table used to carry 14 per-peer boolean fields, one per
+ * `PeerRecord` field cleared on teardown (`clearVideoStreamSlot`,
+ * `clearPendingInits`, `clearLastBytesReceived`, `clearStaleCycles`,
+ * `clearReconcileAttemptCount`, `clearIceDisconnectedAt`,
+ * `clearQualityBucket`, `clearWebrtcExitReason`, `clearLastDisconnectTime`,
+ * `clearLastReconcileTime`, `clearSignalsRttEwma`, `clearScreenShareStream`,
+ * `clearScreenShareIceDisconnectedAt`, `removeAudioAnalyser`). That
+ * field-level knowledge now lives in the ONE authority `resetPeerRecord`
+ * (`../peer-record.ts`, table-tested in `../__tests__/peer-record.test.ts`);
+ * this table now names only WHICH arm runs
+ * (`recordReset: PeerRecordResetArm | 'none'`) and keeps routing,
+ * ordering, and event fields. The row → arm mapping is strict fidelity:
+ * each row's old boolean set equals its arm's field set exactly (see
+ * docs/superpowers/specs/2026-09-02-peer-record-consolidation-design.md,
+ * "Lifecycle: resetPeerRecord and the closeCleanupPlan collapse", and the
+ * per-row pins in `__tests__/close-cleanup-policy.test.ts`).
+ *
  * ## Errors are NOT a teardown path (amended 2026-08-04, review F2)
  *
  * The first cut of this table carried `error-event` rows performing the
@@ -56,6 +75,7 @@
  * (`_handleMediaClosed`, `_handleScreenShareClosed`,
  * `_applyStaleTeardown`, `handleLeaveUi`).
  */
+import type { PeerRecordResetArm } from '../peer-record';
 
 /** Which connection family is being torn down. */
 export type CloseCleanupTarget =
@@ -107,52 +127,32 @@ export type CloseCleanupPlan = {
   /** `_emitIceNeverConnected(peer, eventConnectionId)` — must run before
    *  `clearIceTiming` wipes the record; the executor owns that order. */
   emitIceNeverConnected: boolean;
-  clearVideoStreamSlot: boolean;
-  clearPendingInits: boolean;
-  clearLastBytesReceived: boolean;
-  clearStaleCycles: boolean;
-  clearReconcileAttemptCount: boolean;
-  clearIceDisconnectedAt: boolean;
-  clearQualityBucket: boolean;
-  clearWebrtcExitReason: boolean;
-  /** Stamp `_lastDisconnectTime[peer] = now` (init-retry cooldown input). */
+  /**
+   * Which `resetPeerRecord` arm to run against this peer's record, or
+   * `'none'`. Replaces the 14 field-level clear booleans this table used
+   * to carry directly — see the Task 4 header note above. Field-level
+   * survivor semantics (what a close keeps vs. what a leave wipes,
+   * including `recordLastDisconnect`/`clearLastReconcileTime`/
+   * `clearSignalsRttEwma`'s old rejoin-inheritance rule, and the analyser
+   * reference-drop) are documented on `resetPeerRecord` and its arm
+   * tests in `../__tests__/peer-record.test.ts`.
+   */
+  recordReset: PeerRecordResetArm | 'none';
+  /** Stamp `_lastDisconnectTime[peer] = now` (init-retry cooldown input).
+   *  On `media-leave`/live the nested close-event row stamps this first
+   *  (transport closes before the clears); the executor then applies
+   *  `recordReset`'s `'media-leave-residue'` arm, which wipes
+   *  `lastDisconnectTime` again — the delete wins, pinned in the wiring
+   *  suite. */
   recordLastDisconnect: boolean;
-  /**
-   * Delete `_lastDisconnectTime[peer]`. Peer-leave rows only (§9 item 5):
-   * a REJOINING peer must not inherit the departed session's retry-gap
-   * cooldown. Close rows keep the stamp — that is the retry-gap
-   * semantics. On `media-leave`/live the nested close-event row stamps
-   * `recordLastDisconnect` first (transport closes before the clears);
-   * the executor runs this delete after, so the delete wins — pinned in
-   * the wiring suite.
-   */
-  clearLastDisconnectTime: boolean;
-  /** Delete `_lastReconcileTime[peer]` — same rejoin-inheritance rule. */
-  clearLastReconcileTime: boolean;
-  /**
-   * Delete the peer's `_signalsRttEwma` entry — same rejoin-inheritance
-   * rule (review M5, Task 7 round): since the EWMA feeds
-   * `decideSignalsMediaCadence`, a rejoining peer inheriting the departed
-   * session's collapsed value would pause signals media on a healthy
-   * network for the ~5 ticks the hysteresis needs to walk back. Peer-leave
-   * rows only; a plain close keeps the entry (the link's RTT history is
-   * still about THIS session).
-   */
-  clearSignalsRttEwma: boolean;
   /** Wipe `perceivedStreamInfo` in `_othersConnectionStatuses`. */
   clearPerceivedStreamInfo: boolean;
-  removeAudioAnalyser: boolean;
   clearWebrtcStats: boolean;
   /** Emit `CarrierSwitch webrtc->signals` IF the slot claimed
    *  `connected` at entry (the executor reads that before clearing). */
   emitCarrierSwitch: boolean;
   /** Media rows: also tear down the peer's outgoing screen share. */
   teardownOutgoingScreenShare: boolean;
-  /** Incoming screen rows: drop the peer record's `screenShareStream` so
-   *  paint-restore cannot resurrect a dead share. */
-  clearScreenShareStream: boolean;
-  /** Outgoing screen rows: drop the peer record's `screenShareIceDisconnectedAt`. */
-  clearScreenShareIceDisconnectedAt: boolean;
   fireEvent: 'peer-disconnected' | 'peer-screen-share-disconnected' | 'none';
   setDisconnectedStatus: 'media' | 'screen-share' | 'none';
 };
@@ -163,25 +163,12 @@ const NONE: Omit<CloseCleanupPlan, 'reason'> = {
   clearSlot: false,
   clearIceTiming: false,
   emitIceNeverConnected: false,
-  clearVideoStreamSlot: false,
-  clearPendingInits: false,
-  clearLastBytesReceived: false,
-  clearStaleCycles: false,
-  clearReconcileAttemptCount: false,
-  clearIceDisconnectedAt: false,
-  clearQualityBucket: false,
-  clearWebrtcExitReason: false,
+  recordReset: 'none',
   recordLastDisconnect: false,
-  clearLastDisconnectTime: false,
-  clearLastReconcileTime: false,
-  clearSignalsRttEwma: false,
   clearPerceivedStreamInfo: false,
-  removeAudioAnalyser: false,
   clearWebrtcStats: false,
   emitCarrierSwitch: false,
   teardownOutgoingScreenShare: false,
-  clearScreenShareStream: false,
-  clearScreenShareIceDisconnectedAt: false,
   fireEvent: 'none',
   setDisconnectedStatus: 'none',
 };
@@ -193,17 +180,9 @@ const MEDIA_FULL: Omit<CloseCleanupPlan, 'reason' | 'closeTransport'> = {
   clearSlot: true,
   clearIceTiming: true,
   emitIceNeverConnected: true,
-  clearVideoStreamSlot: true,
-  clearPendingInits: true,
-  clearLastBytesReceived: true,
-  clearStaleCycles: true,
-  clearReconcileAttemptCount: true,
-  clearIceDisconnectedAt: true,
-  clearQualityBucket: true,
-  clearWebrtcExitReason: true,
+  recordReset: 'media-close-full',
   recordLastDisconnect: true,
   clearPerceivedStreamInfo: true,
-  removeAudioAnalyser: true,
   clearWebrtcStats: true,
   emitCarrierSwitch: true,
   teardownOutgoingScreenShare: true,
@@ -239,8 +218,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 ...NONE,
                 closeTransport: 'before-slot-clear',
                 clearSlot: true,
-                clearPendingInits: true,
-                clearVideoStreamSlot: true,
+                recordReset: 'media-stale-residue',
               };
             case 'superseded':
             case 'no-slot':
@@ -256,12 +234,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 ...NONE,
                 closeTransport: 'before-slot-clear',
                 clearSlot: true,
-                clearVideoStreamSlot: true,
-                clearPendingInits: true,
-                clearQualityBucket: true,
-                clearLastDisconnectTime: true,
-                clearLastReconcileTime: true,
-                clearSignalsRttEwma: true,
+                recordReset: 'media-leave-residue',
                 setDisconnectedStatus: 'media',
               };
             case 'no-slot':
@@ -269,12 +242,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
               return {
                 reason: 'media-leave-no-slot',
                 ...NONE,
-                clearVideoStreamSlot: true,
-                clearPendingInits: true,
-                clearQualityBucket: true,
-                clearLastDisconnectTime: true,
-                clearLastReconcileTime: true,
-                clearSignalsRttEwma: true,
+                recordReset: 'media-leave-residue',
                 setDisconnectedStatus: 'media',
               };
             case 'superseded':
@@ -297,7 +265,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 reason: 'screen-out-close',
                 ...NONE,
                 clearSlot: true,
-                clearScreenShareIceDisconnectedAt: true,
+                recordReset: 'screen-out-close',
                 setDisconnectedStatus: 'screen-share',
               };
             case 'superseded':
@@ -353,7 +321,7 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 reason: 'screen-in-close',
                 ...NONE,
                 clearSlot: true,
-                clearScreenShareStream: true,
+                recordReset: 'screen-in-close',
                 fireEvent: 'peer-screen-share-disconnected',
                 setDisconnectedStatus: 'screen-share',
               };
@@ -373,10 +341,10 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
                 ...NONE,
                 closeTransport: 'before-slot-clear',
                 clearSlot: true,
-                clearScreenShareStream: true,
+                recordReset: 'screen-in-close',
               };
             case 'no-slot':
-              return { reason: 'screen-in-leave-no-slot', ...NONE, clearScreenShareStream: true };
+              return { reason: 'screen-in-leave-no-slot', ...NONE, recordReset: 'screen-in-close' };
             case 'superseded':
               return { reason: 'screen-in-leave-unreachable', ...NONE };
           }

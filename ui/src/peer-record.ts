@@ -112,6 +112,53 @@ export function initialPeerRecord(): PeerRecord {
   return { connectionEpoch: 0 };
 }
 
+export type PeerRecordResetArm =
+  | 'media-close-full'
+  | 'media-stale-residue'
+  | 'media-leave-residue'
+  | 'screen-out-close'
+  | 'screen-in-close';
+
+/**
+ * The ONE authority for which PeerRecord fields survive which teardown.
+ * Arms mirror closeCleanupPlan's distinct per-peer clear signatures
+ * (strict fidelity to the pre-fold table — see
+ * docs/superpowers/specs/2026-09-02-peer-record-consolidation-design.md,
+ * "Lifecycle: resetPeerRecord and the closeCleanupPlan collapse"). Field
+ * groups and arm × field expectations are pinned in
+ * `__tests__/peer-record.test.ts`. `sdpTimeoutTimer` and `outageState`
+ * are never arm-owned: the timer is executor-disarmed, the outage state
+ * sweep-owned.
+ */
+export function resetPeerRecord(r: PeerRecord, arm: PeerRecordResetArm): PeerRecord {
+  switch (arm) {
+    case 'media-close-full':
+      return {
+        ...r,
+        iceDisconnectedAt: undefined, lastBytesReceived: undefined,
+        staleCycles: undefined, reconcileAttemptCount: undefined,
+        qualityBucket: undefined, webrtcExitReason: undefined,
+        videoStream: undefined, pendingInits: undefined, analyser: undefined,
+      };
+    case 'media-stale-residue':
+      return { ...r, videoStream: undefined, pendingInits: undefined };
+    case 'media-leave-residue':
+      return {
+        ...r, videoStream: undefined, pendingInits: undefined,
+        qualityBucket: undefined, lastDisconnectTime: undefined,
+        lastReconcileTime: undefined, signalsRttEwma: undefined,
+      };
+    case 'screen-out-close':
+      return { ...r, screenShareIceDisconnectedAt: undefined };
+    case 'screen-in-close':
+      return { ...r, screenShareStream: undefined };
+    default: {
+      const exhaustive: never = arm;
+      return exhaustive;
+    }
+  }
+}
+
 /**
  * Prune expired pending-init entries (PENDING_HANDSHAKE_TTL_MS sweep).
  * Returns undefined when none survive — the field-level equivalent of

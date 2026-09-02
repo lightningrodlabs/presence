@@ -21,7 +21,7 @@ import {
   type PresenceSoundState,
 } from './presence-policy';
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
-import { initialPeerRecord, prunePendingInits, type PeerRecord } from './peer-record';
+import { initialPeerRecord, prunePendingInits, resetPeerRecord, type PeerRecord } from './peer-record';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import {
@@ -1561,28 +1561,18 @@ export class StreamsStore {
         detail: `webrtc->signals reason="${reason}"`,
       });
     }
-    if (plan.clearWebrtcExitReason) { const r = this._peerRecords.get(pubKeyB64); if (r) r.webrtcExitReason = undefined; }
-    if (plan.clearQualityBucket) { const r = this._peerRecords.get(pubKeyB64); if (r) r.qualityBucket = undefined; }
     if (plan.recordLastDisconnect) {
       this._ensurePeerRecord(pubKeyB64).lastDisconnectTime = this.clock.now();
     }
-    // The clears run AFTER recordLastDisconnect on purpose: on the
+    // recordReset runs AFTER recordLastDisconnect on purpose: on the
     // peer-leave/live path the nested close-event row (via the
     // synchronous `closed` from closeTransport above) has already
-    // stamped the cooldown, and the leave row's delete must win — a
-    // rejoining peer starts clean (§9 item 5).
-    if (plan.clearLastDisconnectTime) { const r = this._peerRecords.get(pubKeyB64); if (r) r.lastDisconnectTime = undefined; }
-    if (plan.clearLastReconcileTime) { const r = this._peerRecords.get(pubKeyB64); if (r) r.lastReconcileTime = undefined; }
-    // Rejoin-inheritance clear (review M5): the EWMA feeds the cadence
-    // decision, so a departed session's collapsed value must not pause a
-    // healthy rejoin. Peer-leave rows only, like the two deletes above.
-    if (plan.clearSignalsRttEwma) { const r = this._peerRecords.get(pubKeyB64); if (r) r.signalsRttEwma = undefined; }
-    if (plan.clearVideoStreamSlot) { const r = this._peerRecords.get(pubKeyB64); if (r) r.videoStream = undefined; }
-    // A closed connection's pending InitRequests are dead reservations:
-    // clearing them lets the next pong cycle re-initiate immediately
-    // instead of waiting out INIT_RETRY_THRESHOLD against a stale t0
-    // (Phase 2 item 7 — inits get close-path cleanup like accepts).
-    if (plan.clearPendingInits) { const r = this._peerRecords.get(pubKeyB64); if (r) r.pendingInits = undefined; }
+    // stamped the cooldown, and the leave row's `media-leave-residue`
+    // reset then wipes it — the delete wins (§9 item 5).
+    if (plan.recordReset !== 'none') {
+      const r = this._peerRecords.get(pubKeyB64);
+      if (r) this._peerRecords.set(pubKeyB64, resetPeerRecord(r, plan.recordReset));
+    }
 
     if (plan.clearSlot) {
       slotStore.update(currentValue => {
@@ -1605,27 +1595,12 @@ export class StreamsStore {
       });
     }
 
-    if (plan.clearLastBytesReceived) { const r = this._peerRecords.get(pubKeyB64); if (r) r.lastBytesReceived = undefined; }
-    if (plan.clearStaleCycles) { const r = this._peerRecords.get(pubKeyB64); if (r) r.staleCycles = undefined; }
-    if (plan.clearReconcileAttemptCount) { const r = this._peerRecords.get(pubKeyB64); if (r) r.reconcileAttemptCount = undefined; }
-    if (plan.clearIceDisconnectedAt) { const r = this._peerRecords.get(pubKeyB64); if (r) r.iceDisconnectedAt = undefined; }
-    if (plan.clearScreenShareIceDisconnectedAt) {
-      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareIceDisconnectedAt = undefined; }
-    }
-    if (plan.clearScreenShareStream) {
-      // The incoming share's stream slot dies with its connection —
-      // room-view's paint-restore path reads this map and must not
-      // resurrect a dead share.
-      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareStream = undefined; }
-    }
-
     // Capture failure-side latency before _clearIceTiming wipes the
     // timing entry. _emitIceNeverConnected no-ops if the establishment
     // event already fired (i.e. this is a normal close after a
     // successful connect).
     if (plan.emitIceNeverConnected) this._emitIceNeverConnected(pubKeyB64, connectionId);
     if (plan.clearIceTiming) this._clearIceTiming(pubKeyB64, connectionId);
-    if (plan.removeAudioAnalyser) this.removePeerAudioAnalyser(pubKeyB64);
     if (plan.clearWebrtcStats) this.webrtcStats.delete(pubKeyB64);
 
     if (plan.teardownOutgoingScreenShare) {
