@@ -55,6 +55,12 @@ export type PeerRecord = {
   outageState?: { startedAt: number; emitted: boolean };
   // — screen-share session: reset on the screen-share close rows
   screenShareStream?: MediaStream; // incoming
+  /**
+   * As `iceDisconnectedAt`, but for outgoing screen-share peers. Kept
+   * separate because a single agent can have both a video connection and
+   * an outgoing screen-share connection in flight with independent ICE
+   * states; one going 'disconnected' must not affect the other's grace.
+   */
   screenShareIceDisconnectedAt?: number; // outgoing
   // — close survivors: reset only on peer-leave
   lastDisconnectTime?: number;
