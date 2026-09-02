@@ -509,7 +509,7 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
     media.emitPhase(peerA, 'conn-1', 'signaling');
     media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
     store._pendingInits[peerA] = [{ connectionId: 'conn-1', t0: clock.now() }];
-    store._iceDisconnectedAt[peerA] = clock.now() - 1000;
+    store._ensurePeerRecord(peerA).iceDisconnectedAt = clock.now() - 1000;
 
     media.emit({
       type: 'error',
@@ -532,7 +532,7 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
     });
     expect(media.closeCalls).toHaveLength(0);
     expect(store._pendingInits[peerA]).toHaveLength(1);
-    expect(store._iceDisconnectedAt[peerA]).toBeDefined();
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeDefined();
     expect(store._lastDisconnectTime[peerA]).toBeUndefined();
     expect(events.filter(e => e.type === 'peer-disconnected')).toHaveLength(0);
     expect(

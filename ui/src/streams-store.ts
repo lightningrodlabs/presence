@@ -21,6 +21,7 @@ import {
   type PresenceSoundState,
 } from './presence-policy';
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
+import { initialPeerRecord, type PeerRecord } from './peer-record';
 import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import {
@@ -960,7 +961,7 @@ export class StreamsStore {
       this._clearIceTiming(peer, slotAction.supersedes);
       // Keyed to the old connection; the new connection's
       // ice-diagnostic events set their own.
-      delete this._iceDisconnectedAt[peer];
+      { const r = this._peerRecords.get(peer); if (r) r.iceDisconnectedAt = undefined; }
     }
     this._stakeIceTiming(peer, connectionId);
     const slotWrite = decideSlotWrite(
@@ -1146,7 +1147,7 @@ export class StreamsStore {
    * Route an `ice-diagnostic` event from the media transport: forensic log
    * lines (same formats the in-store pc listeners produced before Phase 4,
    * so log analysis stays stable), establishment-latency milestones, and
-   * the `_iceDisconnectedAt` grace bookkeeping.
+   * the `iceDisconnectedAt` grace bookkeeping.
    */
   private _handleMediaIceDiagnostic(
     pubKeyB64: AgentPubKeyB64,
@@ -1172,9 +1173,9 @@ export class StreamsStore {
         // currently 'disconnected'. The stale-connection net uses a grace
         // period before treating 'disconnected' as terminal.
         if (state === 'disconnected') {
-          this._iceDisconnectedAt[pubKeyB64] = this.clock.now();
+          this._ensurePeerRecord(pubKeyB64).iceDisconnectedAt = this.clock.now();
         } else {
-          delete this._iceDisconnectedAt[pubKeyB64];
+          { const r = this._peerRecords.get(pubKeyB64); if (r) r.iceDisconnectedAt = undefined; }
         }
         if (diag.selectedPair) {
           const { local, remote } = diag.selectedPair;
@@ -1438,7 +1439,7 @@ export class StreamsStore {
       connectionId,
       detail: 'signals->webrtc',
     });
-    this._lastQualityBucket.delete(pubKeyB64);
+    { const r = this._peerRecords.get(pubKeyB64); if (r) r.qualityBucket = undefined; }
 
     delete this._pendingInits[pubKeyB64];
 
@@ -1570,7 +1571,7 @@ export class StreamsStore {
       // reason the FSM took this peer out of `connected`, captured in
       // `_logFsmTransition`. Falls back to 'unknown' if the root reason
       // wasn't seen.
-      const reason = this._lastWebrtcExitReason.get(pubKeyB64) ?? 'unknown';
+      const reason = this._peerRecords.get(pubKeyB64)?.webrtcExitReason ?? 'unknown';
       this.logger.logAgentEvent({
         agent: pubKeyB64,
         timestamp: this.clock.now(),
@@ -1579,8 +1580,8 @@ export class StreamsStore {
         detail: `webrtc->signals reason="${reason}"`,
       });
     }
-    if (plan.clearWebrtcExitReason) this._lastWebrtcExitReason.delete(pubKeyB64);
-    if (plan.clearQualityBucket) this._lastQualityBucket.delete(pubKeyB64);
+    if (plan.clearWebrtcExitReason) { const r = this._peerRecords.get(pubKeyB64); if (r) r.webrtcExitReason = undefined; }
+    if (plan.clearQualityBucket) { const r = this._peerRecords.get(pubKeyB64); if (r) r.qualityBucket = undefined; }
     if (plan.recordLastDisconnect) {
       this._lastDisconnectTime[pubKeyB64] = this.clock.now();
     }
@@ -1623,10 +1624,10 @@ export class StreamsStore {
       });
     }
 
-    if (plan.clearLastBytesReceived) delete this._lastBytesReceived[pubKeyB64];
-    if (plan.clearStaleCycles) delete this._staleCycles[pubKeyB64];
-    if (plan.clearReconcileAttemptCount) delete this._reconcileAttemptCount[pubKeyB64];
-    if (plan.clearIceDisconnectedAt) delete this._iceDisconnectedAt[pubKeyB64];
+    if (plan.clearLastBytesReceived) { const r = this._peerRecords.get(pubKeyB64); if (r) r.lastBytesReceived = undefined; }
+    if (plan.clearStaleCycles) { const r = this._peerRecords.get(pubKeyB64); if (r) r.staleCycles = undefined; }
+    if (plan.clearReconcileAttemptCount) { const r = this._peerRecords.get(pubKeyB64); if (r) r.reconcileAttemptCount = undefined; }
+    if (plan.clearIceDisconnectedAt) { const r = this._peerRecords.get(pubKeyB64); if (r) r.iceDisconnectedAt = undefined; }
     if (plan.clearScreenShareIceDisconnectedAt) {
       delete this._screenShareIceDisconnectedAt[pubKeyB64];
     }
@@ -3550,6 +3551,29 @@ export class StreamsStore {
   private _videoKeepaliveStream: MediaStream | null = null;
 
   /**
+   * The ONE per-peer state record (peer-record.ts). INVARIANT: record
+   * existence is never a liveness predicate — presence/membership come
+   * from _presentPeers/_activeAgents/_knownAgents, never from this map.
+   * Underscore-internal (not private): the wiring suite seeds rows.
+   */
+  _peerRecords: Map<AgentPubKeyB64, PeerRecord> = new Map();
+
+  /** Read a peer's record. Never creates. */
+  _peerRecord(k: AgentPubKeyB64): PeerRecord | undefined {
+    return this._peerRecords.get(k);
+  }
+
+  /** Get-or-create. Write paths only — a read must never create a row. */
+  _ensurePeerRecord(k: AgentPubKeyB64): PeerRecord {
+    let r = this._peerRecords.get(k);
+    if (!r) {
+      r = initialPeerRecord();
+      this._peerRecords.set(k, r);
+    }
+    return r;
+  }
+
+  /**
    * Pending SDP-exchange timeout handles, one per peer, armed by
    * `handleInitAccept`. Tracked so a successor attempt (or `disconnect()`)
    * disarms the predecessor's timer instead of leaving it to fire against
@@ -3591,19 +3615,6 @@ export class StreamsStore {
   }
 
   /**
-   * Tracks the timestamp at which a video peer's iceConnectionState most
-   * recently entered 'disconnected', for the grace-period recovery window
-   * in stale cleanup. Maintained by `_handleMediaIceDiagnostic` from the
-   * transport's `ice-diagnostic` events (the transport owns the pc and
-   * its listeners since Phase 4 item 3); the invariant is that an entry
-   * exists iff the connection's iceConnectionState is currently
-   * 'disconnected'. Cleared on entry to any other ICE state, on close-
-   * cleanup, and on the supersede paths (where the close handler is
-   * short-circuited by the supersede guard).
-   */
-  _iceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
-
-  /**
    * Per-(peer, connectionId) establishment timings, captured for forensic
    * A/B-ing of establishment latency on marginal links. t0 is staked on
    * the `signaling` transition (`_stakeIceTiming`); the ICE milestones
@@ -3624,24 +3635,12 @@ export class StreamsStore {
   }> = {};
 
   /**
-   * As _iceDisconnectedAt, but for outgoing screen-share peers. Kept
+   * As PeerRecord.iceDisconnectedAt, but for outgoing screen-share peers. Kept
    * separate because a single agent can have both a video connection and
    * an outgoing screen-share connection in flight with independent ICE
    * states; one going 'disconnected' must not affect the other's grace.
    */
   _screenShareIceDisconnectedAt: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Tracks how many consecutive reconciliation attempts have been made per agent,
-   * for exponential backoff of the cooldown.
-   */
-  _reconcileAttemptCount: Record<AgentPubKeyB64, number> = {};
-
-  /**
-   * Tracks the last bytesReceived value per peer per track kind,
-   * for detecting dead tracks via getStats().
-   */
-  private _lastBytesReceived: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
    * The set of **present** peers whose media is NOT currently flowing
@@ -3663,11 +3662,6 @@ export class StreamsStore {
    * includes connect, close, give-up, and the disableWebrtcWith teardown.
    */
   _signalsTargets!: Readable<Set<AgentPubKeyB64>>;
-
-  /**
-   * Number of consecutive health check cycles where bytesReceived did not increase.
-   */
-  private _staleCycles: Record<AgentPubKeyB64, { audio: number; video: number }> = {};
 
   /**
    * Our own screen share stream
@@ -4014,7 +4008,7 @@ export class StreamsStore {
       blocked: get(this.blockedAgents).includes(peerB64),
       reachableBucket: this.lastSeenBucket(peerB64),
       slot: get(this._openConnections)[peerB64],
-      audioStaleCycles: this._staleCycles[peerB64]?.audio ?? 0,
+      audioStaleCycles: this._peerRecords.get(peerB64)?.staleCycles?.audio ?? 0,
       lastVoiceMs: voiceController.peerLastRecvMs.get(peerB64),
       now: this.clock.now(),
       // Same media-flowing window as isMediaLive / computePresentPeers —
@@ -4476,23 +4470,6 @@ export class StreamsStore {
    * from jitter on individual ping/pong round trips.
    */
   private _signalsRttEwma = new Map<string, number>();
-
-  /**
-   * Last-emitted quality bucket per peer, keyed by pubKeyB64. Value is
-   * a stable string like `"webrtc:ok:clean"`. Used to dedupe so that
-   * QualityBucketChange events only fire when the bucket actually changes
-   * rather than every poll cycle.
-   */
-  private _lastQualityBucket = new Map<string, string>();
-
-  /**
-   * Most recent reason a peer left the `connected` webrtc phase, captured from
-   * the FSM transition that took it out of `connected` (e.g. "disconnectFromPeerVideo",
-   * "peer left", "transport failure: dtls-failed"). Read by `_handleMediaClosed`
-   * to annotate the `CarrierSwitch fsm->signals` downgrade with *why* webrtc was
-   * abandoned (§6.6), instead of leaving the analyst to correlate timestamps.
-   */
-  private _lastWebrtcExitReason = new Map<AgentPubKeyB64, string>();
 
   /**
    * The **signal-carrier-down** authority's state: `this.clock` timestamp
@@ -5019,7 +4996,7 @@ export class StreamsStore {
   ) {
     // Exponential backoff: 10s, 20s, 40s, 80s, 160s (capped)
     const BASE_COOLDOWN_MS = 10_000;
-    const reconcileCount = this._reconcileAttemptCount[pubkey] || 0;
+    const reconcileCount = this._peerRecords.get(pubkey)?.reconcileAttemptCount || 0;
     const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
     const lastReconcile = this._lastReconcileTime[pubkey] || 0;
     if (this.clock.now() - lastReconcile < cooldown) return;
@@ -5065,7 +5042,7 @@ export class StreamsStore {
             transport.addTrack(track, this.mainStream);
           }
           this._lastReconcileTime[pubkey] = this.clock.now();
-          this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
+          this._ensurePeerRecord(pubkey).reconcileAttemptCount = reconcileCount + 1;
         } catch (e: any) {
           console.warn('Failed to re-add stream during reconcile:', e.message);
         }
@@ -5101,7 +5078,7 @@ export class StreamsStore {
 
     if (!needsRecovery) {
       // Tracks are healthy — reset attempt count
-      this._reconcileAttemptCount[pubkey] = 0;
+      this._ensurePeerRecord(pubkey).reconcileAttemptCount = 0;
       return;
     }
 
@@ -5116,7 +5093,7 @@ export class StreamsStore {
     }
 
     this._lastReconcileTime[pubkey] = this.clock.now();
-    this._reconcileAttemptCount[pubkey] = reconcileCount + 1;
+    this._ensurePeerRecord(pubkey).reconcileAttemptCount = reconcileCount + 1;
   }
 
   /**
@@ -5559,9 +5536,9 @@ export class StreamsStore {
     if (carrier === 'webrtc' && (rttMs === null || lossPercent === null)) return;
     if (rttMs === null && lossPercent === null) return;
     const bucket = this._qualityBucket(carrier, rttMs, jitterMs, lossPercent);
-    const last = this._lastQualityBucket.get(pubKeyB64);
+    const last = this._peerRecords.get(pubKeyB64)?.qualityBucket;
     if (bucket === last) return;
-    this._lastQualityBucket.set(pubKeyB64, bucket);
+    this._ensurePeerRecord(pubKeyB64).qualityBucket = bucket;
     const detail =
       `${bucket}` +
       (rttMs !== null ? ` rtt=${rttMs}ms` : '') +
@@ -5663,7 +5640,7 @@ export class StreamsStore {
     // disconnectFromPeerVideo / peer-left / transport-failure) rather than the
     // eventual close trigger, which is often a downstream "stale ICE" note.
     if (entry.fromState === 'connected' && entry.toState !== 'connected') {
-      this._lastWebrtcExitReason.set(entry.remoteAgent, entry.trigger);
+      this._ensurePeerRecord(entry.remoteAgent).webrtcExitReason = entry.trigger;
     }
     // Include the underlying transport states so a transition's cause can be
     // read straight from the log (e.g. confirm ICE vs DTLS on a 'failed'
@@ -5838,16 +5815,16 @@ export class StreamsStore {
           audioExpected: connInfo.audio,
           audioBytes: summary.audioBytes,
           videoBytes: summary.videoBytes,
-          lastBytes: this._lastBytesReceived[pubKeyB64] || { audio: 0, video: 0 },
-          staleCycles: this._staleCycles[pubKeyB64] || { audio: 0, video: 0 },
+          lastBytes: this._peerRecords.get(pubKeyB64)?.lastBytesReceived || { audio: 0, video: 0 },
+          staleCycles: this._peerRecords.get(pubKeyB64)?.staleCycles || { audio: 0, video: 0 },
           staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
         });
 
-        this._lastBytesReceived[pubKeyB64] = {
+        this._ensurePeerRecord(pubKeyB64).lastBytesReceived = {
           audio: summary.audioBytes,
           video: summary.videoBytes,
         };
-        this._staleCycles[pubKeyB64] = decision.nextStale;
+        this._ensurePeerRecord(pubKeyB64).staleCycles = decision.nextStale;
 
         if (decision.action === 'request-refresh') {
           const stale = decision.nextStale;
@@ -5860,7 +5837,7 @@ export class StreamsStore {
 
           if (this._sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
             // Reset stale count to avoid spamming
-            this._staleCycles[pubKeyB64] = { audio: 0, video: 0 };
+            this._ensurePeerRecord(pubKeyB64).staleCycles = { audio: 0, video: 0 };
           }
         }
       } catch (e) {
@@ -6419,7 +6396,7 @@ export class StreamsStore {
         // infer it from which transport this is.
         carrierOwnsRecovery: activeTransport.ownsTransportRecovery,
         iceState,
-        disconnectedAt: this._iceDisconnectedAt[pubkeyB64],
+        disconnectedAt: this._peerRecords.get(pubkeyB64)?.iceDisconnectedAt,
         now: this.clock.now(),
         graceMs: ICE_DISCONNECTED_GRACE_MS,
       });
