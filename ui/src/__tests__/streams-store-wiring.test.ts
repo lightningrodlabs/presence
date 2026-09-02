@@ -675,11 +675,18 @@ describe('screen-share track-ended watch (Task 2): the display-capture gesture-e
 
   it('ending the display track tears the share down and clears screenShare intent', async () => {
     const track = new FakeScreenTrack();
-    (globalThis as any).navigator = {
-      mediaDevices: {
-        getUserMedia: async () => new FakeScreenStream([track]),
+    // node 22 (0.7 devshell) makes `navigator` a getter-only global — a
+    // plain assignment throws; defineProperty replaces it and the
+    // afterEach `delete` still works (configurable).
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async () => new FakeScreenStream([track]),
+        },
       },
-    };
+      configurable: true,
+      writable: true,
+    });
     const { store, events } = makeStarted();
 
     await store.screenShareOn();
@@ -1353,14 +1360,20 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
     respond: (constraints: unknown) => Promise<FakeStream>
   ): { calls: unknown[] } {
     const calls: unknown[] = [];
-    (globalThis as any).navigator = {
-      mediaDevices: {
-        getUserMedia: async (constraints: unknown) => {
-          calls.push(constraints);
-          return respond(constraints);
+    // node 22 (0.7 devshell): `navigator` is a getter-only global — use
+    // defineProperty, not assignment (see the screen-share block above).
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async (constraints: unknown) => {
+            calls.push(constraints);
+            return respond(constraints);
+          },
         },
       },
-    };
+      configurable: true,
+      writable: true,
+    });
     return { calls };
   }
 
