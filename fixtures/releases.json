@@ -48,5 +48,15 @@
       "uiSha256": "287a6112bf6ec60fa1fbc449587667c341784accacd48940073027a9c244fa4a"
     },
     "releasedAt": 1787775984535
+  },
+  {
+    "version": "0.15.5",
+    "url": "https://github.com/lightningrodlabs/presence/releases/download/v0.15.5/presence.webhapp",
+    "hashes": {
+      "happSha256": "e707d8960e209e58043ea54cdf8347b5e5ba2b797613bbf41fca7e905d8823db",
+      "webhappSha256": "7674a30c8cee209ae2c5db339da9755ec4beb9ba6054a3f6fff52f4af54cbc01",
+      "uiSha256": "083fea1bfeb7e108c616e9477b7db3177f28634d68180e00c441ca1d62b051fc"
+    },
+    "releasedAt": 1788355222979
   }
 ]
