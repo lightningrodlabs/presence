@@ -27,6 +27,9 @@
  *      rebuild on the new track.
  */
 
+import type { CaptureLifecycle } from './mic-source';
+import { isLiveTrack } from './mic-source';
+
 export type CameraConsumerId = string;
 
 export interface CameraConsumerOptions {
@@ -65,6 +68,13 @@ export interface CameraSourceBindings {
     newTrack: MediaStreamTrack | null,
     oldTrack: MediaStreamTrack | null,
   ) => void;
+  /** Fired on every `_setLifecycle` transition (wrapped in try/catch,
+   *  mirroring `MicSource`). Task 3's reconciler and Task 5's diff policy
+   *  are the intended consumers. */
+  onLifecycleChange: (lifecycle: CaptureLifecycle) => void;
+  /** Clock read for lifecycle timestamps — routed from `StreamsStore.clock`
+   *  so this file carries no ambient time (see `no-ambient-clock.test.ts`). */
+  now: () => number;
 }
 
 export class CameraSource {
@@ -81,6 +91,8 @@ export class CameraSource {
 
   private consumers = new Map<CameraConsumerId, CameraConsumerOptions>();
 
+  private _lifecycle: CaptureLifecycle = { state: 'idle' };
+
   /**
    * Guards against concurrent open attempts from multiple parallel
    * `acquire()` callers. If the device is being opened, later callers
@@ -94,6 +106,10 @@ export class CameraSource {
 
   get track(): MediaStreamTrack | null {
     return this._track;
+  }
+
+  get lifecycle(): CaptureLifecycle {
+    return this._lifecycle;
   }
 
   get consumerCount(): number {
@@ -115,7 +131,7 @@ export class CameraSource {
       return null;
     }
 
-    if (!this._track) {
+    if (!isLiveTrack(this._track)) {
       const ok = await this._ensureOpen();
       if (!ok || !this._track) return null;
     }
@@ -148,6 +164,34 @@ export class CameraSource {
 
     if (!this._track) return;
 
+    // A device switch keeps the old track live if the new one fails to
+    // open — `markFailed: false` leaves the lifecycle untouched on error.
+    await this._openAndSwap(deviceId, { markFailed: false });
+  }
+
+  /**
+   * Reopen a dead-but-held device — Task 3's capture reconciler `open`
+   * arm for a handle whose track has `ended`/`failed`. Opens a fresh track
+   * on the current device and swaps it in through the SAME store-level
+   * `onTrackChange` fanout `changeDevice` uses (device-change branch →
+   * `replaceTrack` on peers), so a dead camera's sender recovers without a
+   * renegotiation. Unlike `changeDevice`, a reopen failure IS a lifecycle
+   * `failed`. Returns whether a live track is now installed.
+   */
+  async reopen(): Promise<boolean> {
+    return this._openAndSwap(this.bindings.getDeviceId(), { markFailed: true });
+  }
+
+  /**
+   * Open a fresh track and swap it in via the device-change fanout. Shared
+   * by `changeDevice` (keeps the old track on failure) and `reopen`
+   * (records `failed` on failure). Returns true iff a new live track is
+   * installed.
+   */
+  private async _openAndSwap(
+    deviceId: string | undefined,
+    opts: { markFailed: boolean },
+  ): Promise<boolean> {
     const old = this._track;
     const oldStream = this._rawStream;
 
@@ -157,25 +201,34 @@ export class CameraSource {
         video: this._videoConstraints(deviceId),
       });
     } catch (e) {
-      console.error('CameraSource: changeDevice getUserMedia failed', e);
-      return;
+      console.error('CameraSource: _openAndSwap getUserMedia failed', e);
+      if (opts.markFailed) {
+        this._setLifecycle({ state: 'failed', error: String(e), failedAt: this.bindings.now() });
+      }
+      return false;
     }
 
     const newTrack = newStream.getVideoTracks()[0];
     if (!newTrack) {
-      console.error('CameraSource: changeDevice got no video track');
+      console.error('CameraSource: _openAndSwap got no video track');
       try { newStream.getTracks().forEach(t => t.stop()); } catch {}
-      return;
+      if (opts.markFailed) {
+        this._setLifecycle({ state: 'failed', error: 'no video track', failedAt: this.bindings.now() });
+      }
+      return false;
     }
+
+    newTrack.onended = () => this._onTrackEnded(newTrack);
 
     this._track = newTrack;
     this._rawStream = newStream;
+    this._setLifecycle({ state: 'live', track: newTrack });
 
-    // Store-level fanout first (mainStream + peer add/removeTrack).
+    // Store-level fanout first (mainStream + peer replaceTrack).
     try {
       this.bindings.onTrackChange(newTrack, old);
     } catch (e) {
-      console.warn('CameraSource: onTrackChange threw on device change', e);
+      console.warn('CameraSource: onTrackChange threw on swap', e);
     }
 
     // Then per-consumer callbacks for consumers that bind to track identity.
@@ -191,9 +244,10 @@ export class CameraSource {
     // observed a live track.
     if (oldStream) {
       try { oldStream.getTracks().forEach(t => t.stop()); } catch {}
-    } else {
+    } else if (old) {
       try { old.stop(); } catch {}
     }
+    return true;
   }
 
   /**
@@ -206,11 +260,27 @@ export class CameraSource {
   }
 
   private async _ensureOpen(): Promise<boolean> {
-    if (this._track) return true;
+    if (isLiveTrack(this._track)) return true;
     if (this._openingPromise) return this._openingPromise;
 
     this._openingPromise = (async () => {
+      this._setLifecycle({ state: 'acquiring', since: this.bindings.now() });
       try {
+        // A stale (ended) track can still be sitting here — the last
+        // consumer never released it, the device just died underneath
+        // them. Stop its stream before opening a replacement so it
+        // doesn't leak.
+        if (this._track) {
+          const staleStream = this._rawStream;
+          if (staleStream) {
+            try { staleStream.getTracks().forEach(t => t.stop()); } catch {}
+          } else {
+            try { this._track.stop(); } catch {}
+          }
+          this._track = null;
+          this._rawStream = null;
+        }
+
         const deviceId = this.bindings.getDeviceId();
         let stream: MediaStream;
         try {
@@ -219,16 +289,20 @@ export class CameraSource {
           });
         } catch (e) {
           console.error('CameraSource: getUserMedia failed', e);
+          this._setLifecycle({ state: 'failed', error: String(e), failedAt: this.bindings.now() });
           return false;
         }
         const track = stream.getVideoTracks()[0];
         if (!track) {
           console.error('CameraSource: getUserMedia returned no video track');
           try { stream.getTracks().forEach(t => t.stop()); } catch {}
+          this._setLifecycle({ state: 'failed', error: 'no video track', failedAt: this.bindings.now() });
           return false;
         }
+        track.onended = () => this._onTrackEnded(track);
         this._rawStream = stream;
         this._track = track;
+        this._setLifecycle({ state: 'live', track });
         try {
           this.bindings.onTrackChange(track, null);
         } catch (e) {
@@ -243,11 +317,32 @@ export class CameraSource {
     return this._openingPromise;
   }
 
+  /**
+   * The `ended` event on the currently-installed track. Observation only
+   * — it writes the lifecycle and stops there. Reopening the device is
+   * Task 3's reconciler's job, which polls `lifecycle` on the presence
+   * tick as the correctness backstop if this edge is ever missed.
+   */
+  private _onTrackEnded(track: MediaStreamTrack): void {
+    if (this._track !== track) return; // stale event from a superseded track
+    this._setLifecycle({ state: 'ended', endedAt: this.bindings.now() });
+  }
+
+  private _setLifecycle(next: CaptureLifecycle): void {
+    this._lifecycle = next;
+    try {
+      this.bindings.onLifecycleChange(next);
+    } catch (e) {
+      console.warn('CameraSource: onLifecycleChange handler threw', e);
+    }
+  }
+
   private _closeDevice(): void {
     const old = this._track;
     const oldStream = this._rawStream;
     this._track = null;
     this._rawStream = null;
+    this._setLifecycle({ state: 'idle' });
     if (oldStream) {
       try { oldStream.getTracks().forEach(t => t.stop()); } catch {}
     } else if (old) {

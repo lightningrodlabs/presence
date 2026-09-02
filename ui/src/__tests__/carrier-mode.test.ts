@@ -13,6 +13,10 @@ import type { PresenceLogger } from '../logging';
  * getter drifting from the flag — is a failing test, not a rediscovery.
  * The persisted key (`disableAllWebrtc`) is read with `=== 'true'`, so any
  * legacy third value from an old build parses as `false` → 'webrtc'.
+ *
+ * `webrtcGloballyDisabled` is a getter over `localIntent.webrtc.enabled`
+ * (Task 4) — there is no field left to assign directly, so the "is
+ * signals iff" case drives `_localIntent` itself, the one authority.
  */
 
 const myPubKey = new Uint8Array(39).fill(1);
@@ -32,9 +36,17 @@ describe('carrierMode — the one carrier axis', () => {
 
   it('is signals iff webrtcGloballyDisabled', () => {
     const store = makeUnstartedStore();
-    store.webrtcGloballyDisabled = true;
+    store._localIntent.update(intent => ({
+      ...intent,
+      webrtc: { ...intent.webrtc, enabled: false },
+    }));
+    expect(store.webrtcGloballyDisabled).toBe(true);
     expect(store.carrierMode()).toBe('signals');
-    store.webrtcGloballyDisabled = false;
+    store._localIntent.update(intent => ({
+      ...intent,
+      webrtc: { ...intent.webrtc, enabled: true },
+    }));
+    expect(store.webrtcGloballyDisabled).toBe(false);
     expect(store.carrierMode()).toBe('webrtc');
   });
 

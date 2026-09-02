@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach, vi } from 'vitest';
+import { describe, expect, it, afterEach, beforeEach, vi } from 'vitest';
 import { get } from '@holochain-open-dev/stores';
 import { encodeHashToBase64 } from '@holochain/client';
 import type { AgentPubKey } from '@holochain/client';
@@ -23,6 +23,11 @@ import {
   SIGNALS_RTT_DEGRADED_MS,
 } from '../transport/signals-cadence-policy';
 import { CAP_VOICE_BATCH } from '../transport/wire-contract';
+import { encodeRtcAction } from '../rtc-message-policy';
+import {
+  CAPTURE_REOPEN_MIN_INTERVAL_MS,
+  CAPTURE_REOPEN_MAX_ATTEMPTS,
+} from '../capture-reconcile-policy';
 import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
@@ -47,10 +52,18 @@ import type { RoomSignal, StoreEventPayload } from '../types';
  */
 
 const myPubKey = new Uint8Array(39).fill(1);
+const myPubKeyB64 = encodeHashToBase64(myPubKey as unknown as AgentPubKey);
 const peerAKey = new Uint8Array(39).fill(2) as AgentPubKey;
 const peerA = encodeHashToBase64(peerAKey);
 const peerBKey = new Uint8Array(39).fill(3) as AgentPubKey;
 const peerB = encodeHashToBase64(peerBKey);
+/** Alphabetically LOWER than `myPubKey` (fill(1)) — the initiator arm's
+ *  ordering condition (`handlePongUi` only initiates toward a lower
+ *  peer key; see the acceptor arm's `pubKey64 > this.myPubKeyB64` gate
+ *  for the converse). Used by the D2 caps-race wiring test below, where
+ *  the store itself must be the initiator. */
+const peerLowerKey = new Uint8Array(39).fill(0) as AgentPubKey;
+const peerLower = encodeHashToBase64(peerLowerKey);
 
 type Started = FakeDeps & {
   store: StreamsStore;
@@ -618,6 +631,81 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
   });
 });
 
+describe('screen-share track-ended watch (Task 2): the display-capture gesture-equivalent', () => {
+  /** A display-capture track ending is a user/platform action (the
+   *  browser's native "Stop sharing" bar, the OS revoking capture) — there
+   *  is no picker-less way to re-acquire it, so `ended` here is the ONE
+   *  documented gesture-equivalent (intent.ts, IntentGesture). This pins
+   *  that `screenShareOn` wires `track.onended` to write intent AND tear
+   *  the share down, closing what was previously a real gap: before this
+   *  task, stopping a share from outside the app UI left the pane open. */
+  class FakeScreenTrack {
+    readyState: 'live' | 'ended' = 'live';
+
+    onended: (() => void) | null = null;
+
+    stop(): void {
+      if (this.readyState === 'ended') return;
+      this.readyState = 'ended';
+      this.onended?.();
+    }
+  }
+
+  class FakeScreenStream {
+    constructor(private tracks: FakeScreenTrack[]) {}
+
+    getTracks(): FakeScreenTrack[] {
+      return this.tracks;
+    }
+
+    getVideoTracks(): FakeScreenTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeScreenTrack[] {
+      return [];
+    }
+  }
+
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  afterEach(() => {
+    delete (globalThis as any).navigator;
+  });
+
+  it('ending the display track tears the share down and clears screenShare intent', async () => {
+    const track = new FakeScreenTrack();
+    // node 22 (0.7 devshell) makes `navigator` a getter-only global — a
+    // plain assignment throws; defineProperty replaces it and the
+    // afterEach `delete` still works (configurable).
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async () => new FakeScreenStream([track]),
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    const { store, events } = makeStarted();
+
+    await store.screenShareOn();
+
+    // Sanity: the share is actually up before we end it, so the
+    // assertions below prove teardown rather than a no-op.
+    expect(get(store._myModuleStates)['screen-share']?.active).toBe(true);
+    expect(get(store.localIntent).screenShare.wanted).toBe(true);
+
+    track.stop(); // the platform/browser ends the share, not the app
+    await flush();
+    await flush();
+
+    expect(get(store._myModuleStates)['screen-share']).toBeUndefined();
+    expect(get(store.localIntent).screenShare.wanted).toBe(false);
+    expect(events.some(e => e.type === 'my-screen-share-off')).toBe(true);
+  });
+});
+
 describe('acceptor eligibility through the started store (Round 3 item 2)', () => {
   const conversationEnvelope = (clock: ManualClock, payload: object) => ({
     moduleId: 'conversation',
@@ -686,6 +774,193 @@ describe('acceptor eligibility through the started store (Round 3 item 2)', () =
     expect(
       logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
     ).toBe(true);
+  });
+});
+
+describe('caps-unknown vs lacks-cap — the D2 join-race fix (Task 4)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  // `moduleStatesAt` is required for a non-legacy pong: without it, an
+  // empty `moduleStates` reads as "legacy pong, no stamp" and
+  // unconditionally sweeps every held peer module entry
+  // (`decideModuleStateMerge`'s `legacy-pong-unconditional-sweep` row) —
+  // which would delete the very conversation entry the ModuleState push
+  // just set. A same-build peer's pong always carries this stamp.
+  const bareSignalsPong = (clock: ManualClock) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStatesAt: clock.now() },
+    });
+
+  it('acceptor: an InitRequest from a peer whose conversation payload has not arrived is dropped with a distinct "caps not yet received" log, never "lacks sdp-fsm capability"', async () => {
+    const { store, clock, bus, logger } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // No entry at all for peerA in _peerModuleStates — their conversation
+    // payload (and therefore their declared caps) has not arrived yet.
+    // This is the D2 shape: distinct from the "declared empty caps"
+    // scenario above, which IS a known, capability-less peer.
+    expect(get(store._peerModuleStates)[peerA]).toBeUndefined();
+
+    await bus.deliver(
+      message(
+        peerAKey,
+        'InitRequest',
+        JSON.stringify({ connection_id: 'ir-caps-unknown', connection_type: 'video' })
+      )
+    );
+
+    expect(bus.sentOfType('InitAccept')).toHaveLength(0);
+    expect(
+      logger.customMessages.some(m => m.includes('caps not yet received'))
+    ).toBe(true);
+    expect(
+      logger.customMessages.some(m => m.includes('lacks sdp-fsm capability'))
+    ).toBe(false);
+  });
+
+  it('initiator: the join-race end to end — no InitRequest while the peer\'s payload is unknown, and the very next pong after it lands drives the init with no parking machinery needed', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+
+    // Peer pongs immediately after joining — their conversation payload
+    // (and caps) has not arrived yet. Pre-fix, `webrtcAvailableFor`
+    // reported no caps here and `decideWebrtcEligibility` returned
+    // `peer-lacks-sdp-fsm-cap`, indistinguishable from a genuinely old
+    // build — dropping this join's first InitRequest.
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+
+    // The payload lands (a real 'ModuleState' push, exercising the same
+    // wiring a late module-state broadcast uses).
+    await bus.deliver(
+      message(
+        peerLowerKey,
+        'ModuleState',
+        JSON.stringify(conversationEnvelope(clock, { caps: ['sdp-fsm'] }))
+      )
+    );
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+
+    // No parking/re-drive trigger is needed: the initiator drive is
+    // already level-triggered per pong (`decideInitRetry`), so the very
+    // next pong re-evaluates eligibility with caps now known and drives
+    // the init on its own.
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    const inits = bus.sentOfType('InitRequest');
+    expect(inits).toHaveLength(1);
+    expect(inits[0].to).toEqual([peerLower]);
+  });
+});
+
+describe('per-peer WebRTC disable is a union of our intent and the peer\'s broadcast (Task 4 review finding B)', () => {
+  const conversationEnvelope = (clock: ManualClock, payload: object) => ({
+    moduleId: 'conversation',
+    active: true,
+    payload: JSON.stringify(payload),
+    updatedAt: clock.now(),
+  });
+
+  const bareSignalsPong = (clock: ManualClock) =>
+    JSON.stringify({
+      formatVersion: 1,
+      data: { connectionStatuses: {}, moduleStatesAt: clock.now() },
+    });
+
+  it('a peer who has broadcast a per-peer disable-with-us is never sent an InitRequest, even though our own intent never disabled them', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    // The peer (lower key — we are the key-designated initiator) declares
+    // sdp-fsm capability AND has disabled WebRTC specifically with us on
+    // their end. Our own intent never touched `disabledWith` for this
+    // peer — `_localIntent.webrtc.disabledWith` is empty throughout this
+    // test. If the eligibility conjunct only read our own intent (the
+    // bug this test catches), we would wrongly attempt to initiate every
+    // pong cycle, and the peer would silently refuse each one (their own
+    // eligibility check, evaluated with their own intent) — continuous
+    // one-sided churn.
+    store._peerModuleStates.set({
+      [peerLower]: {
+        conversation: conversationEnvelope(clock, {
+          caps: ['sdp-fsm'],
+          disableWebrtcWith: [myPubKeyB64],
+        }),
+      },
+    });
+    expect(get(store._localIntent).webrtc.disabledWith.has(peerLower)).toBe(false);
+
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+    // The union is honored in both directions: webrtcDisabled itself
+    // reports the link disabled, sourced from the peer's broadcast half.
+    expect(store.webrtcDisabled(peerLower)).toBe(true);
+  });
+
+  it('a peer who has broadcast a GLOBAL webrtc disable is never sent an InitRequest', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._myModuleStates.set({
+      conversation: conversationEnvelope(clock, {}),
+    });
+    store._peerModuleStates.set({
+      [peerLower]: {
+        conversation: conversationEnvelope(clock, {
+          caps: ['sdp-fsm'],
+          webrtcDisabled: true,
+        }),
+      },
+    });
+
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+    await bus.deliver(message(peerLowerKey, 'PongUi', bareSignalsPong(clock)));
+
+    expect(bus.sentOfType('InitRequest')).toHaveLength(0);
+    expect(store.webrtcDisabled(peerLower)).toBe(true);
+  });
+});
+
+describe("setCarrierMode teardown — regression pin for the previous/_applyIntent ordering bug (Task 4 review finding A)", () => {
+  it('switching to signals tears down an open WebRTC connection', async () => {
+    const { store, transports } = makeStarted();
+    const media = transports.media!;
+
+    // Get a connected slot up via the real transport-event routing —
+    // `setCarrierMode` must find it in `_openConnections` for the
+    // teardown branch to do anything observable.
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'signaling');
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+
+    // `carrierMode()` starts at 'webrtc' (default), so this actually
+    // flips the mode and must run the teardown branch, not the
+    // previous-equals-mode early return. `setCarrierMode` read
+    // `previous = this.carrierMode()` AFTER calling `_applyIntent` at one
+    // point in development; since `carrierMode()` now reads the
+    // `webrtcGloballyDisabled` getter (sourced from `_localIntent`, the
+    // same record `_applyIntent` had just updated), `previous` came back
+    // already equal to `mode` and the teardown below never ran. This test
+    // is the regression pin for that ordering bug — see the fix report
+    // for the RED-under-bad-ordering / GREEN-under-the-fix reproduction.
+    await store.setCarrierMode('signals');
+
+    expect(
+      media.closeCalls.some(
+        c => c.peer === peerA && c.reason === 'disconnectFromPeerVideo'
+      )
+    ).toBe(true);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(store.webrtcGloballyDisabled).toBe(true);
   });
 });
 
@@ -919,13 +1194,13 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
   // go red.
   const flush = () => new Promise<void>(r => setTimeout(r, 0));
 
-  /** Arm the voice gate: a present signals target + a held mic. */
+  /** Arm the voice gate: a present signals target + mic WANTED (intent).
+   *  Task 3 replacement #3 gates the signals encoders on intent, not on a
+   *  held handle, so the arm is an intent write. */
   function armVoice(started: Started) {
     const { store, clock } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
-    (store as unknown as { _webrtcMicHandle: unknown })._webrtcMicHandle = {
-      release: () => {},
-    };
+    store._localIntent.update(i => ({ ...i, mic: { wanted: true, muted: false } }));
   }
 
   /** One presence tick with the target peer kept ping-fresh. */
@@ -994,14 +1269,423 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
       .mockRejectedValue(new Error('camera busy'));
     const started = makeStarted();
     started.store._knownAgents.set(knownFresh(started.clock, peerA));
-    (
-      started.store as unknown as { _webrtcCameraHandle: unknown }
-    )._webrtcCameraHandle = { release: () => {} };
+    started.store._localIntent.update(i => ({ ...i, camera: { wanted: true } }));
 
     await tick(started);
     expect(spy).toHaveBeenCalledTimes(1);
     await tick(started);
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('the capture reconciler (Task 3): intent reconciled against capture lifecycle', () => {
+  // The round's highest-risk seam: the store no longer acquires the mic /
+  // camera inline nor gates the signals encoders on "is a handle held".
+  // The reconciler owns the acquire handles and reconciles them against
+  // `localIntent` on the presence tick; the signals reconcilers read
+  // `intent.mic.wanted` / `intent.camera.wanted`. These tests drive the
+  // real started store over fake capture devices.
+  class FakeTrack {
+    readyState: 'live' | 'ended' = 'live';
+
+    enabled = true;
+
+    onended: (() => void) | null = null;
+
+    onmute: (() => void) | null = null;
+
+    onunmute: (() => void) | null = null;
+
+    muted = false;
+
+    constructor(public kind: 'audio' | 'video') {}
+
+    stop(): void {
+      if (this.readyState === 'ended') return;
+      this.readyState = 'ended';
+      this.onended?.();
+    }
+  }
+
+  class FakeStream {
+    constructor(private tracks: FakeTrack[]) {}
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  /** Minimal MediaStream stand-in — node has none, and the store's mic /
+   *  camera open branch does `new MediaStream()` + add/get/removeTrack. */
+  class FakeMediaStream {
+    private tracks: FakeTrack[] = [];
+
+    addTrack(t: FakeTrack): void {
+      this.tracks.push(t);
+    }
+
+    removeTrack(t: FakeTrack): void {
+      this.tracks = this.tracks.filter(x => x !== t);
+    }
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  beforeEach(() => {
+    (globalThis as any).MediaStream = FakeMediaStream;
+  });
+
+  /** Record every getUserMedia call and hand back a scripted stream. */
+  function installNavigator(
+    respond: (constraints: unknown) => Promise<FakeStream>
+  ): { calls: unknown[] } {
+    const calls: unknown[] = [];
+    // node 22 (0.7 devshell): `navigator` is a getter-only global — use
+    // defineProperty, not assignment (see the screen-share block above).
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async (constraints: unknown) => {
+            calls.push(constraints);
+            return respond(constraints);
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    return { calls };
+  }
+
+  /** Fire the presence-tick site: the `_signalsTargets` subscription runs
+   *  captureReconciler.tick() once per tick, the same cadence and pin as
+   *  the encoder reconcilers. Kept ping-fresh so a target stays present. */
+  async function presenceTick(started: Started) {
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    started.clock.advance(PING_INTERVAL);
+    await flush();
+    await flush();
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).navigator;
+    delete (globalThis as any).MediaStream;
+  });
+
+  it('(a) audioOn(true) acquires the mic through the reconciler and applies mute', async () => {
+    const track = new FakeTrack('audio');
+    installNavigator(async () => new FakeStream([track]));
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+
+    expect(started.store.micSource.lifecycle.state).toBe('live');
+    expect(started.store.micSource.track).toBe(track as unknown as MediaStreamTrack);
+    expect(started.store.micSource.muted).toBe(false);
+  });
+
+  it('(a2) audioOff after audioOn(true) mutes but keeps the device live', async () => {
+    // audioOff is `audio-mute`: the mic stays WANTED (fast re-enable, no
+    // renegotiation), so the reconciler keeps the handle and only the mute
+    // flips. (audioOn(false) from scratch never acquires — a never-wanted
+    // mic stays unwanted, intent.ts — and is not a production path.)
+    const track = new FakeTrack('audio');
+    installNavigator(async () => new FakeStream([track]));
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.muted).toBe(false);
+
+    await started.store.audioOff();
+    await flush();
+
+    expect(started.store.micSource.lifecycle.state).toBe('live');
+    expect(started.store.micSource.muted).toBe(true);
+    expect(get(started.store.localIntent).mic.wanted).toBe(true);
+  });
+
+  it('(b) a killed track is reopened on the next tick and the new track reaches peers via replaceTrack', async () => {
+    const trackA = new FakeTrack('audio');
+    const trackB = new FakeTrack('audio');
+    const nav = installNavigator(
+      (() => {
+        let n = 0;
+        return async () => new FakeStream([[trackA, trackB][n++]!]);
+      })()
+    );
+    const started = makeStarted();
+    const media = started.transports.media!;
+
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.track).toBe(trackA as unknown as MediaStreamTrack);
+    media.replaceCalls.length = 0;
+
+    // The device dies underneath the held handle (Incident B / D3).
+    trackA.stop();
+    expect(started.store.micSource.lifecycle.state).toBe('ended');
+
+    // Tick site drives the reopen. Two ticks clear the reopen pacing
+    // interval (PING_INTERVAL < CAPTURE_REOPEN_MIN_INTERVAL_MS).
+    await presenceTick(started);
+    await presenceTick(started);
+
+    expect(nav.calls.length).toBe(2); // opened a fresh device
+    expect(started.store.micSource.track).toBe(trackB as unknown as MediaStreamTrack);
+    // The reopen swaps the corpse for the new track on every peer transport.
+    expect(
+      media.replaceCalls.some(
+        c => c.newTrack === (trackB as unknown as MediaStreamTrack)
+      )
+    ).toBe(true);
+  });
+
+  it("(b') the signals-audio gate reads intent, not device observation: wanted mic with a dead device still runs the encoder", async () => {
+    // Mutation guard (Step 5 i): if `_reconcileSignalsAudio` reverts to a
+    // device-held observation, this goes red — intent says wanted, but no
+    // handle is held / no live track exists.
+    const spy = vi.spyOn(voiceController, 'startCapture').mockResolvedValue(true);
+    const started = makeStarted();
+    // Intent: mic wanted. No fake navigator installed, so the reconciler's
+    // acquire fails and no live track ever exists — the dead-device case.
+    started.store._localIntent.update(i => ({
+      ...i,
+      mic: { wanted: true, muted: false },
+    }));
+
+    await presenceTick(started);
+
+    expect(started.store.micSource.lifecycle.state).not.toBe('live');
+    expect(spy).toHaveBeenCalled();
+    expect(started.store.voiceEncoderRunning).toBe(true);
+  });
+
+  it('(c) a device that keeps failing is retried to the ceiling then reported exactly once', async () => {
+    installNavigator(async () => {
+      throw new Error('NotAllowedError: mic denied');
+    });
+    const started = makeStarted();
+    const errors: string[] = [];
+    started.store.onEvent(e => {
+      if (e.type === 'error') errors.push(e.error);
+    });
+
+    // Gesture: attempt 1 (audioOn ticks once).
+    await started.store.audioOn(true);
+    await flush();
+
+    // Drive further paced ticks well past the ceiling.
+    for (let i = 0; i < 10; i += 1) {
+      started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+      await started.store.captureReconciler.tick();
+      await flush();
+    }
+
+    expect(started.store.captureReconciler.micAttemptState.attemptsSinceGesture).toBe(
+      CAPTURE_REOPEN_MAX_ATTEMPTS + 1
+    );
+    expect(errors.filter(e => e.includes('Microphone'))).toHaveLength(1);
+  });
+
+  it('(c2) getUserMedia is called exactly CAPTURE_REOPEN_MAX_ATTEMPTS times then stops', async () => {
+    const nav = installNavigator(async () => {
+      throw new Error('mic denied');
+    });
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    for (let i = 0; i < 10; i += 1) {
+      started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+      await started.store.captureReconciler.tick();
+      await flush();
+    }
+
+    expect(nav.calls.length).toBe(CAPTURE_REOPEN_MAX_ATTEMPTS);
+  });
+
+  it('(d) a fresh gesture resets the retry pacing and reopens immediately', async () => {
+    const trackA = new FakeTrack('audio');
+    const trackB = new FakeTrack('audio');
+    const nav = installNavigator(
+      (() => {
+        let n = 0;
+        return async () => new FakeStream([[trackA, trackB][n++]!]);
+      })()
+    );
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    expect(nav.calls.length).toBe(1);
+
+    trackA.stop(); // device dies
+    // No clock advance: the reopen interval has NOT elapsed. A bare tick
+    // would hold (paced). The gesture must reset pacing and reopen now.
+    await started.store.captureReconciler.tick();
+    await flush();
+    expect(nav.calls.length).toBe(1); // confirm: paced, no reopen yet
+
+    await started.store.audioOn(true); // the gesture
+    await flush();
+
+    expect(nav.calls.length).toBe(2); // reopened immediately despite pacing
+    expect(started.store.micSource.track).toBe(trackB as unknown as MediaStreamTrack);
+  });
+
+  it('(e) inbound request-track-refresh with a dead source defers instead of pushing a dead track', async () => {
+    // Incident B's exact wedge: a peer asks us to refresh tracks, our mic
+    // died, and the old code replaceTrack'd the corpse and logged success.
+    const track = new FakeTrack('audio');
+    installNavigator(async () => new FakeStream([track]));
+    const started = makeStarted();
+    const media = started.transports.media!;
+
+    // Bring up mic + an open connection to peerA.
+    await started.store.audioOn(true);
+    await flush();
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.refreshMediaCalls.length = 0;
+
+    // The mic dies underneath us.
+    track.stop();
+    expect(started.store.micSource.lifecycle.state).toBe('ended');
+
+    // Inbound request-track-refresh over the real data-channel glue.
+    media.emit({
+      type: 'data-channel-message',
+      peer: peerA,
+      connectionId: 'conn-1',
+      data: encodeRtcAction('request-track-refresh'),
+    });
+
+    expect(media.refreshMediaCalls).toHaveLength(0);
+    expect(
+      started.logger.customMessages.some(m =>
+        m.includes('source dead, deferring to capture reconciler')
+      )
+    ).toBe(true);
+    // The dishonest "replaceTrack: refreshed via transport" success line
+    // must NOT appear for this dead-source refresh.
+    expect(
+      started.logger.customMessages.some(m => m.includes('refreshed via transport'))
+    ).toBe(false);
+  });
+
+  it('(f) videoOn whose first acquire fails still reaches peers + fires my-video-on when a later tick acquires', async () => {
+    // Review finding #1: the camera peer attach and `my-video-on` must be
+    // reachable from a RECONCILER-driven fresh acquire, not only from
+    // videoOn. If videoOn's first acquire fails transiently (camera busy —
+    // the exact class this reconciler handles), intent stays wanted and a
+    // later bare tick acquires; the track must still reach RTCRtpSenders
+    // and my-video-on must fire, else WebRTC peers see no video until a
+    // manual off/on.
+    const camTrack = new FakeTrack('video');
+    let call = 0;
+    installNavigator(async () => {
+      call += 1;
+      if (call === 1) throw new Error('NotReadableError: camera busy');
+      return new FakeStream([camTrack]);
+    });
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+
+    // First videoOn: acquire fails. No handle, but intent stays wanted.
+    await started.store.videoOn();
+    await flush();
+    expect(started.store.cameraSource.lifecycle.state).not.toBe('live');
+    expect(get(started.store.localIntent).camera.wanted).toBe(true);
+    expect(started.events.some(e => e.type === 'my-video-on')).toBe(false);
+    media.addTrackCalls.length = 0;
+
+    // A later bare presence tick (paced) — the reconciler acquires.
+    started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+    await presenceTick(started);
+
+    expect(started.store.cameraSource.track).toBe(camTrack as unknown as MediaStreamTrack);
+    // The freshly-acquired track reached the peer transport (addTrack: no
+    // prior video sender existed) — not stranded on mainStream.
+    expect(
+      media.addTrackCalls.some(t => t === (camTrack as unknown as MediaStreamTrack))
+    ).toBe(true);
+    expect(started.events.some(e => e.type === 'my-video-on')).toBe(true);
+  });
+
+  // Task 6: the store recomputes `intentDiffs` at the SAME presence-tick
+  // site where the reconciler runs, so the UI can never show a diff the
+  // reconciler is not acting on. These pin that wiring — the pure
+  // `describeIntentDiffs` decision is table-tested in intent-diff-policy.
+  it('(e) a dead-but-wanted mic surfaces a pending mic diff on the tick', async () => {
+    installNavigator(async () => {
+      throw new Error('NotAllowedError: mic denied');
+    });
+    const started = makeStarted();
+
+    // Gesture: mic wanted; the reconciler's acquire fails (no live device).
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.lifecycle.state).toBe('failed');
+
+    // Recompute happens in the presence-tick subscription, not in audioOn.
+    await presenceTick(started);
+
+    const diffs = get(started.store.intentDiffs);
+    const mic = diffs.find(d => d.scope === 'mic');
+    expect(mic?.severity).toBe('pending');
+    expect(mic?.copy).toBe('Microphone unavailable — retrying…');
+  });
+
+  it('(f) once the reconciler exhausts its attempts the mic diff goes failed', async () => {
+    installNavigator(async () => {
+      throw new Error('NotAllowedError: mic denied');
+    });
+    const started = makeStarted();
+
+    await started.store.audioOn(true);
+    await flush();
+    // Drive paced ticks past the ceiling; report-failure bumps the count
+    // past the max so the diff's severity flips to 'failed'.
+    for (let i = 0; i < CAPTURE_REOPEN_MAX_ATTEMPTS + 2; i += 1) {
+      started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+      await started.store.captureReconciler.tick();
+      await flush();
+    }
+    expect(
+      started.store.captureReconciler.micAttemptState.attemptsSinceGesture
+    ).toBeGreaterThanOrEqual(CAPTURE_REOPEN_MAX_ATTEMPTS);
+
+    // A recompute tick reflects the exhausted state.
+    await presenceTick(started);
+
+    const mic = get(started.store.intentDiffs).find(d => d.scope === 'mic');
+    expect(mic?.severity).toBe('failed');
+    expect(mic?.copy).toBe('Microphone unavailable');
   });
 });
 

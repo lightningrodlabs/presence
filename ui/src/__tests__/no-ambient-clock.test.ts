@@ -89,6 +89,14 @@ const PINNED_FILES: Array<{
   // seam. (AbortSignal.timeout is deliberately outside the patterns'
   // reach — see the module doc — but a bare timer creeping in is not.)
   { relPath: '../room-ownership.ts', patterns: FULL_PATTERNS },
+  // Task 2 (capture lifecycle): both sources gained a `now: () => number`
+  // binding specifically so `_setLifecycle`'s timestamps have no excuse
+  // for ambient time.
+  { relPath: '../mic-source.ts', patterns: FULL_PATTERNS },
+  { relPath: '../camera-source.ts', patterns: FULL_PATTERNS },
+  // Task 3 (capture reconciler): takes `clock` via bindings and stamps
+  // every retry attempt through it — no ambient time.
+  { relPath: '../capture-reconciler.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
