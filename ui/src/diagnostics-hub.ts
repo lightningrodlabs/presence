@@ -70,7 +70,7 @@ export class DiagnosticsHub {
    */
   private _conversationParticipants = new Set<AgentPubKeyB64>();
 
-  constructor(private readonly b: DiagnosticsHubBindings) {}
+  constructor(private readonly bindings: DiagnosticsHubBindings) {}
 
   /**
    * Record a peer as a genuine call participant for diagnostic-log
@@ -142,9 +142,9 @@ export class DiagnosticsHub {
       : [
           ...new Set<AgentPubKeyB64>([
             ...this._conversationParticipants,
-            ...this.b.globalPresenceSet(),
+            ...this.bindings.globalPresenceSet(),
           ]),
-        ].filter(a => a !== this.b.myPubKeyB64());
+        ].filter(a => a !== this.bindings.myPubKeyB64());
     if (targetKeys.length === 0) return;
 
     // Clear any prior failed state for these peers — manual re-trigger.
@@ -156,7 +156,7 @@ export class DiagnosticsHub {
 
     targetKeys.forEach(k => this._startDiagnosticAttempt(k, 1));
 
-    this.b.logger.logCustomMessage(
+    this.bindings.logger.logCustomMessage(
       `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
     );
   }
@@ -171,7 +171,7 @@ export class DiagnosticsHub {
    * predicate.
    */
   private _computeDiagnosticAttemptTimeout(peerB64: AgentPubKeyB64): number {
-    const rtt = this.b.peerRttEwma(peerB64);
+    const rtt = this.bindings.peerRttEwma(peerB64);
     if (rtt === undefined || rtt <= 0) {
       return DiagnosticsHub.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS;
     }
@@ -193,29 +193,29 @@ export class DiagnosticsHub {
   private _startDiagnosticAttempt(peerB64: AgentPubKeyB64, attempt: number): void {
     this._pendingDiagnosticRequests.update(curr => ({
       ...curr,
-      [peerB64]: { attempts: attempt, startedAt: this.b.now() },
+      [peerB64]: { attempts: attempt, startedAt: this.bindings.now() },
     }));
 
     const peerHash = decodeHashFromBase64(peerB64);
-    this.b.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
-      this.b.logger.logCustomMessage(
+    this.bindings.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
+      this.bindings.logger.logCustomMessage(
         `DiagnosticRequest send failed [${peerB64.slice(0, 8)}] attempt ${attempt}: ${e?.message ?? e}`
       );
     });
 
-    this.b.setTimeout(() => {
+    this.bindings.setTimeout(() => {
       const stillPending = get(this._pendingDiagnosticRequests)[peerB64];
       // Response arrived (handler cleared pending) or user re-triggered
       // a fresh attempt that supersedes this one.
       if (!stillPending || stillPending.attempts !== attempt) return;
 
       if (attempt < DiagnosticsHub.DIAGNOSTIC_MAX_ATTEMPTS) {
-        this.b.logger.logCustomMessage(
+        this.bindings.logger.logCustomMessage(
           `DiagnosticRequest timeout [${peerB64.slice(0, 8)}] attempt ${attempt}, retrying`
         );
         this._startDiagnosticAttempt(peerB64, attempt + 1);
       } else {
-        this.b.logger.logCustomMessage(
+        this.bindings.logger.logCustomMessage(
           `DiagnosticRequest failed [${peerB64.slice(0, 8)}] after ${attempt} attempts`
         );
         this._pendingDiagnosticRequests.update(curr => {
@@ -232,8 +232,8 @@ export class DiagnosticsHub {
    * Build a merged diagnostic log combining local and received remote events for a peer.
    */
   exportMergedLogs(pubKeyB64: AgentPubKeyB64): object {
-    const localAgentEvents = this.b.logger.getRecentAgentEvents();
-    const localCustomLogs = this.b.logger.getRecentCustomLogs();
+    const localAgentEvents = this.bindings.logger.getRecentAgentEvents();
+    const localCustomLogs = this.bindings.logger.getRecentCustomLogs();
     const remoteSnapshot = get(this._receivedDiagnosticLogs)[pubKeyB64];
 
     type MergedEntry = { timestamp: number; source: 'local' | 'remote'; type: string; detail: string; connectionId?: string };
@@ -294,8 +294,8 @@ export class DiagnosticsHub {
     merged.sort((a, b) => a.timestamp - b.timestamp);
 
     return {
-      generatedAt: this.b.now(),
-      localAgent: this.b.myPubKeyB64(),
+      generatedAt: this.bindings.now(),
+      localAgent: this.bindings.myPubKeyB64(),
       remoteAgent: pubKeyB64,
       hasRemoteLogs: !!remoteSnapshot,
       remoteSessionId: remoteSnapshot?.sessionId,
@@ -310,8 +310,8 @@ export class DiagnosticsHub {
    * the room-level bulk download path.
    */
   exportMergedLogsAll(): object {
-    const localAgentEvents = this.b.logger.getRecentAgentEvents();
-    const localCustomLogs = this.b.logger.getRecentCustomLogs();
+    const localAgentEvents = this.bindings.logger.getRecentAgentEvents();
+    const localCustomLogs = this.bindings.logger.getRecentCustomLogs();
     const allRemote = get(this._receivedDiagnosticLogs);
 
     type MergedEntry = {
@@ -328,7 +328,7 @@ export class DiagnosticsHub {
       events.forEach(e => {
         merged.push({
           timestamp: e.timestamp,
-          source: this.b.myPubKeyB64(),
+          source: this.bindings.myPubKeyB64(),
           sourceLabel: 'local',
           type: 'event',
           detail: `[${agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
@@ -339,7 +339,7 @@ export class DiagnosticsHub {
     localCustomLogs.forEach(log => {
       merged.push({
         timestamp: log.timestamp,
-        source: this.b.myPubKeyB64(),
+        source: this.bindings.myPubKeyB64(),
         sourceLabel: 'local',
         type: 'custom',
         detail: log.log,
@@ -373,8 +373,8 @@ export class DiagnosticsHub {
     merged.sort((a, b) => a.timestamp - b.timestamp);
 
     return {
-      generatedAt: this.b.now(),
-      localAgent: this.b.myPubKeyB64(),
+      generatedAt: this.bindings.now(),
+      localAgent: this.bindings.myPubKeyB64(),
       respondingPeers,
       entries: merged,
     };
@@ -384,20 +384,20 @@ export class DiagnosticsHub {
    * Handle a DiagnosticRequest signal — gather recent logs and send back.
    */
   async handleDiagnosticRequest(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const allRecentEvents = this.b.logger.getRecentAgentEvents();
+    const allRecentEvents = this.bindings.logger.getRecentAgentEvents();
     const flatEvents = Object.values(allRecentEvents).flat();
-    const recentCustomLogs = this.b.logger.getRecentCustomLogs();
+    const recentCustomLogs = this.bindings.logger.getRecentCustomLogs();
 
     // The size guard and its self-declaring truncation live in
     // diagnostic-snapshot-policy.ts (Phase 5 item 2).
     const { payload } = buildDiagnosticSnapshot({
-      fromAgent: this.b.myPubKeyB64(),
-      sessionId: this.b.logger.sessionId,
+      fromAgent: this.bindings.myPubKeyB64(),
+      sessionId: this.bindings.logger.sessionId,
       agentEvents: flatEvents,
       customLogs: recentCustomLogs,
-      generatedAt: this.b.now(),
+      generatedAt: this.bindings.now(),
     });
-    await this.b.sendMessage(
+    await this.bindings.sendMessage(
       [signal.from_agent],
       'DiagnosticResponse',
       payload,
@@ -434,7 +434,7 @@ export class DiagnosticsHub {
       const truncationNote = snapshot.truncated
         ? ` (TRUNCATED: ${snapshot.truncated.events} events, ${snapshot.truncated.customLogs} custom logs dropped at sender)`
         : '';
-      this.b.logger.logCustomMessage(
+      this.bindings.logger.logCustomMessage(
         `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs${truncationNote}`
       );
     } catch (e) {

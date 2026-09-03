@@ -31,7 +31,7 @@ export class MediaSettings {
   _audioOutputId: Writable<string | undefined> = writable(undefined); // if undefined, the default audio output is used
   _videoInputId: Writable<string | undefined> = writable(undefined); // if undefined, the default video input source is used
 
-  constructor(private readonly b: MediaSettingsBindings) {}
+  constructor(private readonly bindings: MediaSettingsBindings) {}
 
   // ICE/TURN settings live in storage.local (window.localStorage in
   // production) and are edited from the Settings panel. Read them live (not
@@ -40,19 +40,19 @@ export class MediaSettings {
   // these on every ensureConnection.
   get trickleICE(): boolean {
     // Stored as 'true'/'false'; default ON when unset.
-    return this.b.storage.getItem('trickleICE') !== 'false';
+    return this.bindings.storage.getItem('trickleICE') !== 'false';
   }
 
   get turnUrl(): string {
-    return this.b.storage.getItem('turnUrl') || '';
+    return this.bindings.storage.getItem('turnUrl') || '';
   }
 
   get turnUsername(): string {
-    return this.b.storage.getItem('turnUsername') || '';
+    return this.bindings.storage.getItem('turnUsername') || '';
   }
 
   get turnCredential(): string {
-    return this.b.storage.getItem('turnCredential') || '';
+    return this.bindings.storage.getItem('turnCredential') || '';
   }
 
   // Cloudflare-provisioned TURN. Stored under separate keys from the manual
@@ -60,23 +60,23 @@ export class MediaSettings {
   // ICE agent gathers relay candidates from every configured server). Written
   // by the Settings panel's auto-provisioning; read live here.
   get cfTurnUrl(): string {
-    return this.b.storage.getItem('cfTurnUrl') || '';
+    return this.bindings.storage.getItem('cfTurnUrl') || '';
   }
 
   get cfTurnUsername(): string {
-    return this.b.storage.getItem('cfTurnUsername') || '';
+    return this.bindings.storage.getItem('cfTurnUsername') || '';
   }
 
   get cfTurnCredential(): string {
-    return this.b.storage.getItem('cfTurnCredential') || '';
+    return this.bindings.storage.getItem('cfTurnCredential') || '';
   }
 
   enableTrickleICE() {
-    this.b.storage.setItem('trickleICE', 'true');
+    this.bindings.storage.setItem('trickleICE', 'true');
   }
 
   disableTrickleICE() {
-    this.b.storage.setItem('trickleICE', 'false');
+    this.bindings.storage.setItem('trickleICE', 'false');
   }
 
   get iceConfig(): RTCIceServer[] {
@@ -108,23 +108,23 @@ export class MediaSettings {
   }
 
   async changeVideoInput(deviceId: string) {
-    this.b.logAgentEvent({
-      agent: this.b.myPubKeyB64(),
-      timestamp: this.b.now(),
+    this.bindings.logAgentEvent({
+      agent: this.bindings.myPubKeyB64(),
+      timestamp: this.bindings.now(),
       event: 'ChangeMyVideoInput',
     });
     // CameraSource owns the device-switch path: it stores the new id,
     // opens a new track if a consumer holds the camera, and fires
     // _onCameraTrackChange's device-change branch to replaceTrack on
     // mainStream and on every transport. Mirrors changeAudioInput.
-    await this.b.changeCameraDevice(deviceId);
-    this.b.broadcastRtcAction('change-video-input');
+    await this.bindings.changeCameraDevice(deviceId);
+    this.bindings.broadcastRtcAction('change-video-input');
   }
 
   async changeAudioInput(deviceId: string) {
-    this.b.logAgentEvent({
-      agent: this.b.myPubKeyB64(),
-      timestamp: this.b.now(),
+    this.bindings.logAgentEvent({
+      agent: this.bindings.myPubKeyB64(),
+      timestamp: this.bindings.now(),
       event: 'ChangeMyAudioInput',
     });
     console.log('Changing audio input to: ', deviceId);
@@ -133,12 +133,12 @@ export class MediaSettings {
     // which is what updates mainStream and replaceTracks on all peers.
     // If no consumer currently holds the mic (WebRTC off + voice off), the
     // id is stored and the next acquire picks it up.
-    await this.b.changeMicDevice(deviceId);
-    this.b.broadcastRtcAction('change-audio-input');
+    await this.bindings.changeMicDevice(deviceId);
+    this.bindings.broadcastRtcAction('change-audio-input');
   }
 
   async updateMediaDevices() {
-    const mediaDevices = await this.b.mediaDevices.enumerateDevices();
+    const mediaDevices = await this.bindings.mediaDevices.enumerateDevices();
     this.mediaDevices.set(mediaDevices);
   }
 

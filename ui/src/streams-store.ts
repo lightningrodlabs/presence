@@ -3726,11 +3726,7 @@ export class StreamsStore {
     return this.diagnosticsHub._failedDiagnosticRequests;
   }
 
-  /**
-   * Clear cached diagnostic results so the request button returns to its
-   * default requestable colour. Called after the merged log is downloaded
-   * (results consumed). With no argument, clears every peer.
-   */
+  /** Delegates to `diagnosticsHub`. */
   clearReceivedDiagnostics(pubKeyB64?: AgentPubKeyB64): void {
     this.diagnosticsHub.clearReceivedDiagnostics(pubKeyB64);
   }
@@ -5003,7 +4999,6 @@ export class StreamsStore {
   exportMergedLogsAll(): object {
     return this.diagnosticsHub.exportMergedLogsAll();
   }
-
 
   /**
    * Bucket RTT, loss, and jitter into coarse human-scale bands. The goal
