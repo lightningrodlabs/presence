@@ -106,8 +106,8 @@ function message(
   return { type: 'Message', from_agent: from, msg_type: msgType, payload };
 }
 
-/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds
- *  `_signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
+/** A PongUi from `from` echoing a pingT0 `rttMs` in the past — seeds the
+ *  peer record's `signalsRttEwma` at the raw RTT on the first sample (`foldSignalsRtt`,
  *  first-sample-seeds-raw). Carries `moduleStatesAt` so it doesn't read
  *  as a legacy no-stamp pong (same shape as the Task 7 `pongEchoing`
  *  fixture in the cadence describe below). */
@@ -424,7 +424,7 @@ describe('slot lifecycle applied from transport events (the exit criterion)', ()
     expect(get(store._screenShareConnectionsOutgoing)[peerA]).toBeUndefined();
   });
 
-  it('screen-share (viewer side): install → connected fires the event → remote stream wires _screenShareStreams → failed clears both (review F1)', () => {
+  it('screen-share (viewer side): install → connected fires the event → remote stream wires screenShareStream → failed clears both (review F1)', () => {
     const { store, transports, events } = makeStarted();
     const inc = transports['screen-share-in']!;
 
@@ -440,7 +440,7 @@ describe('slot lifecycle applied from transport events (the exit criterion)', ()
     expect(get(store._screenShareConnectionsIncoming)[peerA].connected).toBe(true);
     expect(events.some(e => e.type === 'peer-screen-share-connected')).toBe(true);
 
-    // The viewer's stream mirror (`_screenShareStreams`, the unscheduled
+    // The viewer's stream mirror (`screenShareStream`, the unscheduled
     // -table row Phase 3 wired) is set on remote-stream…
     const fakeStream = {
       getTracks: () => [],
@@ -453,14 +453,14 @@ describe('slot lifecycle applied from transport events (the exit criterion)', ()
       connectionId: 'sv-1',
       stream: fakeStream,
     });
-    expect(store._screenShareStreams[peerA]).toBe(fakeStream);
+    expect(store._peerRecord(peerA)?.screenShareStream).toBe(fakeStream);
     expect(get(store._screenShareConnectionsIncoming)[peerA].video).toBe(true);
 
     // …and dies with the connection, so paint-restore cannot resurrect
     // a dead share.
     inc.emitPhase(peerA, 'sv-1', 'failed', 'connected');
     expect(get(store._screenShareConnectionsIncoming)[peerA]).toBeUndefined();
-    expect(store._screenShareStreams[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.screenShareStream).toBeUndefined();
     expect(events.some(e => e.type === 'peer-screen-share-disconnected')).toBe(true);
   });
 
@@ -508,8 +508,8 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
 
     media.emitPhase(peerA, 'conn-1', 'signaling');
     media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
-    store._pendingInits[peerA] = [{ connectionId: 'conn-1', t0: clock.now() }];
-    store._iceDisconnectedAt[peerA] = clock.now() - 1000;
+    store._ensurePeerRecord(peerA).pendingInits = [{ connectionId: 'conn-1', t0: clock.now() }];
+    store._ensurePeerRecord(peerA).iceDisconnectedAt = clock.now() - 1000;
 
     media.emit({
       type: 'error',
@@ -531,9 +531,9 @@ describe('the error path is forensic-only (Round 3 item 1 as amended by review F
       connected: true,
     });
     expect(media.closeCalls).toHaveLength(0);
-    expect(store._pendingInits[peerA]).toHaveLength(1);
-    expect(store._iceDisconnectedAt[peerA]).toBeDefined();
-    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.pendingInits).toHaveLength(1);
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeDefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeUndefined();
     expect(events.filter(e => e.type === 'peer-disconnected')).toHaveLength(0);
     expect(
       logger
@@ -1067,21 +1067,19 @@ describe('the manual clock drives the ambient cadences through start()', () => {
   it('pingAgents stamps t0 from the store clock and sweeps pending inits after PENDING_HANDSHAKE_TTL_MS', async () => {
     const { store, clock, bus } = makeStarted();
     store._knownAgents.set(knownFresh(clock, peerA));
-    store._pendingInits = {
-      [peerA]: [{ connectionId: 'stale-init', t0: clock.now() }],
-    };
+    store._ensurePeerRecord(peerA).pendingInits = [{ connectionId: 'stale-init', t0: clock.now() }];
 
     await store.pingAgents();
     const pings = bus.sentOfType('PingUi');
     expect(pings).toHaveLength(1);
     expect(JSON.parse(pings[0].payload!).t0).toBe(clock.now());
     // Inside the TTL: the reservation survives.
-    expect(store._pendingInits[peerA]).toHaveLength(1);
+    expect(store._peerRecord(peerA)?.pendingInits).toHaveLength(1);
 
     clock.advance(20_001);
     await store.pingAgents();
     // Past the TTL: swept by the pure prune through the real call site.
-    expect(store._pendingInits[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.pendingInits).toBeUndefined();
   });
 
   it('holds a peer through a signal-carrier outage, then drops it past PRESENCE_CARRIER_HOLD_MAX_MS, with no peer-left-presence during the hold (Task 8)', async () => {
@@ -1692,7 +1690,7 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
 describe('InitAccept lifecycle (§9 item 5)', () => {
   /** Seed a pending init and deliver the matching video InitAccept. */
   async function acceptVideo(started: Started, connectionId: string) {
-    started.store._pendingInits[peerA] = [
+    started.store._ensurePeerRecord(peerA).pendingInits = [
       { connectionId, t0: started.clock.now() },
     ];
     await started.bus.deliver(
@@ -1793,13 +1791,13 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
 
     media.emitPhase(peerA, 'conn-1', 'signaling');
     media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
-    store._lastReconcileTime[peerA] = clock.now();
+    store._ensurePeerRecord(peerA).lastReconcileTime = clock.now();
 
     // A close STAMPS the cooldown and leaves the throttle alone — the
     // retry-gap semantics, unchanged.
     media.emitPhase(peerA, 'conn-1', 'failed', 'connected');
-    expect(store._lastDisconnectTime[peerA]).toBeDefined();
-    expect(store._lastReconcileTime[peerA]).toBeDefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeDefined();
+    expect(store._peerRecord(peerA)?.lastReconcileTime).toBeDefined();
 
     // The peer LEAVES mid-connection: the leave row's deletes must win
     // even though the nested close (transport closes first) re-stamps
@@ -1807,23 +1805,23 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     media.emitPhase(peerA, 'conn-2', 'signaling');
     media.emitPhase(peerA, 'conn-2', 'connected', 'connecting');
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
-    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
-    expect(store._lastReconcileTime[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastReconcileTime).toBeUndefined();
 
     // And the no-slot leave clears them too (the clears are
     // unconditional per leave, as they always were on this path).
-    store._lastDisconnectTime[peerA] = clock.now();
-    store._lastReconcileTime[peerA] = clock.now();
+    store._ensurePeerRecord(peerA).lastDisconnectTime = clock.now();
+    store._ensurePeerRecord(peerA).lastReconcileTime = clock.now();
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
-    expect(store._lastDisconnectTime[peerA]).toBeUndefined();
-    expect(store._lastReconcileTime[peerA]).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeUndefined();
+    expect(store._peerRecord(peerA)?.lastReconcileTime).toBeUndefined();
   });
 
   it('an elevated signals RTT: the FSM override sits at the raised 30s ceiling, and the tracked backstop is 2x that (review C1) (Task 9)', async () => {
     const started = makeStarted();
     const { store, clock, bus, transports } = started;
     const media = transports.media!;
-    // Seed _signalsRttEwma[peerA] = 2_000ms before the InitAccept arrives.
+    // Seed peerA's signalsRttEwma = 2_000ms before the InitAccept arrives.
     await bus.deliver(pongEchoingRtt(peerAKey, clock, 2_000));
 
     await acceptVideo(started, 'init-1');
@@ -1849,7 +1847,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     const started = makeStarted();
     const { store, clock, bus, transports } = started;
     const media = transports.media!;
-    // Seed _signalsRttEwma[peerA] = 400ms: 20 * 400 = 8_000, well under
+    // Seed peerA's signalsRttEwma = 400ms: 20 * 400 = 8_000, well under
     // both the old and new ceiling.
     await bus.deliver(pongEchoingRtt(peerAKey, clock, 400));
 
@@ -2528,7 +2526,8 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     expect(store.signalsCadence().mode).toBe('paused');
 
     // The peer LEAVES: the media peer-leave cleanup row deletes their
-    // _signalsRttEwma entry (closeCleanupPlan clearSignalsRttEwma).
+    // signalsRttEwma entry (closeCleanupPlan recordReset:
+    // 'media-leave-residue', via resetPeerRecord).
     await bus.deliver(message(peerAKey, 'LeaveUi', ''));
 
     // They rejoin ping-fresh. With no sample, the very next evaluation is

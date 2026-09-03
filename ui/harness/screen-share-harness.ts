@@ -9,7 +9,7 @@
  * fire-and-forget semantics, in the production `SdpFsmScreen` wire
  * envelope — produced and parsed by the store's own glue
  * (`start()`'s onOutgoingSignal wrap / `handleSdpFsmScreen`), not by this
- * file. Slot writes, role routing, the `_screenShareStreams` mirror, and
+ * file. Slot writes, role routing, the `_peerRecords` screenShareStream mirror, and
  * outgoing-share initiation (`_ensureOutgoingScreenShare` off the real
  * ping/pong cycle) are all store code. The Phase 3.5 mirror of that glue
  * is DELETED per one-authority (working agreement 1).
@@ -84,7 +84,7 @@ type HarnessState = {
   peerPresent: boolean;
   out: { phase: ConnectionPhase | 'none'; slot: Slot | null };
   in: { phase: ConnectionPhase | 'none'; slot: Slot | null };
-  /** The store's real `_screenShareStreams` mirror, video-track counts. */
+  /** The store's real `_peerRecords` screenShareStream mirror, video-track counts. */
   streams: Record<string, { video: number }>;
   /** Observe-only tallies. toIn/toOut count arriving envelopes by their
    *  raw `dir` tag (the store does the actual routing); `dropped` counts
@@ -265,9 +265,7 @@ function start(): void {
   // standing in for a sharer that re-initiates WITHIN a session, which is
   // what drives the manager's supersede route on the viewer.
   if (EPOCH0 > 0) {
-    (store as unknown as { _connectionEpoch: Record<string, number> })._connectionEpoch[
-      PEER_B64
-    ] = EPOCH0;
+    store._ensurePeerRecord(PEER_B64).connectionEpoch = EPOCH0;
   }
 
   // static connect's glue, reproduced: roster + ping cadence. The
@@ -343,7 +341,7 @@ function injectIncoming(dir: unknown): void {
 }
 
 function state(): HarnessState {
-  const stream = store?._screenShareStreams[PEER_B64];
+  const stream = store?._peerRecord(PEER_B64)?.screenShareStream;
   return {
     me: ME,
     peer: PEER,

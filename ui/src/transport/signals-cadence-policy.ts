@@ -28,7 +28,7 @@ export type SignalsMediaCadence =
 
 export function decideSignalsMediaCadence(inputs: {
   carrierDown: boolean;
-  /** Min of `_signalsRttEwma` across current signals targets. */
+  /** Min of the peer records' `signalsRttEwma` across current signals targets. */
   bestRttEwmaMs: number | undefined;
   prevMode: SignalsMediaCadence['mode'];
 }): SignalsMediaCadence {

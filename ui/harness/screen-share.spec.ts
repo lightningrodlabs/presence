@@ -17,7 +17,7 @@
  *      builds the viewer's FSM lazily (the first incoming-side event
  *      INSTALLS the real slot — there is no reservation to check anymore)
  *      and a real captured video track arrives, wiring the store's
- *      `_screenShareStreams` mirror.
+ *      `_peerRecords` screenShareStream mirror.
  *   2. Role-routing under MUTUAL share: A→B and B→A are two independent
  *      connections on two transport pairs, kept apart by the sender's
  *      `dir` tag — connectionId cannot do it (each side allocates its

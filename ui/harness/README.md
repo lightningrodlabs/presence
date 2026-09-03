@@ -27,8 +27,8 @@ reproduce. The rigs living here:
   real `canvas.captureStream` video track. Asserts lazy viewer-side
   establishment (no reservation handshake), role-routing under mutual
   share with zero drops, the malformed-`dir` drop path
-  (`decideScreenSignalRoute`, executed not mirrored), and slot +
-  `_screenShareStreams` teardown on a silent peer drop through the
+  (`decideScreenSignalRoute`, executed not mirrored), and slot + the peer
+  record's `screenShareStream` teardown on a silent peer drop through the
   production recovery phases. Also in the nightly gate.
 - **Layout** (below) — NOT in any gate yet: its split-mode baseline is red
   by design; it joins the nightly gate when split-mode is unified onto the
