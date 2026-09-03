@@ -2,7 +2,7 @@
  * ScreenShareLinks — owner of the two screen-share FSM transports (out =
  * sharer, in = viewer) and their signal/event wiring (store-decomposition
  * round two, Task 5; see
- * docs/superpowers/sdd/2026-09-03-owner-extraction). Owns the three
+ * docs/superpowers/specs/2026-09-03-owner-extraction-design.md). Owns the three
  * screen-share `Writable`s, the transport event subscription, the
  * connected/closed/remote-stream/remote-track/ice-diagnostic/error
  * handlers, outgoing-share establishment, the `SdpFsmScreen` signal
