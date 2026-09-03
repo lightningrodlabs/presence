@@ -801,17 +801,7 @@ export class StreamsStore {
       onTrackChange: (newTrack, oldTrack) => {
         this._onMicTrackChange(newTrack, oldTrack);
       },
-      onMutedChange: muted => {
-        // Fan the mute state out to cloned streams (simple-peer issue #606).
-        // The primary track's `enabled` flag is flipped inside MicSource;
-        // only the clones need to be touched here.
-        this.mainStreamClones.forEach(clonedStream => {
-          clonedStream.getAudioTracks().forEach(track => {
-            // eslint-disable-next-line no-param-reassign
-            track.enabled = !muted;
-          });
-        });
-      },
+      onMutedChange: () => {},
       // Nothing consumes mic lifecycle yet — Task 3's reconciler reads
       // `micSource.lifecycle` directly on the presence tick rather than
       // subscribing here. Wire this if a push-driven consumer arrives.
@@ -1988,19 +1978,17 @@ export class StreamsStore {
   /**
    * Handles MicSource track lifecycle events. Branches on the (new, old)
    * pair because opening, replacing, and closing all have different
-   * implications for `mainStream`, `mainStreamClones`, and peer fanout.
+   * implications for `mainStream` and peer fanout.
    *
    *   - open         (newTrack, null)   : lazily create mainStream if needed,
    *                                       add the track, addTrack on peers.
    *   - device-change (newTrack, oldTrack): removeTrack/addTrack on
    *                                       mainStream, replaceTrack on peers.
-   *                                       mainStreamClones are intentionally
-   *                                       left alone here — device-change
-   *                                       during an active reconnection path
-   *                                       is a latent bug that predates this
-   *                                       refactor; don't introduce new
-   *                                       regressions while fixing the
-   *                                       normal path.
+   *                                       Device-change during an active
+   *                                       reconnection path is a latent bug
+   *                                       that predates this refactor; don't
+   *                                       introduce new regressions while
+   *                                       fixing the normal path.
    *   - close         (null, oldTrack)  : removeTrack from mainStream, remove
    *                                       from peers.
    */
@@ -2944,12 +2932,9 @@ export class StreamsStore {
       event: 'MyAudioOff',
     });
 
-    // Mute via MicSource. This flips track.enabled on the primary track and
-    // fires the onMutedChange binding, which fans the flag out to every
-    // mainStreamClones entry — matching the old behavior without any
-    // per-stream track iteration here. We intentionally do NOT release the
-    // WebRTC mic handle: the track stays alive for fast re-enable without
-    // WebRTC renegotiation.
+    // Mute via MicSource. This flips track.enabled on the primary track.
+    // We intentionally do NOT release the WebRTC mic handle: the track
+    // stays alive for fast re-enable without WebRTC renegotiation.
     this.micSource.setMuted(true);
 
     // Propagate mute state to the conversation module so peers' icon
@@ -3182,13 +3167,6 @@ export class StreamsStore {
    * Our own video/audio stream
    */
   mainStream: MediaStream | undefined | null;
-
-  /**
-   * Clones of the main stream. These are required in case a reconnection needs to be made for
-   * an individual peer because our audio and/or video track is non-functional from their
-   * perspective
-   */
-  mainStreamClones: MediaStream[] = [];
 
   /**
    * Black-frame video track used as a NAT-keepalive replacement for the
