@@ -5,6 +5,13 @@ Written 2026-09-02, brainstormed from
 pre-plan brief for the store-decomposition effort). This is round one of
 that effort: consolidate per-peer state; extract nothing.
 
+**Landed** 2026-09-02/03 on branch `peer-record-consolidation`, built on
+`main-0.7` — a user decision (2026-09-02) superseding the handoff brief's
+0.6-first practice. The handoff doc
+(`docs/superpowers/plans/2026-09-02-store-decomposition-handoff.md`) lives
+on `main-0.6`; it gets its status note as a post-merge step from a
+`main-0.6` checkout once this round reaches that branch.
+
 ## Problem
 
 `ui/src/streams-store.ts` (7,013 lines at 2026-09-02, `main-0.6` @
@@ -199,23 +206,24 @@ Fold tasks (1–3) each fold a group, rewrite its access sites, and
 delete the folded collections in the same commit; every task ends
 `verify` green.
 
-1. **Scaffold + numeric bookkeeping** — `peer-record.ts` (type +
+1. **Landed** (`402b8ba`). **Scaffold + numeric bookkeeping** — `peer-record.ts` (type +
    `initialPeerRecord`), the map + helpers; fold `_iceDisconnectedAt`,
    `_reconcileAttemptCount`, `_staleCycles`, `_lastBytesReceived`,
    `_lastQualityBucket`, `_lastWebrtcExitReason`.
-2. **Streams + establishment** — fold `_videoStreams`,
+2. **Landed** (`7b641b8`, fixup `f49e5c1`). **Streams + establishment** — fold `_videoStreams`,
    `_screenShareStreams`, `_screenShareIceDisconnectedAt`,
    `_pendingInits`, `_sdpTimeoutTimers`.
-3. **Objects + survivors** — fold `_peerAnalysers` +
+3. **Landed** (`6cb7ed4`). **Objects + survivors** — fold `_peerAnalysers` +
    `_peerAnalyserBuffers` (merged), `_outageStates`, then
    `_lastDisconnectTime`, `_lastReconcileTime`, `_signalsRttEwma`,
    `_connectionEpoch`.
-4. **Lifecycle collapse** — `resetPeerRecord` + table tests;
+4. **Landed** (`cd6d50e`). **Lifecycle collapse** — `resetPeerRecord` + table tests;
    `closeCleanupPlan` booleans → `recordReset` arms;
    `_applyCloseCleanup` executor rewrite; `close-cleanup-policy.test.ts`
    updated row-for-row. Until this task, fold tasks keep the existing
    plan booleans, re-pointing their executor clears at record fields.
-5. **Doc-sync** — CLAUDE.md "True today" bullet, handoff/plan status,
+5. **Landed** (`d516fbe` review-cleanup rider, plus this doc-sync commit).
+   **Doc-sync** — CLAUDE.md "True today" bullet, handoff/plan status,
    and the written next steps (below).
 
 Process: `superpowers:writing-plans` produces the implementation plan;

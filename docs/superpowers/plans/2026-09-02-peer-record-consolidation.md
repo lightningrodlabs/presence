@@ -30,6 +30,8 @@
 
 ### Task 1: Scaffold + numeric bookkeeping fold
 
+**Landed:** commit `402b8ba` on `peer-record-consolidation`.
+
 **Files:**
 - Create: `ui/src/peer-record.ts`
 - Create: `ui/src/__tests__/peer-record.test.ts`
@@ -226,6 +228,8 @@ No behavior change."
 
 ### Task 2: Streams + establishment fold
 
+**Landed:** commit `7b641b8` on `peer-record-consolidation` (fixup `f49e5c1`).
+
 **Files:**
 - Modify: `ui/src/peer-record.ts` (add `prunePendingInits`)
 - Modify: `ui/src/streams-store.ts`
@@ -356,6 +360,8 @@ disconnect() wipes exactly the three fields it wiped before. No behavior change.
 
 ### Task 3: Objects + survivors fold
 
+**Landed:** commit `6cb7ed4` on `peer-record-consolidation`.
+
 **Files:**
 - Modify: `ui/src/streams-store.ts`
 - Modify: `ui/src/__tests__/streams-store-wiring.test.ts`
@@ -447,6 +453,8 @@ behavior change."
 ---
 
 ### Task 4: Lifecycle collapse — `resetPeerRecord` + `closeCleanupPlan` rewrite
+
+**Landed:** commit `cd6d50e` on `peer-record-consolidation`.
 
 **Files:**
 - Modify: `ui/src/peer-record.ts` (add `PeerRecordResetArm`, `resetPeerRecord`)
@@ -640,6 +648,8 @@ ordering, and events. Strict-fidelity row mapping. No behavior change."
 
 ### Task 5: Doc-sync
 
+**Landed:** this commit, on `peer-record-consolidation` (review-cleanup rider `d516fbe` landed first as a sanctioned separate commit).
+
 **Files:**
 - Modify: `CLAUDE.md` (repo root, this branch)
 - Modify: `docs/superpowers/specs/2026-09-02-peer-record-consolidation-design.md`
@@ -647,23 +657,23 @@ ordering, and events. Strict-fidelity row mapping. No behavior change."
 
 **Interfaces:** none — prose only.
 
-- [ ] **Step 1: Add the round's fact bullet to CLAUDE.md's "True today" section**
+- [x] **Step 1: Add the round's fact bullet to CLAUDE.md's "True today" section**
 
-Follow the existing bullets' contract exactly: anchor to the merge date, name enforcing files/tests for present-tense claims, no counters, no unanchored negations. Content to record: `ui/src/peer-record.ts` is the one per-peer state record (`PeerRecord`, `Map` on `StreamsStore._peerRecords`); the 17 folded collections are deleted; `resetPeerRecord` is the one teardown-survivor authority (pinned by `ui/src/__tests__/peer-record.test.ts`); `closeCleanupPlan` names arms, not field clears; record existence is never a liveness predicate (documented on the field); `connectionEpoch` monotonic-per-session semantics unchanged; zero declared behavior changes.
+Follow the existing bullets' contract exactly: anchor to the merge date, name enforcing files/tests for present-tense claims, no counters, no unanchored negations. Content to record: `ui/src/peer-record.ts` is the one per-peer state record (`PeerRecord`, `Map` on `StreamsStore._peerRecords`); the 17 folded collections are deleted; `resetPeerRecord` is the one teardown-survivor authority (pinned by `ui/src/__tests__/peer-record.test.ts`); `closeCleanupPlan` names arms, not field clears; record existence is never a liveness predicate (documented on the field); `connectionEpoch` monotonic-per-session semantics unchanged; zero declared behavior changes. (Landed count verified by grep against the pre-fold declarations at `b300371`: eighteen collections deleted, folding into the type's seventeen fields — the CLAUDE.md bullet records the verified eighteen, not the plan's original "~17" estimate.)
 
-- [ ] **Step 2: Mark the spec's task plan landed**
+- [x] **Step 2: Mark the spec's task plan landed**
 
 Add "landed" markers per task (working agreement 3 — a design doc marks each item landed once it ships). Record in the spec's "Next steps" that they remain open: round two (concern extraction), optional forensic fold, reactive unification.
 
-- [ ] **Step 3: Note the branch-line decision**
+- [x] **Step 3: Note the branch-line decision**
 
 In the spec header: the round was built on `main-0.7` (user decision 2026-09-02, superseding the handoff's 0.6-first practice); the handoff doc `docs/superpowers/plans/2026-09-02-store-decomposition-handoff.md` lives on `main-0.6` and gets its status note when this round merges (post-merge step, main checkout).
 
-- [ ] **Step 4: Run the drift guard + full gate**
+- [x] **Step 4: Run the drift guard + full gate**
 
 `nix develop -c npm run test -w ui -- src/__tests__/claude-md-drift.test.ts`, then `nix develop -c npm run verify`. Green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add CLAUDE.md docs/superpowers/specs/2026-09-02-peer-record-consolidation-design.md docs/superpowers/plans/2026-09-02-peer-record-consolidation.md
