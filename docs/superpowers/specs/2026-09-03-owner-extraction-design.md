@@ -72,6 +72,18 @@ verifies exact ranges).
 (The name `screen-share-links.ts` avoids colliding with
 `ui/src/room/modules/screen-share.ts`.)
 
+**Amendment (2026-09-03, plan-writing verification):** the gesture entry
+points `screenShareOn`, `screenShareOff`, and `stopScreenShare` STAY on
+`StreamsStore` — `ui/src/__tests__/intent-write-sites.test.ts` pins
+`_applyIntent` as store-only-writer and greps `streams-store.ts` for the
+gesture-method headers (exact signatures) whose bodies must contain the
+`_applyIntent` calls, including `screenShareOn`'s `track.onended`
+gesture-equivalent. The owner therefore takes the connection/status/
+routing mechanics (transport handlers, ensure/close, status bookkeeping,
+`handleSdpFsmScreen`, the three screen-share `Writable`s); the store's
+gesture methods keep intent writes + acquisition and call the owner for
+connection work. Moved-line estimate drops to roughly 400.
+
 ## What deliberately does not move (round three by name)
 
 - `handlePongUi`'s five embedded fragments (signals-RTT fold, module
@@ -110,6 +122,11 @@ controller, not deleted on an implementer's own judgment.
 - New tests only where a move creates a genuinely new seam: at most a
   small construction test per owner. No speculative suites — the
   wiring net stays the authority (round-one precedent).
+- Each owner file joins `no-ambient-clock.test.ts`'s `PINNED_FILES`
+  with `FULL_PATTERNS` (owners take the clock injected, like
+  `capture-reconciler.ts`). `event-taxonomy.test.ts` walks the whole
+  source tree, so moved emission sites stay covered — keep them as
+  literals on `event:` lines through the move.
 - **Per-task repo-wide reference grep** (round-one lesson): every task
   ends with a grep proving the moved method/field names have no stale
   references outside the owner and its delegation points — `ui/harness`
