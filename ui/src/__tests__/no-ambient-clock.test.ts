@@ -111,6 +111,11 @@ const PINNED_FILES: Array<{
   // reconcile cooldown and every peer-record timestamp write route
   // through the `now` binding, late-bound onto the clock.
   { relPath: '../track-health.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 5 (ScreenShareLinks): the ICE-
+  // diagnostic timestamp and every Superseded/SupersededError/FsmError
+  // event stamp route through the `now` binding, late-bound onto the
+  // clock.
+  { relPath: '../screen-share-links.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {

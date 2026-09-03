@@ -42,15 +42,13 @@ import {
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
-import { closeCleanupPlan } from './transport/close-cleanup-policy';
+import { closeCleanupPlan, closeGuardOutcome } from './transport/close-cleanup-policy';
 import type {
   CloseCleanupContext,
-  CloseCleanupOutcome,
   CloseCleanupPlan,
 } from './transport/close-cleanup-policy';
 import { decideInitRetry } from './transport/init-retry-policy';
 import { decideModuleStateMerge } from './module-state-policy';
-import { decideScreenSignalRoute } from './transport/screen-signal-policy';
 import {
   derived,
   get,
@@ -85,7 +83,6 @@ import {
 } from './room/modules/conversation';
 import {
   CAP_SDP_FSM,
-  CAP_SDP_FSM_SCREEN,
   CAP_VOICE_BATCH,
   isSignalMsgType,
 } from './transport/wire-contract';
@@ -99,6 +96,7 @@ import { PeerAudioLevels } from './peer-audio-levels';
 import { MediaSettings } from './media-settings';
 import { DiagnosticsHub } from './diagnostics-hub';
 import { TrackHealthMonitor } from './track-health';
+import { ScreenShareLinks } from './screen-share-links';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -219,22 +217,6 @@ const INIT_RETRY_THRESHOLD = 5000;
  * pendingInits grew unboundedly against an unresponsive peer.)
  */
 const PENDING_HANDSHAKE_TTL_MS = 20000;
-
-/**
- * Map a `closed` `decideSlotWrite` result onto the cleanup table's
- * outcome axis. Only the guard outcomes a `closed` event can produce
- * appear here; `install`/`replace`/`set-connected` belong to other event
- * kinds and reaching this with one is a programming error. (The log-only
- * error handlers use `attributeSlotEvent` directly — they perform no
- * slot write and never consult the cleanup table.)
- */
-function closeGuardOutcome(
-  write: ReturnType<typeof decideSlotWrite>,
-): CloseCleanupOutcome {
-  if (write.write === 'clear') return 'live';
-  if (write.write === 'none' && write.reason === 'superseded') return 'superseded';
-  return 'no-slot';
-}
 
 /**
  * A store that handles the creation and management of WebRTC streams with
@@ -495,6 +477,15 @@ export class StreamsStore {
    *  the store — it is a shared teardown bridge, not track-health-only. */
   trackHealth!: TrackHealthMonitor;
 
+  /** The ONE owner of the two screen-share FSM transports and their
+   *  signal/event wiring (store-decomposition round two, Task 5; see
+   *  screen-share-links.ts). Constructed in the constructor body, not as
+   *  a field initializer, for the same reason as the other owners above.
+   *  `screenShareOn`/`screenShareOff`/`stopScreenShare` stay on the store
+   *  (pinned by `intent-write-sites.test.ts`); `_applyCloseCleanup` stays
+   *  too, as the shared teardown bridge. */
+  screenShareLinks!: ScreenShareLinks;
+
   /**
    * WebRTC transports. Three instances by purpose:
    *  - mediaTransport: bidirectional mic+camera (one connection per peer).
@@ -506,7 +497,8 @@ export class StreamsStore {
    * screen-share transports signal over 'SdpFsmScreen'. Because the FSM
    * allocates its own connectionId per side, incoming screen signals are
    * routed by the sender's declared role (`dir: 'sharer' | 'viewer'`),
-   * not by connectionId — see `handleSdpFsmScreen`.
+   * not by connectionId — see
+   * `screen-share-links.ts:ScreenShareLinks.handleSdpFsmScreen`.
    */
   // Typed as the interface, not the implementation (Phase 4 item 3 made
   // `PeerTransport` a real annotation): the store can only use the
@@ -638,6 +630,23 @@ export class StreamsStore {
       webrtcStats: this.webrtcStats,
       logger: this.logger,
       now: () => this.clock.now(),
+    });
+    this.screenShareLinks = new ScreenShareLinks({
+      outTransport: () => this.screenShareOutTransport,
+      inTransport: () => this.screenShareInTransport,
+      applyCloseCleanup: (ctx, plan, pubKeyB64, connectionId, closeReason) =>
+        this._applyCloseCleanup(ctx, plan, pubKeyB64, connectionId, closeReason),
+      computeSdpTimeout: peerB64 => this._computeSdpTimeout(peerB64),
+      nextConnectionEpoch: peer => this._nextConnectionEpoch(peer),
+      peerCaps: peerB64 => this._peerCaps(peerB64),
+      peerRecord: k => this._peerRecord(k),
+      ensurePeerRecord: k => this._ensurePeerRecord(k),
+      logSdpDataEvent: (agent, connectionId, sdpType) =>
+        this._logSdpDataEvent(agent, connectionId, sdpType),
+      eventCallback: e => this.eventCallback(e),
+      logger: this.logger,
+      now: () => this.clock.now(),
+      screenShareStream: () => this.screenShareStream,
     });
 
     // Construction ends here: fields and derived stores only, no
@@ -779,8 +788,8 @@ export class StreamsStore {
 
     // Subscribe transport events to the application-level handlers.
     this._subscribeMediaTransport();
-    this._subscribeScreenShareTransport(this.screenShareOutTransport, true);
-    this._subscribeScreenShareTransport(this.screenShareInTransport, false);
+    this.screenShareLinks.subscribe(this.screenShareOutTransport, true);
+    this.screenShareLinks.subscribe(this.screenShareInTransport, false);
 
     this.deps.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
@@ -1069,92 +1078,6 @@ export class StreamsStore {
     return [this.mediaTransport];
   }
 
-  private _subscribeScreenShareTransport(
-    transport: PeerTransport,
-    initiator: boolean,
-  ): void {
-    transport.onAny((event: TransportEvent) => {
-      switch (event.type) {
-        case 'connection-state-change': {
-          // Same authority as the media path: `routeTransportPhase` is
-          // exhaustive over ConnectionPhase, so `failed` clears the slot
-          // and `reconnecting`/`disconnected` defer to the FSM's own
-          // recovery instead of tearing the share down.
-          const route = routeTransportPhase({
-            phase: event.phase,
-            connectionId: event.connectionId,
-            openConnectionId:
-              get(this._screenShareStore(initiator))[event.peer]?.connectionId,
-          });
-          switch (route.handler) {
-            case 'signaling': {
-              const slotWrite = decideSlotWrite(
-                { kind: 'signaling', slot: route.slot },
-                event.connectionId,
-                get(this._screenShareStore(initiator))[event.peer],
-              );
-              if (slotWrite.write === 'install' || slotWrite.write === 'replace') {
-                if (slotWrite.write === 'replace') {
-                  // The FSM behind the slot was replaced in place
-                  // (higher-epoch offer / new remote session) with no
-                  // close event — adopt the live connectionId, exactly
-                  // like the media path.
-                  this.logger.logAgentEvent({
-                    agent: event.peer,
-                    timestamp: this.clock.now(),
-                    event: 'Superseded',
-                    connectionId: slotWrite.supersedes,
-                    detail: `superseded-by=${event.connectionId}; path=screen-transport-replace`,
-                  });
-                }
-                this._screenShareStore(initiator).update(currentValue => {
-                  currentValue[event.peer] = {
-                    ...slotWrite.slot,
-                    video: initiator,
-                    audio: false,
-                    direction: initiator ? 'outgoing' : 'incoming',
-                  };
-                  return currentValue;
-                });
-                this.updateScreenShareConnectionStatus(event.peer, {
-                  type: 'SdpExchange',
-                });
-              }
-              break;
-            }
-            case 'media-connected':
-              this._handleScreenShareConnected(event.peer, event.connectionId, initiator);
-              break;
-            case 'media-closed':
-              this._handleScreenShareClosed(event.peer, event.connectionId, initiator);
-              break;
-            case 'ignore':
-              break;
-          }
-          break;
-        }
-        case 'remote-stream':
-          this._handleScreenShareRemoteStream(event.peer, event.connectionId, event.stream);
-          break;
-        case 'remote-track':
-          this._handleScreenShareRemoteTrack(event.peer, event.connectionId, event.track);
-          break;
-        case 'ice-diagnostic':
-          // Outgoing side only: the stale-cleanup grace bookkeeping (the
-          // net itself stands down while the FSM owns recovery, but the
-          // timestamps keep the forensic story readable). The viewer side
-          // has no stale supervisor and needs nothing here.
-          if (initiator) {
-            this._handleScreenShareIceDiagnostic(event.peer, event.diag);
-          }
-          break;
-        case 'error':
-          this._handleScreenShareError(event.peer, event.connectionId, event.error, initiator);
-          break;
-      }
-    });
-  }
-
   // --- media transport event handlers ---
 
   /**
@@ -1325,26 +1248,6 @@ export class StreamsStore {
       connectionId,
       detail: `impl=${t.impl} ice=${ice} gather=${gather} elapsed=${elapsed} relay=${t.relay ?? 'unknown'} finalIceState=${t.finalIceState ?? 'none'}`,
     });
-  }
-
-  /**
-   * `ice-diagnostic` bookkeeping for the outgoing screen-share transport:
-   * maintains the invariant on `screenShareIceDisconnectedAt` — an entry
-   * exists iff the share's iceState is currently 'disconnected' — which
-   * the stale-connection net reads for its grace window. No log lines:
-   * the media transport is the forensic subject; the share only needs
-   * the timestamps.
-   */
-  private _handleScreenShareIceDiagnostic(
-    pubKeyB64: AgentPubKeyB64,
-    diag: import('./transport').IceDiagnostic,
-  ): void {
-    if (diag.kind !== 'ice-state') return;
-    if (diag.state === 'disconnected') {
-      this._ensurePeerRecord(pubKeyB64).screenShareIceDisconnectedAt = this.clock.now();
-    } else {
-      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareIceDisconnectedAt = undefined; }
-    }
   }
 
   /** DTLS-stall watchdog timeout (ms) for the FSM transport. Defaults to a
@@ -1682,7 +1585,7 @@ export class StreamsStore {
     if (plan.setDisconnectedStatus === 'media') {
       this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
     } else if (plan.setDisconnectedStatus === 'screen-share') {
-      this.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Disconnected' });
+      this.screenShareLinks.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Disconnected' });
     }
     if (plan.fireEvent === 'peer-disconnected') {
       this.eventCallback({
@@ -1959,185 +1862,6 @@ export class StreamsStore {
       event: 'FsmError',
       connectionId,
       detail: `${error.message || String(error)}; slot=${attribution.outcome}`,
-    });
-  }
-
-  // --- screen-share transport event handlers ---
-
-  private _screenShareStore(initiator: boolean): Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> {
-    return initiator
-      ? this._screenShareConnectionsOutgoing
-      : this._screenShareConnectionsIncoming;
-  }
-
-  private _handleScreenShareConnected(
-    pubKeyB64: AgentPubKeyB64,
-    _connectionId: string,
-    initiator: boolean,
-  ): void {
-
-    const store = this._screenShareStore(initiator);
-    // Supersede guard, same decision as the media path: a `connected` for
-    // a connectionId that no longer owns the slot must not flip the flag.
-    const write = decideSlotWrite(
-      { kind: 'connected' },
-      _connectionId,
-      get(store)[pubKeyB64],
-    );
-    if (write.write !== 'set-connected') return;
-    store.update(currentValue => {
-      const relevantConnection = currentValue[pubKeyB64];
-      if (relevantConnection) {
-        relevantConnection.connected = true;
-      }
-      return currentValue;
-    });
-
-    // If we are the sharer, ensure the outgoing screen-share stream is
-    // attached. addStream-style auto-attach has already happened for new
-    // connections via setLocalStream, but addTrack-per-track is a safe
-    // no-op fallback when the stream was set after this peer was created.
-    if (initiator && this.screenShareStream) {
-      const conn = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-      if (conn && conn.direction === 'outgoing') {
-        try {
-          for (const track of this.screenShareStream.getTracks()) {
-            this.screenShareOutTransport.addTrack(track, this.screenShareStream);
-          }
-        } catch (_e) {
-          // duplicate tracks are silently ignored
-        }
-      }
-    }
-
-    if (!initiator) {
-      this.eventCallback({
-        type: 'peer-screen-share-connected',
-        pubKeyB64,
-        connectionId: _connectionId,
-      });
-    }
-
-    this.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Connected' });
-  }
-
-  private _handleScreenShareClosed(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    initiator: boolean,
-  ): void {
-
-    // Supersede guard: a stale close from a replaced FSM must not clear
-    // the slot a newer connection owns (decideSlotWrite drops it).
-    const write = decideSlotWrite(
-      { kind: 'closed' },
-      connectionId,
-      get(this._screenShareStore(initiator))[pubKeyB64],
-    );
-    const ctx: CloseCleanupContext = {
-      target: initiator ? 'screen-share-outgoing' : 'screen-share-incoming',
-      via: 'close-event',
-      outcome: closeGuardOutcome(write),
-    };
-    this._applyCloseCleanup(
-      ctx,
-      closeCleanupPlan(ctx),
-      pubKeyB64,
-      connectionId,
-      'close event',
-    );
-  }
-
-  private _handleScreenShareRemoteStream(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    stream: MediaStream,
-  ): void {
-    // Keep the stream reachable for room-view's paint-restore path
-    // (`screenShareStream` was declared for exactly this and written
-    // nowhere — the unscheduled-defects table; wired here by Phase 3).
-    this._ensurePeerRecord(pubKeyB64).screenShareStream = stream;
-    this._screenShareConnectionsIncoming.update(currentValue => {
-      const relevantConnection = currentValue[pubKeyB64];
-      if (relevantConnection) {
-        if (stream.getAudioTracks().length > 0) {
-          relevantConnection.audio = true;
-        }
-        if (stream.getVideoTracks().length > 0) {
-          relevantConnection.video = true;
-        }
-      }
-      return currentValue;
-    });
-
-    this.eventCallback({
-      type: 'peer-screen-share-stream',
-      pubKeyB64,
-      connectionId,
-      stream,
-    });
-  }
-
-  private _handleScreenShareRemoteTrack(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    track: MediaStreamTrack,
-  ): void {
-    this._screenShareConnectionsIncoming.update(currentValue => {
-      const relevantConnection = currentValue[pubKeyB64];
-      if (!relevantConnection) return currentValue;
-      if (track.kind === 'audio' && track.enabled) {
-        relevantConnection.audio = true;
-      }
-      if (track.kind === 'video' && track.enabled) {
-        relevantConnection.video = true;
-      }
-      return currentValue;
-    });
-    this.eventCallback({
-      type: 'peer-screen-share-track',
-      pubKeyB64,
-      connectionId,
-      track,
-    });
-  }
-
-  private _handleScreenShareError(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    error: Error,
-    initiator: boolean,
-  ): void {
-    this.logger.logCustomMessage(
-      `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
-    );
-
-    // FORENSIC-ONLY, like the media error handler above (Round 3 item 1
-    // as amended by review F2): the FSM owns screen-share recovery too,
-    // and its `failed`/`closed` phases drive the teardown rows. The
-    // attribution keeps a stale (replaced) FSM's error from reading as
-    // the live share failing — the Phase 3 review-F1 hazard, now with no
-    // writes to guard at all.
-    const attribution = attributeSlotEvent(
-      connectionId,
-      get(this._screenShareStore(initiator))[pubKeyB64],
-    );
-    if (attribution.outcome === 'superseded') {
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: this.clock.now(),
-        event: 'SupersededError',
-        connectionId,
-        detail: `superseded-by=${attribution.supersededBy}; err=${error.message || error}; path=screen`,
-      });
-      return;
-    }
-    this.logger.logAgentEvent({
-      agent: pubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'FsmError',
-      connectionId,
-      detail: `${error.message || String(error)}; path=screen; slot=${attribution.outcome}`,
     });
   }
 
@@ -3246,44 +2970,6 @@ export class StreamsStore {
     );
   }
 
-  /**
-   * Ensure an outgoing screen-share connection toward `pubkeyB64` exists.
-   *
-   * Replaces the InitRequest/InitAccept handshake the SimplePeer screen
-   * path needed: the FSM acceptor creates state lazily from the incoming
-   * offer, so there is no reservation to negotiate, no pending-init map,
-   * and no retry cadence of our own — `ensureConnection` is idempotent,
-   * the FSM owns signaling timeouts/retries, and when it gives up the
-   * `failed` route clears the slot so the next ping/pong re-enters here.
-   *
-   * Emission gate (wire-contract.ts): a peer that has not declared
-   * `sdp-fsm-screen` never receives an `SdpFsmScreen` signal — releases
-   * ≤ v0.14.8 spoke SimplePeer screen share, which this port retires, so
-   * those peers simply do not get our share.
-   */
-  private _ensureOutgoingScreenShare(pubkeyB64: AgentPubKeyB64): void {
-    if (!this.screenShareStream) return;
-    if (get(this._screenShareConnectionsOutgoing)[pubkeyB64]) return;
-    if (!this._peerCaps(pubkeyB64).has(CAP_SDP_FSM_SCREEN)) return;
-
-    this.screenShareOutTransport.setLocalStream(this.screenShareStream);
-    const connectionId = this.screenShareOutTransport.ensureConnection(pubkeyB64, {
-      sdpExchangeTimeoutMs: this._computeSdpTimeout(pubkeyB64),
-      epoch: this._nextConnectionEpoch(pubkeyB64),
-    });
-    this._screenShareConnectionsOutgoing.update(currentValue => {
-      currentValue[pubkeyB64] = {
-        connectionId,
-        video: true,
-        audio: false,
-        connected: false,
-        direction: 'outgoing',
-      };
-      return currentValue;
-    });
-    this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'SdpExchange' });
-  }
-
   async screenShareOn() {
     if (this.screenShareStream) {
       this.screenShareStream.getVideoTracks().forEach(track => {
@@ -3388,10 +3074,10 @@ export class StreamsStore {
     }
   }
 
+  /** View surface (also called from `blockAgent`): delegates to
+   *  `screenShareLinks`. */
   disconnectFromPeerScreen(pubKeyB64: AgentPubKeyB64) {
-    if (get(this._screenShareConnectionsIncoming)[pubKeyB64]) {
-      this.screenShareInTransport.closeConnection(pubKeyB64, 'disconnectFromPeerScreen');
-    }
+    this.screenShareLinks.disconnectFromPeerScreen(pubKeyB64);
   }
 
   blockAgent(pubKey64: AgentPubKeyB64) {
@@ -3618,18 +3304,22 @@ export class StreamsStore {
     writable({});
 
   /**
-   * Connections where we are sharing our own screen and the Init/Accept handshake succeeded
+   * Connections where we are sharing our own screen and the Init/Accept
+   * handshake succeeded. Delegates to `screenShareLinks` (store-
+   * decomposition round two, Task 5) — wiring tests and views read this
+   * getter directly.
    */
-  _screenShareConnectionsOutgoing: Writable<
-    Record<AgentPubKeyB64, OpenConnectionInfo>
-  > = writable({});
+  get _screenShareConnectionsOutgoing(): Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> {
+    return this.screenShareLinks._screenShareConnectionsOutgoing;
+  }
 
   /**
-   * Connections where others are sharing their screen and the Init/Accept handshake succeeded
+   * Connections where others are sharing their screen and the Init/Accept
+   * handshake succeeded. Delegates to `screenShareLinks`.
    */
-  _screenShareConnectionsIncoming: Writable<
-    Record<AgentPubKeyB64, OpenConnectionInfo>
-  > = writable({});
+  get _screenShareConnectionsIncoming(): Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> {
+    return this.screenShareLinks._screenShareConnectionsIncoming;
+  }
 
   // ===========================================================================================
   // CONNECTION META DATA
@@ -3696,9 +3386,11 @@ export class StreamsStore {
 
   /**
    * The statuses of WebRTC connections with peers to our own screen share
-   * stream
+   * stream. Delegates to `screenShareLinks`.
    */
-  _screenShareConnectionStatuses: Writable<ConnectionStatuses> = writable({});
+  get _screenShareConnectionStatuses(): Writable<ConnectionStatuses> {
+    return this.screenShareLinks._screenShareConnectionStatuses;
+  }
 
   /**
    * Connection statuses of other peers from their perspective. Is sent to us
@@ -4737,53 +4429,6 @@ export class StreamsStore {
     }
   }
 
-  updateScreenShareConnectionStatus(
-    pubKey: AgentPubKeyB64,
-    status: ConnectionStatus
-  ) {
-    this._screenShareConnectionStatuses.update(currentValue => {
-      const connectionStatuses = currentValue;
-      if (status.type === 'InitSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'InitSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-      if (status.type === 'AcceptSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'AcceptSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-      connectionStatuses[pubKey] = status;
-      return connectionStatuses;
-    });
-  }
-
   /**
    * Request diagnostic logs from a specific peer (or, with no argument,
    * every peer in this conversation). Delegates to `diagnosticsHub`
@@ -5244,7 +4889,7 @@ export class StreamsStore {
             this.handleSdpFsm(signal);
             break;
           case 'SdpFsmScreen':
-            this.handleSdpFsmScreen(signal);
+            this.screenShareLinks.handleSdpFsmScreen(signal);
             break;
           case 'LeaveUi':
             await this.handleLeaveUi(signal);
@@ -5355,7 +5000,7 @@ export class StreamsStore {
         }
         // Re-joining peer pinged us while we're sharing: start the screen
         // connection immediately rather than waiting for the pong cycle.
-        this._ensureOutgoingScreenShare(pubkeyB64);
+        this.screenShareLinks.ensureOutgoingScreenShare(pubkeyB64);
       }
     }
   }
@@ -5788,7 +5433,7 @@ export class StreamsStore {
     // idempotent per pong, the FSM owns retry/timeout, and a failed link
     // cleared its slot so this re-enters. Guards (are we sharing, slot
     // exists, peer capability) live inside.
-    this._ensureOutgoingScreenShare(pubkeyB64);
+    this.screenShareLinks.ensureOutgoingScreenShare(pubkeyB64);
   }
 
   /**
@@ -6126,68 +5771,6 @@ export class StreamsStore {
     // session would show up under two different ids in the timeline.
     const localConnId = this.mediaTransport.getConnectionId(pubkeyB64) ?? parsed.connection_id;
     this._logSdpDataEvent(pubkeyB64, localConnId, `fsm-${sdpType}`);
-  }
-
-  /**
-   * Handle an SdpFsmScreen signal — feeds the two screen-share FSM
-   * transports (Phase 3 item 2).
-   *
-   * Routing is by the sender's declared role, not by connectionId: each
-   * side's FSM allocates its own connectionId, so the id on the wire is
-   * the *sender's* and cannot select a local transport. A signal from the
-   * peer's sharer side (`dir: 'sharer'`) belongs to our incoming-share
-   * transport; a signal from their viewer side answers our outgoing
-   * share. Mutual sharing is simply both matches at once on two
-   * independent connections.
-   *
-   * Like the media FSM path, the viewer needs no reservation: the first
-   * offer creates the acceptor FSM lazily, and the slot is installed by
-   * the `signaling` transition in `_subscribeScreenShareTransport`.
-   */
-  handleSdpFsmScreen(signal: Extract<RoomSignal, { type: 'Message' }>): void {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const parsedScreen = parseSignalPayload<{
-      connection_id: string;
-      peer_session_id?: number;
-      epoch?: number;
-      dir?: string;
-      data: unknown;
-    }>(signal.payload);
-    if (!parsedScreen.ok) {
-      console.warn(
-        `Dropped SdpFsmScreen from ${pubkeyB64.slice(0, 8)}: ${parsedScreen.error}`
-      );
-      return;
-    }
-    const parsed = parsedScreen.value;
-    // The routing rule is `decideScreenSignalRoute`
-    // (transport/screen-signal-policy.ts) — by the sender's role, never by
-    // connectionId, and drop-not-guess on anything malformed.
-    const routed = decideScreenSignalRoute(parsed.dir);
-    if (routed.route === 'drop') {
-      this.logger.logCustomMessage(
-        `Dropped SdpFsmScreen from ${pubkeyB64.slice(0, 8)}: ${routed.reason} dir=${String(parsed.dir)}`
-      );
-      return;
-    }
-    const transport =
-      routed.route === 'incoming-share'
-        ? this.screenShareInTransport
-        : this.screenShareOutTransport;
-    const data = parsed.data as { type?: string } | null;
-    const sdpType = data && typeof data === 'object' && 'type' in data && data.type
-      ? data.type
-      : 'candidate';
-    transport.processIncomingSignal({
-      from: pubkeyB64,
-      connectionId: parsed.connection_id,
-      peerSessionId: parsed.peer_session_id,
-      epoch: parsed.epoch,
-      data: parsed.data,
-    });
-    // Log under the LOCAL connectionId (see handleSdpFsm for why).
-    const localConnId = transport.getConnectionId(pubkeyB64) ?? parsed.connection_id;
-    this._logSdpDataEvent(pubkeyB64, localConnId, `screen-fsm-${sdpType}`);
   }
 
 }

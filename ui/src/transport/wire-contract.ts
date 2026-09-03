@@ -157,10 +157,11 @@ export const WIRE_CONTRACT: Record<SignalMsgType, SignalTypeContract> = {
   // emits it) instead of the anonymous unknown-type warn.
   SdpData: { emits: false, parses: false, requiresCap: null },
   SdpFsm: { emits: true, parses: true, requiresCap: CAP_SDP_FSM },
-  // Production gate: `StreamsStore._ensureOutgoingScreenShare` initiates a
-  // screen-share connection only when `conversationPayloadCaps` contains
-  // this capability; the answering side only ever emits toward a sharer
-  // that already emitted. Pinned with the model in compat-corpus.test.ts.
+  // Production gate: `ScreenShareLinks.ensureOutgoingScreenShare`
+  // (ui/src/screen-share-links.ts) initiates a screen-share connection
+  // only when `conversationPayloadCaps` contains this capability; the
+  // answering side only ever emits toward a sharer that already emitted.
+  // Pinned with the model in compat-corpus.test.ts.
   SdpFsmScreen: { emits: true, parses: true, requiresCap: CAP_SDP_FSM_SCREEN },
   LeaveUi: { emits: true, parses: true, requiresCap: null },
   DiagnosticRequest: { emits: true, parses: true, requiresCap: null },

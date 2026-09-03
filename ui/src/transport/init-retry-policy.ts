@@ -6,8 +6,11 @@
  *
  * Since Phase 3 this serves the video connection only: the screen-share
  * port replaced that path's InitRequest cadence with an idempotent
- * `_ensureOutgoingScreenShare` (the FSM acceptor needs no reservation and
- * the FSM owns retry), which deleted this function's `kind` axis and both
+ * `ScreenShareLinks.ensureOutgoingScreenShare`
+ * (ui/src/screen-share-links.ts; store-decomposition round two, Task 5 —
+ * previously `StreamsStore._ensureOutgoingScreenShare`) — the FSM
+ * acceptor needs no reservation and the FSM owns retry — which deleted
+ * this function's `kind` axis and both
  * divergences the extraction had preserved (the screen path's missing
  * tie-break and its InitSent re-assertion).
  *

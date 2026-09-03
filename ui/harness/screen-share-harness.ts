@@ -8,10 +8,13 @@
  * DTLS). Signaling rides a `BroadcastChannel` bus with Holochain's
  * fire-and-forget semantics, in the production `SdpFsmScreen` wire
  * envelope — produced and parsed by the store's own glue
- * (`start()`'s onOutgoingSignal wrap / `handleSdpFsmScreen`), not by this
- * file. Slot writes, role routing, the `_peerRecords` screenShareStream mirror, and
- * outgoing-share initiation (`_ensureOutgoingScreenShare` off the real
- * ping/pong cycle) are all store code. The Phase 3.5 mirror of that glue
+ * (`start()`'s onOutgoingSignal wrap / `ScreenShareLinks.handleSdpFsmScreen`,
+ * ui/src/screen-share-links.ts), not by this file. Slot writes, role
+ * routing, the `_peerRecords` screenShareStream mirror, and outgoing-share
+ * initiation (`ScreenShareLinks.ensureOutgoingScreenShare` off the real
+ * ping/pong cycle) are all store-decomposition round two, Task 5 code
+ * (previously `StreamsStore._ensureOutgoingScreenShare` /
+ * `StreamsStore.handleSdpFsmScreen`). The Phase 3.5 mirror of that glue
  * is DELETED per one-authority (working agreement 1).
  *
  * What the harness still supplies (declared, not mirrored logic):
@@ -120,8 +123,8 @@ const routed = { toIn: 0, toOut: 0 };
 
 function deliver(from: string, msgType: string, payload: string): void {
   // Observe-only tally of arriving screen envelopes by their raw dir tag;
-  // the store's handleSdpFsmScreen does the actual routing (and the
-  // dropping — see `droppedCount`).
+  // the store's ScreenShareLinks.handleSdpFsmScreen does the actual
+  // routing (and the dropping — see `droppedCount`).
   if (msgType === 'SdpFsmScreen') {
     try {
       const dir = JSON.parse(payload)?.dir;
@@ -316,8 +319,9 @@ function makeShareStream(): MediaStream {
  * Acquisition injection — the ONLY stand-in for `screenShareOn`, whose
  * `getUserMedia({chromeMediaSource:'desktop'})` needs Electron. Assigning
  * the stream is all it takes: the store's own pong cycle notices
- * (`handlePingUi`/`handlePongUi` → `_ensureOutgoingScreenShare`), sets the
- * transport's local stream, allocates the epoch, and installs the slot.
+ * (`handlePingUi`/`handlePongUi` → `ScreenShareLinks.ensureOutgoingScreenShare`),
+ * sets the transport's local stream, allocates the epoch, and installs
+ * the slot.
  */
 function share(): void {
   if (!store || store.screenShareStream) return;
@@ -327,7 +331,8 @@ function share(): void {
 }
 
 /** Test seam: feed a raw envelope from the peer through the store's real
- *  handleSignal → handleSdpFsmScreen path (e.g. a malformed `dir`). */
+ *  handleSignal → ScreenShareLinks.handleSdpFsmScreen path (e.g. a
+ *  malformed `dir`). */
 function injectIncoming(dir: unknown): void {
   deliver(
     PEER_B64,
