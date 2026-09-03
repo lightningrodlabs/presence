@@ -229,9 +229,10 @@ delete the folded collections in the same commit; every task ends
 Process: `superpowers:writing-plans` produces the implementation plan;
 execution is subagent-driven (fresh subagent per task, independent
 adversarial review per task, final whole-branch review — working
-agreement 9) in an isolated worktree, branched off `main-0.6`.
-Forward-port to `main-0.7` afterward as cherry-picks (not a merge — the
-handoff brief records why).
+agreement 9) in an isolated worktree, branched off `main-0.7` (superseding
+this paragraph's original 0.6-first practice — see the Landed block above).
+Any `main-0.6` backport is a separate later decision, taken as cherry-picks
+(not a merge — the handoff brief records why) if and when it happens.
 
 ## Testing and enforcement
 

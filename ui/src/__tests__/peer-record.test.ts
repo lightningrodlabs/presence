@@ -16,10 +16,10 @@ function fullRecord(): PeerRecord {
     iceDisconnectedAt: 1, lastBytesReceived: { audio: 2, video: 3 },
     staleCycles: { audio: 4, video: 5 }, reconcileAttemptCount: 6,
     qualityBucket: 'poor', webrtcExitReason: 'ice-failed',
-    videoStream: {} as MediaStream, pendingInits: [{ connectionId: 'c', t0: 7 }],
+    videoStream: { id: 'video' } as unknown as MediaStream, pendingInits: [{ connectionId: 'c', t0: 7 }],
     sdpTimeoutTimer: 8, analyser: { node: {} as AnalyserNode, buffer: new Uint8Array(1) },
     outageState: { startedAt: 9, emitted: true },
-    screenShareStream: {} as MediaStream, screenShareIceDisconnectedAt: 10,
+    screenShareStream: { id: 'screen' } as unknown as MediaStream, screenShareIceDisconnectedAt: 10,
     lastDisconnectTime: 11, lastReconcileTime: 12, signalsRttEwma: 13,
     connectionEpoch: 14,
   };

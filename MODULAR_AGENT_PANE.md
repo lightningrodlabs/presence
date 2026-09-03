@@ -4,7 +4,7 @@ The module system is built and shipping. Panes are decoupled from WebRTC (driven
 
 The "Share-type Module Abstraction" section below is the design that produced them, kept for its rationale; its four implementation phases all landed. The genuinely open items are the two at the end of this document, plus one defect worth knowing about before you touch the share path:
 
-> **`_screenShareStreams` is wired since Phase 3** (correction 2026-08-03 — the retro found this note still asserting the pre-Phase-3 defect). It is written in `StreamsStore._handleScreenShareRemoteStream`, cleared on close/error/leave/disconnect, and read by room-view's share pane; the render-time resolution the design below relies on works. The original defect (declared, read, written nowhere — permanently `{}`) is recorded in `MAINTAINABILITY_ASSESSMENT.md` §3.9 and its unscheduled table.
+> **The incoming screen-share stream mirror is wired since Phase 3** (correction 2026-08-03 — the retro found this note still asserting the pre-Phase-3 defect; since the 2026-09 PeerRecord round it lives on the peer record's `screenShareStream` field, previously the `_screenShareStreams` collection). It is written in `StreamsStore._handleScreenShareRemoteStream`, cleared on close/error/leave/disconnect, and read by room-view's share pane; the render-time resolution the design below relies on works. The original defect (declared, read, written nowhere — permanently `{}`) is recorded in `MAINTAINABILITY_ASSESSMENT.md` §3.9 and its unscheduled table.
 
 ## What's Built
 
@@ -56,7 +56,7 @@ The "Share-type Module Abstraction" section below is the design that produced th
 | Render | `<video>` with srcObject lookup | `<shared-wal-embed>` | Custom element with 1s tick + chime |
 | Multiplicity | One per agent | One per agent | One per agent |
 
-The common abstraction: a share is `(moduleId, agent, state)` rendered as a tile in a shared panel, plus optional lifecycle hooks for activation. Screen share's WebRTC stream lives outside module state — the module's `renderShare` resolves it from `streamsStore._screenShareStreams[agent]` at render time.
+The common abstraction: a share is `(moduleId, agent, state)` rendered as a tile in a shared panel, plus optional lifecycle hooks for activation. Screen share's WebRTC stream lives outside module state — the module's `renderShare` resolves it from `streamsStore._peerRecord(agent)?.screenShareStream` at render time (since the 2026-09 PeerRecord round; previously `streamsStore._screenShareStreams[agent]`).
 
 #### Module system extensions
 
@@ -108,7 +108,7 @@ New room-view machinery:
 - New file `ui/src/room/modules/screen-share.ts`
 - `onActivate` calls existing `streamsStore.screenShareOn()` (which still does `getUserMedia` + drives the InitRequest cycle)
 - `onDeactivate` calls existing `streamsStore.screenShareOff()`
-- `renderShare` looks up `streamsStore._screenShareStreams[agent]`, renders `<video>` with stable id `share-screen-${pubkey}` for srcObject reapply
+- `renderShare` looks up `streamsStore._peerRecord(agent)?.screenShareStream` (since the 2026-09 PeerRecord round; previously `streamsStore._screenShareStreams[agent]`), renders `<video>` with stable id `share-screen-${pubkey}` for srcObject reapply
 - Module state is just `{ active: true }` — actual stream coordination stays in the existing `_screenShareConnectionsOutgoing`/`Incoming` infrastructure (this is the part that **cannot** be deduplicated)
 - `renderToolbarButton` for the screen share start/stop
 - Audio mute icon for incoming screen shares becomes a screen-share state icon (via `getStateIcons`)

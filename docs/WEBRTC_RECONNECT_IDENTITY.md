@@ -271,10 +271,12 @@ is exactly as today, so the 200 package tests stay green):
    the FSM/manager options; document it as the cross‑FSM generation that
    generalizes `peerSessionId`.
 2. **Orchestrator** (`streams-store.ts`): keep a per‑peer monotonic
-   `_connectionEpoch`. The **initiator** bumps it on each new `InitRequest` and
-   includes it in the payload; the **acceptor** adopts the epoch from the
-   `InitRequest`. Both pass it into `ensureConnection({ epoch })`. Because this
-   map lives in the orchestrator, it does **not** reset when an FSM is recreated.
+   `connectionEpoch` (since the 2026-09 PeerRecord round: the peer record's
+   field; previously the `_connectionEpoch` collection). The **initiator**
+   bumps it on each new `InitRequest` and includes it in the payload; the
+   **acceptor** adopts the epoch from the `InitRequest`. Both pass it into
+   `ensureConnection({ epoch })`. Because this lives in the orchestrator, it
+   does **not** reset when an FSM is recreated.
 3. **Manager** (`connection-manager.ts`): store the epoch per agent; stamp it on
    every outgoing `SignalMessage`. In `_routeSignalToFSM`, when both the incoming
    and current epoch are present, **decide supersede/drop by epoch order** — for
