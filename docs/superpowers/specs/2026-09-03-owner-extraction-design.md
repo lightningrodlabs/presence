@@ -142,16 +142,41 @@ controller, not deleted on an implementer's own judgment.
 
 ## Task plan
 
-1. `PeerAudioLevels` (smallest; proves the pattern).
-2. `MediaSettings`.
-3. `DiagnosticsHub`.
-4. `TrackHealthMonitor`.
-5. `ScreenShareLinks` (largest; lands last so the pattern is settled).
-6. Janitorial dead-code deletion (may fold into task 5's branch or
-   stand alone — plan decides).
-7. Doc-sync: CLAUDE.md "True today" bullet per its contract; landed
-   markers here; the round-three list recorded where the next session
-   will find it.
+1. **Landed** `818e5cd` (+ fixup `b20e2d5`) — `PeerAudioLevels`
+   (smallest; proves the pattern).
+2. **Landed** `29b2ff2` (+ fixup `f52b0aa`, shared with task 3) —
+   `MediaSettings`.
+3. **Landed** `c1bf254` (+ fixup `f52b0aa`, shared with task 2 — the
+   fixup touches `media-settings.ts` and `diagnostics-hub.ts` only,
+   landed as one commit between tasks 3 and 4) — `DiagnosticsHub`.
+4. **Landed** `79d158d` — `TrackHealthMonitor`. In-review amendment:
+   the bindings-record sketch above named `applyStaleTeardown`,
+   `myPubKeyB64`, and `localIntent`, none of which the moved bodies
+   actually reference; the landed `TrackHealthBindings`
+   (`ui/src/track-health.ts`) drops all three and adds `mainStream`
+   (late-bound, `StreamsStore.mainStream` is reassigned outside the
+   constructor) and `webrtcStats` (a direct mutable-Map reference,
+   field-initialized before this owner is constructed, so no
+   late-binding was needed) — found true to the bodies during
+   implementation, not a scope change.
+5. **Landed** `e47e6dc` — `ScreenShareLinks` (largest; landed last so
+   the pattern was settled). In-review amendment: `closeGuardOutcome`
+   — read by the moved connected-handler body — was relocated from
+   `streams-store.ts` to `ui/src/transport/close-cleanup-policy.ts` as
+   the one exported (target × via × outcome)-table outcome adapter,
+   table-tested there, rather than added to the owner's bindings
+   record; both the owner and the store import it from its new home.
+6. **Landed** `fc72032` — janitorial dead-code deletion
+   (`mainStreamClones`), its own branch rather than folded into task 5.
+7. **Landed** `475c3da` (deferred comment fixes) + this commit —
+   doc-sync: CLAUDE.md "True today" bullet per its contract; landed
+   markers here; the round-three list recorded below and in CLAUDE.md
+   where the next session will find it.
+
+Also landed, outside the numbered plan: `ac62385` — review-deferred
+normalizations spanning tasks 2–5 (binding-field naming, duplicate
+delegate-doc trim), folded in at task 6's close rather than reopening
+each task's branch.
 
 ## Risks (named)
 

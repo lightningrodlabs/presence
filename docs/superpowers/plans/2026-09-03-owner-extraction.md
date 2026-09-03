@@ -39,7 +39,7 @@
 - Consumes: `PeerRecord` (`ui/src/peer-record.ts`), `_peerRecords`/`_ensurePeerRecord` (store).
 - Produces: `PeerAudioLevels` with `setupPeerAudioAnalyser(pubKeyB64: string, stream: MediaStream): void` and `getWebrtcAudioLevel(pubKeyB64: string): number`; store field `peerAudioLevels: PeerAudioLevels`; store delegate `getWebrtcAudioLevel` (view surface).
 
-- [ ] **Step 1: Create `ui/src/peer-audio-levels.ts`**
+- [x] **Step 1: Create `ui/src/peer-audio-levels.ts`**
 
 ```ts
 /**
@@ -73,7 +73,7 @@ export class PeerAudioLevels {
 
 (Move the two methods' full bodies and their doc comments; the comment blocks travel with them.)
 
-- [ ] **Step 2: Write `ui/src/__tests__/peer-audio-levels.test.ts`**
+- [x] **Step 2: Write `ui/src/__tests__/peer-audio-levels.test.ts`**
 
 ```ts
 import { describe, expect, it } from 'vitest';
@@ -113,11 +113,11 @@ describe('PeerAudioLevels', () => {
 });
 ```
 
-- [ ] **Step 3: Run it — FAIL (module absent) before Step 1 lands, PASS after.**
+- [x] **Step 3: Run it — FAIL (module absent) before Step 1 lands, PASS after.**
 
 Run: `nix develop -c npm run test -w ui -- src/__tests__/peer-audio-levels.test.ts`
 
-- [ ] **Step 4: Wire the store**
+- [x] **Step 4: Wire the store**
 
 In `streams-store.ts`: delete the two moved methods; add the field (near the other owner constructions — `captureReconciler` is the pattern):
 
@@ -140,16 +140,16 @@ getWebrtcAudioLevel(pubKeyB64: string): number {
 }
 ```
 
-- [ ] **Step 5: Add `'../peer-audio-levels.ts'` to `no-ambient-clock.test.ts` `PINNED_FILES` with `FULL_PATTERNS`.**
+- [x] **Step 5: Add `'../peer-audio-levels.ts'` to `no-ambient-clock.test.ts` `PINNED_FILES` with `FULL_PATTERNS`.**
 
-- [ ] **Step 6: Reference grep**
+- [x] **Step 6: Reference grep**
 
 Run: `grep -rn 'setupPeerAudioAnalyser\|getWebrtcAudioLevel' ui/ packages/ --include='*.ts' | grep -v peer-audio-levels`
 Expected: only the store's delegate + two re-pointed call sites + `audio-level-meter.ts:86` + doc mentions.
 
-- [ ] **Step 7: Focused + full gate** — wiring suite + new test, then `nix develop -c npm run verify`. Green.
+- [x] **Step 7: Focused + full gate** — wiring suite + new test, then `nix develop -c npm run verify`. Green.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add ui/src/peer-audio-levels.ts ui/src/__tests__/peer-audio-levels.test.ts ui/src/streams-store.ts ui/src/__tests__/no-ambient-clock.test.ts
@@ -172,7 +172,7 @@ move; no behavior change."
 - Consumes: Task 1's pattern only.
 - Produces: `MediaSettings` owning the four `Writable`s and all listed members; store delegates with IDENTICAL names/signatures for every member listed (external consumers: `room-view.ts` device pickers, `presence-app.ts`, transport option closures wired in `start()`/`store-deps`, `mic-source.ts`, `cloudflare-turn.ts`, wiring tests).
 
-- [ ] **Step 1: Create `ui/src/media-settings.ts`**
+- [x] **Step 1: Create `ui/src/media-settings.ts`**
 
 ```ts
 /**
@@ -226,7 +226,7 @@ Substitution table for the moved bodies (complete — anything else: STOP):
 
 Move `DEFAULT_ICE_SERVERS` usage: `iceConfig` references the module-level `DEFAULT_ICE_SERVERS` constant — move the constant to `media-settings.ts` if streams-store has no other reader (grep first; if it has another reader, import it in media-settings from where it lives).
 
-- [ ] **Step 2: Wire the store**
+- [x] **Step 2: Wire the store**
 
 Construct (assignment style as Task 1):
 
@@ -258,16 +258,16 @@ get _audioInputId() { return this.mediaSettings._audioInputId; }
 
 (Check each original's getter-vs-method shape and mirror it exactly — `trickleICE` and `iceConfig` are getters today; the device lists are methods; the `Writable`s become delegating getters returning the owner's instances.)
 
-- [ ] **Step 3: Add `'../media-settings.ts'` to `no-ambient-clock.test.ts` `PINNED_FILES` with `FULL_PATTERNS`.** (The owner takes `now` injected; it must contain no `Date.now`/`new Date`/bare `setTimeout` — the moved bodies already comply.)
+- [x] **Step 3: Add `'../media-settings.ts'` to `no-ambient-clock.test.ts` `PINNED_FILES` with `FULL_PATTERNS`.** (The owner takes `now` injected; it must contain no `Date.now`/`new Date`/bare `setTimeout` — the moved bodies already comply.)
 
-- [ ] **Step 4: Reference grep**
+- [x] **Step 4: Reference grep**
 
 Run: `grep -rn 'trickleICE\|turnUrl\|turnUsername\|turnCredential\|cfTurnUrl\|iceConfig\|updateMediaDevices\|InputDevices\|OutputDevices\|audioInputId\|audioOutputId\|videoInputId\|changeVideoInput\|changeAudioInput' ui/ --include='*.ts' | grep -v media-settings | grep -v '\.md'`
 Expected: store delegates + external consumers unchanged (room-view, presence-app, store-deps, mic-source, cloudflare-turn, wiring tests) — zero references that would now dangle.
 
-- [ ] **Step 5: Focused + full gate** — `settings-path.test.ts`, wiring suite, then full verify. The wiring suite's live-closure pins (iceServers/trickleICE live-read) MUST stay green unmodified — if one fails, a binding captured a value; fix the binding, never the test.
+- [x] **Step 5: Focused + full gate** — `settings-path.test.ts`, wiring suite, then full verify. The wiring suite's live-closure pins (iceServers/trickleICE live-read) MUST stay green unmodified — if one fails, a binding captured a value; fix the binding, never the test.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add ui/src/media-settings.ts ui/src/streams-store.ts ui/src/__tests__/no-ambient-clock.test.ts
@@ -309,12 +309,12 @@ export type DiagnosticsHubBindings = {
 
 (Verify each field against the moved bodies' actual uses — the bodies are the authority for the exact signature; extend the record if a body reads something not listed, and STOP if that something is another cluster's mutable state.)
 
-- [ ] **Step 1: Create the hub with the moved members (verbatim + substitution table analogous to Task 2 — `this.deps.bus.sendMessage`→`this.b.sendMessage`, `this.clock.now()`→`this.b.now()`, `this.clock.setTimeout/clearTimeout`→bindings, `this._peerRecords.get(k)?.signalsRttEwma`→`this.b.peerRttEwma(k)`, `this.globalPresenceSet()`→`this.b.globalPresenceSet()`, writables/set→own fields).**
-- [ ] **Step 2: Wire the store: construct `diagnosticsHub`, delete moved members, add the delegating getters/methods, re-point `_processSignal`'s `DiagnosticRequest`/`DiagnosticResponse` cases and `_handleMediaConnected`'s participant add (`this.diagnosticsHub.noteConversationParticipant(pubKeyB64)`).**
-- [ ] **Step 3: Add `'../diagnostics-hub.ts'` to the no-ambient-clock pin (FULL_PATTERNS).**
-- [ ] **Step 4: Reference grep:** `grep -rn 'DiagnosticLogs\|DiagnosticRequest\|DiagnosticResponse\|exportMergedLogs\|_conversationParticipants\|DiagnosticAttempt' ui/ --include='*.ts' | grep -v diagnostics-hub | grep -v '\.md'` — no dangles.
-- [ ] **Step 5: Focused + full gate** — the wiring suite's diagnostic retry tests (1922–1942) must pass UNMODIFIED (they drive `store.requestDiagnosticLogs` + `store._pendingDiagnosticRequests`, both delegated).
-- [ ] **Step 6: Commit** (explicit paths; message: `refactor: extract DiagnosticsHub owner from streams-store` + Task 3 trailer as in Task 1).
+- [x] **Step 1: Create the hub with the moved members (verbatim + substitution table analogous to Task 2 — `this.deps.bus.sendMessage`→`this.b.sendMessage`, `this.clock.now()`→`this.b.now()`, `this.clock.setTimeout/clearTimeout`→bindings, `this._peerRecords.get(k)?.signalsRttEwma`→`this.b.peerRttEwma(k)`, `this.globalPresenceSet()`→`this.b.globalPresenceSet()`, writables/set→own fields).**
+- [x] **Step 2: Wire the store: construct `diagnosticsHub`, delete moved members, add the delegating getters/methods, re-point `_processSignal`'s `DiagnosticRequest`/`DiagnosticResponse` cases and `_handleMediaConnected`'s participant add (`this.diagnosticsHub.noteConversationParticipant(pubKeyB64)`).**
+- [x] **Step 3: Add `'../diagnostics-hub.ts'` to the no-ambient-clock pin (FULL_PATTERNS).**
+- [x] **Step 4: Reference grep:** `grep -rn 'DiagnosticLogs\|DiagnosticRequest\|DiagnosticResponse\|exportMergedLogs\|_conversationParticipants\|DiagnosticAttempt' ui/ --include='*.ts' | grep -v diagnostics-hub | grep -v '\.md'` — no dangles.
+- [x] **Step 5: Focused + full gate** — the wiring suite's diagnostic retry tests (1922–1942) must pass UNMODIFIED (they drive `store.requestDiagnosticLogs` + `store._pendingDiagnosticRequests`, both delegated).
+- [x] **Step 6: Commit** (explicit paths; message: `refactor: extract DiagnosticsHub owner from streams-store` + Task 3 trailer as in Task 1).
 
 ---
 
@@ -349,12 +349,12 @@ export type TrackHealthBindings = {
 };
 ```
 
-- [ ] **Step 1: Create the owner with verbatim bodies + the substitution table (same style as Tasks 2–3; the table rows come 1:1 from the bindings above).**
-- [ ] **Step 2: Wire the store: construct `trackHealth`, delete the five moved methods, re-point the three inbound call sites.**
-- [ ] **Step 3: no-ambient-clock pin (`'../track-health.ts'`, FULL_PATTERNS).**
-- [ ] **Step 4: Reference grep:** `grep -rn '_checkTrackHealth\|reconcileVideoStreamState\|refreshTracksForPeer\|ReplaceTrackRecovery\|CloneStreamRecovery' ui/ --include='*.ts' | grep -v track-health | grep -v '\.md'` — remaining hits only the three re-pointed call sites and policy-file prose (update `transport/track-health-policy.ts`'s constraining comment to cite `ui/src/track-health.ts`, working agreement 3).
-- [ ] **Step 5: Focused + full gate** — wiring suite (its track-health/encoder tests drive `pingAgents`, which now delegates) unmodified and green.
-- [ ] **Step 6: Commit** (`refactor: extract TrackHealthMonitor owner from streams-store`, Task 4 trailer).
+- [x] **Step 1: Create the owner with verbatim bodies + the substitution table (same style as Tasks 2–3; the table rows come 1:1 from the bindings above).**
+- [x] **Step 2: Wire the store: construct `trackHealth`, delete the five moved methods, re-point the three inbound call sites.**
+- [x] **Step 3: no-ambient-clock pin (`'../track-health.ts'`, FULL_PATTERNS).**
+- [x] **Step 4: Reference grep:** `grep -rn '_checkTrackHealth\|reconcileVideoStreamState\|refreshTracksForPeer\|ReplaceTrackRecovery\|CloneStreamRecovery' ui/ --include='*.ts' | grep -v track-health | grep -v '\.md'` — remaining hits only the three re-pointed call sites and policy-file prose (update `transport/track-health-policy.ts`'s constraining comment to cite `ui/src/track-health.ts`, working agreement 3).
+- [x] **Step 5: Focused + full gate** — wiring suite (its track-health/encoder tests drive `pingAgents`, which now delegates) unmodified and green.
+- [x] **Step 6: Commit** (`refactor: extract TrackHealthMonitor owner from streams-store`, Task 4 trailer).
 
 ---
 
@@ -389,12 +389,12 @@ export type ScreenShareLinksBindings = {
 };
 ```
 
-- [ ] **Step 1: Create the owner with verbatim bodies + substitution table (rows 1:1 from bindings; `this._screenShareConnectionsOutgoing` etc. become own fields).**
-- [ ] **Step 2: Wire the store: construct `screenShareLinks`; delete moved members; add the three `Writable` delegating getters + `disconnectFromPeerScreen` delegate; re-point every inbound site listed above; `screenShareOff`'s loop keeps reading `get(this._screenShareConnectionsOutgoing)` (now the delegate) and calling `this.screenShareOutTransport.closeConnection(...)` directly — unchanged.**
-- [ ] **Step 3: no-ambient-clock pin (`'../screen-share-links.ts'`, FULL_PATTERNS).**
-- [ ] **Step 4: Reference grep:** `grep -rn '_subscribeScreenShareTransport\|_handleScreenShare\|_ensureOutgoingScreenShare\|handleSdpFsmScreen\|updateScreenShareConnectionStatus\|_screenShareStore' ui/ --include='*.ts' | grep -v screen-share-links | grep -v '\.md'` — remaining hits only re-pointed call sites, delegates, and prose (update `transport/screen-signal-policy.ts` + `wire-contract.ts` + `media-event-policy.ts` + `init-retry-policy.ts` constraining comments to cite `ui/src/screen-share-links.ts`; `ui/harness/screen-share*.ts` headers likewise).
-- [ ] **Step 5: Run the intent pin + wiring suite + full gate** — `intent-write-sites.test.ts` green UNMODIFIED (the gesture methods did not move); the wiring suite's screen-share lifecycle tests (377–462, 619–692) green UNMODIFIED (they read the delegating getters and call `store.screenShareOn()`).
-- [ ] **Step 6: Commit** (`refactor: extract ScreenShareLinks owner from streams-store`, Task 5 trailer; note the gesture-methods-stay amendment in the body).
+- [x] **Step 1: Create the owner with verbatim bodies + substitution table (rows 1:1 from bindings; `this._screenShareConnectionsOutgoing` etc. become own fields).**
+- [x] **Step 2: Wire the store: construct `screenShareLinks`; delete moved members; add the three `Writable` delegating getters + `disconnectFromPeerScreen` delegate; re-point every inbound site listed above; `screenShareOff`'s loop keeps reading `get(this._screenShareConnectionsOutgoing)` (now the delegate) and calling `this.screenShareOutTransport.closeConnection(...)` directly — unchanged.**
+- [x] **Step 3: no-ambient-clock pin (`'../screen-share-links.ts'`, FULL_PATTERNS).**
+- [x] **Step 4: Reference grep:** `grep -rn '_subscribeScreenShareTransport\|_handleScreenShare\|_ensureOutgoingScreenShare\|handleSdpFsmScreen\|updateScreenShareConnectionStatus\|_screenShareStore' ui/ --include='*.ts' | grep -v screen-share-links | grep -v '\.md'` — remaining hits only re-pointed call sites, delegates, and prose (update `transport/screen-signal-policy.ts` + `wire-contract.ts` + `media-event-policy.ts` + `init-retry-policy.ts` constraining comments to cite `ui/src/screen-share-links.ts`; `ui/harness/screen-share*.ts` headers likewise).
+- [x] **Step 5: Run the intent pin + wiring suite + full gate** — `intent-write-sites.test.ts` green UNMODIFIED (the gesture methods did not move); the wiring suite's screen-share lifecycle tests (377–462, 619–692) green UNMODIFIED (they read the delegating getters and call `store.screenShareOn()`).
+- [x] **Step 6: Commit** (`refactor: extract ScreenShareLinks owner from streams-store`, Task 5 trailer; note the gesture-methods-stay amendment in the body).
 
 ---
 
@@ -403,16 +403,16 @@ export type ScreenShareLinksBindings = {
 **Files:**
 - Modify: `ui/src/streams-store.ts`
 
-- [ ] **Step 1: Verify `mainStreamClones` is dead**
+- [x] **Step 1: Verify `mainStreamClones` is dead**
 
 Run: `grep -rn 'mainStreamClones' ui/ --include='*.ts'`
 Expected: the field declaration (~3491), the `start()` loop (~740), comment mentions (~2214, ~3212), and nothing that ever pushes to it. If ANY `.push(` or assignment other than the `= []` initializer appears: STOP and report — it is not dead.
 
-- [ ] **Step 2: Delete** the field, the no-op loop in `start()`'s `onMutedChange` callback, and rewrite the two comments that cite it (keep each comment's surviving claim; drop only the clone-fanout clause).
+- [x] **Step 2: Delete** the field, the no-op loop in `start()`'s `onMutedChange` callback, and rewrite the two comments that cite it (keep each comment's surviving claim; drop only the clone-fanout clause).
 
 Do NOT touch: the `SdpData` drop arm, the screen-typed Init log-and-drop branches (declared diagnostic arms), or any commentary block that is itself the declaration of a prior deletion.
 
-- [ ] **Step 3: Full gate; commit** (`chore: delete dead mainStreamClones fan-out`, notes the verification grep in the body).
+- [x] **Step 3: Full gate; commit** (`chore: delete dead mainStreamClones fan-out`, notes the verification grep in the body).
 
 ---
 
@@ -421,9 +421,9 @@ Do NOT touch: the `SdpData` drop arm, the screen-typed Init log-and-drop branche
 **Files:**
 - Modify: `CLAUDE.md`, `docs/superpowers/specs/2026-09-03-owner-extraction-design.md`, this plan file.
 
-- [ ] **Step 1: CLAUDE.md "True today" bullet** — follow the existing round bullets' contract exactly (anchored to date + branch + commit range; present tense only naming the enforcing file/test; no counters/snapshots/unanchored negations — `claude-md-drift.test.ts` is the guard). Record: the five owner files as the one home of each concern's behavior (each in `no-ambient-clock.test.ts`'s pin list); store keeps same-named delegating members (bare forwards); gesture entry points stayed on the store (`intent-write-sites.test.ts` unchanged); `PeerRecord` unchanged as the per-peer state home; `mainStreamClones` deleted as verified-dead; zero declared behavior changes.
-- [ ] **Step 2: Spec landed-markers** on each task; the round-three list stays open (pong/ping fragment splits, transport-glue kernel, composition root, reactive unification, forensic fold).
-- [ ] **Step 3: Drift guard + full gate; commit** (`docs: sync CLAUDE.md and round docs for owner extraction`).
+- [x] **Step 1: CLAUDE.md "True today" bullet** — follow the existing round bullets' contract exactly (anchored to date + branch + commit range; present tense only naming the enforcing file/test; no counters/snapshots/unanchored negations — `claude-md-drift.test.ts` is the guard). Record: the five owner files as the one home of each concern's behavior (each in `no-ambient-clock.test.ts`'s pin list); store keeps same-named delegating members (bare forwards); gesture entry points stayed on the store (`intent-write-sites.test.ts` unchanged); `PeerRecord` unchanged as the per-peer state home; `mainStreamClones` deleted as verified-dead; zero declared behavior changes.
+- [x] **Step 2: Spec landed-markers** on each task; the round-three list stays open (pong/ping fragment splits, transport-glue kernel, composition root, reactive unification, forensic fold).
+- [x] **Step 3: Drift guard + full gate; commit** (`docs: sync CLAUDE.md and round docs for owner extraction`).
 
 ---
 
