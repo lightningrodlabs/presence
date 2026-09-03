@@ -55,7 +55,6 @@ import {
 } from './transport/track-health-policy';
 import type { RtcStatsReportLike } from './transport/track-health-policy';
 import { decideInitRetry } from './transport/init-retry-policy';
-import { buildDiagnosticSnapshot } from './diagnostic-snapshot-policy';
 import { decideModuleStateMerge } from './module-state-policy';
 import { decideScreenSignalRoute } from './transport/screen-signal-policy';
 import {
@@ -104,6 +103,7 @@ import { CameraSource } from './camera-source';
 import { CaptureReconciler } from './capture-reconciler';
 import { PeerAudioLevels } from './peer-audio-levels';
 import { MediaSettings } from './media-settings';
+import { DiagnosticsHub } from './diagnostics-hub';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -484,6 +484,13 @@ export class StreamsStore {
    *  constructor body. */
   mediaSettings!: MediaSettings;
 
+  /** The ONE owner of the diagnostic-log request/response pipeline
+   *  (store-decomposition round two, Task 3; see diagnostics-hub.ts).
+   *  Constructed in the constructor body, not as a field initializer,
+   *  for the same reason as `mediaSettings`: its `sendMessage` binding
+   *  dereferences `this.deps.bus` directly. */
+  diagnosticsHub!: DiagnosticsHub;
+
   /**
    * WebRTC transports. Three instances by purpose:
    *  - mediaTransport: bidirectional mic+camera (one connection per peer).
@@ -602,6 +609,16 @@ export class StreamsStore {
       logAgentEvent: e => this.logger.logAgentEvent(e),
       now: () => this.clock.now(),
       myPubKeyB64: () => this.myPubKeyB64,
+    });
+    this.diagnosticsHub = new DiagnosticsHub({
+      sendMessage: (agents, msgType, payload) =>
+        this.deps.bus.sendMessage(agents, msgType, payload),
+      logger: this.logger,
+      now: () => this.clock.now(),
+      setTimeout: (fn, ms) => this.clock.setTimeout(fn, ms),
+      myPubKeyB64: () => this.myPubKeyB64,
+      globalPresenceSet: () => this.globalPresenceSet(),
+      peerRttEwma: k => this._peerRecord(k)?.signalsRttEwma,
     });
 
     // Construction ends here: fields and derived stores only, no
@@ -1427,7 +1444,7 @@ export class StreamsStore {
     this._flushSdpAggregatesForConnection(connectionId);
     // Record this peer as a genuine call participant for diagnostic-log
     // targeting. Kept for the whole session even if they later drop.
-    this._conversationParticipants.add(pubKeyB64);
+    this.diagnosticsHub.noteConversationParticipant(pubKeyB64);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: this.clock.now(),
@@ -3692,34 +3709,22 @@ export class StreamsStore {
     >
   > = writable({});
 
-  /**
-   * Diagnostic logs received from remote peers via Holochain signals
-   */
-  _receivedDiagnosticLogs: Writable<Record<AgentPubKeyB64, import('./types').DiagnosticSnapshot>> = writable({});
+  // Diagnostic log request/response pipeline is owned by `diagnosticsHub`
+  // (store-decomposition round two, Task 3; see diagnostics-hub.ts). The
+  // three Writables, the conversation-participants set, and the moved
+  // methods now live there; these are bare view-surface/wiring delegates.
 
-  /**
-   * Peers a diagnostic request is in-flight for. Value carries the
-   * current retry attempt (1-based). Removed on response receipt or
-   * when retries are exhausted (and moved to `_failedDiagnosticRequests`).
-   */
-  _pendingDiagnosticRequests: Writable<Record<AgentPubKeyB64, { attempts: number; startedAt: number }>> = writable({});
+  get _receivedDiagnosticLogs(): Writable<Record<AgentPubKeyB64, DiagnosticSnapshot>> {
+    return this.diagnosticsHub._receivedDiagnosticLogs;
+  }
 
-  /**
-   * Peers that exhausted retries with no response. UI surfaces these
-   * so the user can see partial coverage and (optionally) re-try.
-   */
-  _failedDiagnosticRequests: Writable<Record<AgentPubKeyB64, true>> = writable({});
+  get _pendingDiagnosticRequests(): Writable<Record<AgentPubKeyB64, { attempts: number; startedAt: number }>> {
+    return this.diagnosticsHub._pendingDiagnosticRequests;
+  }
 
-  /**
-   * Peers we have actually had a WebRTC media connection with this
-   * session — added the first time a connection to them reaches the
-   * `connected` state. Session-scoped; entries are kept even after the
-   * peer disconnects, because a peer who dropped mid-call is exactly who
-   * we want diagnostic logs from. Drives `requestDiagnosticLogs()`'s
-   * recipient list so a room-level request targets genuine call
-   * participants rather than every known (incl. merely heard-about) agent.
-   */
-  private _conversationParticipants = new Set<AgentPubKeyB64>();
+  get _failedDiagnosticRequests(): Writable<Record<AgentPubKeyB64, true>> {
+    return this.diagnosticsHub._failedDiagnosticRequests;
+  }
 
   /**
    * Clear cached diagnostic results so the request button returns to its
@@ -3727,18 +3732,7 @@ export class StreamsStore {
    * (results consumed). With no argument, clears every peer.
    */
   clearReceivedDiagnostics(pubKeyB64?: AgentPubKeyB64): void {
-    this._receivedDiagnosticLogs.update(curr => {
-      if (!pubKeyB64) return {};
-      const next = { ...curr };
-      delete next[pubKeyB64];
-      return next;
-    });
-    this._failedDiagnosticRequests.update(curr => {
-      if (!pubKeyB64) return {};
-      const next = { ...curr };
-      delete next[pubKeyB64];
-      return next;
-    });
+    this.diagnosticsHub.clearReceivedDiagnostics(pubKeyB64);
   }
 
   // ===========================================================================================
@@ -4985,284 +4979,31 @@ export class StreamsStore {
     return success;
   }
 
-  /** Maximum number of attempts before marking a diagnostic request failed. */
-  private static readonly DIAGNOSTIC_MAX_ATTEMPTS = 3;
-  /** Per-attempt timeout (ms) before retrying or giving up — the no-RTT-
-   *  sample default, and the floor for the RTT-scaled timeout below.
-   *  Diagnostic attempt cadence, NOT a liveness predicate. */
-  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MS = 8_000;
-  /** Ceiling for the RTT-scaled diagnostic attempt timeout
-   *  (`_computeDiagnosticAttemptTimeout`). Diagnostic attempt cadence,
-   *  NOT a liveness predicate. Field observation (2026-08-11): diagnostic
-   *  requests failed 3x8s against the same 20-58s signals RTTs that were
-   *  blowing the SDP-exchange ceiling — the retries were noise, not
-   *  recovery attempts. */
-  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS = 30_000;
-  /** RTT multiplier for the diagnostic attempt timeout
-   *  (`_computeDiagnosticAttemptTimeout`). */
-  private static readonly DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER = 4;
-
   /**
    * Request diagnostic logs from a specific peer (or, with no argument,
-   * every peer in this conversation) via Holochain signal. Retries up to
-   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within the
-   * per-attempt timeout (`_computeDiagnosticAttemptTimeout` — RTT-scaled,
-   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS with no RTT sample). Peers that exhaust
-   * retries land in `_failedDiagnosticRequests`.
-   *
-   * The room-level recipient set is the union of `_conversationParticipants`
-   * (peers we have had a media connection with this session, incl. ones who
-   * have since dropped) and the current `globalPresenceSet()`. This
-   * deliberately excludes merely heard-about (`'told'`) agents who were
-   * never in the call — requesting from them only produced timeouts and
-   * polluted the merged log.
-   *
-   * Calling again for a peer already in pending/failed re-starts the
-   * retry loop from attempt 1 — lets the user manually retry from the UI.
+   * every peer in this conversation). Delegates to `diagnosticsHub`
+   * (store-decomposition round two, Task 3).
    */
   async requestDiagnosticLogs(pubKeyB64?: AgentPubKeyB64) {
-    const targetKeys = pubKeyB64
-      ? [pubKeyB64]
-      : [
-          ...new Set<AgentPubKeyB64>([
-            ...this._conversationParticipants,
-            ...this.globalPresenceSet(),
-          ]),
-        ].filter(a => a !== this.myPubKeyB64);
-    if (targetKeys.length === 0) return;
-
-    // Clear any prior failed state for these peers — manual re-trigger.
-    this._failedDiagnosticRequests.update(curr => {
-      const next = { ...curr };
-      targetKeys.forEach(k => delete next[k]);
-      return next;
-    });
-
-    targetKeys.forEach(k => this._startDiagnosticAttempt(k, 1));
-
-    this.logger.logCustomMessage(
-      `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
-    );
+    return this.diagnosticsHub.requestDiagnosticLogs(pubKeyB64);
   }
 
   /**
-   * RTT-scaled diagnostic-attempt timeout (ms) for `peerB64`. Reuses the
-   * same signals RTT EWMA that scales the SDP-exchange timeout
-   * (`_computeSdpTimeout`) — a slow signals path gets a diagnostic
-   * round-trip window it can actually clear instead of retrying blind.
-   * No RTT sample yet -> the fixed DIAGNOSTIC_ATTEMPT_TIMEOUT_MS default
-   * (unchanged behaviour). Diagnostic attempt cadence, NOT a liveness
-   * predicate.
-   */
-  private _computeDiagnosticAttemptTimeout(peerB64: AgentPubKeyB64): number {
-    const rtt = this._peerRecords.get(peerB64)?.signalsRttEwma;
-    if (rtt === undefined || rtt <= 0) {
-      return StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS;
-    }
-    return Math.min(
-      StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS,
-      Math.max(
-        StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS,
-        Math.round(rtt * StreamsStore.DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER)
-      )
-    );
-  }
-
-  /**
-   * Single attempt of a diagnostic request to one peer. Sends the signal,
-   * schedules a timeout that either retries (attempt + 1) or marks failed.
-   * Handler is no-op if a response has already arrived by the time the
-   * timeout fires (the peer is no longer pending).
-   */
-  private _startDiagnosticAttempt(peerB64: AgentPubKeyB64, attempt: number): void {
-    this._pendingDiagnosticRequests.update(curr => ({
-      ...curr,
-      [peerB64]: { attempts: attempt, startedAt: this.clock.now() },
-    }));
-
-    const peerHash = decodeHashFromBase64(peerB64);
-    this.deps.bus.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
-      this.logger.logCustomMessage(
-        `DiagnosticRequest send failed [${peerB64.slice(0, 8)}] attempt ${attempt}: ${e?.message ?? e}`
-      );
-    });
-
-    this.clock.setTimeout(() => {
-      const stillPending = get(this._pendingDiagnosticRequests)[peerB64];
-      // Response arrived (handler cleared pending) or user re-triggered
-      // a fresh attempt that supersedes this one.
-      if (!stillPending || stillPending.attempts !== attempt) return;
-
-      if (attempt < StreamsStore.DIAGNOSTIC_MAX_ATTEMPTS) {
-        this.logger.logCustomMessage(
-          `DiagnosticRequest timeout [${peerB64.slice(0, 8)}] attempt ${attempt}, retrying`
-        );
-        this._startDiagnosticAttempt(peerB64, attempt + 1);
-      } else {
-        this.logger.logCustomMessage(
-          `DiagnosticRequest failed [${peerB64.slice(0, 8)}] after ${attempt} attempts`
-        );
-        this._pendingDiagnosticRequests.update(curr => {
-          const next = { ...curr };
-          delete next[peerB64];
-          return next;
-        });
-        this._failedDiagnosticRequests.update(curr => ({ ...curr, [peerB64]: true }));
-      }
-    }, this._computeDiagnosticAttemptTimeout(peerB64));
-  }
-
-  /**
-   * Build a merged diagnostic log combining local and received remote events for a peer.
+   * Build a merged diagnostic log combining local and received remote
+   * events for a peer. Delegates to `diagnosticsHub`.
    */
   exportMergedLogs(pubKeyB64: AgentPubKeyB64): object {
-    const localAgentEvents = this.logger.getRecentAgentEvents();
-    const localCustomLogs = this.logger.getRecentCustomLogs();
-    const remoteSnapshot = get(this._receivedDiagnosticLogs)[pubKeyB64];
-
-    type MergedEntry = { timestamp: number; source: 'local' | 'remote'; type: string; detail: string; connectionId?: string };
-    const merged: MergedEntry[] = [];
-
-    // Add local agent events (all agents, to see the full picture)
-    Object.entries(localAgentEvents).forEach(([agent, events]) => {
-      events.forEach(e => {
-        merged.push({
-          timestamp: e.timestamp,
-          source: 'local',
-          type: 'event',
-          detail: `[${agent.slice(0, 8)}] ${e.event}`,
-          connectionId: e.connectionId,
-        });
-      });
-    });
-
-    // Add local custom logs
-    localCustomLogs.forEach(log => {
-      merged.push({
-        timestamp: log.timestamp,
-        source: 'local',
-        type: 'custom',
-        detail: log.log,
-      });
-    });
-
-    // Add remote events if available
-    if (remoteSnapshot) {
-      Object.entries(
-        remoteSnapshot.agentEvents.reduce((acc, e) => {
-          (acc[e.agent] = acc[e.agent] || []).push(e);
-          return acc;
-        }, {} as Record<string, typeof remoteSnapshot.agentEvents>)
-      ).forEach(([agent, events]) => {
-        events.forEach(e => {
-          merged.push({
-            timestamp: e.timestamp,
-            source: 'remote',
-            type: 'event',
-            detail: `[${agent.slice(0, 8)}] ${e.event}`,
-            connectionId: e.connectionId,
-          });
-        });
-      });
-
-      remoteSnapshot.customLogs.forEach(log => {
-        merged.push({
-          timestamp: log.timestamp,
-          source: 'remote',
-          type: 'custom',
-          detail: log.log,
-        });
-      });
-    }
-
-    merged.sort((a, b) => a.timestamp - b.timestamp);
-
-    return {
-      generatedAt: this.clock.now(),
-      localAgent: this.myPubKeyB64,
-      remoteAgent: pubKeyB64,
-      hasRemoteLogs: !!remoteSnapshot,
-      remoteSessionId: remoteSnapshot?.sessionId,
-      entries: merged,
-    };
+    return this.diagnosticsHub.exportMergedLogs(pubKeyB64);
   }
 
   /**
    * Build a merged diagnostic log combining local events with every
-   * received remote snapshot. The result is a single timeline ordered
-   * by timestamp, tagged with which agent emitted each entry. Used by
-   * the room-level bulk download path.
+   * received remote snapshot. Delegates to `diagnosticsHub`.
    */
   exportMergedLogsAll(): object {
-    const localAgentEvents = this.logger.getRecentAgentEvents();
-    const localCustomLogs = this.logger.getRecentCustomLogs();
-    const allRemote = get(this._receivedDiagnosticLogs);
-
-    type MergedEntry = {
-      timestamp: number;
-      source: AgentPubKeyB64; // emitter of the entry
-      sourceLabel: 'local' | 'remote';
-      type: string;
-      detail: string;
-      connectionId?: string;
-    };
-    const merged: MergedEntry[] = [];
-
-    Object.entries(localAgentEvents).forEach(([agent, events]) => {
-      events.forEach(e => {
-        merged.push({
-          timestamp: e.timestamp,
-          source: this.myPubKeyB64,
-          sourceLabel: 'local',
-          type: 'event',
-          detail: `[${agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
-          connectionId: e.connectionId,
-        });
-      });
-    });
-    localCustomLogs.forEach(log => {
-      merged.push({
-        timestamp: log.timestamp,
-        source: this.myPubKeyB64,
-        sourceLabel: 'local',
-        type: 'custom',
-        detail: log.log,
-      });
-    });
-
-    const respondingPeers: AgentPubKeyB64[] = [];
-    Object.entries(allRemote).forEach(([peerB64, snapshot]) => {
-      respondingPeers.push(peerB64);
-      snapshot.agentEvents.forEach(e => {
-        merged.push({
-          timestamp: e.timestamp,
-          source: peerB64,
-          sourceLabel: 'remote',
-          type: 'event',
-          detail: `[${e.agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
-          connectionId: e.connectionId,
-        });
-      });
-      snapshot.customLogs.forEach(log => {
-        merged.push({
-          timestamp: log.timestamp,
-          source: peerB64,
-          sourceLabel: 'remote',
-          type: 'custom',
-          detail: log.log,
-        });
-      });
-    });
-
-    merged.sort((a, b) => a.timestamp - b.timestamp);
-
-    return {
-      generatedAt: this.clock.now(),
-      localAgent: this.myPubKeyB64,
-      respondingPeers,
-      entries: merged,
-    };
+    return this.diagnosticsHub.exportMergedLogsAll();
   }
+
 
   /**
    * Bucket RTT, loss, and jitter into coarse human-scale bands. The goal
@@ -5778,10 +5519,10 @@ export class StreamsStore {
             await this.handleLeaveUi(signal);
             break;
           case 'DiagnosticRequest':
-            await this.handleDiagnosticRequest(signal);
+            await this.diagnosticsHub.handleDiagnosticRequest(signal);
             break;
           case 'DiagnosticResponse':
-            this.handleDiagnosticResponse(signal);
+            this.diagnosticsHub.handleDiagnosticResponse(signal);
             break;
           case 'ModuleState':
             this.handleModuleState(signal);
@@ -6716,68 +6457,6 @@ export class StreamsStore {
     // Log under the LOCAL connectionId (see handleSdpFsm for why).
     const localConnId = transport.getConnectionId(pubkeyB64) ?? parsed.connection_id;
     this._logSdpDataEvent(pubkeyB64, localConnId, `screen-fsm-${sdpType}`);
-  }
-
-  /**
-   * Handle a DiagnosticRequest signal — gather recent logs and send back.
-   */
-  async handleDiagnosticRequest(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const allRecentEvents = this.logger.getRecentAgentEvents();
-    const flatEvents = Object.values(allRecentEvents).flat();
-    const recentCustomLogs = this.logger.getRecentCustomLogs();
-
-    // The size guard and its self-declaring truncation live in
-    // diagnostic-snapshot-policy.ts (Phase 5 item 2).
-    const { payload } = buildDiagnosticSnapshot({
-      fromAgent: this.myPubKeyB64,
-      sessionId: this.logger.sessionId,
-      agentEvents: flatEvents,
-      customLogs: recentCustomLogs,
-      generatedAt: this.clock.now(),
-    });
-    await this.deps.bus.sendMessage(
-      [signal.from_agent],
-      'DiagnosticResponse',
-      payload,
-    );
-  }
-
-  /**
-   * Handle a DiagnosticResponse signal — store the received logs.
-   */
-  handleDiagnosticResponse(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-
-    try {
-      const parsedSnapshot = parseSignalPayload<DiagnosticSnapshot>(signal.payload);
-      if (!parsedSnapshot.ok) {
-        console.warn(
-          `Dropped DiagnosticResponse from ${pubkeyB64.slice(0, 8)}: ${parsedSnapshot.error}`
-        );
-        return;
-      }
-      const snapshot = parsedSnapshot.value;
-      this._receivedDiagnosticLogs.update(current => ({ ...current, [pubkeyB64]: snapshot }));
-      this._pendingDiagnosticRequests.update(curr => {
-        const next = { ...curr };
-        delete next[pubkeyB64];
-        return next;
-      });
-      this._failedDiagnosticRequests.update(curr => {
-        if (!curr[pubkeyB64]) return curr;
-        const next = { ...curr };
-        delete next[pubkeyB64];
-        return next;
-      });
-      const truncationNote = snapshot.truncated
-        ? ` (TRUNCATED: ${snapshot.truncated.events} events, ${snapshot.truncated.customLogs} custom logs dropped at sender)`
-        : '';
-      this.logger.logCustomMessage(
-        `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs${truncationNote}`
-      );
-    } catch (e) {
-      console.warn('Failed to parse DiagnosticResponse:', e);
-    }
   }
 
 }

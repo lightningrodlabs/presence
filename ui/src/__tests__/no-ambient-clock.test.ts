@@ -103,6 +103,10 @@ const PINNED_FILES: Array<{
   // Store-decomposition round two, Task 2 (MediaSettings): takes `now` via
   // bindings; storage/mediaDevices reads stay live per-call, not snapshotted.
   { relPath: '../media-settings.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 3 (DiagnosticsHub): the retry
+  // timer stamps `startedAt` and schedules its timeout through the
+  // `now`/`setTimeout` bindings, both late-bound onto the clock.
+  { relPath: '../diagnostics-hub.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
