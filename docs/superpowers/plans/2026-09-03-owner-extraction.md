@@ -1,5 +1,7 @@
 # Owner Extraction Implementation Plan
 
+**Status: LANDED on `owner-extraction`.** All seven tasks executed and committed to that branch (`818e5cd`..`ac62385` for the six code tasks, plus the Task 7 doc-sync commits and this fixup). Merging `owner-extraction` into `main-0.7` is a pending human step — this document describes the `owner-extraction` branch, not `main-0.7`, until that merge lands. The corresponding `CLAUDE.md` "True today" bullet was added by the Task 7 doc-sync (see the "Owner-extraction round facts" bullet).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Lift five concern clusters out of `ui/src/streams-store.ts` into owner objects (`PeerAudioLevels`, `MediaSettings`, `DiagnosticsHub`, `TrackHealthMonitor`, `ScreenShareLinks`), plus a narrow dead-code deletion — with zero behavior change.

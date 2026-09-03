@@ -22,15 +22,31 @@ import { join } from 'node:path';
 const src = (rel: string) =>
   readFileSync(join(__dirname, '..', rel), 'utf8');
 
+const DEAD_SETTER_NAMES = [
+  'setTurnUrl(',
+  'setTurnUsername(',
+  'setTurnCredential(',
+  'setSignalDelay(',
+];
+
 describe('the dead settings setters stay deleted', () => {
   it('streams-store exposes no uncalled TURN/signal-delay setters', () => {
     const text = src('streams-store.ts');
-    for (const name of [
-      'setTurnUrl(',
-      'setTurnUsername(',
-      'setTurnCredential(',
-      'setSignalDelay(',
-    ]) {
+    for (const name of DEAD_SETTER_NAMES) {
+      expect(
+        text.includes(name),
+        `${name} was deleted as a zero-caller dead path (item 6); reintroduce it only WITH its caller and update this pin`,
+      ).toBe(false);
+    }
+  });
+
+  // The TURN/ICE settings concern moved off streams-store.ts into
+  // MediaSettings (store-decomposition round two, owner-extraction,
+  // 2026-09-03) — the store-only scan above is blind to a setter
+  // resurrected there. Same four names, same absence assertion.
+  it('media-settings exposes no uncalled TURN/signal-delay setters', () => {
+    const text = src('media-settings.ts');
+    for (const name of DEAD_SETTER_NAMES) {
       expect(
         text.includes(name),
         `${name} was deleted as a zero-caller dead path (item 6); reintroduce it only WITH its caller and update this pin`,

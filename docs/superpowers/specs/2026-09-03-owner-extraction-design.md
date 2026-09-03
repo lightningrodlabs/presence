@@ -147,8 +147,9 @@ controller, not deleted on an implementer's own judgment.
 2. **Landed** `29b2ff2` (+ fixup `f52b0aa`, shared with task 3) —
    `MediaSettings`.
 3. **Landed** `c1bf254` (+ fixup `f52b0aa`, shared with task 2 — the
-   fixup touches `media-settings.ts` and `diagnostics-hub.ts` only,
-   landed as one commit between tasks 3 and 4) — `DiagnosticsHub`.
+   fixup touches `media-settings.ts`, `diagnostics-hub.ts`, and
+   `streams-store.ts` (delegate-doc trim), landed as one commit between
+   tasks 3 and 4) — `DiagnosticsHub`.
 4. **Landed** `79d158d` — `TrackHealthMonitor`. In-review amendment:
    the bindings-record sketch above named `applyStaleTeardown`,
    `myPubKeyB64`, and `localIntent`, none of which the moved bodies
@@ -161,7 +162,8 @@ controller, not deleted on an implementer's own judgment.
    implementation, not a scope change.
 5. **Landed** `e47e6dc` — `ScreenShareLinks` (largest; landed last so
    the pattern was settled). In-review amendment: `closeGuardOutcome`
-   — read by the moved connected-handler body — was relocated from
+   — read by the moved close handler, `_handleScreenShareClosed`
+   (`ui/src/screen-share-links.ts:291`) — was relocated from
    `streams-store.ts` to `ui/src/transport/close-cleanup-policy.ts` as
    the one exported (target × via × outcome)-table outcome adapter,
    table-tested there, rather than added to the owner's bindings
@@ -173,10 +175,29 @@ controller, not deleted on an implementer's own judgment.
    markers here; the round-three list recorded below and in CLAUDE.md
    where the next session will find it.
 
-Also landed, outside the numbered plan: `ac62385` — review-deferred
-normalizations spanning tasks 2–5 (binding-field naming, duplicate
-delegate-doc trim), folded in at task 6's close rather than reopening
-each task's branch.
+Also landed, outside the numbered plan: `ac62385` — six review-deferred
+normalizations spanning tasks 2–5, folded in at task 6's close rather
+than reopening each task's branch: (1) `media-settings.ts`'s header
+cites the design spec by path, matching `peer-audio-levels.ts`; (2)
+`StreamsStore`'s `MediaSettings` construction moved from the end of the
+constructor to immediately after the `_localIntent` assignment — a
+code-position change, not a behavior one, but worth recording in a
+zero-behavior round; it shrinks the window where a delegating getter
+could read an unconstructed owner (verified no statement between the
+old and new positions reads a `mediaSettings`-delegated member); (3)
+`TrackHealthMonitor.reconcileVideoStreamState`'s JSDoc, dropped by the
+extraction, was restored verbatim from the pre-extraction
+`streams-store.ts` at `d33834a`; (4) stale prose in
+`init-retry-policy.test.ts` and `compat-corpus.test.ts` re-pointed from
+the deleted `StreamsStore._ensureOutgoingScreenShare` to its current
+home, `ScreenShareLinks.ensureOutgoingScreenShare`
+(`ui/src/screen-share-links.ts`) — comments only, no assertion changes;
+(5) `screen-share-harness.ts`'s header layering claim (the listed paths
+are store code, now `ui/src/screen-share-links.ts`, not harness code)
+was restored after task 5's edit lost it; (6) a table-driven `describe`
+block for the newly exported `closeGuardOutcome` was added to
+`close-cleanup-policy.test.ts`, covering all `SlotWrite` arms it maps
+onto the outcome axis.
 
 ## Risks (named)
 
