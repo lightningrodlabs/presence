@@ -22,7 +22,7 @@ import {
 } from './presence-policy';
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { initialPeerRecord, prunePendingInits, resetPeerRecord, type PeerRecord } from './peer-record';
-import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
+import { FsmTransport } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import {
   routeTransportPhase,
@@ -103,6 +103,7 @@ import { MicSource } from './mic-source';
 import { CameraSource } from './camera-source';
 import { CaptureReconciler } from './capture-reconciler';
 import { PeerAudioLevels } from './peer-audio-levels';
+import { MediaSettings } from './media-settings';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -284,42 +285,35 @@ export class StreamsStore {
   // lazy allAgents polling deactivate after the room is left.
   _allAgentsUnsub: (() => void) | null = null;
 
-  // ICE/TURN settings live in storage.local (window.localStorage in
-  // production) and are edited from the Settings panel. Read them live (not
-  // snapshotted at construction) so edits take effect on the next connection
-  // without a reload. iceConfig / the transport trickle getters consult
-  // these on every ensureConnection.
+  // ICE/TURN settings, device enumeration/selection, and the storage-backed
+  // trickle toggle are owned by MediaSettings (store-decomposition round
+  // two, Task 2; see media-settings.ts). Bare-forward delegates below.
   get trickleICE(): boolean {
-    // Stored as 'true'/'false'; default ON when unset.
-    return this.deps.storage.local.getItem('trickleICE') !== 'false';
+    return this.mediaSettings.trickleICE;
   }
 
   get turnUrl(): string {
-    return this.deps.storage.local.getItem('turnUrl') || '';
+    return this.mediaSettings.turnUrl;
   }
 
   get turnUsername(): string {
-    return this.deps.storage.local.getItem('turnUsername') || '';
+    return this.mediaSettings.turnUsername;
   }
 
   get turnCredential(): string {
-    return this.deps.storage.local.getItem('turnCredential') || '';
+    return this.mediaSettings.turnCredential;
   }
 
-  // Cloudflare-provisioned TURN. Stored under separate keys from the manual
-  // TURN server so both can be offered as ICE candidates simultaneously (the
-  // ICE agent gathers relay candidates from every configured server). Written
-  // by the Settings panel's auto-provisioning; read live here.
   get cfTurnUrl(): string {
-    return this.deps.storage.local.getItem('cfTurnUrl') || '';
+    return this.mediaSettings.cfTurnUrl;
   }
 
   get cfTurnUsername(): string {
-    return this.deps.storage.local.getItem('cfTurnUsername') || '';
+    return this.mediaSettings.cfTurnUsername;
   }
 
   get cfTurnCredential(): string {
-    return this.deps.storage.local.getItem('cfTurnCredential') || '';
+    return this.mediaSettings.cfTurnCredential;
   }
 
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
@@ -481,6 +475,15 @@ export class StreamsStore {
     ensurePeerRecord: k => this._ensurePeerRecord(k),
   });
 
+  /** The ONE owner of device enumeration/selection and the storage-backed
+   *  ICE/TURN configuration (store-decomposition round two, Task 2; see
+   *  media-settings.ts). Constructed in the constructor body, not as a
+   *  field initializer, because its bindings dereference `this.deps`
+   *  directly (a live storage/mediaDevices handle, not a late-bound
+   *  arrow) — field initializers run before `this.deps = deps` in the
+   *  constructor body. */
+  mediaSettings!: MediaSettings;
+
   /**
    * WebRTC transports. Three instances by purpose:
    *  - mediaTransport: bidirectional mic+camera (one connection per peer).
@@ -590,6 +593,17 @@ export class StreamsStore {
           openConnections: connections,
         }),
     );
+    this.mediaSettings = new MediaSettings({
+      storage: this.deps.storage.local,
+      mediaDevices: this.deps.mediaDevices,
+      changeMicDevice: id => this.micSource.changeDevice(id),
+      changeCameraDevice: id => this.cameraSource.changeDevice(id),
+      broadcastRtcAction: a => this._broadcastRtcAction(a),
+      logAgentEvent: e => this.logger.logAgentEvent(e),
+      now: () => this.clock.now(),
+      myPubKeyB64: () => this.myPubKeyB64,
+    });
+
     // Construction ends here: fields and derived stores only, no
     // subscriptions, no transports, no browser APIs. Everything that
     // touches the ambient world (window, navigator, the signal bus, the
@@ -2534,39 +2548,15 @@ export class StreamsStore {
   }
 
   enableTrickleICE() {
-    this.deps.storage.local.setItem('trickleICE', 'true');
+    this.mediaSettings.enableTrickleICE();
   }
 
   disableTrickleICE() {
-    this.deps.storage.local.setItem('trickleICE', 'false');
+    this.mediaSettings.disableTrickleICE();
   }
 
   get iceConfig(): RTCIceServer[] {
-    const servers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
-    // A TURN field may carry more than one URL (comma- or whitespace-separated)
-    // so a single credential covers multiple transports — typically the UDP
-    // relay `turn:host:3478` plus the TLS-over-TCP relay
-    // `turns:host:443?transport=tcp`. The latter survives lossy-UDP paths and
-    // firewalls that only permit 443 (§6.3). One m-line per distinct URL is
-    // fine; the agent picks the best.
-    const pushTurn = (url: string, username: string, credential: string) => {
-      const urls = url
-        .split(/[\s,]+/)
-        .map(u => u.trim())
-        .filter(Boolean);
-      if (urls.length > 0) {
-        servers.push({
-          urls: urls.length === 1 ? urls[0] : urls,
-          username,
-          credential,
-        });
-      }
-    };
-    // Manual and Cloudflare TURN are independent entries — both are offered as
-    // candidates when present (WebRTC supports multiple TURN servers).
-    pushTurn(this.turnUrl, this.turnUsername, this.turnCredential);
-    pushTurn(this.cfTurnUrl, this.cfTurnUsername, this.cfTurnCredential);
-    return servers;
+    return this.mediaSettings.iceConfig;
   }
 
   // The setTurnUrl/setTurnUsername/setTurnCredential/setSignalDelay
@@ -2956,17 +2946,7 @@ export class StreamsStore {
   }
 
   async changeVideoInput(deviceId: string) {
-    this.logger.logAgentEvent({
-      agent: this.myPubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'ChangeMyVideoInput',
-    });
-    // CameraSource owns the device-switch path: it stores the new id,
-    // opens a new track if a consumer holds the camera, and fires
-    // _onCameraTrackChange's device-change branch to replaceTrack on
-    // mainStream and on every transport. Mirrors changeAudioInput.
-    await this.cameraSource.changeDevice(deviceId);
-    this._broadcastRtcAction('change-video-input');
+    return this.mediaSettings.changeVideoInput(deviceId);
   }
 
   async videoOn() {
@@ -3139,19 +3119,7 @@ export class StreamsStore {
   }
 
   async changeAudioInput(deviceId: string) {
-    this.logger.logAgentEvent({
-      agent: this.myPubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'ChangeMyAudioInput',
-    });
-    console.log('Changing audio input to: ', deviceId);
-    // MicSource owns the device-switch path: it stores the new id, opens a
-    // new track, replaces the active track, and fires _onMicTrackChange,
-    // which is what updates mainStream and replaceTracks on all peers.
-    // If no consumer currently holds the mic (WebRTC off + voice off), the
-    // id is stored and the next acquire picks it up.
-    await this.micSource.changeDevice(deviceId);
-    this._broadcastRtcAction('change-audio-input');
+    return this.mediaSettings.changeAudioInput(deviceId);
   }
 
   async audioOn(enabled: boolean) {
@@ -3440,47 +3408,48 @@ export class StreamsStore {
   // MEDIA DEVICES
   // ===========================================================================================
 
-  mediaDevices: Writable<MediaDeviceInfo[]> = writable([]);
+  get mediaDevices(): Writable<MediaDeviceInfo[]> {
+    return this.mediaSettings.mediaDevices;
+  }
 
   async updateMediaDevices() {
-    const mediaDevices = await this.deps.mediaDevices.enumerateDevices();
-    this.mediaDevices.set(mediaDevices);
+    return this.mediaSettings.updateMediaDevices();
   }
 
   audioInputDevices(): Readable<MediaDeviceInfo[]> {
-    return derived(this.mediaDevices, devices =>
-      devices.filter(device => device.kind === 'audioinput')
-    );
+    return this.mediaSettings.audioInputDevices();
   }
 
   videoInputDevices(): Readable<MediaDeviceInfo[]> {
-    return derived(this.mediaDevices, devices =>
-      devices.filter(device => device.kind === 'videoinput')
-    );
+    return this.mediaSettings.videoInputDevices();
   }
 
   audioOutputDevices(): Readable<MediaDeviceInfo[]> {
-    return derived(this.mediaDevices, devices =>
-      devices.filter(device => device.kind === 'audiooutput')
-    );
+    return this.mediaSettings.audioOutputDevices();
   }
 
-  _audioInputId: Writable<string | undefined> = writable(undefined); // if undefined, the default audio input source is used
+  get _audioInputId(): Writable<string | undefined> {
+    return this.mediaSettings._audioInputId;
+  }
 
   audioInputId(): Readable<string | undefined> {
-    return derived(this._audioInputId, id => id);
+    return this.mediaSettings.audioInputId();
   }
 
-  _audioOutputId: Writable<string | undefined> = writable(undefined); // if undefined, the default audio output is used
+  get _audioOutputId(): Writable<string | undefined> {
+    return this.mediaSettings._audioOutputId;
+  }
 
   audioOutputId(): Readable<string | undefined> {
-    return derived(this._audioOutputId, id => id);
+    return this.mediaSettings.audioOutputId();
   }
 
-  _videoInputId: Writable<string | undefined> = writable(undefined); // if undefined, the default video input source is used
+  get _videoInputId(): Writable<string | undefined> {
+    return this.mediaSettings._videoInputId;
+  }
 
   videoInputId(): Readable<string | undefined> {
-    return derived(this._videoInputId, id => id);
+    return this.mediaSettings.videoInputId();
   }
 
   // ===========================================================================================

@@ -100,6 +100,9 @@ const PINNED_FILES: Array<{
   // Store-decomposition round two, Task 1 (PeerAudioLevels): no timing at
   // all in this owner, but pinned per the round's pattern.
   { relPath: '../peer-audio-levels.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 2 (MediaSettings): takes `now` via
+  // bindings; storage/mediaDevices reads stay live per-call, not snapshotted.
+  { relPath: '../media-settings.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
