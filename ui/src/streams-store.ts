@@ -102,6 +102,7 @@ import { PresenceLogger } from './logging';
 import { MicSource } from './mic-source';
 import { CameraSource } from './camera-source';
 import { CaptureReconciler } from './capture-reconciler';
+import { PeerAudioLevels } from './peer-audio-levels';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -471,6 +472,14 @@ export class StreamsStore {
   /** The ONE owner of the WebRTC mic/camera acquire handles and their
    *  retry state (Task 3; see capture-reconciler.ts). Assigned in start(). */
   captureReconciler!: CaptureReconciler;
+
+  /** The ONE owner of the per-peer WebRTC AnalyserNode surface (store-
+   *  decomposition round two, Task 1; see peer-audio-levels.ts). */
+  peerAudioLevels: PeerAudioLevels = new PeerAudioLevels({
+    ensureAudioContext: () => this.micSource.ensureAudioContext(),
+    peerRecord: k => this._peerRecords.get(k),
+    ensurePeerRecord: k => this._ensurePeerRecord(k),
+  });
 
   /**
    * WebRTC transports. Three instances by purpose:
@@ -1730,7 +1739,7 @@ export class StreamsStore {
       }
       return currentValue;
     });
-    this.setupPeerAudioAnalyser(pubKeyB64, stream);
+    this.peerAudioLevels.setupPeerAudioAnalyser(pubKeyB64, stream);
     this.eventCallback({
       type: 'peer-stream',
       pubKeyB64,
@@ -1758,7 +1767,7 @@ export class StreamsStore {
     // never gets a second pass when the audio track arrives later. Hook it
     // here as well: idempotent if the analyser already exists.
     if (track.kind === 'audio' && stream && !this._peerRecords.get(pubKeyB64)?.analyser) {
-      this.setupPeerAudioAnalyser(pubKeyB64, stream);
+      this.peerAudioLevels.setupPeerAudioAnalyser(pubKeyB64, stream);
     }
 
     if (!track.muted) {
@@ -4448,59 +4457,10 @@ export class StreamsStore {
   }>();
   private static readonly SDP_AGGREGATE_WINDOW_MS = 1000;
 
-  /**
-   * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
-   * Connected as: MediaStreamSource → AnalyserNode (no destination —
-   * the <video> element handles playback). Called from the peer-stream
-   * event handler.
-   */
-  setupPeerAudioAnalyser(pubKeyB64: string, stream: MediaStream): void {
-    // Clean up any existing analyser for this peer
-    { const r = this._peerRecords.get(pubKeyB64); if (r) r.analyser = undefined; }
-
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks.length === 0) return;
-
-    const ctx = this.micSource.ensureAudioContext();
-    if (!ctx) return;
-
-    // Resume if still suspended (Electron/Wayland sometimes leaves the
-    // context suspended past creation; a suspended context means the audio
-    // graph doesn't run and the analyser reads back zeros, even though the
-    // <video> element plays audio fine).
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
-    }
-
-    try {
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      // Do NOT connect analyser to destination — <video> handles playback
-      this._ensurePeerRecord(pubKeyB64).analyser = { node: analyser, buffer: new Uint8Array(analyser.fftSize) };
-    } catch (e) {
-      console.warn('Failed to create audio analyser for peer:', e);
-    }
-  }
-
-  /**
-   * Read the current peak audio level for a peer from the WebRTC
-   * AnalyserNode. Returns 0.0–1.0, or 0 if no analyser exists.
-   * Called by the audio-level-meter element at 10fps.
-   */
+  /** View-surface delegate to `peerAudioLevels` (Task 1; see
+   *  peer-audio-levels.ts). Called by the audio-level-meter element. */
   getWebrtcAudioLevel(pubKeyB64: string): number {
-    const a = this._peerRecords.get(pubKeyB64)?.analyser;
-    if (!a) return 0;
-
-    a.node.getByteTimeDomainData(a.buffer);
-    let peak = 0;
-    for (let i = 0; i < a.buffer.length; i += 4) {
-      // Byte domain data is 0–255 centered at 128
-      const v = Math.abs(a.buffer[i] - 128) / 128;
-      if (v > peak) peak = v;
-    }
-    return peak;
+    return this.peerAudioLevels.getWebrtcAudioLevel(pubKeyB64);
   }
 
   setReceiverOverride(agentPubKeyB64: AgentPubKeyB64, moduleId: string | null): void {
