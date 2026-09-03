@@ -20,8 +20,9 @@ describe('PeerAudioLevels', () => {
 
   it('setup is a no-op when the stream has no audio tracks', () => {
     const records = new Map<string, PeerRecord>();
+    let ensureAudioContextCalls = 0;
     const levels = new PeerAudioLevels({
-      ensureAudioContext: () => null,
+      ensureAudioContext: () => { ensureAudioContextCalls += 1; return null; },
       peerRecord: k => records.get(k),
       ensurePeerRecord: k => {
         let r = records.get(k);
@@ -31,5 +32,7 @@ describe('PeerAudioLevels', () => {
     });
     levels.setupPeerAudioAnalyser('peer', { getAudioTracks: () => [] } as unknown as MediaStream);
     expect(records.get('peer')?.analyser).toBeUndefined();
+    expect(records.size).toBe(0); // the cleanup read never creates a row
+    expect(ensureAudioContextCalls).toBe(0); // the no-audio-tracks early return survived the move
   });
 });

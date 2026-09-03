@@ -15,7 +15,7 @@ export type PeerAudioLevelsBindings = {
 };
 
 export class PeerAudioLevels {
-  constructor(private readonly b: PeerAudioLevelsBindings) {}
+  constructor(private readonly bindings: PeerAudioLevelsBindings) {}
 
   /**
    * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
@@ -23,14 +23,14 @@ export class PeerAudioLevels {
    * the <video> element handles playback). Called from the peer-stream
    * event handler.
    */
-  setupPeerAudioAnalyser(pubKeyB64: string, stream: MediaStream): void {
+  setupPeerAudioAnalyser(pubKeyB64: AgentPubKeyB64, stream: MediaStream): void {
     // Clean up any existing analyser for this peer
-    { const r = this.b.peerRecord(pubKeyB64); if (r) r.analyser = undefined; }
+    { const r = this.bindings.peerRecord(pubKeyB64); if (r) r.analyser = undefined; }
 
     const audioTracks = stream.getAudioTracks();
     if (audioTracks.length === 0) return;
 
-    const ctx = this.b.ensureAudioContext();
+    const ctx = this.bindings.ensureAudioContext();
     if (!ctx) return;
 
     // Resume if still suspended (Electron/Wayland sometimes leaves the
@@ -47,7 +47,7 @@ export class PeerAudioLevels {
       analyser.fftSize = 256;
       source.connect(analyser);
       // Do NOT connect analyser to destination — <video> handles playback
-      this.b.ensurePeerRecord(pubKeyB64).analyser = { node: analyser, buffer: new Uint8Array(analyser.fftSize) };
+      this.bindings.ensurePeerRecord(pubKeyB64).analyser = { node: analyser, buffer: new Uint8Array(analyser.fftSize) };
     } catch (e) {
       console.warn('Failed to create audio analyser for peer:', e);
     }
@@ -58,8 +58,8 @@ export class PeerAudioLevels {
    * AnalyserNode. Returns 0.0–1.0, or 0 if no analyser exists.
    * Called by the audio-level-meter element at 10fps.
    */
-  getWebrtcAudioLevel(pubKeyB64: string): number {
-    const a = this.b.peerRecord(pubKeyB64)?.analyser;
+  getWebrtcAudioLevel(pubKeyB64: AgentPubKeyB64): number {
+    const a = this.bindings.peerRecord(pubKeyB64)?.analyser;
     if (!a) return 0;
 
     a.node.getByteTimeDomainData(a.buffer);

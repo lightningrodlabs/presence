@@ -477,7 +477,7 @@ export class StreamsStore {
    *  decomposition round two, Task 1; see peer-audio-levels.ts). */
   peerAudioLevels: PeerAudioLevels = new PeerAudioLevels({
     ensureAudioContext: () => this.micSource.ensureAudioContext(),
-    peerRecord: k => this._peerRecords.get(k),
+    peerRecord: k => this._peerRecord(k),
     ensurePeerRecord: k => this._ensurePeerRecord(k),
   });
 
