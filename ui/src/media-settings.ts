@@ -1,8 +1,9 @@
 /**
  * MediaSettings — owner of device enumeration/selection and the
- * storage-backed ICE/TURN configuration (round two; see the design
- * spec). Storage reads stay LIVE (per-call), matching the Phase 6
- * live-closure pin in the wiring suite.
+ * storage-backed ICE/TURN configuration (store-decomposition round two;
+ * docs/superpowers/specs/2026-09-03-owner-extraction-design.md). Storage
+ * reads stay LIVE (per-call), matching the Phase 6 live-closure pin in
+ * the wiring suite.
  */
 import { derived, writable, type Readable, type Writable } from '@holochain-open-dev/stores';
 import type { AgentPubKeyB64 } from '@holochain/client';

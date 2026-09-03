@@ -138,6 +138,14 @@ export class TrackHealthMonitor {
     }
   }
 
+  /**
+   * Compares how the other peer sees our stream and if this mismatches our expectations,
+   * reset streams accordingly. Uses exponential backoff (10s, 20s, 40s...) and tries
+   * lightweight replaceTrack first before falling back to the heavier clone approach.
+   *
+   * @param pubkey
+   * @param streamAndTrackInfo
+   */
   reconcileVideoStreamState(
     pubkey: AgentPubKeyB64,
     streamAndTrackInfo: StreamAndTrackInfo

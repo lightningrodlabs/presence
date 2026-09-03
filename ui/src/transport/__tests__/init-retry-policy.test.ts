@@ -4,9 +4,9 @@ import type { InitRetryInputs } from '../init-retry-policy';
 
 // Since Phase 3 this policy serves the video connection only: the
 // screen-share port replaced its InitRequest cadence with the idempotent
-// `_ensureOutgoingScreenShare`, deleting the `kind` axis and both screen
-// divergence rows (no-tie-break, InitSent re-assertion) this file used to
-// pin.
+// `ScreenShareLinks.ensureOutgoingScreenShare` (`ui/src/screen-share-links.ts`),
+// deleting the `kind` axis and both screen divergence rows (no-tie-break,
+// InitSent re-assertion) this file used to pin.
 
 const NOW = 1_000_000;
 const THRESHOLD = 5_000;

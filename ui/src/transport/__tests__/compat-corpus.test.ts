@@ -87,9 +87,10 @@ function envelopeFor(payload: Record<string, unknown>): ModuleStateEnvelope {
  * conversation payload is `payload` — the emission rule, whose gated
  * types are enforced at runtime by the same capability read: `SdpFsm`
  * through `StreamsStore.webrtcAvailableFor` (the video init/accept
- * gates), `SdpFsmScreen` through `_ensureOutgoingScreenShare`. The
- * impl-preference resolution (`resolveWebrtcImpl`) died with SimplePeer
- * in Phase 3; capability is the whole decision now.
+ * gates), `SdpFsmScreen` through `ScreenShareLinks.ensureOutgoingScreenShare`
+ * (`ui/src/screen-share-links.ts`). The impl-preference resolution
+ * (`resolveWebrtcImpl`) died with SimplePeer in Phase 3; capability is
+ * the whole decision now.
  */
 function currentBuildSendsTo(payload: Record<string, unknown>): {
   sent: SignalMsgType[];
@@ -183,8 +184,9 @@ describe('compat corpus — pinned resolutions', () => {
     // SdpData screen channel with SdpFsmScreen. No released build parses
     // it: 0.14.7 resolves baseline-only, 0.14.8's field-probe fallback
     // yields only sdp-fsm. The production gate is
-    // `StreamsStore._ensureOutgoingScreenShare`'s capability check, fed
-    // from the same `conversationPayloadCaps` read as this model.
+    // `ScreenShareLinks.ensureOutgoingScreenShare`'s (`ui/src/screen-share-links.ts`)
+    // capability check, fed from the same `conversationPayloadCaps` read as
+    // this model.
     for (const version of ['0.14.7', '0.14.8']) {
       const { sent } = currentBuildSendsTo(
         byVersion[version].defaultConversationPayload,

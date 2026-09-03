@@ -520,6 +520,16 @@ export class StreamsStore {
     this.clock = deps.clock;
     this.myPubKeyB64 = encodeHashToBase64(deps.bus.myPubKey);
     this._localIntent = writable(initialLocalIntent(this.deps.storage.local));
+    this.mediaSettings = new MediaSettings({
+      storage: this.deps.storage.local,
+      mediaDevices: this.deps.mediaDevices,
+      changeMicDevice: id => this.micSource.changeDevice(id),
+      changeCameraDevice: id => this.cameraSource.changeDevice(id),
+      broadcastRtcAction: a => this._broadcastRtcAction(a),
+      logAgentEvent: e => this.logger.logAgentEvent(e),
+      now: () => this.clock.now(),
+      myPubKeyB64: () => this.myPubKeyB64,
+    });
 
     this._activeAgents = derived(
       [this._knownAgents, this.blockedAgents, this._presenceTick] as [
@@ -596,16 +606,6 @@ export class StreamsStore {
           openConnections: connections,
         }),
     );
-    this.mediaSettings = new MediaSettings({
-      storage: this.deps.storage.local,
-      mediaDevices: this.deps.mediaDevices,
-      changeMicDevice: id => this.micSource.changeDevice(id),
-      changeCameraDevice: id => this.cameraSource.changeDevice(id),
-      broadcastRtcAction: a => this._broadcastRtcAction(a),
-      logAgentEvent: e => this.logger.logAgentEvent(e),
-      now: () => this.clock.now(),
-      myPubKeyB64: () => this.myPubKeyB64,
-    });
     this.diagnosticsHub = new DiagnosticsHub({
       sendMessage: (agents, msgType, payload) =>
         this.deps.bus.sendMessage(agents, msgType, payload),

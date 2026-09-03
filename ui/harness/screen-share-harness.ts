@@ -12,10 +12,11 @@
  * ui/src/screen-share-links.ts), not by this file. Slot writes, role
  * routing, the `_peerRecords` screenShareStream mirror, and outgoing-share
  * initiation (`ScreenShareLinks.ensureOutgoingScreenShare` off the real
- * ping/pong cycle) are all store-decomposition round two, Task 5 code
- * (previously `StreamsStore._ensureOutgoingScreenShare` /
- * `StreamsStore.handleSdpFsmScreen`). The Phase 3.5 mirror of that glue
- * is DELETED per one-authority (working agreement 1).
+ * ping/pong cycle) are all store code (now `ui/src/screen-share-links.ts`
+ * — store-decomposition round two, Task 5; previously
+ * `StreamsStore._ensureOutgoingScreenShare` / `StreamsStore.handleSdpFsmScreen`),
+ * not harness code. The Phase 3.5 mirror of that glue is DELETED per
+ * one-authority (working agreement 1).
  *
  * What the harness still supplies (declared, not mirrored logic):
  *   - the deps binding and dwell compression, identical in role to
