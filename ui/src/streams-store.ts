@@ -801,6 +801,9 @@ export class StreamsStore {
       onTrackChange: (newTrack, oldTrack) => {
         this._onMicTrackChange(newTrack, oldTrack);
       },
+      // The clone fanout this served was deleted as dead code (round two
+      // Task 6, `mainStreamClones` had zero writers) — MicSource flips the
+      // shared track's `enabled` flag itself, so this binding is a no-op.
       onMutedChange: () => {},
       // Nothing consumes mic lifecycle yet — Task 3's reconciler reads
       // `micSource.lifecycle` directly on the presence tick rather than
