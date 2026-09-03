@@ -107,6 +107,10 @@ const PINNED_FILES: Array<{
   // timer stamps `startedAt` and schedules its timeout through the
   // `now`/`setTimeout` bindings, both late-bound onto the clock.
   { relPath: '../diagnostics-hub.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 4 (TrackHealthMonitor): the
+  // reconcile cooldown and every peer-record timestamp write route
+  // through the `now` binding, late-bound onto the clock.
+  { relPath: '../track-health.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {

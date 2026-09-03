@@ -1,8 +1,8 @@
 /**
  * Phase 2b — pure decision logic for the WebRTC track-health poll.
  *
- * Every 2s, `StreamsStore._checkTrackHealth` polls `pc.getStats()` for each
- * connected peer and answers two questions:
+ * Every 2s, `TrackHealthMonitor.checkTrackHealth` (`ui/src/track-health.ts`)
+ * polls `pc.getStats()` for each connected peer and answers two questions:
  *
  *   1. What are the display stats for this link (RTT, jitter, loss)?
  *   2. Are the tracks we expect to be flowing actually flowing — and if
@@ -11,11 +11,11 @@
  *
  * Both answers were computed inline; roughly 100 of the method's 144 lines
  * touched no `this` and are moved here verbatim so they can be table tested
- * without a `StreamsStore` instance (which cannot be built under vitest;
- * see CLAUDE.md). The store keeps the I/O: getStats, the store writes, and
- * the request-track-refresh send.
+ * without a `StreamsStore` or `TrackHealthMonitor` instance. `TrackHealthMonitor`
+ * (store-decomposition round two, Task 4) keeps the I/O: getStats, the peer-
+ * record writes, and the request-track-refresh send.
  *
- * Constrains `streams-store.ts:_checkTrackHealth`.
+ * Constrains `ui/src/track-health.ts:TrackHealthMonitor.checkTrackHealth`.
  */
 
 /**
@@ -128,7 +128,7 @@ export type StaleCycleCounts = { audio: number; video: number };
  * Consecutive poll cycles a track's byte counter may sit frozen before we
  * ask the peer to re-send. At the 2s poll interval this is 4+ seconds.
  * Serves the media-flowing predicate; the counters it thresholds are
- * advanced once per `_checkTrackHealth` poll.
+ * advanced once per `TrackHealthMonitor.checkTrackHealth` poll.
  */
 export const STALE_CYCLES_REFRESH_THRESHOLD = 2;
 
