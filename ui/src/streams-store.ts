@@ -2391,6 +2391,47 @@ export class StreamsStore {
     // ahead of the next presence tick).
     this._emitPresenceForensics();
 
+    this._applyPingRosterSweep();
+
+    await this._sendPings();
+
+    // Log our stream state
+    this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
+
+    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
+    // Accepts are connectionId reservations — the transport owns the peer
+    // lifecycle, so dropping the entry is the entire teardown. Inits are
+    // our sent-InitRequest records; without the sweep they grow one entry
+    // per 5s retry for as long as a peer stays unresponsive.
+    const now = this.clock.now();
+    this._sweepPendingInits(now);
+
+    // Health check for dead tracks (bytesReceived stall detection)
+    await this.trackHealth.checkTrackHealth();
+
+    // Scan for sustained audibility outages with a relay opportunity
+    this._checkAudibilityOutages();
+
+    // Flush any SdpData bursts that ended without a follow-up event.
+    this._flushStaleSdpAggregates();
+
+    // Forensics (signal-carrier liveness + presence-set membership)
+    // already ran at the top of this function, before the roster-merge
+    // write — see the comment there. Not repeated here (review C1: a
+    // second call this late would just be dead weight, since nothing
+    // between the two spots can change `_knownAgents`' lastSeen stamps).
+
+    // Signals media cadence: one evaluation per ping cycle, reading
+    // `_signalCarrierDownSince` from this cycle's forensics call above.
+    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
+    // targets — the healthiest link bounds what the relay can still
+    // deliver; targets with no sample yet contribute nothing, and no
+    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
+    // policy's declared design).
+    this._evaluateSignalsCadence();
+  }
+
+  private _applyPingRosterSweep(): void {
     const knownAgents = get(this._knownAgents);
     this.allAgents
       .map(agent => encodeHashToBase64(agent))
@@ -2437,7 +2478,9 @@ export class StreamsStore {
       });
       return connectionStatuses;
     });
+  }
 
+  private async _sendPings(): Promise<void> {
     // Ping known agents
     // This could potentially be optimized by only pinging agents that are online according to Moss (which would only work in shared rooms though)
     const agentsToPing = Object.keys(get(this._knownAgents))
@@ -2451,42 +2494,15 @@ export class StreamsStore {
       'PingUi',
       JSON.stringify({ t0: this.clock.now() }),
     );
+  }
 
-    // Log our stream state
-    this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
-
-    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
-    // Accepts are connectionId reservations — the transport owns the peer
-    // lifecycle, so dropping the entry is the entire teardown. Inits are
-    // our sent-InitRequest records; without the sweep they grow one entry
-    // per 5s retry for as long as a peer stays unresponsive.
-    const now = this.clock.now();
+  private _sweepPendingInits(now: number): void {
     for (const r of this._peerRecords.values()) {
       if (r.pendingInits) r.pendingInits = prunePendingInits(r.pendingInits, now, PENDING_HANDSHAKE_TTL_MS);
     }
+  }
 
-    // Health check for dead tracks (bytesReceived stall detection)
-    await this.trackHealth.checkTrackHealth();
-
-    // Scan for sustained audibility outages with a relay opportunity
-    this._checkAudibilityOutages();
-
-    // Flush any SdpData bursts that ended without a follow-up event.
-    this._flushStaleSdpAggregates();
-
-    // Forensics (signal-carrier liveness + presence-set membership)
-    // already ran at the top of this function, before the roster-merge
-    // write — see the comment there. Not repeated here (review C1: a
-    // second call this late would just be dead weight, since nothing
-    // between the two spots can change `_knownAgents`' lastSeen stamps).
-
-    // Signals media cadence: one evaluation per ping cycle, reading
-    // `_signalCarrierDownSince` from this cycle's forensics call above.
-    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
-    // targets — the healthiest link bounds what the relay can still
-    // deliver; targets with no sample yet contribute nothing, and no
-    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
-    // policy's declared design).
+  private _evaluateSignalsCadence(): void {
     let bestRttEwmaMs: number | undefined;
     for (const target of get(this._signalsTargets)) {
       const rtt = this._peerRecords.get(target)?.signalsRttEwma;
