@@ -1421,7 +1421,8 @@ export class StreamsStore {
   }
 
   disconnect(reason: string = 'unknown') {
-    this._teardownIntentAndForensics(reason);
+    this._applyIntent({ type: 'session-end' });
+    this._teardownForensics(reason);
     this._teardownNotifyPeers();
     this._teardownTimers();
     this._teardownSubscriptions();
@@ -1431,10 +1432,9 @@ export class StreamsStore {
     this._teardownState();
   }
 
-  /** Mark the session ended in local intent and log disconnect forensics
-   *  (caller stack + page visibility) before any teardown happens. */
-  private _teardownIntentAndForensics(reason: string): void {
-    this._applyIntent({ type: 'session-end' });
+  /** Log disconnect forensics (caller stack + page visibility) before any
+   *  teardown happens. */
+  private _teardownForensics(reason: string): void {
     // Forensics: capture WHO called disconnect (button vs. Lit lifecycle
     // unmount) so we can tell user-initiated leaves from DOM-remount leaves.
     // Stack is best-effort — useful when reason='unknown' to find a new caller.
@@ -1522,8 +1522,14 @@ export class StreamsStore {
     filmstripController.unbind();
   }
 
-  /** Unsubscribe the signals-targets subscription, disarm presence
-   *  sounds, and release the mic/camera capture sources. */
+  /** Unsubscribe the signals-targets subscription (kept here, not with
+   *  the other unsubs in `_teardownSubscriptions`, to preserve origin
+   *  teardown order — it sits between the encoder unbinds and the
+   *  capture-source release in the source body, and a phase boundary
+   *  cannot reorder statements relative to their origin neighbors),
+   *  disarm presence sounds, release the mic/camera capture sources, and
+   *  stop any outgoing/incoming screen share (`screenShareOff()` — itself
+   *  an indirect `_applyIntent` call site, via its own gesture method). */
   private _teardownCaptureAndSignals(): void {
     if (this._signalsTargetsUnsub) {
       this._signalsTargetsUnsub();
