@@ -78,9 +78,14 @@ members and line anchors at `5b63272`):
   `_emitPresenceForensics` (the review-C1 forensics-before-
   roster-write ordering is a pinned invariant that travels with the
   pipeline — its comment moves verbatim), `_applyPongRoster`, the
-  presence-sound arming/decision glue, and `handlePingUi`'s presence
+  presence-sound arming/decision glue, and ~~`handlePingUi`'s presence
   half (the plan draws the exact line; its screen-share stale check
-  stays a store/MediaLinks-side call as today).
+  stays a store/MediaLinks-side call as today)~~ — **AMENDED at plan
+  time (recorded in the plan header, landed Task 4):** `handlePingUi`
+  moves NOTHING. Its body is a pong-reply builder over cross-concern
+  reads plus the screen-share fragment, so it stays a store dispatcher
+  entirely; the pong side contributes only `_applyPongRoster` to the
+  owner. This sketch is superseded by that line.
 - The presence-tick subscription work currently armed in `start()`
   moves behind owner methods that the root's phase methods call.
 
@@ -118,7 +123,7 @@ the wiring suite stay green unmodified.
 
 ## Closing the line
 
-The doc-sync task DECLARES the store-decomposition line closed and
+**Landed** (Task 4 doc-sync). The doc-sync task DECLARES the store-decomposition line closed and
 moves the two remaining items to CLAUDE.md's dormant-until-trigger
 list (the meta-review precedent):
 
@@ -146,14 +151,18 @@ changes is the definition of done.
 
 ## Task plan
 
-1. PresenceLoop A — state + roster fragments (`_applyPingRosterSweep`,
-   `_applyPongRoster`, forensics, sounds) + the `Writable` getters.
-2. PresenceLoop B — the `pingAgents` pipeline + `_sendPings` +
-   `handlePingUi`'s presence half + start()-side tick-arming behind
-   owner methods.
-3. Composition-root split (`start()`/`disconnect()` phases).
-4. Doc-sync + closing declaration (CLAUDE.md bullet per its contract;
-   dormant list entries; spec/plan markers; Status line).
+1. **Landed** (`2805192`, fixup `9b9580d`). PresenceLoop A — state +
+   roster fragments (`_applyPingRosterSweep`, `_applyPongRoster`,
+   forensics, sounds) + the `Writable` getters.
+2. **Landed** (`3def783`). PresenceLoop B — the `pingAgents` pipeline +
+   `_sendPings` + start()-side tick-arming behind owner methods (NOT
+   `handlePingUi`'s presence half — amended at plan time, see Part 1
+   above: `handlePingUi` moves nothing).
+3. **Landed** (`aab830a`, fixup `2765dfe`). Composition-root split
+   (`start()`/`disconnect()` phases).
+4. **Landed** (prose-fix commit `8d6c315`, plus this doc-sync). Doc-sync
+   + closing declaration (CLAUDE.md bullet per its contract; dormant
+   list entries; spec/plan markers; Status line).
 
 Process: `superpowers:writing-plans` →
 `superpowers:subagent-driven-development`, worktree

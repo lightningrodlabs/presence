@@ -1,5 +1,7 @@
 # PresenceLoop + Root Split Implementation Plan
 
+**Status: LANDED on `presence-loop`.** All four tasks executed and committed to that branch (`2805192`..`aab830a` for the three code tasks, the Task 1 fixup `9b9580d` and the Task 3 fixup `2765dfe` included, plus the Task 4 doc-sync commits `8d6c315` and this one). Merging `presence-loop` into `main-0.7` is a pending human step — this document describes the `presence-loop` branch, not `main-0.7`, until that merge lands. The corresponding `CLAUDE.md` "True today" bullet was added by the Task 4 doc-sync (see the "Presence-loop round facts" bullet). This round CLOSES the store-decomposition line — see the spec's "Closing the line" section, landed below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extract a `PresenceLoop` owner (presence state + roster/forensics/sounds behavior), split `start()`/`disconnect()` into named phase methods, and close the store-decomposition line — with zero behavior change.
@@ -44,12 +46,12 @@
 - Bindings sketched (bodies are the authority; uncovered `this.X` = STOP): `clock`, `logger`, `myPubKeyB64`, `allAgents` read, `blockedAgents` read, `eventCallback` (sound events), `connectionStatusesStore` (roster seed writes the store-resident `_connectionStatuses`), `presentPeers` (the derived store, for the sound subscription), pure imports move with bodies (`decideSignalCarrier`, `decidePresenceSoundEvents`, `computeActiveAgents`-adjacent — whatever the bodies import).
 - Constructor ordering: `presenceLoop` constructed immediately after `mediaLinks` (both before the derived-store definitions). CAUTION: the derived `_presentPeers` callback writes `this._lastComputedPresent` through the accessor — the accessor pair must exist before the derived definitions run (it does: accessors are prototype members).
 
-- [ ] **Step 1: Create the owner; move state + the four methods; write the substitution table.**
-- [ ] **Step 2: Wire the store: construct owner; delete moved members; add three getters + two accessor pairs + re-points.**
-- [ ] **Step 3: no-ambient-clock pin (`'../presence-loop.ts'`, `FULL_PATTERNS`).**
-- [ ] **Step 4: Reference grep** — `grep -rn '_applyPingRosterSweep\|_emitPresenceForensics\|_applyPongRoster\|_armPresenceSounds\|_presenceSoundState\|_lastPresenceSet\|_presentPeersUnsub' ui/ --include='*.ts' | grep -v presence-loop` — remaining hits only re-points/delegates/prose.
-- [ ] **Step 5: Focused (wiring + construction + no-ambient-clock) then full gate** — wiring's carrier-hold and sound tests green UNMODIFIED.
-- [ ] **Step 6: Commit** — `refactor: extract PresenceLoop owner — presence state, roster fragments, forensics, sounds` + plan Task 1 body line.
+- [x] **Step 1: Create the owner; move state + the four methods; write the substitution table.**
+- [x] **Step 2: Wire the store: construct owner; delete moved members; add three getters + two accessor pairs + re-points.**
+- [x] **Step 3: no-ambient-clock pin (`'../presence-loop.ts'`, `FULL_PATTERNS`).**
+- [x] **Step 4: Reference grep** — `grep -rn '_applyPingRosterSweep\|_emitPresenceForensics\|_applyPongRoster\|_armPresenceSounds\|_presenceSoundState\|_lastPresenceSet\|_presentPeersUnsub' ui/ --include='*.ts' | grep -v presence-loop` — remaining hits only re-points/delegates/prose.
+- [x] **Step 5: Focused (wiring + construction + no-ambient-clock) then full gate** — wiring's carrier-hold and sound tests green UNMODIFIED.
+- [x] **Step 6: Commit** — `refactor: extract PresenceLoop owner — presence state, roster fragments, forensics, sounds` + plan Task 1 body line.
 
 ---
 
@@ -64,11 +66,11 @@
 - Store keeps: bare `pingAgents()` delegate (callers: `static connect`'s interval + await ~1330–1332, both harnesses, ~30 wiring-test sites — the delegate serves all unchanged); `_sweepPendingInits`/`_evaluateSignalsCadence`/`_checkAudibilityOutages` stay store-resident (spec decision 3) reached via bindings; the interval HANDLES (`pingInterval`, `_presenceTickInterval`) stay root state.
 - The C1 ordering must hold in the owner pipeline (forensics first) AND in `onPresenceTick` — both comments verbatim.
 
-- [ ] **Step 1: Move the pipeline + `_sendPings` + the tick callback; extend bindings (reuse Task 1's, never duplicate a seam).**
-- [ ] **Step 2: Store: `pingAgents()` becomes the bare delegate; `start()`'s interval callback re-pointed to `onPresenceTick`; delete moved members.**
-- [ ] **Step 3: Reference grep** — `grep -rn '_sendPings\|onPresenceTick\|pingAgents' ui/ --include='*.ts' | grep -v presence-loop` — delegate + external callers only.
-- [ ] **Step 4: Focused (wiring — its ~30 pingAgents-driving tests and the tick tests must be green UNMODIFIED) then full gate.**
-- [ ] **Step 5: Commit** — `refactor: move pingAgents pipeline and presence tick into PresenceLoop` + plan Task 2 line.
+- [x] **Step 1: Move the pipeline + `_sendPings` + the tick callback; extend bindings (reuse Task 1's, never duplicate a seam).**
+- [x] **Step 2: Store: `pingAgents()` becomes the bare delegate; `start()`'s interval callback re-pointed to `onPresenceTick`; delete moved members.**
+- [x] **Step 3: Reference grep** — `grep -rn '_sendPings\|onPresenceTick\|pingAgents' ui/ --include='*.ts' | grep -v presence-loop` — delegate + external callers only.
+- [x] **Step 4: Focused (wiring — its ~30 pingAgents-driving tests and the tick tests must be green UNMODIFIED) then full gate.**
+- [x] **Step 5: Commit** — `refactor: move pingAgents pipeline and presence tick into PresenceLoop` + plan Task 2 line.
 
 ---
 
@@ -81,9 +83,9 @@
 - Produces: `start()` and `disconnect()` as pipelines of named store-private phase methods. Names fixed from the actual bodies at implementation time following this shape (indicative set — the implementer partitions the REAL body into contiguous verbatim fragments and names each by its concern; the partition and names go in the report for review): `_startTransports`, `_startSignalRouting`, `_startPresenceTicking`, `_startCaptureSources`, `_startPageLifecycle` + residue; `_teardownTimers`, `_teardownTransports`, `_teardownCaptureAndEncoders`, `_teardownSubscriptions`, `_teardownState` + residue. RULES (binding): fragments contiguous and verbatim; order and awaits identical; no statement moves across a phase boundary relative to origin order; locals shared across fragment boundaries become parameters or provably-pure re-reads declared per variable in the report (the round-three fragment-variable discipline); any try/catch or conditional must sit wholly inside one phase or wholly wrap the pipeline exactly as origin (the round-three Task-1 lesson — verify what each guard ACTUALLY covers in origin before drawing a boundary through its neighborhood; a boundary that would change guard coverage is a STOP).
 - The wiring suite's start/disconnect symmetry and destroy-exactly-once pins green UNMODIFIED.
 
-- [ ] **Step 1: Read both bodies in full; partition; split (verbatim fragments + pipeline).**
-- [ ] **Step 2: Focused (wiring + construction) then full gate; diff review — split-only.**
-- [ ] **Step 3: Commit** — `refactor: split start/disconnect into named composition-root phases` + plan Task 3 line.
+- [x] **Step 1: Read both bodies in full; partition; split (verbatim fragments + pipeline).**
+- [x] **Step 2: Focused (wiring + construction) then full gate; diff review — split-only.**
+- [x] **Step 3: Commit** — `refactor: split start/disconnect into named composition-root phases` + plan Task 3 line.
 
 ---
 
@@ -91,10 +93,10 @@
 
 **Files:** `CLAUDE.md`, the spec, this plan.
 
-- [ ] **Step 1: CLAUDE.md "True today" bullet** per its contract (read the media-links bullet as the model; anchored range incl. closing commits by role; present tense only naming enforcing file/test; no counters/snapshots/unanchored negations; drift test run). Record: PresenceLoop's ownership (state list, the three getters, the two accessor pairs and WHY — the derived `_presentPeers` callback and cadence eval still touch those fields store-side), the bare `pingAgents()` delegate, the root phases, the handlePingUi refinement (nothing moved from it — spec amended), zero declared behavior changes. Inline-correct earlier bullets falsified by the move (grep every moved name against CLAUDE.md and verdict every hit — known candidates: the connection-thrash bullet's "both evaluators (`pingAgents`'s top and the presence-tick callback)" phrasing, the §7.5/Phase-2 bullets' `_presentPeers`/`computePresentPeers` location claims if any name store residency, the meta-review bullet's dormant list gains the two new entries below).
-- [ ] **Step 2: THE CLOSING DECLARATION**: add to the dormant-until-trigger list (the meta-review bullet holds it): reactive-`Writable` unification — trigger: a view-layer round needing the store surface reshaped; `_iceTimings`/`_sdpDataAggregates` forensic fold — trigger: observed friction from the composite keys. State that the store-decomposition line (rounds one–four, PeerRecord → owner extraction → media-links → presence-loop) is closed with no standing loop; further decomposition only on feature-traffic demand.
-- [ ] **Step 3: Spec landed-markers + the Part-1 handlePingUi amendment + plan Status line.**
-- [ ] **Step 4: Drift guard focused + full gate; commit** — `docs: sync CLAUDE.md and close the store-decomposition line`.
+- [x] **Step 1: CLAUDE.md "True today" bullet** per its contract (read the media-links bullet as the model; anchored range incl. closing commits by role; present tense only naming enforcing file/test; no counters/snapshots/unanchored negations; drift test run). Record: PresenceLoop's ownership (state list, the three getters, the two accessor pairs and WHY — the derived `_presentPeers` callback and cadence eval still touch those fields store-side), the bare `pingAgents()` delegate, the root phases, the handlePingUi refinement (nothing moved from it — spec amended), zero declared behavior changes. Inline-correct earlier bullets falsified by the move (grep every moved name against CLAUDE.md and verdict every hit — known candidates: the connection-thrash bullet's "both evaluators (`pingAgents`'s top and the presence-tick callback)" phrasing, the §7.5/Phase-2 bullets' `_presentPeers`/`computePresentPeers` location claims if any name store residency, the meta-review bullet's dormant list gains the two new entries below).
+- [x] **Step 2: THE CLOSING DECLARATION**: add to the dormant-until-trigger list (the meta-review bullet holds it): reactive-`Writable` unification — trigger: a view-layer round needing the store surface reshaped; `_iceTimings`/`_sdpDataAggregates` forensic fold — trigger: observed friction from the composite keys. State that the store-decomposition line (rounds one–four, PeerRecord → owner extraction → media-links → presence-loop) is closed with no standing loop; further decomposition only on feature-traffic demand.
+- [x] **Step 3: Spec landed-markers + the Part-1 handlePingUi amendment + plan Status line.**
+- [x] **Step 4: Drift guard focused + full gate; commit** — `docs: sync CLAUDE.md and close the store-decomposition line`.
 
 ---
 
