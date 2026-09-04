@@ -2,7 +2,7 @@
  * MediaLinks — owner of the media FSM transport's event glue, the shared
  * connection-teardown kernel, the ICE/SDP forensics pipeline, and (since
  * store-decomposition round three, Task 4; see
- * docs/superpowers/sdd/2026-09-04-media-links/task-4-brief.md)
+ * docs/superpowers/specs/2026-09-04-media-links-design.md)
  * connection establishment and the pong-driven initiation loop. Owns the
  * `_openConnections` `Writable`, the media transport's event
  * subscription, the connected/closed/remote-stream/remote-track/data-
@@ -30,12 +30,11 @@
  *
  * Do NOT live here (stay on the store): `_readDtlsStallTimeoutMs` /
  * `_readIceTransportPolicy` (start()'s transport-construction callers —
- * composition root, out of scope for an owner extraction) — reached here
- * only via the `readIceTransportPolicy` binding; `_sendRtcAction`,
- * `_maybeEmitQualityChange`, `_sendImmediatePongToAll`, `webrtcDisabled`,
- * `webrtcGloballyDisabled`, `webrtcAvailableFor`, `_nextConnectionEpoch`,
- * `_peerCaps`, `_allMediaTransports`, `_logFsmTransition` — each reached
- * here only via its binding. `_drivePongScreenShare` also stays on the
+ * composition root, out of scope for an owner extraction); `_sendRtcAction`,
+ * `_sendImmediatePongToAll`, `webrtcDisabled`, `webrtcGloballyDisabled`,
+ * `webrtcAvailableFor`, `_nextConnectionEpoch`, `_allMediaTransports` —
+ * each reached here via its binding; `_maybeEmitQualityChange`, `_peerCaps`,
+ * `_logFsmTransition` — stay on the store, untouched by this owner. `_drivePongScreenShare` also stays on the
  * store (it is `drivePong`'s screen-share twin, not part of this owner's
  * concern) and keeps calling the store's own `_applyStaleTeardown`/
  * `webrtcAvailableFor`/etc. directly, unaffected by this move.
