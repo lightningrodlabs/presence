@@ -123,7 +123,9 @@ const PINNED_FILES: Array<{
   { relPath: '../media-links.ts', patterns: FULL_PATTERNS },
   // Store-decomposition round four, Task 1 (PresenceLoop): every
   // forensic timestamp and sound-decision `now` routes through the
-  // `clock` binding, late-bound onto the store clock.
+  // `clock` binding — an eager capture of the store's injected clock
+  // (`clock: this.clock`), assigned once in the constructor, not a
+  // late-bound arrow (the field itself is never reassigned).
   { relPath: '../presence-loop.ts', patterns: FULL_PATTERNS },
 ];
 

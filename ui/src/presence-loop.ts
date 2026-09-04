@@ -373,10 +373,12 @@ export class PresenceLoop {
     // Peers with no `lastSeen` yet are deliberately excluded here, not
     // passed through as a value `decideSignalCarrier` could treat as
     // "not fresh" — there are three paths that leave `lastSeen`
-    // undefined: initial roster seeding (the all-agents subscription's
-    // `_knownAgents.update`, in `start()`), a peer-leave clear
-    // (`handleLeaveUi`), and a told-only agent we've never received a
-    // Pong from directly (`_applyPongRoster`'s `knownAgents` merge).
+    // undefined: initial roster seeding (this class's own
+    // `_applyPingRosterSweep`'s `!alreadyKnown` branch, which seeds a
+    // newly-seen `allAgents` entry with no `lastSeen`), a peer-leave
+    // clear (`handleLeaveUi`), and a told-only agent we've never
+    // received a Pong from directly (`_applyPongRoster`'s `knownAgents`
+    // merge).
     // Declared behavior change from the old inline predicate: it counted
     // a known-but-never-ponged peer as "not fresh", so a relay that was
     // dead from the very first tick (nobody had ponged yet) logged a
