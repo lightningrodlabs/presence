@@ -63,16 +63,26 @@
  * (the roster-seed WRITE target — shared with `handleLeaveUi` and other
  * non-presence write paths, so it stays store-resident and is reached
  * here via the `connectionStatuses` binding); `_signalsCadence`,
- * `_evaluateSignalsCadence`, `_sweepPendingInits`, `_checkAudibilityOutages`,
- * `_flushStaleSdpAggregates`, `trackHealth.checkTrackHealth` (the rest of
- * `pingAgents`'s fragments — the carrier-down transition writes
- * `_signalsCadence` through the `setSignalsCadence` binding, but the
- * field and its per-tick evaluation stay store-resident, per the design's
- * round-four list; each is reached here via a binding of the same shape);
- * `globalPresenceSet`/`isPeerMediaLive`/`_activeAgents`
- * (used far beyond forensics — reached here via bindings);
- * `_presenceTickInterval` (the timer handle — `start()`/`disconnect()`
- * composition root, out of scope for an owner extraction).
+ * `_evaluateSignalsCadence`, `_sweepPendingInits`, `_checkAudibilityOutages`
+ * (the rest of `pingAgents`'s fragments that are genuinely store-resident
+ * holdouts — the carrier-down transition writes `_signalsCadence` through
+ * the `setSignalsCadence` binding, but the field and its per-tick
+ * evaluation stay store-resident, per the design's round-four list; each
+ * is reached here via a binding of the same shape); `globalPresenceSet`/
+ * `isPeerMediaLive`/`_activeAgents` (used far beyond forensics — reached
+ * here via bindings); `_presenceTickInterval` (the timer handle —
+ * `start()`/`disconnect()` composition root, out of scope for an owner
+ * extraction).
+ *
+ * Two further `pingAgents` fragments are reached via bindings but are NOT
+ * store-resident holdouts — they are cross-owner seams onto other rounds'
+ * owners, misdescribed as store-resident in an earlier draft of this
+ * comment: `checkTrackHealth` is `TrackHealthMonitor.checkTrackHealth`
+ * (`ui/src/track-health.ts`, the owner-extraction round), reached through
+ * the store's `trackHealth` arrow; `flushStaleSdpAggregates`'s
+ * implementation is `MediaLinks.flushStaleSdpAggregates`
+ * (`ui/src/media-links.ts`, the media-links round), reached through the
+ * store's bare `_flushStaleSdpAggregates` delegate.
  */
 import { AgentPubKey, AgentPubKeyB64, decodeHashFromBase64, encodeHashToBase64 } from '@holochain/client';
 import { get, writable, type Readable, type Writable } from '@holochain-open-dev/stores';
@@ -144,8 +154,9 @@ export type PresenceLoopBindings = {
   /** StreamsStore._checkAudibilityOutages, late-bound — stays
    *  store-resident per the design's round-four list. */
   checkAudibilityOutages: () => void;
-  /** StreamsStore._flushStaleSdpAggregates, late-bound — stays
-   *  store-resident per the design's round-four list. */
+  /** StreamsStore._flushStaleSdpAggregates, late-bound — a bare delegate
+   *  onto `MediaLinks.flushStaleSdpAggregates` (`ui/src/media-links.ts`,
+   *  the media-links round), not a store-resident implementation. */
   flushStaleSdpAggregates: () => void;
   /** StreamsStore._evaluateSignalsCadence, late-bound — stays
    *  store-resident per the design's round-four list. */
