@@ -40,7 +40,10 @@ const APPLY_INTENT_HEADER = /private _applyIntent\(gesture: IntentGesture\): voi
 // closing brace at column 0 (methods in this class are never indented
 // past one level, matching the no-ambient-clock file-slicing technique).
 const ALLOWED_CALL_SITES: Array<[name: string, header: RegExp]> = [
-  ['disconnect', /^  disconnect\(reason: string = 'unknown'\) \{/],
+  // disconnect() calls _applyIntent via its first composition-root phase,
+  // _teardownIntentAndForensics (store-decomposition round four, Task 3) —
+  // that phase method is the actual call site now, not disconnect() itself.
+  ['_teardownIntentAndForensics', /^  private _teardownIntentAndForensics\(reason: string\): void \{/],
   ['videoOn', /^  async videoOn\(\) \{/],
   ['videoOff', /^  videoOff\(\) \{/],
   ['audioOn', /^  async audioOn\(enabled: boolean\) \{/],

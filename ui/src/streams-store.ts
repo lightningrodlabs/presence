@@ -763,10 +763,24 @@ export class StreamsStore {
    * call exactly once, then disconnect() to tear down.
    */
   start(): void {
+    this._startSignalRouting();
+    this._startPresenceTicking();
+    this._startPersistedSettings();
+    this._startTransports();
+    this._startCaptureSources();
+    this._startMediaControllers();
+    this._startSignalsReconciliation();
+  }
+
+  /** Route incoming bus signals to `handleSignal`. */
+  private _startSignalRouting(): void {
     this.signalUnsubscribe = this.deps.bus.onSignal(async signal =>
       this.handleSignal(signal)
     );
+  }
 
+  /** Arm the presence-tick interval. */
+  private _startPresenceTicking(): void {
     // Drive the presence tick from the store clock so _activeAgents
     // re-evaluates staleness once per ping cadence even when no store
     // write happens (Phase 2 item 4). See `PresenceLoop.onPresenceTick`
@@ -777,7 +791,11 @@ export class StreamsStore {
       () => this.presenceLoop.onPresenceTick(),
       PING_INTERVAL
     );
+  }
 
+  /** Load the blocked-agents list and the signal-delay override from
+   *  storage at start time. */
+  private _startPersistedSettings(): void {
     const blockedAgentsJson = this.deps.storage.session.getItem('blockedAgents');
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
@@ -791,7 +809,11 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
+  }
 
+  /** Construct the media and screen-share FSM transports and subscribe
+   *  their events to the application-level handlers. */
+  private _startTransports(): void {
     // Construct transports. iceServers / trickleICE are getters so the
     // transport always uses the current values (TURN credentials, trickle
     // toggle, etc. can change at runtime).
@@ -872,7 +894,11 @@ export class StreamsStore {
     this.mediaLinks.subscribe();
     this.screenShareLinks.subscribe(this.screenShareOutTransport, true);
     this.screenShareLinks.subscribe(this.screenShareInTransport, false);
+  }
 
+  /** Wire the device-change listener and construct the mic/camera
+   *  sources plus the capture reconciler that owns their lifecycle. */
+  private _startCaptureSources(): void {
     this.deps.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
@@ -916,14 +942,23 @@ export class StreamsStore {
       log: message => this.logger.logCustomMessage(message),
       onCameraAcquired: () => this._attachCameraToPeers(),
     });
+  }
 
+  /** Bind the voice/filmstrip controllers so their receive side works
+   *  regardless of local mic/camera state. Unbind happens in disconnect(). */
+  private _startMediaControllers(): void {
     // Bind controllers permanently so the receive side (decoders /
     // playback) works regardless of whether the local mic / camera is
     // on. Send sides are gated by the reconcilers. Unbind happens in
     // disconnect().
     voiceController.bind(this);
     filmstripController.bind(this);
+  }
 
+  /** Subscribe to `_signalsTargets` to drive the per-tick signals-carrier
+   *  reconcilers (encoder retry cadence, intent diffs). Load-bearing —
+   *  see the inline comment for the encoder-retry wiring-test pin. */
+  private _startSignalsReconciliation(): void {
     // Subscribe to _signalsTargets changes. When the set transitions
     // between empty and non-empty while the mic / camera is held, start
     // or stop the corresponding signals-carrier encoder. The subscription
@@ -1386,6 +1421,19 @@ export class StreamsStore {
   }
 
   disconnect(reason: string = 'unknown') {
+    this._teardownIntentAndForensics(reason);
+    this._teardownNotifyPeers();
+    this._teardownTimers();
+    this._teardownSubscriptions();
+    this._teardownTransports();
+    this._teardownEncoders();
+    this._teardownCaptureAndSignals();
+    this._teardownState();
+  }
+
+  /** Mark the session ended in local intent and log disconnect forensics
+   *  (caller stack + page visibility) before any teardown happens. */
+  private _teardownIntentAndForensics(reason: string): void {
     this._applyIntent({ type: 'session-end' });
     // Forensics: capture WHO called disconnect (button vs. Lit lifecycle
     // unmount) so we can tell user-initiated leaves from DOM-remount leaves.
@@ -1398,7 +1446,11 @@ export class StreamsStore {
     this.logger.logCustomMessage(
       `Disconnect reason=${reason} visibility=${visibility} ${stack}`
     );
+  }
 
+  /** Best-effort LeaveUi notification to every known peer before we tear
+   *  anything down. */
+  private _teardownNotifyPeers(): void {
     // Notify peers immediately before tearing down
     const agentsToNotify = Object.keys(get(this._knownAgents))
       .filter(a => a !== this.myPubKeyB64)
@@ -1406,7 +1458,11 @@ export class StreamsStore {
     if (agentsToNotify.length > 0) {
       this.deps.bus.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
     }
+  }
 
+  /** Clear the ping and presence-tick intervals, and the per-peer-record
+   *  timer/pending state (sdpTimeoutTimer, screenShareStream, pendingInits). */
+  private _teardownTimers(): void {
     if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
     if (this._presenceTickInterval !== undefined) {
       this.clock.clearInterval(this._presenceTickInterval);
@@ -1418,6 +1474,10 @@ export class StreamsStore {
       r.screenShareStream = undefined;
       r.pendingInits = undefined;
     }
+  }
+
+  /** Unsubscribe the signal, page-lifecycle, and all-agents subscriptions. */
+  private _teardownSubscriptions(): void {
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -1427,6 +1487,11 @@ export class StreamsStore {
       this._allAgentsUnsub();
       this._allAgentsUnsub = null;
     }
+  }
+
+  /** Destroy the three transports and release local video/audio output
+   *  state (videoOff/audioOff plus the keepalive track). */
+  private _teardownTransports(): void {
     // Close all connections and stop all streams. (A duplicated
     // `mediaTransport.destroy()` line lived here until Phase 6's
     // symmetry test asserted destroy-exactly-once per transport;
@@ -1439,6 +1504,10 @@ export class StreamsStore {
     // videoOff allocates a keepalive track if not already; on disconnect
     // there are no peers to swap it onto, so just release the resources.
     this._releaseVideoKeepalive();
+  }
+
+  /** Stop and unbind the voice/filmstrip signals-carrier controllers. */
+  private _teardownEncoders(): void {
     // Stop the voice encoder if running, then unbind the controller
     // (tears down both send and receive state).
     if (this._voiceEncoderRunning) {
@@ -1451,6 +1520,11 @@ export class StreamsStore {
       this._filmstripEncoderRunning = false;
     }
     filmstripController.unbind();
+  }
+
+  /** Unsubscribe the signals-targets subscription, disarm presence
+   *  sounds, and release the mic/camera capture sources. */
+  private _teardownCaptureAndSignals(): void {
     if (this._signalsTargetsUnsub) {
       this._signalsTargetsUnsub();
       this._signalsTargetsUnsub = null;
@@ -1462,6 +1536,10 @@ export class StreamsStore {
     this.micSource.dispose();
     this.cameraSource.dispose();
     this.screenShareOff();
+  }
+
+  /** Reset the remaining store-level stream/connection state. */
+  private _teardownState(): void {
     this.mainStream = null;
     this.screenShareStream = null;
     this._openConnections.set({});
