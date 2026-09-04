@@ -434,7 +434,7 @@ describe('decideSignalCarrier', () => {
     expect(decideSignalCarrier({ knownPeerLastSeen: [], prevDownSince: undefined, now: 10_000 })).toEqual({ down: false });
   });
   it('a nonempty roster where nobody has ever ponged is indistinguishable from an empty roster', () => {
-    // Mirrors the call site's filter (streams-store.ts _emitPresenceForensics):
+    // Mirrors the call site's filter (presence-loop.ts _emitPresenceForensics):
     // three known peers, none has a lastSeen stamp yet, so knownPeerLastSeen
     // comes out empty even though the roster itself has three entries. The
     // function only ever sees stamps, never roster size, so this input is
