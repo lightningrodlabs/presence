@@ -186,14 +186,17 @@ the bodies are the authority; an uncovered `this.X` is a STOP.
 
 ## Task plan
 
-1. Split `handlePongUi` into the five named private methods.
-2. Split `pingAgents` the same way.
-3. MediaLinks A — transport glue + kernel + ICE/SDP forensics +
-   `_openConnections`, with store delegates for the kernel.
-4. MediaLinks B — establishment (`handleInitRequest`/`Accept`,
-   `handleSdpFsm`, SDP timers, `updateConnectionStatus`,
-   `drivePong`).
-5. Doc-sync — CLAUDE.md bullet per its contract; landed markers here;
+1. **Landed** (`f6a4563`, fixup `103ab37`). Split `handlePongUi` into
+   the five named private methods.
+2. **Landed** (`b726d6d`). Split `pingAgents` the same way.
+3. **Landed** (`f423efd`). MediaLinks A — transport glue + kernel +
+   ICE/SDP forensics + `_openConnections`, with store delegates for
+   the kernel.
+4. **Landed** (`2ca43c8`). MediaLinks B — establishment
+   (`handleInitRequest`/`Accept`, `handleSdpFsm`, SDP timers,
+   `updateConnectionStatus`, `drivePong`).
+5. **Landed** (this doc-sync, plus prose-fix commit `87a8e34`).
+   Doc-sync — CLAUDE.md bullet per its contract; landed markers here;
    the round-four list recorded.
 
 Process: `superpowers:writing-plans` →

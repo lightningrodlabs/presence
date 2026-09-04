@@ -1,5 +1,7 @@
 # Fragment Splits + MediaLinks Implementation Plan
 
+**Status: LANDED on `media-links`.** All five tasks executed and committed to that branch (`f6a4563`..`2ca43c8` for the four code tasks, the Task 1 fixup `103ab37` included, plus the Task 5 doc-sync commits `87a8e34` and this one). Merging `media-links` into `main-0.7` is a pending human step — this document describes the `media-links` branch, not `main-0.7`, until that merge lands. The corresponding `CLAUDE.md` "True today" bullet was added by the Task 5 doc-sync (see the "Media-links round facts" bullet).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Split `handlePongUi` and `pingAgents` into pipelines of named single-concern methods, then extract the media transport glue + shared teardown kernel + establishment into a `MediaLinks` owner — with zero behavior change.
@@ -56,12 +58,14 @@ this._drivePongScreenShare(pubkeyB64, now);
 
 CAUTION — the parse guard and its `return` (5089–5098) plus `logAgentPongMetaData`/`metaDataExt = metaData` (5100–5101) currently sit INSIDE the `try`. Restructure minimally: parse+early-return+log+capture move ABOVE the `try` (the parse path cannot throw past its own `.ok` check — `parseSignalPayload` returns a result, verify by reading it; if it can throw, keep the parse inside the try with the same early-return and STOP to report the deviation), and the `try` wraps exactly the three apply calls so the catch covers the same fragment set it covers today (its comment says so: "spans the RTT stats, presence merge and module-state reconciliation").
 
+**Amended 2026-09-04, post-implementation (Task 1 review round 1):** the pipeline sketch above and this CAUTION paragraph are SUPERSEDED. `parseSignalPayload` is confirmed non-throwing, but the origin `try` in fact covered four fragments, not three — `logAgentPongMetaData` and `metaDataExt = metaData` sat inside it too, ahead of the three apply calls, and `logAgentPongMetaData` is throw-capable on reachable paths. The implementer's first cut followed this sketch verbatim (move both above the `try`) and a reviewer caught that this widens what escapes uncaught, contradicting the zero-behavior-change contract. Controller ruling: zero-behavior-change wins over this sketch. Landed shape (`103ab37`): only the parse guard and its early `return` move above the `try`; `logAgentPongMetaData` and `metaDataExt = metaData` stay inside it, immediately before the three apply calls, so the catch covers all four fragments (its comment now says so). See `.superpowers/sdd/2026-09-04-media-links/task-1-report.md`'s "Fix report" section for the full account.
+
 **Fragment-variable table (binding):** `pubkeyB64`, `now` — parameters (computed once at top, as today). `metaData` — parameter to the three try-block methods. `metaDataExt` — parameter to `_drivePongMediaLink` (nullable exactly as today). `conversationActive`, `peerWebrtcDisabled`, `peerCapsKnown`, `existingConn`, `alreadyOpen` — recomputed inside `_drivePongMediaLink` in the same order and by the same expressions as origin (pure re-reads; they were computed after the try block and are used only by the drive). `signal.from_agent` — the `fromAgent` parameter.
 
-- [ ] **Step 1: Perform the split** — cut each origin range into its method verbatim; write the new pipeline body.
-- [ ] **Step 2: Focused run** — `nix develop -c npm run test -w ui -- src/__tests__/streams-store-wiring.test.ts` (drives handlePongUi via real pong traffic) — green, UNMODIFIED.
-- [ ] **Step 3: Full gate; diff review** — `git diff` shows only the split (moved lines + pipeline + signatures); no expression changed.
-- [ ] **Step 4: Commit** — `git add ui/src/streams-store.ts && git commit -m "refactor: split handlePongUi into single-concern methods"` (+ a body line citing this plan Task 1).
+- [x] **Step 1: Perform the split** — cut each origin range into its method verbatim; write the new pipeline body.
+- [x] **Step 2: Focused run** — `nix develop -c npm run test -w ui -- src/__tests__/streams-store-wiring.test.ts` (drives handlePongUi via real pong traffic) — green, UNMODIFIED.
+- [x] **Step 3: Full gate; diff review** — `git diff` shows only the split (moved lines + pipeline + signatures); no expression changed.
+- [x] **Step 4: Commit** — `git add ui/src/streams-store.ts && git commit -m "refactor: split handlePongUi into single-concern methods"` (+ a body line citing this plan Task 1).
 
 ---
 
@@ -93,10 +97,10 @@ this._evaluateSignalsCadence();
 
 **Fragment-variable table:** `now` (2463) — parameter to `_sweepPendingInits`; everything else fragment-local. Order and `await`s exactly as origin.
 
-- [ ] **Step 1: Perform the split.**
-- [ ] **Step 2: Focused run** — wiring suite (its carrier-hold and encoder-retry tests drive `pingAgents`) — green, UNMODIFIED.
-- [ ] **Step 3: Full gate; diff review** (split-only diff).
-- [ ] **Step 4: Commit** — `refactor: split pingAgents into single-concern methods` (+ plan Task 2 line).
+- [x] **Step 1: Perform the split.**
+- [x] **Step 2: Focused run** — wiring suite (its carrier-hold and encoder-retry tests drive `pingAgents`) — green, UNMODIFIED.
+- [x] **Step 3: Full gate; diff review** (split-only diff).
+- [x] **Step 4: Commit** — `refactor: split pingAgents into single-concern methods` (+ plan Task 2 line).
 
 ---
 
@@ -135,12 +139,12 @@ export type MediaLinksBindings = {
 };
 ```
 
-- [ ] **Step 1: Read `screen-share-links.ts` (the twin) and the moved bodies; write `media-links.ts`** with the members above, substitution table in your report.
-- [ ] **Step 2: Wire the store** — construct `mediaLinks` in the constructor body (after deps/logger/clock/owners it binds); delete moved members; add the getter + four bare delegates; re-point `start()`'s subscribe call.
-- [ ] **Step 3: no-ambient-clock pin** (`'../media-links.ts'`, `FULL_PATTERNS`).
-- [ ] **Step 4: Reference grep** — `grep -rn '_subscribeMediaTransport\|_dispatchMediaEvent\|_handleMedia\|_stakeIceTiming\|_emitIceEstablishment\|_emitIceNeverConnected\|_videoMaxBitrate\|_applySenderPriorities\|_iceTimings\|_sdpDataAggregates\|_emitSdpAggregateSummary\|_flushSdpAggregatesForConnection' ui/ packages/ --include='*.ts' | grep -v media-links` — remaining hits only delegates, bindings, re-pointed prose.
-- [ ] **Step 5: Focused (wiring + construction + no-ambient-clock) then full gate** — all green, wiring UNMODIFIED.
-- [ ] **Step 6: Commit** — `refactor: extract MediaLinks owner — transport glue, teardown kernel, ICE/SDP forensics` (+ plan Task 3 line).
+- [x] **Step 1: Read `screen-share-links.ts` (the twin) and the moved bodies; write `media-links.ts`** with the members above, substitution table in your report.
+- [x] **Step 2: Wire the store** — construct `mediaLinks` in the constructor body (after deps/logger/clock/owners it binds); delete moved members; add the getter + four bare delegates; re-point `start()`'s subscribe call.
+- [x] **Step 3: no-ambient-clock pin** (`'../media-links.ts'`, `FULL_PATTERNS`).
+- [x] **Step 4: Reference grep** — `grep -rn '_subscribeMediaTransport\|_dispatchMediaEvent\|_handleMedia\|_stakeIceTiming\|_emitIceEstablishment\|_emitIceNeverConnected\|_videoMaxBitrate\|_applySenderPriorities\|_iceTimings\|_sdpDataAggregates\|_emitSdpAggregateSummary\|_flushSdpAggregatesForConnection' ui/ packages/ --include='*.ts' | grep -v media-links` — remaining hits only delegates, bindings, re-pointed prose.
+- [x] **Step 5: Focused (wiring + construction + no-ambient-clock) then full gate** — all green, wiring UNMODIFIED.
+- [x] **Step 6: Commit** — `refactor: extract MediaLinks owner — transport glue, teardown kernel, ICE/SDP forensics` (+ plan Task 3 line).
 
 ---
 
@@ -153,11 +157,11 @@ export type MediaLinksBindings = {
 - Consumes: Task 3's owner + delegates; Task 1's `_drivePongMediaLink`.
 - Produces: MediaLinks gains (moved verbatim, 612e7da anchors): `updateConnectionStatus` 4303 (writes `_connectionStatuses` via the Task 3 binding; the Task 3 glue binding `updateConnectionStatus` is REBOUND to the owner's own method — one-line constructor change, or call it internally as `this.updateConnectionStatus`), `handleInitRequest` 5425, `handleInitAccept` 5547, `handleSdpFsm` 5719, `_computeSdpTimeout` 2664, `_computeSdpBackstopTimeout` 2691, and `drivePong` (Task 1's `_drivePongMediaLink`, moved with pubkey/fromAgent/meta/now signature intact). New bindings from the bodies (verify each): `sendMessage` (bus, InitRequest/InitAccept sends), `signalsRttEwma` read for `_computeSdpTimeout` (via `peerRecord`), `webrtcDisabled`, `webrtcGloballyDisabled`, `webrtcAvailableFor`, `myModuleStates`/`peerModuleStates` reads (`conversationActive`/`peerCapsKnown`), `nextConnectionEpoch`, `peerCaps`, `blockedAgents` if read, `_signalsCadence`? — NO: cadence is ping-side, stays. The bodies are the authority.
 - Store: `_processSignal`'s `InitRequest`/`InitAccept`/`SdpFsm` cases → `this.mediaLinks.*`; `handlePongUi`'s `await this._drivePongMediaLink(...)` → `await this.mediaLinks.drivePong(...)`; delete the store methods; keep the existing `_computeSdpTimeout` surface ONLY as needed by the ScreenShareLinks binding (~line 630 region constructs `computeSdpTimeout: peerB64 => this._computeSdpTimeout(peerB64)`) — keep a bare store delegate so the round-two file stays untouched. `updateConnectionStatus`: grep first (`grep -rn 'updateConnectionStatus' ui/ --include='*.ts' | grep -v media-links | grep -v Screen`) — at 612e7da its callers are all moving code; if the grep at your HEAD agrees, delete the store method with NO delegate; any surviving caller means keep a bare delegate instead.
-- [ ] **Step 1: Move the members; extend bindings; rebind the Task 3 `updateConnectionStatus` arrow to the owner method.**
-- [ ] **Step 2: Re-point `_processSignal` + `handlePongUi`; delete store methods; keep the `_computeSdpTimeout` delegate.**
-- [ ] **Step 3: Reference grep** — `grep -rn 'handleInitRequest\|handleInitAccept\|handleSdpFsm\b\|_computeSdpTimeout\|_computeSdpBackstopTimeout\|_drivePongMediaLink\|updateConnectionStatus' ui/ --include='*.ts' | grep -v media-links | grep -v screen-share-links` — only the delegate, re-pointed call sites, prose.
-- [ ] **Step 4: Focused (wiring — its init/accept/SDP-timer/backstop pins all drive this surface) then full gate** — green, UNMODIFIED.
-- [ ] **Step 5: Commit** — `refactor: move establishment and pong drive into MediaLinks` (+ plan Task 4 line).
+- [x] **Step 1: Move the members; extend bindings; rebind the Task 3 `updateConnectionStatus` arrow to the owner method.**
+- [x] **Step 2: Re-point `_processSignal` + `handlePongUi`; delete store methods; keep the `_computeSdpTimeout` delegate.**
+- [x] **Step 3: Reference grep** — `grep -rn 'handleInitRequest\|handleInitAccept\|handleSdpFsm\b\|_computeSdpTimeout\|_computeSdpBackstopTimeout\|_drivePongMediaLink\|updateConnectionStatus' ui/ --include='*.ts' | grep -v media-links | grep -v screen-share-links` — only the delegate, re-pointed call sites, prose.
+- [x] **Step 4: Focused (wiring — its init/accept/SDP-timer/backstop pins all drive this surface) then full gate** — green, UNMODIFIED.
+- [x] **Step 5: Commit** — `refactor: move establishment and pong drive into MediaLinks` (+ plan Task 4 line).
 
 ---
 
@@ -165,9 +169,9 @@ export type MediaLinksBindings = {
 
 **Files:** `CLAUDE.md`, the spec, this plan.
 
-- [ ] **Step 1: CLAUDE.md "True today" bullet** per its contract (read the two prior round bullets first; anchored date/branch/commits + closing-commit clause; present tense only naming enforcing file/test; no counters/snapshots/unanchored negations — run the drift test). Record: the two method splits (named fragments); `ui/src/media-links.ts` as the one home of the media glue, teardown kernel, ICE/SDP forensics, establishment, and `_openConnections` (in the no-ambient-clock pin); the four store bare delegates and why (round-two owner bindings unchanged); what stayed (`_readDtls*`/`_readIceTransportPolicy` with the composition root, `_sendRtcAction`, `_maybeEmitQualityChange`, `_connectionStatuses`); zero declared behavior changes; round four's list (composition root, reactive unification, forensic fold, presence owner for the ping/pong roster fragments).
-- [ ] **Step 2: Spec landed-markers + plan Status line** (intent-reconciliation plan pattern). Also inline-correct any earlier CLAUDE.md bullet that names a member this round moved (grep the moved names against CLAUDE.md; the "since the 2026-09 …; previously …" clause is the house shape — the §9 bullet's `_applyMediaSignalingRoute` mention and the Post-Phase-4 bullet's `_iceTimings` mention are known candidates; verdict every hit).
-- [ ] **Step 3: Drift guard focused + full gate; commit** — `docs: sync CLAUDE.md and round docs for media-links round`.
+- [x] **Step 1: CLAUDE.md "True today" bullet** per its contract (read the two prior round bullets first; anchored date/branch/commits + closing-commit clause; present tense only naming enforcing file/test; no counters/snapshots/unanchored negations — run the drift test). Record: the two method splits (named fragments); `ui/src/media-links.ts` as the one home of the media glue, teardown kernel, ICE/SDP forensics, establishment, and `_openConnections` (in the no-ambient-clock pin); the four store bare delegates and why (round-two owner bindings unchanged); what stayed (`_readDtls*`/`_readIceTransportPolicy` with the composition root, `_sendRtcAction`, `_maybeEmitQualityChange`, `_connectionStatuses`); zero declared behavior changes; round four's list (composition root, reactive unification, forensic fold, presence owner for the ping/pong roster fragments).
+- [x] **Step 2: Spec landed-markers + plan Status line** (intent-reconciliation plan pattern). Also inline-correct any earlier CLAUDE.md bullet that names a member this round moved (grep the moved names against CLAUDE.md; the "since the 2026-09 …; previously …" clause is the house shape — the §9 bullet's `_applyMediaSignalingRoute` mention and the Post-Phase-4 bullet's `_iceTimings` mention are known candidates; verdict every hit).
+- [x] **Step 3: Drift guard focused + full gate; commit** — `docs: sync CLAUDE.md and round docs for media-links round`.
 
 ---
 
