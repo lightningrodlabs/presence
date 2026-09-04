@@ -5096,17 +5096,18 @@ export class StreamsStore {
       return;
     }
     const metaData = parsedMeta.value;
-    this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
-    metaDataExt = metaData;
 
     try {
+      this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
+      metaDataExt = metaData;
       this._applyPongStats(pubkeyB64, metaData);
       this._applyPongRoster(pubkeyB64, metaData, now);
       this._applyPongModuleSweep(pubkeyB64, metaData);
     } catch (e) {
       // Not a parse failure — the payload is validated and returned on above.
-      // This block spans the RTT stats, presence merge and module-state
-      // reconciliation, so the throw came from one of those.
+      // This block spans the pong-meta logging/capture, RTT stats, presence
+      // merge and module-state reconciliation, so the throw came from one
+      // of those.
       console.warn(
         `Pong handling failed for ${pubkeyB64.slice(0, 8)} (post-parse):`,
         e
@@ -5120,7 +5121,7 @@ export class StreamsStore {
   /**
    * The pong-echo RTT fold — plausibility bound, EWMA smoothing, and
    * the emit gate — is one pure decision (`foldSignalsRtt`,
-   * carrier-stats-policy.ts, §9 item 4). This block only executes it.
+   * carrier-stats-policy.ts, §9 item 4). This method only executes it.
    */
   private _applyPongStats(
     pubkeyB64: AgentPubKeyB64,
