@@ -168,9 +168,11 @@ export type WebrtcEligibility =
  * incapable, even when it also happens to fail the (not-yet-meaningful)
  * capability read.
  *
- * Constrains `streams-store.ts:handlePongUi` (initiator arm) and
- * `streams-store.ts:handleInitRequest` (acceptor arm) — grep for these
- * conjuncts should find no third composition site.
+ * Constrains `media-links.ts:MediaLinks.drivePong` (initiator arm,
+ * called from `streams-store.ts:handlePongUi`; store-decomposition round
+ * three, Task 4) and `media-links.ts:MediaLinks.handleInitRequest`
+ * (acceptor arm) — grep for these conjuncts should find no third
+ * composition site.
  */
 export function decideWebrtcEligibility(
   input: WebrtcEligibilityInputs,

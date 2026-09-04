@@ -6,8 +6,9 @@
  * `StreamsStore`, constructed with the Phase 6 deps record and started, so
  * every piece of glue between the wire and the slot table is the store's
  * own — `handleSignal` → ping/pong presence → the InitRequest/InitAccept
- * handshake → `_dispatchMediaEvent` → `routeTransportPhase` →
- * `decideSlotWrite` → the actual `_openConnections` mutation →
+ * handshake → `MediaLinks._dispatchMediaEvent` (`ui/src/media-links.ts`)
+ * → `routeTransportPhase` → `decideSlotWrite` → the actual
+ * `_openConnections` mutation →
  * `computeSignalsTargets` over the real present set. The transports are
  * real `FsmTransport`s over real `RTCPeerConnection`s (loopback ICE +
  * DTLS); signaling rides a `BroadcastChannel` bus with Holochain's

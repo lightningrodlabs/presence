@@ -2,17 +2,23 @@
  * Phase 1 — pure decision logic for the pong-driven stale-connection
  * supervisor.
  *
- * Every 2s, for each peer that pongs, `handlePongUi` asks: does the app
- * still hold a connection slot whose underlying `RTCPeerConnection` is
- * dead? The predicate was written inline three times, verbatim
+ * Every 2s, for each peer that pongs, `handlePongUi` (which drives the
+ * video check via `MediaLinks.drivePong`, media-links.ts — store-
+ * decomposition round three, Task 4) asks: does the app still hold a
+ * connection slot whose underlying `RTCPeerConnection` is dead? The
+ * predicate was written inline three times, verbatim
  * (MAINTAINABILITY_ASSESSMENT.md §3.9) — once for video and twice for
  * outgoing screen share — each followed by a different cleanup set. This
  * file is the single authority for the *predicate*. The cleanup sets
  * (Phase 2b's `staleTeardownPlan`) moved to `closeCleanupPlan` in
  * `close-cleanup-policy.ts` (Round 3 item 1), which states every
  * teardown path's cleanup in one table; the stale rows there are these
- * teardowns'. `StreamsStore._applyStaleTeardown` is still the one
- * executor all three stale call sites use.
+ * teardowns'. `MediaLinks.applyStaleTeardown` is still the one executor
+ * all three stale call sites use — the video site (`drivePong`) calls it
+ * directly, being a method of the same class since Task 4; the two
+ * screen-share sites (`streams-store.ts:handlePingUi` and
+ * `streams-store.ts:_drivePongScreenShare`) reach it through the store's
+ * `_applyStaleTeardown` bare delegate.
  *
  * Two behavioural changes are folded in, both deliberate:
  *
@@ -36,7 +42,9 @@
  *     pc, so its absence is a zombie; a slot that does not is still being
  *     established.
  *
- * Constrains `streams-store.ts:handlePongUi` and `streams-store.ts:handlePingUi`.
+ * Constrains `media-links.ts:MediaLinks.drivePong`,
+ * `streams-store.ts:handlePingUi`, and
+ * `streams-store.ts:_drivePongScreenShare`.
  */
 
 export type StaleConnectionInputs = {

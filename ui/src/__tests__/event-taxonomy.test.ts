@@ -108,9 +108,14 @@ describe('SimpleEvent taxonomy', () => {
     // splits `event:` from its literal repo-wide). This pins that the
     // heuristic still finds a known-real site, so "no emission site"
     // keeps meaning what it claims.
+    //
+    // The site lived in streams-store.ts until store-decomposition round
+    // three, Task 3 (2026-09-04) moved `_handleMediaConnected` — the
+    // emitter of `Connected` — to media-links.ts along with the rest of
+    // the media transport event glue.
     expect(
       emissionSites('Connected').some(site =>
-        site.startsWith('streams-store.ts:'),
+        site.startsWith('media-links.ts:'),
       ),
     ).toBe(true);
   });

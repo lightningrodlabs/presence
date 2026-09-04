@@ -116,6 +116,11 @@ const PINNED_FILES: Array<{
   // event stamp route through the `now` binding, late-bound onto the
   // clock.
   { relPath: '../screen-share-links.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round three, Task 3 (MediaLinks): every ICE-
+  // timing stake, SdpData aggregate stamp, and forensic event timestamp
+  // routes through the `now`/`setTimeout`/`clearTimeout` bindings,
+  // late-bound onto the clock.
+  { relPath: '../media-links.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {

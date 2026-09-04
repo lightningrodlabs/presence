@@ -17,7 +17,8 @@
  * extraction; the table test in `__tests__/media-event-policy.test.ts`
  * enumerates all eight so a *changed* routing is a failing row.
  *
- * Constrains `streams-store.ts:_dispatchMediaEvent`.
+ * Constrains `media-links.ts:MediaLinks._dispatchMediaEvent` (moved from
+ * `streams-store.ts` in store-decomposition round three, Task 3).
  */
 
 import type { ConnectionPhase } from './types';
@@ -142,13 +143,15 @@ export type SlotWrite =
 
 /**
  * The single slot-transition decision, executed by BOTH
- * `StreamsStore._dispatchMediaEvent` / `_handleMediaConnected` /
- * `_handleMediaClosed` and the carrier-handover harness
- * (`ui/harness/carrier-handover-harness.ts`). Before this existed the
- * harness carried a hand-written mirror of these rules, and the mirror had
- * already drifted (adopt kept the stale `connected`; connect skipped the
- * supersede guard) — in the same PR that introduced it. A shared decision
- * makes that drift a compile error instead of a header caveat.
+ * `MediaLinks._dispatchMediaEvent` / `_handleMediaConnected` /
+ * `_handleMediaClosed` (`ui/src/media-links.ts`, moved from
+ * `streams-store.ts` in store-decomposition round three, Task 3) and the
+ * carrier-handover harness (`ui/harness/carrier-handover-harness.ts`).
+ * Before this existed the harness carried a hand-written mirror of these
+ * rules, and the mirror had already drifted (adopt kept the stale
+ * `connected`; connect skipped the supersede guard) — in the same PR that
+ * introduced it. A shared decision makes that drift a compile error
+ * instead of a header caveat.
  *
  * Guard semantics preserved verbatim from the store:
  *  - `connected`/`closed` for a connectionId that does not match the slot's
@@ -157,7 +160,7 @@ export type SlotWrite =
  *    / duplicate close respectively; the store stops the ICE monitor on the
  *    latter — a side effect, not a slot write).
  *
- * Constrains `streams-store.ts:_dispatchMediaEvent`,
+ * Constrains `media-links.ts:MediaLinks._dispatchMediaEvent`,
  * `_handleMediaConnected`, `_handleMediaClosed`.
  */
 export function decideSlotWrite(
