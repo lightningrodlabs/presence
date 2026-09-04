@@ -618,6 +618,15 @@ export class StreamsStore {
       isPeerMediaLive: peerB64 => this.isPeerMediaLive(peerB64),
       ensurePeerRecord: k => this._ensurePeerRecord(k),
       setSignalsCadence: c => { this._signalsCadence = c; },
+      // -- pingAgents pipeline + presence tick (Task 2) --
+      sendMessage: (agents, msgType, payload) =>
+        this.deps.bus.sendMessage(agents, msgType, payload),
+      checkTrackHealth: () => this.trackHealth.checkTrackHealth(),
+      checkAudibilityOutages: () => this._checkAudibilityOutages(),
+      flushStaleSdpAggregates: () => this._flushStaleSdpAggregates(),
+      evaluateSignalsCadence: () => this._evaluateSignalsCadence(),
+      sweepPendingInits: now => this._sweepPendingInits(now),
+      mainStream: () => this.mainStream,
     });
 
     this._activeAgents = derived(
@@ -760,28 +769,12 @@ export class StreamsStore {
 
     // Drive the presence tick from the store clock so _activeAgents
     // re-evaluates staleness once per ping cadence even when no store
-    // write happens (Phase 2 item 4). _emitPresenceForensics() runs
-    // FIRST, in the same breath, so _signalCarrierDownSince is current
-    // before the tick bump triggers _presentPeers' recompute: carrier-
-    // down (SIGNAL_CARRIER_DOWN_MS) and a lone surviving peer's own
-    // ping-staleness (PRESENT_STALENESS_MS) are the same 3-tick window
-    // by design, so they cross on the SAME tick, and pingAgents() (the
-    // only other _emitPresenceForensics call site) is not guaranteed to
-    // run before this interval fires — without this, the carrier-hold
-    // (Task 8) reads a stale `undefined` on exactly the tick it needs
-    // to catch, and _lastComputedPresent gets wiped before the hold can
-    // apply. decideSignalCarrier's stickiness makes calling this from
-    // both sites idempotent: whichever call notices the transition
-    // first logs it, the other sees it already applied and no-ops.
-    // pingAgents() has the matching guard internally (forensics runs
-    // before ITS OWN `_knownAgents.set()` write, review C1) — the two
-    // fixes are independent because either evaluator can be the first
-    // to observe a given crossing.
+    // write happens (Phase 2 item 4). See `PresenceLoop.onPresenceTick`
+    // for the full rationale (forensics-first ordering, review C1) — the
+    // callback body lives there now (store-decomposition round four,
+    // Task 2); this just arms the interval.
     this._presenceTickInterval = this.clock.setInterval(
-      () => {
-        this.presenceLoop._emitPresenceForensics();
-        this._presenceTick.update(n => n + 1);
-      },
+      () => this.presenceLoop.onPresenceTick(),
       PING_INTERVAL
     );
 
@@ -1514,77 +1507,14 @@ export class StreamsStore {
     this.presenceLoop.armPresenceSounds();
   }
 
+  /**
+   * Bare delegate onto `PresenceLoop.pingAgents()` (store-decomposition
+   * round four, Task 2) — kept under this name because callers are
+   * unchanged: `static connect`'s interval + await, both field harnesses,
+   * and the wiring-test suite.
+   */
   async pingAgents() {
-    // Forensics FIRST, before the roster-merge write below: the merge
-    // only adds unstamped entries (new agents) or upgrades `type` for
-    // already-known agents while preserving their `lastSeen` — it never
-    // touches an existing `lastSeen` stamp, so `_emitPresenceForensics`
-    // reading the PRE-merge `_knownAgents` sees the identical
-    // `knownPeerLastSeen` input either way. Ordering here is NOT
-    // cosmetic: the merge's `_knownAgents.set()` below synchronously
-    // re-derives `_activeAgents` -> `_presentPeers` (Task 8's carrier
-    // hold reads `_signalCarrierDownSince` there), so if forensics ran
-    // after that write, the hold would see this cycle's carrier verdict
-    // one write too late on exactly the tick a lone surviving peer's
-    // own staleness crosses — review C1, reproduced with a mid-cycle
-    // crossing (pingAgents() as the FIRST evaluator after the flip,
-    // ahead of the next presence tick).
-    this.presenceLoop._emitPresenceForensics();
-
-    this.presenceLoop._applyPingRosterSweep();
-
-    await this._sendPings();
-
-    // Log our stream state
-    this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
-
-    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
-    // Accepts are connectionId reservations — the transport owns the peer
-    // lifecycle, so dropping the entry is the entire teardown. Inits are
-    // our sent-InitRequest records; without the sweep they grow one entry
-    // per 5s retry for as long as a peer stays unresponsive.
-    const now = this.clock.now();
-    this._sweepPendingInits(now);
-
-    // Health check for dead tracks (bytesReceived stall detection)
-    await this.trackHealth.checkTrackHealth();
-
-    // Scan for sustained audibility outages with a relay opportunity
-    this._checkAudibilityOutages();
-
-    // Flush any SdpData bursts that ended without a follow-up event.
-    this._flushStaleSdpAggregates();
-
-    // Forensics (signal-carrier liveness + presence-set membership)
-    // already ran at the top of this function, before the roster-merge
-    // write — see the comment there. Not repeated here (review C1: a
-    // second call this late would just be dead weight, since nothing
-    // between the two spots can change `_knownAgents`' lastSeen stamps).
-
-    // Signals media cadence: one evaluation per ping cycle, reading
-    // `_signalCarrierDownSince` from this cycle's forensics call above.
-    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
-    // targets — the healthiest link bounds what the relay can still
-    // deliver; targets with no sample yet contribute nothing, and no
-    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
-    // policy's declared design).
-    this._evaluateSignalsCadence();
-  }
-
-  private async _sendPings(): Promise<void> {
-    // Ping known agents
-    // This could potentially be optimized by only pinging agents that are online according to Moss (which would only work in shared rooms though)
-    const agentsToPing = Object.keys(get(this._knownAgents))
-      .filter(agent => !get(this.blockedAgents).includes(agent))
-      .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
-    // Include a send-side timestamp so peers can echo it back in their
-    // pong, letting us compute signals-carrier RTT on receipt without
-    // adding new messages. See handlePingUi / handlePongUi.
-    await this.deps.bus.sendMessage(
-      agentsToPing,
-      'PingUi',
-      JSON.stringify({ t0: this.clock.now() }),
-    );
+    return this.presenceLoop.pingAgents();
   }
 
   private _sweepPendingInits(now: number): void {

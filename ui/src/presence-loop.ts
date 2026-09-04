@@ -1,8 +1,8 @@
 /**
  * PresenceLoop — owner of the presence roster state, the signal-carrier-
- * down forensics authority, the per-ping-cycle roster sweep/merge
- * fragments, and the join/leave sound subscription (store-decomposition
- * round four, Task 1; see
+ * down forensics authority, the pingAgents pipeline and presence-tick
+ * callback, and the join/leave sound subscription (store-decomposition
+ * round four, Tasks 1-2; see
  * docs/superpowers/specs/2026-09-04-presence-loop-design.md).
  *
  * Owns the roster `Writable`s (`_knownAgents`, `_presenceTick`,
@@ -26,9 +26,9 @@
  * (the per-pong roster/othersConnectionStatuses merge, called from
  * `handlePongUi`), `_emitPresenceForensics` (the signal-carrier-down
  * transition detector plus the PresenceAdd/PresenceRemove forensic diff,
- * called from both `pingAgents()` and the presence-tick interval in
- * `start()` — review C1's ordering comment on why forensics must run
- * before the roster-merge write travelled with the method), and
+ * called from both `pingAgents()` and `onPresenceTick()` — review C1's
+ * ordering comment on why forensics must run before the roster-merge
+ * write travelled with the method, in both places), and
  * `armPresenceSounds`/`disarmPresenceSounds` (the `_presentPeers`
  * subscription driving join/leave chimes — `disarmPresenceSounds` is the
  * one sanctioned wrapper extracting `disconnect()`'s inline unsub block).
@@ -43,6 +43,18 @@
  * single-caller orphan on the store — same rationale as `MediaLinks`'
  * `_setTrackReady`.
  *
+ * Task 2 (this round) moved the pipeline orchestrators in on top: public
+ * `pingAgents()` (the whole per-ping-cycle pipeline — forensics, roster
+ * sweep, `_sendPings`, then the store-resident fragments named below,
+ * reached via bindings), private `_sendPings` (the PingUi broadcast, pure
+ * presence wire traffic), and public `onPresenceTick()` (the interval
+ * body `start()` used to run inline — forensics then the `_presenceTick`
+ * bump; `start()` now just arms `this.clock.setInterval(() =>
+ * this.presenceLoop.onPresenceTick(), PING_INTERVAL)`). The store keeps a
+ * bare `pingAgents()` delegate onto this owner's `pingAgents()` — its
+ * external callers (`static connect`'s interval + await, both field
+ * harnesses, the wiring-test suite) are unchanged.
+ *
  * Do NOT live here (stay on the store): `_activeAgents`/`_presentPeers`/
  * `_signalsTargets` (the derived stores themselves — defined in the
  * store's constructor, reading this owner's state only through the
@@ -51,16 +63,18 @@
  * (the roster-seed WRITE target — shared with `handleLeaveUi` and other
  * non-presence write paths, so it stays store-resident and is reached
  * here via the `connectionStatuses` binding); `_signalsCadence`,
- * `_evaluateSignalsCadence`, `_sweepPendingInits`, `_sendPings` (the rest
- * of `pingAgents`'s fragments — the carrier-down transition writes
+ * `_evaluateSignalsCadence`, `_sweepPendingInits`, `_checkAudibilityOutages`,
+ * `_flushStaleSdpAggregates`, `trackHealth.checkTrackHealth` (the rest of
+ * `pingAgents`'s fragments — the carrier-down transition writes
  * `_signalsCadence` through the `setSignalsCadence` binding, but the
  * field and its per-tick evaluation stay store-resident, per the design's
- * round-four list); `globalPresenceSet`/`isPeerMediaLive`/`_activeAgents`
+ * round-four list; each is reached here via a binding of the same shape);
+ * `globalPresenceSet`/`isPeerMediaLive`/`_activeAgents`
  * (used far beyond forensics — reached here via bindings);
  * `_presenceTickInterval` (the timer handle — `start()`/`disconnect()`
  * composition root, out of scope for an owner extraction).
  */
-import { AgentPubKey, AgentPubKeyB64, encodeHashToBase64 } from '@holochain/client';
+import { AgentPubKey, AgentPubKeyB64, decodeHashFromBase64, encodeHashToBase64 } from '@holochain/client';
 import { get, writable, type Readable, type Writable } from '@holochain-open-dev/stores';
 import {
   decidePresenceSoundEvents,
@@ -71,6 +85,7 @@ import {
 import type { PresenceSoundState } from './presence-policy';
 import { SIGNALS_RTT_DEGRADED_MS } from './transport/signals-cadence-policy';
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
+import type { SignalMsgType } from './transport/wire-contract';
 import type { PeerRecord } from './peer-record';
 import type {
   AgentInfo,
@@ -81,6 +96,7 @@ import type {
   StoreEventPayload,
 } from './types';
 import type { PresenceLogger } from './logging';
+import { getStreamInfo } from './utils';
 
 export type PresenceLoopBindings = {
   clock: { now(): number };
@@ -115,6 +131,31 @@ export type PresenceLoopBindings = {
   /** StreamsStore._signalsCadence, late-bound setter — written on the
    *  carrier-down transition, in the same breath as the flip. */
   setSignalsCadence: (c: SignalsMediaCadence) => void;
+  /** deps.bus.sendMessage, late-bound (the PingUi broadcast in
+   *  `_sendPings`). */
+  sendMessage: (
+    toAgents: AgentPubKey[],
+    msgType: SignalMsgType,
+    payload?: string
+  ) => Promise<void>;
+  /** StreamsStore.trackHealth.checkTrackHealth, late-bound — dead-track
+   *  (bytesReceived stall) detection, run once per ping cycle. */
+  checkTrackHealth: () => Promise<void>;
+  /** StreamsStore._checkAudibilityOutages, late-bound — stays
+   *  store-resident per the design's round-four list. */
+  checkAudibilityOutages: () => void;
+  /** StreamsStore._flushStaleSdpAggregates, late-bound — stays
+   *  store-resident per the design's round-four list. */
+  flushStaleSdpAggregates: () => void;
+  /** StreamsStore._evaluateSignalsCadence, late-bound — stays
+   *  store-resident per the design's round-four list. */
+  evaluateSignalsCadence: () => void;
+  /** StreamsStore._sweepPendingInits, late-bound — stays store-resident
+   *  per the design's round-four list. */
+  sweepPendingInits: (now: number) => void;
+  /** StreamsStore.mainStream, late-bound — read for the per-cycle
+   *  `logMyStreamInfo` diagnostic line. */
+  mainStream: () => MediaStream | undefined | null;
 };
 
 export class PresenceLoop {
@@ -352,15 +393,15 @@ export class PresenceLoop {
    *    reason a peer entered (media-live / ping-fresh / observer-reported),
    *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
    *
-   * Ordering (review C1): both call sites — `pingAgents()` and the
-   * presence-tick interval in `start()` — must run this BEFORE the next
-   * write that re-derives `_activeAgents` -> `_presentPeers`
-   * (`pingAgents()`'s roster-merge `_knownAgents.set()`, the interval's
-   * own `_presenceTick.update()`), so the carrier hold reading
+   * Ordering (review C1): both call sites — `pingAgents()` and
+   * `onPresenceTick()` — must run this BEFORE the next write that
+   * re-derives `_activeAgents` -> `_presentPeers` (`pingAgents()`'s
+   * roster-merge `_knownAgents.set()`, `onPresenceTick()`'s own
+   * `_presenceTick.update()`), so the carrier hold reading
    * `_signalCarrierDownSince` there sees THIS tick's verdict, not last
-   * tick's. See the full rationale at each call site in streams-store.ts
-   * (`pingAgents`'s comment above its call, and `start()`'s comment above
-   * the interval) — not repeated here to avoid a second copy drifting.
+   * tick's. See the full rationale at each call site below (`pingAgents`'s
+   * comment above its call, and `onPresenceTick`'s own doc comment) — not
+   * repeated here to avoid a second copy drifting.
    */
   _emitPresenceForensics(): void {
     const now = this.bindings.clock.now();
@@ -464,5 +505,104 @@ export class PresenceLoop {
     if (this.bindings.isPeerMediaLive(peer)) return 'media-live';
     if (get(this.bindings.activeAgents())[peer]) return 'ping-fresh';
     return 'observer-reported';
+  }
+
+  async pingAgents() {
+    // Forensics FIRST, before the roster-merge write below: the merge
+    // only adds unstamped entries (new agents) or upgrades `type` for
+    // already-known agents while preserving their `lastSeen` — it never
+    // touches an existing `lastSeen` stamp, so `_emitPresenceForensics`
+    // reading the PRE-merge `_knownAgents` sees the identical
+    // `knownPeerLastSeen` input either way. Ordering here is NOT
+    // cosmetic: the merge's `_knownAgents.set()` below synchronously
+    // re-derives `_activeAgents` -> `_presentPeers` (Task 8's carrier
+    // hold reads `_signalCarrierDownSince` there), so if forensics ran
+    // after that write, the hold would see this cycle's carrier verdict
+    // one write too late on exactly the tick a lone surviving peer's
+    // own staleness crosses — review C1, reproduced with a mid-cycle
+    // crossing (pingAgents() as the FIRST evaluator after the flip,
+    // ahead of the next presence tick).
+    this._emitPresenceForensics();
+
+    this._applyPingRosterSweep();
+
+    await this._sendPings();
+
+    // Log our stream state
+    this.bindings.logger.logMyStreamInfo(getStreamInfo(this.bindings.mainStream()));
+
+    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
+    // Accepts are connectionId reservations — the transport owns the peer
+    // lifecycle, so dropping the entry is the entire teardown. Inits are
+    // our sent-InitRequest records; without the sweep they grow one entry
+    // per 5s retry for as long as a peer stays unresponsive.
+    const now = this.bindings.clock.now();
+    this.bindings.sweepPendingInits(now);
+
+    // Health check for dead tracks (bytesReceived stall detection)
+    await this.bindings.checkTrackHealth();
+
+    // Scan for sustained audibility outages with a relay opportunity
+    this.bindings.checkAudibilityOutages();
+
+    // Flush any SdpData bursts that ended without a follow-up event.
+    this.bindings.flushStaleSdpAggregates();
+
+    // Forensics (signal-carrier liveness + presence-set membership)
+    // already ran at the top of this function, before the roster-merge
+    // write — see the comment there. Not repeated here (review C1: a
+    // second call this late would just be dead weight, since nothing
+    // between the two spots can change `_knownAgents`' lastSeen stamps).
+
+    // Signals media cadence: one evaluation per ping cycle, reading
+    // `_signalCarrierDownSince` from this cycle's forensics call above.
+    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
+    // targets — the healthiest link bounds what the relay can still
+    // deliver; targets with no sample yet contribute nothing, and no
+    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
+    // policy's declared design).
+    this.bindings.evaluateSignalsCadence();
+  }
+
+  private async _sendPings(): Promise<void> {
+    // Ping known agents
+    // This could potentially be optimized by only pinging agents that are online according to Moss (which would only work in shared rooms though)
+    const agentsToPing = Object.keys(get(this._knownAgents))
+      .filter(agent => !get(this.bindings.blockedAgents()).includes(agent))
+      .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
+    // Include a send-side timestamp so peers can echo it back in their
+    // pong, letting us compute signals-carrier RTT on receipt without
+    // adding new messages. See handlePingUi / handlePongUi.
+    await this.bindings.sendMessage(
+      agentsToPing,
+      'PingUi',
+      JSON.stringify({ t0: this.bindings.clock.now() }),
+    );
+  }
+
+  /**
+   * Drive the presence tick from the store clock so _activeAgents
+   * re-evaluates staleness once per ping cadence even when no store
+   * write happens (Phase 2 item 4). _emitPresenceForensics() runs
+   * FIRST, in the same breath, so _signalCarrierDownSince is current
+   * before the tick bump triggers _presentPeers' recompute: carrier-
+   * down (SIGNAL_CARRIER_DOWN_MS) and a lone surviving peer's own
+   * ping-staleness (PRESENT_STALENESS_MS) are the same 3-tick window
+   * by design, so they cross on the SAME tick, and pingAgents() (the
+   * only other _emitPresenceForensics call site) is not guaranteed to
+   * run before this interval fires — without this, the carrier-hold
+   * (Task 8) reads a stale `undefined` on exactly the tick it needs
+   * to catch, and _lastComputedPresent gets wiped before the hold can
+   * apply. decideSignalCarrier's stickiness makes calling this from
+   * both sites idempotent: whichever call notices the transition
+   * first logs it, the other sees it already applied and no-ops.
+   * pingAgents() has the matching guard internally (forensics runs
+   * before ITS OWN `_knownAgents.set()` write, review C1) — the two
+   * fixes are independent because either evaluator can be the first
+   * to observe a given crossing.
+   */
+  onPresenceTick(): void {
+    this._emitPresenceForensics();
+    this._presenceTick.update(n => n + 1);
   }
 }
