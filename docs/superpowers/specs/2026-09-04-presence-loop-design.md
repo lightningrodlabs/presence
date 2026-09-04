@@ -19,9 +19,10 @@ list no longer justify their cost:
   bodies; they are the composition root and should STAY on the store,
   but as named phases.
 - The forensic fold's own trigger ("only if extraction shows
-  friction") never fired — `_iceTimings`/`_sdpDataAggregates` moved
-  cleanly through two rounds with their composite keys intact. YAGNI:
-  not done, dormant.
+  friction") never fired — `_iceTimings`/`_sdpDataAggregates` survived
+  three rounds with their composite keys intact (rounds one and two
+  deferred the fold by declaration; round three moved both fields into
+  `MediaLinks` unchanged). YAGNI: not done, dormant.
 - Reactive-`Writable` unification drags the view layer in and has
   been deferred by declaration since round one. Dormant.
 
@@ -133,8 +134,8 @@ list (the meta-review precedent):
 - **Reactive-`Writable` unification** — trigger: a view-layer round
   that needs the store surface reshaped.
 - **`_iceTimings`/`_sdpDataAggregates` forensic fold** — trigger:
-  observed friction from the composite keys (two rounds of moves
-  produced none).
+  observed friction from the composite keys (three rounds produced
+  none — one move, in round three).
 
 No standing loop remains; further decomposition happens only when
 feature traffic demands it.
