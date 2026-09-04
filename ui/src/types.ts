@@ -127,6 +127,28 @@ export type PeerLinkSnapshot = {
   lastSeen: LastSeenBucket;
 };
 
+/**
+ * Shape of one entry in `StreamsStore._othersConnectionStatuses` — a
+ * peer's own view of their connection statuses, broadcast to us via
+ * pingAgents(). Named out here (rather than inline on the field) so
+ * `media-links.ts` can bind to the same field without re-declaring its
+ * shape (store-decomposition round three, Task 3).
+ */
+export type OthersConnectionStatusEntry = {
+  lastUpdated: number;
+  statuses: ConnectionStatuses;
+  /** Connection statuses to their screen share in case they're sharing screen */
+  screenShareStatuses?: ConnectionStatuses;
+  knownAgents?: Record<AgentPubKeyB64, AgentInfo>;
+  /** How they perceive our stream */
+  perceivedStreamInfo?: StreamAndTrackInfo;
+  /**
+   * Their per-peer snapshot of every other agent's audio link state.
+   * Drives the pair-wise indicators in the details overlay.
+   */
+  peerLinks?: Record<AgentPubKeyB64, PeerLinkSnapshot>;
+};
+
 export type PongMetaDataV1 = {
   connectionStatuses: ConnectionStatuses;
   screenShareConnectionStatuses?: ConnectionStatuses;

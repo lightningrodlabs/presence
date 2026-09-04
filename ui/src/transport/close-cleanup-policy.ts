@@ -71,8 +71,11 @@
  * they described a path with no producer (see the amendment in §8
  * item 1).
  *
- * Constrains `streams-store.ts:_applyCloseCleanup` and its callers
- * (`_handleMediaClosed`, `_applyStaleTeardown`, `handleLeaveUi`) and
+ * Constrains `streams-store.ts:_applyCloseCleanup` (a bare delegate onto
+ * `media-links.ts:MediaLinks.applyCloseCleanup` since store-decomposition
+ * round three, Task 3 — the real executor lives there now) and its
+ * callers (`MediaLinks._handleMediaClosed`/`applyStaleTeardown`, both in
+ * `media-links.ts`, plus `streams-store.ts:handleLeaveUi`) and
  * `ui/src/screen-share-links.ts:ScreenShareLinks._handleScreenShareClosed`
  * (store-decomposition round two, Task 5).
  */
@@ -376,7 +379,9 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
  * reaching this with one is a programming error. (The log-only error
  * handlers use `attributeSlotEvent` directly — they perform no slot write
  * and never consult this table.) Shared by the media close handler
- * (`streams-store.ts:_handleMediaClosed`) and the screen-share one
+ * (`media-links.ts:MediaLinks._handleMediaClosed`, moved from
+ * `streams-store.ts` in store-decomposition round three, Task 3) and the
+ * screen-share one
  * (`ui/src/screen-share-links.ts:ScreenShareLinks._handleScreenShareClosed`)
  * — moved here from `streams-store.ts` in store-decomposition round two,
  * Task 5, so both call sites import the one authority instead of one

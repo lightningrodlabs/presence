@@ -7,8 +7,9 @@
  * ICE + DTLS), signaling relayed page-to-page with Holochain's
  * fire-and-forget semantics. Establishment is the production path end to
  * end: pings → pongs carrying capability declarations → the initiator
- * tie-break → InitRequest/InitAccept → SDP over the bus → the store's own
- * `_dispatchMediaEvent` applying the slot. Asserts the Phase 1 carrier
+ * tie-break → InitRequest/InitAccept → SDP over the bus → `MediaLinks`'
+ * own `_dispatchMediaEvent` (`ui/src/media-links.ts`) applying the slot.
+ * Asserts the Phase 1 carrier
  * invariant against a real network stack, in both directions:
  *
  *   1. Signals carries the peer for the ENTIRE establishment window

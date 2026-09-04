@@ -11,8 +11,10 @@
  * message→effect mapping somewhere it can be table tested without a
  * `StreamsStore` instance (which cannot be built under vitest; see CLAUDE.md).
  *
- * Constrains `streams-store.ts:_handleMediaDataChannelMessage`, which
- * dispatches the returned actions with an exhaustive `switch`.
+ * Constrains `media-links.ts:MediaLinks._handleMediaDataChannelMessage`
+ * (moved from `streams-store.ts` in store-decomposition round three,
+ * Task 3), which dispatches the returned actions with an exhaustive
+ * `switch`.
  */
 
 import type { RTCMessage } from './types';
