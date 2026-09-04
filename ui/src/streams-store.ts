@@ -22,7 +22,7 @@ import {
 } from './presence-policy';
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { initialPeerRecord, prunePendingInits, resetPeerRecord, type PeerRecord } from './peer-record';
-import { FsmTransport, DEFAULT_ICE_SERVERS } from './transport';
+import { FsmTransport } from './transport';
 import type { PeerTransport, TransportEvent } from './transport';
 import {
   routeTransportPhase,
@@ -42,22 +42,13 @@ import {
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
-import { closeCleanupPlan } from './transport/close-cleanup-policy';
+import { closeCleanupPlan, closeGuardOutcome } from './transport/close-cleanup-policy';
 import type {
   CloseCleanupContext,
-  CloseCleanupOutcome,
   CloseCleanupPlan,
 } from './transport/close-cleanup-policy';
-import {
-  summarizeRtcStats,
-  decideTrackRefresh,
-  STALE_CYCLES_REFRESH_THRESHOLD,
-} from './transport/track-health-policy';
-import type { RtcStatsReportLike } from './transport/track-health-policy';
 import { decideInitRetry } from './transport/init-retry-policy';
-import { buildDiagnosticSnapshot } from './diagnostic-snapshot-policy';
 import { decideModuleStateMerge } from './module-state-policy';
-import { decideScreenSignalRoute } from './transport/screen-signal-policy';
 import {
   derived,
   get,
@@ -92,7 +83,6 @@ import {
 } from './room/modules/conversation';
 import {
   CAP_SDP_FSM,
-  CAP_SDP_FSM_SCREEN,
   CAP_VOICE_BATCH,
   isSignalMsgType,
 } from './transport/wire-contract';
@@ -102,6 +92,11 @@ import { PresenceLogger } from './logging';
 import { MicSource } from './mic-source';
 import { CameraSource } from './camera-source';
 import { CaptureReconciler } from './capture-reconciler';
+import { PeerAudioLevels } from './peer-audio-levels';
+import { MediaSettings } from './media-settings';
+import { DiagnosticsHub } from './diagnostics-hub';
+import { TrackHealthMonitor } from './track-health';
+import { ScreenShareLinks } from './screen-share-links';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -224,22 +219,6 @@ const INIT_RETRY_THRESHOLD = 5000;
 const PENDING_HANDSHAKE_TTL_MS = 20000;
 
 /**
- * Map a `closed` `decideSlotWrite` result onto the cleanup table's
- * outcome axis. Only the guard outcomes a `closed` event can produce
- * appear here; `install`/`replace`/`set-connected` belong to other event
- * kinds and reaching this with one is a programming error. (The log-only
- * error handlers use `attributeSlotEvent` directly — they perform no
- * slot write and never consult the cleanup table.)
- */
-function closeGuardOutcome(
-  write: ReturnType<typeof decideSlotWrite>,
-): CloseCleanupOutcome {
-  if (write.write === 'clear') return 'live';
-  if (write.write === 'none' && write.reason === 'superseded') return 'superseded';
-  return 'no-slot';
-}
-
-/**
  * A store that handles the creation and management of WebRTC streams with
  * holochain peers
  */
@@ -283,42 +262,35 @@ export class StreamsStore {
   // lazy allAgents polling deactivate after the room is left.
   _allAgentsUnsub: (() => void) | null = null;
 
-  // ICE/TURN settings live in storage.local (window.localStorage in
-  // production) and are edited from the Settings panel. Read them live (not
-  // snapshotted at construction) so edits take effect on the next connection
-  // without a reload. iceConfig / the transport trickle getters consult
-  // these on every ensureConnection.
+  // ICE/TURN settings, device enumeration/selection, and the storage-backed
+  // trickle toggle are owned by MediaSettings (store-decomposition round
+  // two, Task 2; see media-settings.ts). Bare-forward delegates below.
   get trickleICE(): boolean {
-    // Stored as 'true'/'false'; default ON when unset.
-    return this.deps.storage.local.getItem('trickleICE') !== 'false';
+    return this.mediaSettings.trickleICE;
   }
 
   get turnUrl(): string {
-    return this.deps.storage.local.getItem('turnUrl') || '';
+    return this.mediaSettings.turnUrl;
   }
 
   get turnUsername(): string {
-    return this.deps.storage.local.getItem('turnUsername') || '';
+    return this.mediaSettings.turnUsername;
   }
 
   get turnCredential(): string {
-    return this.deps.storage.local.getItem('turnCredential') || '';
+    return this.mediaSettings.turnCredential;
   }
 
-  // Cloudflare-provisioned TURN. Stored under separate keys from the manual
-  // TURN server so both can be offered as ICE candidates simultaneously (the
-  // ICE agent gathers relay candidates from every configured server). Written
-  // by the Settings panel's auto-provisioning; read live here.
   get cfTurnUrl(): string {
-    return this.deps.storage.local.getItem('cfTurnUrl') || '';
+    return this.mediaSettings.cfTurnUrl;
   }
 
   get cfTurnUsername(): string {
-    return this.deps.storage.local.getItem('cfTurnUsername') || '';
+    return this.mediaSettings.cfTurnUsername;
   }
 
   get cfTurnCredential(): string {
-    return this.deps.storage.local.getItem('cfTurnCredential') || '';
+    return this.mediaSettings.cfTurnCredential;
   }
 
   blockedAgents: Writable<AgentPubKeyB64[]> = writable([]);
@@ -472,6 +444,48 @@ export class StreamsStore {
    *  retry state (Task 3; see capture-reconciler.ts). Assigned in start(). */
   captureReconciler!: CaptureReconciler;
 
+  /** The ONE owner of the per-peer WebRTC AnalyserNode surface (store-
+   *  decomposition round two, Task 1; see peer-audio-levels.ts). */
+  peerAudioLevels: PeerAudioLevels = new PeerAudioLevels({
+    ensureAudioContext: () => this.micSource.ensureAudioContext(),
+    peerRecord: k => this._peerRecord(k),
+    ensurePeerRecord: k => this._ensurePeerRecord(k),
+  });
+
+  /** The ONE owner of device enumeration/selection and the storage-backed
+   *  ICE/TURN configuration (store-decomposition round two, Task 2; see
+   *  media-settings.ts). Constructed in the constructor body, not as a
+   *  field initializer, because its bindings dereference `this.deps`
+   *  directly (a live storage/mediaDevices handle, not a late-bound
+   *  arrow) — field initializers run before `this.deps = deps` in the
+   *  constructor body. */
+  mediaSettings!: MediaSettings;
+
+  /** The ONE owner of the diagnostic-log request/response pipeline
+   *  (store-decomposition round two, Task 3; see diagnostics-hub.ts).
+   *  Constructed in the constructor body, not as a field initializer,
+   *  for the same reason as `mediaSettings`: its `sendMessage` binding
+   *  dereferences `this.deps.bus` directly. */
+  diagnosticsHub!: DiagnosticsHub;
+
+  /** The ONE owner of the dead-track detection/recovery surface
+   *  (store-decomposition round two, Task 4; see track-health.ts).
+   *  Constructed in the constructor body, not as a field initializer,
+   *  for the same reason as `mediaSettings`/`diagnosticsHub`: several of
+   *  its bindings dereference `this` state assigned later in the
+   *  constructor body (or in `start()`). `_applyStaleTeardown` stays on
+   *  the store — it is a shared teardown bridge, not track-health-only. */
+  trackHealth!: TrackHealthMonitor;
+
+  /** The ONE owner of the two screen-share FSM transports and their
+   *  signal/event wiring (store-decomposition round two, Task 5; see
+   *  screen-share-links.ts). Constructed in the constructor body, not as
+   *  a field initializer, for the same reason as the other owners above.
+   *  `screenShareOn`/`screenShareOff`/`stopScreenShare` stay on the store
+   *  (pinned by `intent-write-sites.test.ts`); `_applyCloseCleanup` stays
+   *  too, as the shared teardown bridge. */
+  screenShareLinks!: ScreenShareLinks;
+
   /**
    * WebRTC transports. Three instances by purpose:
    *  - mediaTransport: bidirectional mic+camera (one connection per peer).
@@ -483,7 +497,8 @@ export class StreamsStore {
    * screen-share transports signal over 'SdpFsmScreen'. Because the FSM
    * allocates its own connectionId per side, incoming screen signals are
    * routed by the sender's declared role (`dir: 'sharer' | 'viewer'`),
-   * not by connectionId — see `handleSdpFsmScreen`.
+   * not by connectionId — see
+   * `screen-share-links.ts:ScreenShareLinks.handleSdpFsmScreen`.
    */
   // Typed as the interface, not the implementation (Phase 4 item 3 made
   // `PeerTransport` a real annotation): the store can only use the
@@ -505,6 +520,16 @@ export class StreamsStore {
     this.clock = deps.clock;
     this.myPubKeyB64 = encodeHashToBase64(deps.bus.myPubKey);
     this._localIntent = writable(initialLocalIntent(this.deps.storage.local));
+    this.mediaSettings = new MediaSettings({
+      storage: this.deps.storage.local,
+      mediaDevices: this.deps.mediaDevices,
+      changeMicDevice: id => this.micSource.changeDevice(id),
+      changeCameraDevice: id => this.cameraSource.changeDevice(id),
+      broadcastRtcAction: a => this._broadcastRtcAction(a),
+      logAgentEvent: e => this.logger.logAgentEvent(e),
+      now: () => this.clock.now(),
+      myPubKeyB64: () => this.myPubKeyB64,
+    });
 
     this._activeAgents = derived(
       [this._knownAgents, this.blockedAgents, this._presenceTick] as [
@@ -581,6 +606,49 @@ export class StreamsStore {
           openConnections: connections,
         }),
     );
+    this.diagnosticsHub = new DiagnosticsHub({
+      sendMessage: (agents, msgType, payload) =>
+        this.deps.bus.sendMessage(agents, msgType, payload),
+      logger: this.logger,
+      now: () => this.clock.now(),
+      setTimeout: (fn, ms) => this.clock.setTimeout(fn, ms),
+      myPubKeyB64: () => this.myPubKeyB64,
+      globalPresenceSet: () => this.globalPresenceSet(),
+      peerRttEwma: k => this._peerRecord(k)?.signalsRttEwma,
+    });
+    this.trackHealth = new TrackHealthMonitor({
+      mediaTransport: () => this.mediaTransport,
+      openConnections: () => get(this._openConnections),
+      sendRtcAction: (message, peers) => this._sendRtcAction(message, peers),
+      maybeEmitQualityChange: (pubKeyB64, carrier, rttMs, jitterMs, lossPercent) =>
+        this._maybeEmitQualityChange(pubKeyB64, carrier, rttMs, jitterMs, lossPercent),
+      peerRecord: k => this._peerRecord(k),
+      ensurePeerRecord: k => this._ensurePeerRecord(k),
+      micLifecycle: () => this.micSource.lifecycle,
+      cameraLifecycle: () => this.cameraSource.lifecycle,
+      mainStream: () => this.mainStream,
+      webrtcStats: this.webrtcStats,
+      logger: this.logger,
+      now: () => this.clock.now(),
+    });
+    this.screenShareLinks = new ScreenShareLinks({
+      outTransport: () => this.screenShareOutTransport,
+      inTransport: () => this.screenShareInTransport,
+      applyCloseCleanup: (ctx, plan, pubKeyB64, connectionId, closeReason) =>
+        this._applyCloseCleanup(ctx, plan, pubKeyB64, connectionId, closeReason),
+      computeSdpTimeout: peerB64 => this._computeSdpTimeout(peerB64),
+      nextConnectionEpoch: peer => this._nextConnectionEpoch(peer),
+      peerCaps: peerB64 => this._peerCaps(peerB64),
+      peerRecord: k => this._peerRecord(k),
+      ensurePeerRecord: k => this._ensurePeerRecord(k),
+      logSdpDataEvent: (agent, connectionId, sdpType) =>
+        this._logSdpDataEvent(agent, connectionId, sdpType),
+      eventCallback: e => this.eventCallback(e),
+      logger: this.logger,
+      now: () => this.clock.now(),
+      screenShareStream: () => this.screenShareStream,
+    });
+
     // Construction ends here: fields and derived stores only, no
     // subscriptions, no transports, no browser APIs. Everything that
     // touches the ambient world (window, navigator, the signal bus, the
@@ -720,8 +788,8 @@ export class StreamsStore {
 
     // Subscribe transport events to the application-level handlers.
     this._subscribeMediaTransport();
-    this._subscribeScreenShareTransport(this.screenShareOutTransport, true);
-    this._subscribeScreenShareTransport(this.screenShareInTransport, false);
+    this.screenShareLinks.subscribe(this.screenShareOutTransport, true);
+    this.screenShareLinks.subscribe(this.screenShareInTransport, false);
 
     this.deps.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
@@ -733,17 +801,10 @@ export class StreamsStore {
       onTrackChange: (newTrack, oldTrack) => {
         this._onMicTrackChange(newTrack, oldTrack);
       },
-      onMutedChange: muted => {
-        // Fan the mute state out to cloned streams (simple-peer issue #606).
-        // The primary track's `enabled` flag is flipped inside MicSource;
-        // only the clones need to be touched here.
-        this.mainStreamClones.forEach(clonedStream => {
-          clonedStream.getAudioTracks().forEach(track => {
-            // eslint-disable-next-line no-param-reassign
-            track.enabled = !muted;
-          });
-        });
-      },
+      // The clone fanout this served was deleted as dead code (round two
+      // Task 6, `mainStreamClones` had zero writers) — MicSource flips the
+      // shared track's `enabled` flag itself, so this binding is a no-op.
+      onMutedChange: () => {},
       // Nothing consumes mic lifecycle yet — Task 3's reconciler reads
       // `micSource.lifecycle` directly on the presence tick rather than
       // subscribing here. Wire this if a push-driven consumer arrives.
@@ -1010,92 +1071,6 @@ export class StreamsStore {
     return [this.mediaTransport];
   }
 
-  private _subscribeScreenShareTransport(
-    transport: PeerTransport,
-    initiator: boolean,
-  ): void {
-    transport.onAny((event: TransportEvent) => {
-      switch (event.type) {
-        case 'connection-state-change': {
-          // Same authority as the media path: `routeTransportPhase` is
-          // exhaustive over ConnectionPhase, so `failed` clears the slot
-          // and `reconnecting`/`disconnected` defer to the FSM's own
-          // recovery instead of tearing the share down.
-          const route = routeTransportPhase({
-            phase: event.phase,
-            connectionId: event.connectionId,
-            openConnectionId:
-              get(this._screenShareStore(initiator))[event.peer]?.connectionId,
-          });
-          switch (route.handler) {
-            case 'signaling': {
-              const slotWrite = decideSlotWrite(
-                { kind: 'signaling', slot: route.slot },
-                event.connectionId,
-                get(this._screenShareStore(initiator))[event.peer],
-              );
-              if (slotWrite.write === 'install' || slotWrite.write === 'replace') {
-                if (slotWrite.write === 'replace') {
-                  // The FSM behind the slot was replaced in place
-                  // (higher-epoch offer / new remote session) with no
-                  // close event — adopt the live connectionId, exactly
-                  // like the media path.
-                  this.logger.logAgentEvent({
-                    agent: event.peer,
-                    timestamp: this.clock.now(),
-                    event: 'Superseded',
-                    connectionId: slotWrite.supersedes,
-                    detail: `superseded-by=${event.connectionId}; path=screen-transport-replace`,
-                  });
-                }
-                this._screenShareStore(initiator).update(currentValue => {
-                  currentValue[event.peer] = {
-                    ...slotWrite.slot,
-                    video: initiator,
-                    audio: false,
-                    direction: initiator ? 'outgoing' : 'incoming',
-                  };
-                  return currentValue;
-                });
-                this.updateScreenShareConnectionStatus(event.peer, {
-                  type: 'SdpExchange',
-                });
-              }
-              break;
-            }
-            case 'media-connected':
-              this._handleScreenShareConnected(event.peer, event.connectionId, initiator);
-              break;
-            case 'media-closed':
-              this._handleScreenShareClosed(event.peer, event.connectionId, initiator);
-              break;
-            case 'ignore':
-              break;
-          }
-          break;
-        }
-        case 'remote-stream':
-          this._handleScreenShareRemoteStream(event.peer, event.connectionId, event.stream);
-          break;
-        case 'remote-track':
-          this._handleScreenShareRemoteTrack(event.peer, event.connectionId, event.track);
-          break;
-        case 'ice-diagnostic':
-          // Outgoing side only: the stale-cleanup grace bookkeeping (the
-          // net itself stands down while the FSM owns recovery, but the
-          // timestamps keep the forensic story readable). The viewer side
-          // has no stale supervisor and needs nothing here.
-          if (initiator) {
-            this._handleScreenShareIceDiagnostic(event.peer, event.diag);
-          }
-          break;
-        case 'error':
-          this._handleScreenShareError(event.peer, event.connectionId, event.error, initiator);
-          break;
-      }
-    });
-  }
-
   // --- media transport event handlers ---
 
   /**
@@ -1268,26 +1243,6 @@ export class StreamsStore {
     });
   }
 
-  /**
-   * `ice-diagnostic` bookkeeping for the outgoing screen-share transport:
-   * maintains the invariant on `screenShareIceDisconnectedAt` — an entry
-   * exists iff the share's iceState is currently 'disconnected' — which
-   * the stale-connection net reads for its grace window. No log lines:
-   * the media transport is the forensic subject; the share only needs
-   * the timestamps.
-   */
-  private _handleScreenShareIceDiagnostic(
-    pubKeyB64: AgentPubKeyB64,
-    diag: import('./transport').IceDiagnostic,
-  ): void {
-    if (diag.kind !== 'ice-state') return;
-    if (diag.state === 'disconnected') {
-      this._ensurePeerRecord(pubKeyB64).screenShareIceDisconnectedAt = this.clock.now();
-    } else {
-      { const r = this._peerRecords.get(pubKeyB64); if (r) r.screenShareIceDisconnectedAt = undefined; }
-    }
-  }
-
   /** DTLS-stall watchdog timeout (ms) for the FSM transport. Defaults to a
    *  link-tolerant 12s; override via localStorage('dtlsStallTimeoutMs').
    *  Floored at 1s to avoid an unusably twitchy watchdog. */
@@ -1404,7 +1359,7 @@ export class StreamsStore {
     this._flushSdpAggregatesForConnection(connectionId);
     // Record this peer as a genuine call participant for diagnostic-log
     // targeting. Kept for the whole session even if they later drop.
-    this._conversationParticipants.add(pubKeyB64);
+    this.diagnosticsHub.noteConversationParticipant(pubKeyB64);
     this.logger.logAgentEvent({
       agent: pubKeyB64,
       timestamp: this.clock.now(),
@@ -1623,7 +1578,7 @@ export class StreamsStore {
     if (plan.setDisconnectedStatus === 'media') {
       this.updateConnectionStatus(pubKeyB64, { type: 'Disconnected' });
     } else if (plan.setDisconnectedStatus === 'screen-share') {
-      this.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Disconnected' });
+      this.screenShareLinks.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Disconnected' });
     }
     if (plan.fireEvent === 'peer-disconnected') {
       this.eventCallback({
@@ -1730,7 +1685,7 @@ export class StreamsStore {
       }
       return currentValue;
     });
-    this.setupPeerAudioAnalyser(pubKeyB64, stream);
+    this.peerAudioLevels.setupPeerAudioAnalyser(pubKeyB64, stream);
     this.eventCallback({
       type: 'peer-stream',
       pubKeyB64,
@@ -1758,7 +1713,7 @@ export class StreamsStore {
     // never gets a second pass when the audio track arrives later. Hook it
     // here as well: idempotent if the analyser already exists.
     if (track.kind === 'audio' && stream && !this._peerRecords.get(pubKeyB64)?.analyser) {
-      this.setupPeerAudioAnalyser(pubKeyB64, stream);
+      this.peerAudioLevels.setupPeerAudioAnalyser(pubKeyB64, stream);
     }
 
     if (!track.muted) {
@@ -1835,7 +1790,7 @@ export class StreamsStore {
           this.logger.logCustomMessage(
             `request-track-refresh received from [${pubKeyB64.slice(0, 8)}]`
           );
-          this.refreshTracksForPeer(pubKeyB64);
+          this.trackHealth.refreshTracksForPeer(pubKeyB64);
           break;
         }
         case 'ignore':
@@ -1900,185 +1855,6 @@ export class StreamsStore {
       event: 'FsmError',
       connectionId,
       detail: `${error.message || String(error)}; slot=${attribution.outcome}`,
-    });
-  }
-
-  // --- screen-share transport event handlers ---
-
-  private _screenShareStore(initiator: boolean): Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> {
-    return initiator
-      ? this._screenShareConnectionsOutgoing
-      : this._screenShareConnectionsIncoming;
-  }
-
-  private _handleScreenShareConnected(
-    pubKeyB64: AgentPubKeyB64,
-    _connectionId: string,
-    initiator: boolean,
-  ): void {
-
-    const store = this._screenShareStore(initiator);
-    // Supersede guard, same decision as the media path: a `connected` for
-    // a connectionId that no longer owns the slot must not flip the flag.
-    const write = decideSlotWrite(
-      { kind: 'connected' },
-      _connectionId,
-      get(store)[pubKeyB64],
-    );
-    if (write.write !== 'set-connected') return;
-    store.update(currentValue => {
-      const relevantConnection = currentValue[pubKeyB64];
-      if (relevantConnection) {
-        relevantConnection.connected = true;
-      }
-      return currentValue;
-    });
-
-    // If we are the sharer, ensure the outgoing screen-share stream is
-    // attached. addStream-style auto-attach has already happened for new
-    // connections via setLocalStream, but addTrack-per-track is a safe
-    // no-op fallback when the stream was set after this peer was created.
-    if (initiator && this.screenShareStream) {
-      const conn = get(this._screenShareConnectionsOutgoing)[pubKeyB64];
-      if (conn && conn.direction === 'outgoing') {
-        try {
-          for (const track of this.screenShareStream.getTracks()) {
-            this.screenShareOutTransport.addTrack(track, this.screenShareStream);
-          }
-        } catch (_e) {
-          // duplicate tracks are silently ignored
-        }
-      }
-    }
-
-    if (!initiator) {
-      this.eventCallback({
-        type: 'peer-screen-share-connected',
-        pubKeyB64,
-        connectionId: _connectionId,
-      });
-    }
-
-    this.updateScreenShareConnectionStatus(pubKeyB64, { type: 'Connected' });
-  }
-
-  private _handleScreenShareClosed(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    initiator: boolean,
-  ): void {
-
-    // Supersede guard: a stale close from a replaced FSM must not clear
-    // the slot a newer connection owns (decideSlotWrite drops it).
-    const write = decideSlotWrite(
-      { kind: 'closed' },
-      connectionId,
-      get(this._screenShareStore(initiator))[pubKeyB64],
-    );
-    const ctx: CloseCleanupContext = {
-      target: initiator ? 'screen-share-outgoing' : 'screen-share-incoming',
-      via: 'close-event',
-      outcome: closeGuardOutcome(write),
-    };
-    this._applyCloseCleanup(
-      ctx,
-      closeCleanupPlan(ctx),
-      pubKeyB64,
-      connectionId,
-      'close event',
-    );
-  }
-
-  private _handleScreenShareRemoteStream(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    stream: MediaStream,
-  ): void {
-    // Keep the stream reachable for room-view's paint-restore path
-    // (`screenShareStream` was declared for exactly this and written
-    // nowhere — the unscheduled-defects table; wired here by Phase 3).
-    this._ensurePeerRecord(pubKeyB64).screenShareStream = stream;
-    this._screenShareConnectionsIncoming.update(currentValue => {
-      const relevantConnection = currentValue[pubKeyB64];
-      if (relevantConnection) {
-        if (stream.getAudioTracks().length > 0) {
-          relevantConnection.audio = true;
-        }
-        if (stream.getVideoTracks().length > 0) {
-          relevantConnection.video = true;
-        }
-      }
-      return currentValue;
-    });
-
-    this.eventCallback({
-      type: 'peer-screen-share-stream',
-      pubKeyB64,
-      connectionId,
-      stream,
-    });
-  }
-
-  private _handleScreenShareRemoteTrack(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    track: MediaStreamTrack,
-  ): void {
-    this._screenShareConnectionsIncoming.update(currentValue => {
-      const relevantConnection = currentValue[pubKeyB64];
-      if (!relevantConnection) return currentValue;
-      if (track.kind === 'audio' && track.enabled) {
-        relevantConnection.audio = true;
-      }
-      if (track.kind === 'video' && track.enabled) {
-        relevantConnection.video = true;
-      }
-      return currentValue;
-    });
-    this.eventCallback({
-      type: 'peer-screen-share-track',
-      pubKeyB64,
-      connectionId,
-      track,
-    });
-  }
-
-  private _handleScreenShareError(
-    pubKeyB64: AgentPubKeyB64,
-    connectionId: string,
-    error: Error,
-    initiator: boolean,
-  ): void {
-    this.logger.logCustomMessage(
-      `ScreenSharePeerError [${pubKeyB64.slice(0, 8)}]: ${error.message || error}`
-    );
-
-    // FORENSIC-ONLY, like the media error handler above (Round 3 item 1
-    // as amended by review F2): the FSM owns screen-share recovery too,
-    // and its `failed`/`closed` phases drive the teardown rows. The
-    // attribution keeps a stale (replaced) FSM's error from reading as
-    // the live share failing — the Phase 3 review-F1 hazard, now with no
-    // writes to guard at all.
-    const attribution = attributeSlotEvent(
-      connectionId,
-      get(this._screenShareStore(initiator))[pubKeyB64],
-    );
-    if (attribution.outcome === 'superseded') {
-      this.logger.logAgentEvent({
-        agent: pubKeyB64,
-        timestamp: this.clock.now(),
-        event: 'SupersededError',
-        connectionId,
-        detail: `superseded-by=${attribution.supersededBy}; err=${error.message || error}; path=screen`,
-      });
-      return;
-    }
-    this.logger.logAgentEvent({
-      agent: pubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'FsmError',
-      connectionId,
-      detail: `${error.message || String(error)}; path=screen; slot=${attribution.outcome}`,
     });
   }
 
@@ -2205,19 +1981,17 @@ export class StreamsStore {
   /**
    * Handles MicSource track lifecycle events. Branches on the (new, old)
    * pair because opening, replacing, and closing all have different
-   * implications for `mainStream`, `mainStreamClones`, and peer fanout.
+   * implications for `mainStream` and peer fanout.
    *
    *   - open         (newTrack, null)   : lazily create mainStream if needed,
    *                                       add the track, addTrack on peers.
    *   - device-change (newTrack, oldTrack): removeTrack/addTrack on
    *                                       mainStream, replaceTrack on peers.
-   *                                       mainStreamClones are intentionally
-   *                                       left alone here — device-change
-   *                                       during an active reconnection path
-   *                                       is a latent bug that predates this
-   *                                       refactor; don't introduce new
-   *                                       regressions while fixing the
-   *                                       normal path.
+   *                                       Device-change during an active
+   *                                       reconnection path is a latent bug
+   *                                       that predates this refactor; don't
+   *                                       introduce new regressions while
+   *                                       fixing the normal path.
    *   - close         (null, oldTrack)  : removeTrack from mainStream, remove
    *                                       from peers.
    */
@@ -2525,39 +2299,15 @@ export class StreamsStore {
   }
 
   enableTrickleICE() {
-    this.deps.storage.local.setItem('trickleICE', 'true');
+    this.mediaSettings.enableTrickleICE();
   }
 
   disableTrickleICE() {
-    this.deps.storage.local.setItem('trickleICE', 'false');
+    this.mediaSettings.disableTrickleICE();
   }
 
   get iceConfig(): RTCIceServer[] {
-    const servers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
-    // A TURN field may carry more than one URL (comma- or whitespace-separated)
-    // so a single credential covers multiple transports — typically the UDP
-    // relay `turn:host:3478` plus the TLS-over-TCP relay
-    // `turns:host:443?transport=tcp`. The latter survives lossy-UDP paths and
-    // firewalls that only permit 443 (§6.3). One m-line per distinct URL is
-    // fine; the agent picks the best.
-    const pushTurn = (url: string, username: string, credential: string) => {
-      const urls = url
-        .split(/[\s,]+/)
-        .map(u => u.trim())
-        .filter(Boolean);
-      if (urls.length > 0) {
-        servers.push({
-          urls: urls.length === 1 ? urls[0] : urls,
-          username,
-          credential,
-        });
-      }
-    };
-    // Manual and Cloudflare TURN are independent entries — both are offered as
-    // candidates when present (WebRTC supports multiple TURN servers).
-    pushTurn(this.turnUrl, this.turnUsername, this.turnCredential);
-    pushTurn(this.cfTurnUrl, this.cfTurnUsername, this.cfTurnCredential);
-    return servers;
+    return this.mediaSettings.iceConfig;
   }
 
   // The setTurnUrl/setTurnUsername/setTurnCredential/setSignalDelay
@@ -2716,7 +2466,7 @@ export class StreamsStore {
     }
 
     // Health check for dead tracks (bytesReceived stall detection)
-    await this._checkTrackHealth();
+    await this.trackHealth.checkTrackHealth();
 
     // Scan for sustained audibility outages with a relay opportunity
     this._checkAudibilityOutages();
@@ -2947,17 +2697,7 @@ export class StreamsStore {
   }
 
   async changeVideoInput(deviceId: string) {
-    this.logger.logAgentEvent({
-      agent: this.myPubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'ChangeMyVideoInput',
-    });
-    // CameraSource owns the device-switch path: it stores the new id,
-    // opens a new track if a consumer holds the camera, and fires
-    // _onCameraTrackChange's device-change branch to replaceTrack on
-    // mainStream and on every transport. Mirrors changeAudioInput.
-    await this.cameraSource.changeDevice(deviceId);
-    this._broadcastRtcAction('change-video-input');
+    return this.mediaSettings.changeVideoInput(deviceId);
   }
 
   async videoOn() {
@@ -3130,19 +2870,7 @@ export class StreamsStore {
   }
 
   async changeAudioInput(deviceId: string) {
-    this.logger.logAgentEvent({
-      agent: this.myPubKeyB64,
-      timestamp: this.clock.now(),
-      event: 'ChangeMyAudioInput',
-    });
-    console.log('Changing audio input to: ', deviceId);
-    // MicSource owns the device-switch path: it stores the new id, opens a
-    // new track, replaces the active track, and fires _onMicTrackChange,
-    // which is what updates mainStream and replaceTracks on all peers.
-    // If no consumer currently holds the mic (WebRTC off + voice off), the
-    // id is stored and the next acquire picks it up.
-    await this.micSource.changeDevice(deviceId);
-    this._broadcastRtcAction('change-audio-input');
+    return this.mediaSettings.changeAudioInput(deviceId);
   }
 
   async audioOn(enabled: boolean) {
@@ -3207,12 +2935,9 @@ export class StreamsStore {
       event: 'MyAudioOff',
     });
 
-    // Mute via MicSource. This flips track.enabled on the primary track and
-    // fires the onMutedChange binding, which fans the flag out to every
-    // mainStreamClones entry — matching the old behavior without any
-    // per-stream track iteration here. We intentionally do NOT release the
-    // WebRTC mic handle: the track stays alive for fast re-enable without
-    // WebRTC renegotiation.
+    // Mute via MicSource. This flips track.enabled on the primary track.
+    // We intentionally do NOT release the WebRTC mic handle: the track
+    // stays alive for fast re-enable without WebRTC renegotiation.
     this.micSource.setMuted(true);
 
     // Propagate mute state to the conversation module so peers' icon
@@ -3231,44 +2956,6 @@ export class StreamsStore {
     return conversationPayloadCaps(
       get(this._peerModuleStates)[peerB64]?.['conversation'] ?? null,
     );
-  }
-
-  /**
-   * Ensure an outgoing screen-share connection toward `pubkeyB64` exists.
-   *
-   * Replaces the InitRequest/InitAccept handshake the SimplePeer screen
-   * path needed: the FSM acceptor creates state lazily from the incoming
-   * offer, so there is no reservation to negotiate, no pending-init map,
-   * and no retry cadence of our own — `ensureConnection` is idempotent,
-   * the FSM owns signaling timeouts/retries, and when it gives up the
-   * `failed` route clears the slot so the next ping/pong re-enters here.
-   *
-   * Emission gate (wire-contract.ts): a peer that has not declared
-   * `sdp-fsm-screen` never receives an `SdpFsmScreen` signal — releases
-   * ≤ v0.14.8 spoke SimplePeer screen share, which this port retires, so
-   * those peers simply do not get our share.
-   */
-  private _ensureOutgoingScreenShare(pubkeyB64: AgentPubKeyB64): void {
-    if (!this.screenShareStream) return;
-    if (get(this._screenShareConnectionsOutgoing)[pubkeyB64]) return;
-    if (!this._peerCaps(pubkeyB64).has(CAP_SDP_FSM_SCREEN)) return;
-
-    this.screenShareOutTransport.setLocalStream(this.screenShareStream);
-    const connectionId = this.screenShareOutTransport.ensureConnection(pubkeyB64, {
-      sdpExchangeTimeoutMs: this._computeSdpTimeout(pubkeyB64),
-      epoch: this._nextConnectionEpoch(pubkeyB64),
-    });
-    this._screenShareConnectionsOutgoing.update(currentValue => {
-      currentValue[pubkeyB64] = {
-        connectionId,
-        video: true,
-        audio: false,
-        connected: false,
-        direction: 'outgoing',
-      };
-      return currentValue;
-    });
-    this.updateScreenShareConnectionStatus(pubkeyB64, { type: 'SdpExchange' });
   }
 
   async screenShareOn() {
@@ -3375,10 +3062,10 @@ export class StreamsStore {
     }
   }
 
+  /** View surface (also called from `blockAgent`): delegates to
+   *  `screenShareLinks`. */
   disconnectFromPeerScreen(pubKeyB64: AgentPubKeyB64) {
-    if (get(this._screenShareConnectionsIncoming)[pubKeyB64]) {
-      this.screenShareInTransport.closeConnection(pubKeyB64, 'disconnectFromPeerScreen');
-    }
+    this.screenShareLinks.disconnectFromPeerScreen(pubKeyB64);
   }
 
   blockAgent(pubKey64: AgentPubKeyB64) {
@@ -3431,47 +3118,48 @@ export class StreamsStore {
   // MEDIA DEVICES
   // ===========================================================================================
 
-  mediaDevices: Writable<MediaDeviceInfo[]> = writable([]);
+  get mediaDevices(): Writable<MediaDeviceInfo[]> {
+    return this.mediaSettings.mediaDevices;
+  }
 
   async updateMediaDevices() {
-    const mediaDevices = await this.deps.mediaDevices.enumerateDevices();
-    this.mediaDevices.set(mediaDevices);
+    return this.mediaSettings.updateMediaDevices();
   }
 
   audioInputDevices(): Readable<MediaDeviceInfo[]> {
-    return derived(this.mediaDevices, devices =>
-      devices.filter(device => device.kind === 'audioinput')
-    );
+    return this.mediaSettings.audioInputDevices();
   }
 
   videoInputDevices(): Readable<MediaDeviceInfo[]> {
-    return derived(this.mediaDevices, devices =>
-      devices.filter(device => device.kind === 'videoinput')
-    );
+    return this.mediaSettings.videoInputDevices();
   }
 
   audioOutputDevices(): Readable<MediaDeviceInfo[]> {
-    return derived(this.mediaDevices, devices =>
-      devices.filter(device => device.kind === 'audiooutput')
-    );
+    return this.mediaSettings.audioOutputDevices();
   }
 
-  _audioInputId: Writable<string | undefined> = writable(undefined); // if undefined, the default audio input source is used
+  get _audioInputId(): Writable<string | undefined> {
+    return this.mediaSettings._audioInputId;
+  }
 
   audioInputId(): Readable<string | undefined> {
-    return derived(this._audioInputId, id => id);
+    return this.mediaSettings.audioInputId();
   }
 
-  _audioOutputId: Writable<string | undefined> = writable(undefined); // if undefined, the default audio output is used
+  get _audioOutputId(): Writable<string | undefined> {
+    return this.mediaSettings._audioOutputId;
+  }
 
   audioOutputId(): Readable<string | undefined> {
-    return derived(this._audioOutputId, id => id);
+    return this.mediaSettings.audioOutputId();
   }
 
-  _videoInputId: Writable<string | undefined> = writable(undefined); // if undefined, the default video input source is used
+  get _videoInputId(): Writable<string | undefined> {
+    return this.mediaSettings._videoInputId;
+  }
 
   videoInputId(): Readable<string | undefined> {
-    return derived(this._videoInputId, id => id);
+    return this.mediaSettings.videoInputId();
   }
 
   // ===========================================================================================
@@ -3482,13 +3170,6 @@ export class StreamsStore {
    * Our own video/audio stream
    */
   mainStream: MediaStream | undefined | null;
-
-  /**
-   * Clones of the main stream. These are required in case a reconnection needs to be made for
-   * an individual peer because our audio and/or video track is non-functional from their
-   * perspective
-   */
-  mainStreamClones: MediaStream[] = [];
 
   /**
    * Black-frame video track used as a NAT-keepalive replacement for the
@@ -3604,18 +3285,22 @@ export class StreamsStore {
     writable({});
 
   /**
-   * Connections where we are sharing our own screen and the Init/Accept handshake succeeded
+   * Connections where we are sharing our own screen and the Init/Accept
+   * handshake succeeded. Delegates to `screenShareLinks` (store-
+   * decomposition round two, Task 5) — wiring tests and views read this
+   * getter directly.
    */
-  _screenShareConnectionsOutgoing: Writable<
-    Record<AgentPubKeyB64, OpenConnectionInfo>
-  > = writable({});
+  get _screenShareConnectionsOutgoing(): Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> {
+    return this.screenShareLinks._screenShareConnectionsOutgoing;
+  }
 
   /**
-   * Connections where others are sharing their screen and the Init/Accept handshake succeeded
+   * Connections where others are sharing their screen and the Init/Accept
+   * handshake succeeded. Delegates to `screenShareLinks`.
    */
-  _screenShareConnectionsIncoming: Writable<
-    Record<AgentPubKeyB64, OpenConnectionInfo>
-  > = writable({});
+  get _screenShareConnectionsIncoming(): Writable<Record<AgentPubKeyB64, OpenConnectionInfo>> {
+    return this.screenShareLinks._screenShareConnectionsIncoming;
+  }
 
   // ===========================================================================================
   // CONNECTION META DATA
@@ -3682,9 +3367,11 @@ export class StreamsStore {
 
   /**
    * The statuses of WebRTC connections with peers to our own screen share
-   * stream
+   * stream. Delegates to `screenShareLinks`.
    */
-  _screenShareConnectionStatuses: Writable<ConnectionStatuses> = writable({});
+  get _screenShareConnectionStatuses(): Writable<ConnectionStatuses> {
+    return this.screenShareLinks._screenShareConnectionStatuses;
+  }
 
   /**
    * Connection statuses of other peers from their perspective. Is sent to us
@@ -3714,53 +3401,26 @@ export class StreamsStore {
     >
   > = writable({});
 
-  /**
-   * Diagnostic logs received from remote peers via Holochain signals
-   */
-  _receivedDiagnosticLogs: Writable<Record<AgentPubKeyB64, import('./types').DiagnosticSnapshot>> = writable({});
+  // Diagnostic log request/response pipeline is owned by `diagnosticsHub`
+  // (store-decomposition round two, Task 3; see diagnostics-hub.ts). The
+  // three Writables, the conversation-participants set, and the moved
+  // methods now live there; these are bare view-surface/wiring delegates.
 
-  /**
-   * Peers a diagnostic request is in-flight for. Value carries the
-   * current retry attempt (1-based). Removed on response receipt or
-   * when retries are exhausted (and moved to `_failedDiagnosticRequests`).
-   */
-  _pendingDiagnosticRequests: Writable<Record<AgentPubKeyB64, { attempts: number; startedAt: number }>> = writable({});
+  get _receivedDiagnosticLogs(): Writable<Record<AgentPubKeyB64, DiagnosticSnapshot>> {
+    return this.diagnosticsHub._receivedDiagnosticLogs;
+  }
 
-  /**
-   * Peers that exhausted retries with no response. UI surfaces these
-   * so the user can see partial coverage and (optionally) re-try.
-   */
-  _failedDiagnosticRequests: Writable<Record<AgentPubKeyB64, true>> = writable({});
+  get _pendingDiagnosticRequests(): Writable<Record<AgentPubKeyB64, { attempts: number; startedAt: number }>> {
+    return this.diagnosticsHub._pendingDiagnosticRequests;
+  }
 
-  /**
-   * Peers we have actually had a WebRTC media connection with this
-   * session — added the first time a connection to them reaches the
-   * `connected` state. Session-scoped; entries are kept even after the
-   * peer disconnects, because a peer who dropped mid-call is exactly who
-   * we want diagnostic logs from. Drives `requestDiagnosticLogs()`'s
-   * recipient list so a room-level request targets genuine call
-   * participants rather than every known (incl. merely heard-about) agent.
-   */
-  private _conversationParticipants = new Set<AgentPubKeyB64>();
+  get _failedDiagnosticRequests(): Writable<Record<AgentPubKeyB64, true>> {
+    return this.diagnosticsHub._failedDiagnosticRequests;
+  }
 
-  /**
-   * Clear cached diagnostic results so the request button returns to its
-   * default requestable colour. Called after the merged log is downloaded
-   * (results consumed). With no argument, clears every peer.
-   */
+  /** Delegates to `diagnosticsHub`. */
   clearReceivedDiagnostics(pubKeyB64?: AgentPubKeyB64): void {
-    this._receivedDiagnosticLogs.update(curr => {
-      if (!pubKeyB64) return {};
-      const next = { ...curr };
-      delete next[pubKeyB64];
-      return next;
-    });
-    this._failedDiagnosticRequests.update(curr => {
-      if (!pubKeyB64) return {};
-      const next = { ...curr };
-      delete next[pubKeyB64];
-      return next;
-    });
+    this.diagnosticsHub.clearReceivedDiagnostics(pubKeyB64);
   }
 
   // ===========================================================================================
@@ -4448,59 +4108,10 @@ export class StreamsStore {
   }>();
   private static readonly SDP_AGGREGATE_WINDOW_MS = 1000;
 
-  /**
-   * Set up an AnalyserNode for a peer's incoming WebRTC audio stream.
-   * Connected as: MediaStreamSource → AnalyserNode (no destination —
-   * the <video> element handles playback). Called from the peer-stream
-   * event handler.
-   */
-  setupPeerAudioAnalyser(pubKeyB64: string, stream: MediaStream): void {
-    // Clean up any existing analyser for this peer
-    { const r = this._peerRecords.get(pubKeyB64); if (r) r.analyser = undefined; }
-
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks.length === 0) return;
-
-    const ctx = this.micSource.ensureAudioContext();
-    if (!ctx) return;
-
-    // Resume if still suspended (Electron/Wayland sometimes leaves the
-    // context suspended past creation; a suspended context means the audio
-    // graph doesn't run and the analyser reads back zeros, even though the
-    // <video> element plays audio fine).
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
-    }
-
-    try {
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      // Do NOT connect analyser to destination — <video> handles playback
-      this._ensurePeerRecord(pubKeyB64).analyser = { node: analyser, buffer: new Uint8Array(analyser.fftSize) };
-    } catch (e) {
-      console.warn('Failed to create audio analyser for peer:', e);
-    }
-  }
-
-  /**
-   * Read the current peak audio level for a peer from the WebRTC
-   * AnalyserNode. Returns 0.0–1.0, or 0 if no analyser exists.
-   * Called by the audio-level-meter element at 10fps.
-   */
+  /** View-surface delegate to `peerAudioLevels` (Task 1; see
+   *  peer-audio-levels.ts). Called by the audio-level-meter element. */
   getWebrtcAudioLevel(pubKeyB64: string): number {
-    const a = this._peerRecords.get(pubKeyB64)?.analyser;
-    if (!a) return 0;
-
-    a.node.getByteTimeDomainData(a.buffer);
-    let peak = 0;
-    for (let i = 0; i < a.buffer.length; i += 4) {
-      // Byte domain data is 0–255 centered at 128
-      const v = Math.abs(a.buffer[i] - 128) / 128;
-      if (v > peak) peak = v;
-    }
-    return peak;
+    return this.peerAudioLevels.getWebrtcAudioLevel(pubKeyB64);
   }
 
   setReceiverOverride(agentPubKeyB64: AgentPubKeyB64, moduleId: string | null): void {
@@ -4799,540 +4410,29 @@ export class StreamsStore {
     }
   }
 
-  updateScreenShareConnectionStatus(
-    pubKey: AgentPubKeyB64,
-    status: ConnectionStatus
-  ) {
-    this._screenShareConnectionStatuses.update(currentValue => {
-      const connectionStatuses = currentValue;
-      if (status.type === 'InitSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'InitSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-      if (status.type === 'AcceptSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'AcceptSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-      connectionStatuses[pubKey] = status;
-      return connectionStatuses;
-    });
-  }
-
-  /**
-   * Compares how the other peer sees our stream and if this mismatches our expectations,
-   * reset streams accordingly. Uses exponential backoff (10s, 20s, 40s...) and tries
-   * lightweight replaceTrack first before falling back to the heavier clone approach.
-   *
-   * @param pubkey
-   * @param streamAndTrackInfo
-   */
-  reconcileVideoStreamState(
-    pubkey: AgentPubKeyB64,
-    streamAndTrackInfo: StreamAndTrackInfo
-  ) {
-    // Exponential backoff: 10s, 20s, 40s, 80s, 160s (capped)
-    const BASE_COOLDOWN_MS = 10_000;
-    const reconcileCount = this._peerRecords.get(pubkey)?.reconcileAttemptCount || 0;
-    const cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(reconcileCount, 4));
-    const lastReconcile = this._peerRecords.get(pubkey)?.lastReconcileTime || 0;
-    if (this.clock.now() - lastReconcile < cooldown) return;
-
-    if (!this.mainStream) return;
-
-    // Case 1: Peer doesn't see our stream at all — re-add the whole stream
-    if (!streamAndTrackInfo.stream) {
-      console.warn(
-        'Peer does not seem to see our own stream. Re-adding it to their peer object...'
-      );
-      this.logger.logAgentEvent({
-        agent: pubkey,
-        timestamp: this.clock.now(),
-        event: 'ReconcileStream',
-      });
-      const conn = get(this._openConnections)[pubkey];
-      if (conn) {
-        // Repair on the media transport, but only when it actually holds
-        // this peer (the hasConnection guard below). History: before
-        // Phase 3 this addressed the bare SimplePeer transport, whose
-        // addTrack iterates its own connection map — a silent no-op for
-        // FSM-carried peers that still consumed the cooldown and attempt
-        // budget (MAINTAINABILITY_ASSESSMENT.md §3.12). With one
-        // transport since Phase 3, the wrong-map failure mode is gone;
-        // the guard remains because a slot can outlive transport state.
-        // Transport-level addTrack (updateLocalStream) is chosen over
-        // per-peer pc.addTrack so the FSM's own negotiation stays in
-        // charge of the renegotiation.
-        const transport = this.mediaTransport;
-        if (!transport.hasConnection(pubkey)) {
-          // The slot has outlived the transport's own state; there is
-          // nothing to add a track to. Return without recording an
-          // attempt — burning the budget on a no-op is what let this
-          // defect hide.
-          this.logger.logCustomMessage(
-            `Reconcile skipped [${pubkey.slice(0, 8)}]: no transport connection`,
-          );
-          return;
-        }
-        try {
-          for (const track of this.mainStream.getTracks()) {
-            transport.addTrack(track, this.mainStream);
-          }
-          this._ensurePeerRecord(pubkey).lastReconcileTime = this.clock.now();
-          this._ensurePeerRecord(pubkey).reconcileAttemptCount = reconcileCount + 1;
-        } catch (e: any) {
-          console.warn('Failed to re-add stream during reconcile:', e.message);
-        }
-      }
-      return;
-    }
-
-    const connInfo = get(this._openConnections)[pubkey];
-    if (!connInfo) return;
-
-    const myAudioTrack = this.mainStream.getAudioTracks()[0];
-    const myVideoTrack = this.mainStream.getVideoTracks()[0];
-
-    let needsRecovery = false;
-
-    // Check audio track
-    if (myAudioTrack) {
-      const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'audio');
-      if (!perceived || perceived.muted) {
-        needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: this.clock.now(), event: 'ReconcileAudio' });
-      }
-    }
-
-    // Check video track
-    if (myVideoTrack) {
-      const perceived = streamAndTrackInfo.tracks.find(t => t.kind === 'video');
-      if (!perceived || perceived.muted) {
-        needsRecovery = true;
-        this.logger.logAgentEvent({ agent: pubkey, timestamp: this.clock.now(), event: 'ReconcileVideo' });
-      }
-    }
-
-    if (!needsRecovery) {
-      // Tracks are healthy — reset attempt count
-      this._ensurePeerRecord(pubkey).reconcileAttemptCount = 0;
-      return;
-    }
-
-    console.warn(`Reconciling tracks for ${pubkey.slice(0, 8)} (attempt ${reconcileCount + 1})`);
-
-    // Try lightweight replaceTrack first
-    const success = this._tryReplaceTrackRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
-
-    if (!success) {
-      // Fall back to heavier clone approach
-      this._cloneStreamRecovery(pubkey, connInfo, myAudioTrack, myVideoTrack);
-    }
-
-    this._ensurePeerRecord(pubkey).lastReconcileTime = this.clock.now();
-    this._ensurePeerRecord(pubkey).reconcileAttemptCount = reconcileCount + 1;
-  }
-
-  /**
-   * Attempt lightweight track recovery: the transport's per-peer
-   * `refreshMediaForPeer` replaces each sender's track with the matching
-   * mainStream track (forcing re-encoding) without perturbing other
-   * peers, and adds a track that has no sender yet. Returns true if the
-   * peer had a live connection to refresh, false if the heavier
-   * reconnect fallback is needed.
-   *
-   * Declared behavior change (Phase 4 item 3): a missing sender for one
-   * kind no longer fails the whole recovery into a full reconnect — the
-   * transport adds the track in place (one renegotiation instead of a
-   * teardown + InitRequest cycle).
-   */
-  private _tryReplaceTrackRecovery(
-    pubkey: AgentPubKeyB64,
-    _connInfo: OpenConnectionInfo,
-    _audioTrack: MediaStreamTrack | undefined,
-    _videoTrack: MediaStreamTrack | undefined
-  ): boolean {
-    if (!this.mainStream) return false;
-    try {
-      const ok = this.mediaTransport.refreshMediaForPeer(pubkey, this.mainStream);
-      this.logger.logCustomMessage(
-        `replaceTrack [${pubkey.slice(0, 8)}]: ${ok ? 'refreshed via transport' : 'no live connection'}`
-      );
-      return ok;
-    } catch (e: any) {
-      console.warn(`replaceTrack recovery failed for ${pubkey.slice(0, 8)}:`, e.message);
-      this.logger.logCustomMessage(`replaceTrack [${pubkey.slice(0, 8)}]: failed -- ${e.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Heavier track recovery: closes the connection so the next ensureConnection
-   * cycle re-creates the peer with fresh tracks. This triggers renegotiation
-   * but is more reliable than replaceTrack for some edge cases.
-   *
-   * The original implementation cloned the local stream and re-added tracks
-   * on the live peer; with the transport abstraction we drop that mode and
-   * fall back to a full reconnect, which the conversation module's normal
-   * pong-driven retry will execute on the next cycle.
-   */
-  private _cloneStreamRecovery(
-    pubkey: AgentPubKeyB64,
-    _connInfo: OpenConnectionInfo,
-    _audioTrack: MediaStreamTrack | undefined,
-    _videoTrack: MediaStreamTrack | undefined
-  ) {
-    if (!this.mainStream) return;
-    console.warn(`Falling back to reconnect-based recovery for ${pubkey.slice(0, 8)}`);
-    this.logger.logCustomMessage(`Reconnect recovery [${pubkey.slice(0, 8)}]`);
-    this.mediaTransport.closeConnection(pubkey, 'clone-recovery fallback');
-  }
-
-  /**
-   * Public method for manual track recovery. Tries replaceTrack first,
-   * falls back to clone approach. Does not tear down the WebRTC connection.
-   */
-  refreshTracksForPeer(pubKeyB64: AgentPubKeyB64): boolean {
-    const connInfo = get(this._openConnections)[pubKeyB64];
-    if (!connInfo || !this.mainStream) {
-      console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no connection or stream`);
-      return false;
-    }
-    const myAudioTrack = this.mainStream.getAudioTracks()[0];
-    const myVideoTrack = this.mainStream.getVideoTracks()[0];
-
-    // Task 3 replacement #4 (Incident B): refuse to push a track whose
-    // source is not live — replaceTrack'ing a dead track and logging
-    // "refreshed via transport" was the dishonest success that hid the
-    // wedge. Defer to the reconciler's reopen fanout; return false so a
-    // later real recovery (`_cloneStreamRecovery`) stays available.
-    const audioDead = !!myAudioTrack && this.micSource.lifecycle.state !== 'live';
-    const videoDead = !!myVideoTrack && this.cameraSource.lifecycle.state !== 'live';
-    if (audioDead || videoDead) {
-      this.logger.logCustomMessage(
-        `Track refresh [${pubKeyB64.slice(0, 8)}]: source dead, deferring to capture reconciler`
-      );
-      return false;
-    }
-
-    this.logger.logCustomMessage(
-      `Track refresh [${pubKeyB64.slice(0, 8)}]: audio=${myAudioTrack ? `${myAudioTrack.enabled ? 'enabled' : 'disabled'},${myAudioTrack.muted ? 'muted' : 'unmuted'},${myAudioTrack.readyState}` : 'none'} video=${myVideoTrack ? `${myVideoTrack.enabled ? 'enabled' : 'disabled'},${myVideoTrack.muted ? 'muted' : 'unmuted'},${myVideoTrack.readyState}` : 'none'}`
-    );
-
-    const success = this._tryReplaceTrackRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
-    if (!success) {
-      this._cloneStreamRecovery(pubKeyB64, connInfo, myAudioTrack, myVideoTrack);
-    }
-    this.logger.logCustomMessage(
-      `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
-    );
-    return success;
-  }
-
-  /** Maximum number of attempts before marking a diagnostic request failed. */
-  private static readonly DIAGNOSTIC_MAX_ATTEMPTS = 3;
-  /** Per-attempt timeout (ms) before retrying or giving up — the no-RTT-
-   *  sample default, and the floor for the RTT-scaled timeout below.
-   *  Diagnostic attempt cadence, NOT a liveness predicate. */
-  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MS = 8_000;
-  /** Ceiling for the RTT-scaled diagnostic attempt timeout
-   *  (`_computeDiagnosticAttemptTimeout`). Diagnostic attempt cadence,
-   *  NOT a liveness predicate. Field observation (2026-08-11): diagnostic
-   *  requests failed 3x8s against the same 20-58s signals RTTs that were
-   *  blowing the SDP-exchange ceiling — the retries were noise, not
-   *  recovery attempts. */
-  private static readonly DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS = 30_000;
-  /** RTT multiplier for the diagnostic attempt timeout
-   *  (`_computeDiagnosticAttemptTimeout`). */
-  private static readonly DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER = 4;
-
   /**
    * Request diagnostic logs from a specific peer (or, with no argument,
-   * every peer in this conversation) via Holochain signal. Retries up to
-   * DIAGNOSTIC_MAX_ATTEMPTS times if no response arrives within the
-   * per-attempt timeout (`_computeDiagnosticAttemptTimeout` — RTT-scaled,
-   * DIAGNOSTIC_ATTEMPT_TIMEOUT_MS with no RTT sample). Peers that exhaust
-   * retries land in `_failedDiagnosticRequests`.
-   *
-   * The room-level recipient set is the union of `_conversationParticipants`
-   * (peers we have had a media connection with this session, incl. ones who
-   * have since dropped) and the current `globalPresenceSet()`. This
-   * deliberately excludes merely heard-about (`'told'`) agents who were
-   * never in the call — requesting from them only produced timeouts and
-   * polluted the merged log.
-   *
-   * Calling again for a peer already in pending/failed re-starts the
-   * retry loop from attempt 1 — lets the user manually retry from the UI.
+   * every peer in this conversation). Delegates to `diagnosticsHub`
+   * (store-decomposition round two, Task 3).
    */
   async requestDiagnosticLogs(pubKeyB64?: AgentPubKeyB64) {
-    const targetKeys = pubKeyB64
-      ? [pubKeyB64]
-      : [
-          ...new Set<AgentPubKeyB64>([
-            ...this._conversationParticipants,
-            ...this.globalPresenceSet(),
-          ]),
-        ].filter(a => a !== this.myPubKeyB64);
-    if (targetKeys.length === 0) return;
-
-    // Clear any prior failed state for these peers — manual re-trigger.
-    this._failedDiagnosticRequests.update(curr => {
-      const next = { ...curr };
-      targetKeys.forEach(k => delete next[k]);
-      return next;
-    });
-
-    targetKeys.forEach(k => this._startDiagnosticAttempt(k, 1));
-
-    this.logger.logCustomMessage(
-      `Requested diagnostic logs from ${targetKeys.map(k => k.slice(0, 8)).join(', ')}`
-    );
+    return this.diagnosticsHub.requestDiagnosticLogs(pubKeyB64);
   }
 
   /**
-   * RTT-scaled diagnostic-attempt timeout (ms) for `peerB64`. Reuses the
-   * same signals RTT EWMA that scales the SDP-exchange timeout
-   * (`_computeSdpTimeout`) — a slow signals path gets a diagnostic
-   * round-trip window it can actually clear instead of retrying blind.
-   * No RTT sample yet -> the fixed DIAGNOSTIC_ATTEMPT_TIMEOUT_MS default
-   * (unchanged behaviour). Diagnostic attempt cadence, NOT a liveness
-   * predicate.
-   */
-  private _computeDiagnosticAttemptTimeout(peerB64: AgentPubKeyB64): number {
-    const rtt = this._peerRecords.get(peerB64)?.signalsRttEwma;
-    if (rtt === undefined || rtt <= 0) {
-      return StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS;
-    }
-    return Math.min(
-      StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MAX_MS,
-      Math.max(
-        StreamsStore.DIAGNOSTIC_ATTEMPT_TIMEOUT_MS,
-        Math.round(rtt * StreamsStore.DIAGNOSTIC_TIMEOUT_RTT_MULTIPLIER)
-      )
-    );
-  }
-
-  /**
-   * Single attempt of a diagnostic request to one peer. Sends the signal,
-   * schedules a timeout that either retries (attempt + 1) or marks failed.
-   * Handler is no-op if a response has already arrived by the time the
-   * timeout fires (the peer is no longer pending).
-   */
-  private _startDiagnosticAttempt(peerB64: AgentPubKeyB64, attempt: number): void {
-    this._pendingDiagnosticRequests.update(curr => ({
-      ...curr,
-      [peerB64]: { attempts: attempt, startedAt: this.clock.now() },
-    }));
-
-    const peerHash = decodeHashFromBase64(peerB64);
-    this.deps.bus.sendMessage([peerHash], 'DiagnosticRequest', '').catch(e => {
-      this.logger.logCustomMessage(
-        `DiagnosticRequest send failed [${peerB64.slice(0, 8)}] attempt ${attempt}: ${e?.message ?? e}`
-      );
-    });
-
-    this.clock.setTimeout(() => {
-      const stillPending = get(this._pendingDiagnosticRequests)[peerB64];
-      // Response arrived (handler cleared pending) or user re-triggered
-      // a fresh attempt that supersedes this one.
-      if (!stillPending || stillPending.attempts !== attempt) return;
-
-      if (attempt < StreamsStore.DIAGNOSTIC_MAX_ATTEMPTS) {
-        this.logger.logCustomMessage(
-          `DiagnosticRequest timeout [${peerB64.slice(0, 8)}] attempt ${attempt}, retrying`
-        );
-        this._startDiagnosticAttempt(peerB64, attempt + 1);
-      } else {
-        this.logger.logCustomMessage(
-          `DiagnosticRequest failed [${peerB64.slice(0, 8)}] after ${attempt} attempts`
-        );
-        this._pendingDiagnosticRequests.update(curr => {
-          const next = { ...curr };
-          delete next[peerB64];
-          return next;
-        });
-        this._failedDiagnosticRequests.update(curr => ({ ...curr, [peerB64]: true }));
-      }
-    }, this._computeDiagnosticAttemptTimeout(peerB64));
-  }
-
-  /**
-   * Build a merged diagnostic log combining local and received remote events for a peer.
+   * Build a merged diagnostic log combining local and received remote
+   * events for a peer. Delegates to `diagnosticsHub`.
    */
   exportMergedLogs(pubKeyB64: AgentPubKeyB64): object {
-    const localAgentEvents = this.logger.getRecentAgentEvents();
-    const localCustomLogs = this.logger.getRecentCustomLogs();
-    const remoteSnapshot = get(this._receivedDiagnosticLogs)[pubKeyB64];
-
-    type MergedEntry = { timestamp: number; source: 'local' | 'remote'; type: string; detail: string; connectionId?: string };
-    const merged: MergedEntry[] = [];
-
-    // Add local agent events (all agents, to see the full picture)
-    Object.entries(localAgentEvents).forEach(([agent, events]) => {
-      events.forEach(e => {
-        merged.push({
-          timestamp: e.timestamp,
-          source: 'local',
-          type: 'event',
-          detail: `[${agent.slice(0, 8)}] ${e.event}`,
-          connectionId: e.connectionId,
-        });
-      });
-    });
-
-    // Add local custom logs
-    localCustomLogs.forEach(log => {
-      merged.push({
-        timestamp: log.timestamp,
-        source: 'local',
-        type: 'custom',
-        detail: log.log,
-      });
-    });
-
-    // Add remote events if available
-    if (remoteSnapshot) {
-      Object.entries(
-        remoteSnapshot.agentEvents.reduce((acc, e) => {
-          (acc[e.agent] = acc[e.agent] || []).push(e);
-          return acc;
-        }, {} as Record<string, typeof remoteSnapshot.agentEvents>)
-      ).forEach(([agent, events]) => {
-        events.forEach(e => {
-          merged.push({
-            timestamp: e.timestamp,
-            source: 'remote',
-            type: 'event',
-            detail: `[${agent.slice(0, 8)}] ${e.event}`,
-            connectionId: e.connectionId,
-          });
-        });
-      });
-
-      remoteSnapshot.customLogs.forEach(log => {
-        merged.push({
-          timestamp: log.timestamp,
-          source: 'remote',
-          type: 'custom',
-          detail: log.log,
-        });
-      });
-    }
-
-    merged.sort((a, b) => a.timestamp - b.timestamp);
-
-    return {
-      generatedAt: this.clock.now(),
-      localAgent: this.myPubKeyB64,
-      remoteAgent: pubKeyB64,
-      hasRemoteLogs: !!remoteSnapshot,
-      remoteSessionId: remoteSnapshot?.sessionId,
-      entries: merged,
-    };
+    return this.diagnosticsHub.exportMergedLogs(pubKeyB64);
   }
 
   /**
    * Build a merged diagnostic log combining local events with every
-   * received remote snapshot. The result is a single timeline ordered
-   * by timestamp, tagged with which agent emitted each entry. Used by
-   * the room-level bulk download path.
+   * received remote snapshot. Delegates to `diagnosticsHub`.
    */
   exportMergedLogsAll(): object {
-    const localAgentEvents = this.logger.getRecentAgentEvents();
-    const localCustomLogs = this.logger.getRecentCustomLogs();
-    const allRemote = get(this._receivedDiagnosticLogs);
-
-    type MergedEntry = {
-      timestamp: number;
-      source: AgentPubKeyB64; // emitter of the entry
-      sourceLabel: 'local' | 'remote';
-      type: string;
-      detail: string;
-      connectionId?: string;
-    };
-    const merged: MergedEntry[] = [];
-
-    Object.entries(localAgentEvents).forEach(([agent, events]) => {
-      events.forEach(e => {
-        merged.push({
-          timestamp: e.timestamp,
-          source: this.myPubKeyB64,
-          sourceLabel: 'local',
-          type: 'event',
-          detail: `[${agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
-          connectionId: e.connectionId,
-        });
-      });
-    });
-    localCustomLogs.forEach(log => {
-      merged.push({
-        timestamp: log.timestamp,
-        source: this.myPubKeyB64,
-        sourceLabel: 'local',
-        type: 'custom',
-        detail: log.log,
-      });
-    });
-
-    const respondingPeers: AgentPubKeyB64[] = [];
-    Object.entries(allRemote).forEach(([peerB64, snapshot]) => {
-      respondingPeers.push(peerB64);
-      snapshot.agentEvents.forEach(e => {
-        merged.push({
-          timestamp: e.timestamp,
-          source: peerB64,
-          sourceLabel: 'remote',
-          type: 'event',
-          detail: `[${e.agent.slice(0, 8)}] ${e.event}${e.detail ? ` ${e.detail}` : ''}`,
-          connectionId: e.connectionId,
-        });
-      });
-      snapshot.customLogs.forEach(log => {
-        merged.push({
-          timestamp: log.timestamp,
-          source: peerB64,
-          sourceLabel: 'remote',
-          type: 'custom',
-          detail: log.log,
-        });
-      });
-    });
-
-    merged.sort((a, b) => a.timestamp - b.timestamp);
-
-    return {
-      generatedAt: this.clock.now(),
-      localAgent: this.myPubKeyB64,
-      respondingPeers,
-      entries: merged,
-    };
+    return this.diagnosticsHub.exportMergedLogsAll();
   }
 
   /**
@@ -5638,79 +4738,6 @@ export class StreamsStore {
   }
 
   /**
-   * Checks inbound RTP bytesReceived for each open connection.
-   * If bytes haven't increased for 2+ consecutive cycles (4+ seconds at 2s ping interval),
-   * the track is considered dead and we request the sender to refresh via data channel.
-   */
-  private async _checkTrackHealth() {
-    const openConnections = get(this._openConnections);
-    for (const [pubKeyB64, connInfo] of Object.entries(openConnections)) {
-      if (!connInfo.connected) continue;
-      // Don't gate on remote tracks here — RTT is observable from
-      // candidate-pair.currentRoundTripTime (and from remote-inbound-rtp
-      // once we're sending) even when the remote has neither mic nor
-      // camera open. The per-kind dead-track detection further down has
-      // its own (connInfo.video / connInfo.audio) gates and self-skips
-      // when bytesReceived is 0, so removing the outer gate doesn't
-      // perturb that path.
-
-      try {
-        const stats = await this.mediaTransport.getStats(pubKeyB64);
-        if (!stats) continue;
-        const reports: RtcStatsReportLike[] = [];
-        stats.raw.forEach((report: RtcStatsReportLike) => reports.push(report));
-        const summary = summarizeRtcStats(reports);
-
-        this.webrtcStats.set(pubKeyB64, {
-          rttMs: summary.rttMs,
-          jitterMs: summary.jitterMs,
-          lossPercent: summary.lossPercent,
-        });
-        this._maybeEmitQualityChange(
-          pubKeyB64,
-          'webrtc',
-          summary.rttMs,
-          summary.jitterMs,
-          summary.lossPercent,
-        );
-
-        const decision = decideTrackRefresh({
-          videoExpected: connInfo.video,
-          audioExpected: connInfo.audio,
-          audioBytes: summary.audioBytes,
-          videoBytes: summary.videoBytes,
-          lastBytes: this._peerRecords.get(pubKeyB64)?.lastBytesReceived || { audio: 0, video: 0 },
-          staleCycles: this._peerRecords.get(pubKeyB64)?.staleCycles || { audio: 0, video: 0 },
-          staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
-        });
-
-        this._ensurePeerRecord(pubKeyB64).lastBytesReceived = {
-          audio: summary.audioBytes,
-          video: summary.videoBytes,
-        };
-        this._ensurePeerRecord(pubKeyB64).staleCycles = decision.nextStale;
-
-        if (decision.action === 'request-refresh') {
-          const stale = decision.nextStale;
-          console.warn(
-            `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
-          );
-          this.logger.logCustomMessage(
-            `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
-          );
-
-          if (this._sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
-            // Reset stale count to avoid spamming
-            this._ensurePeerRecord(pubKeyB64).staleCycles = { audio: 0, video: 0 };
-          }
-        }
-      } catch (e) {
-        // getStats may fail if connection was already closed
-      }
-    }
-  }
-
-  /**
    * The one executor for a stale-connection teardown. The predicate that
    * decides *whether* to tear down is `decideStaleConnectionCleanup`
    * (`transport/stale-connection-policy.ts`); the cleanup set is the
@@ -5843,16 +4870,16 @@ export class StreamsStore {
             this.handleSdpFsm(signal);
             break;
           case 'SdpFsmScreen':
-            this.handleSdpFsmScreen(signal);
+            this.screenShareLinks.handleSdpFsmScreen(signal);
             break;
           case 'LeaveUi':
             await this.handleLeaveUi(signal);
             break;
           case 'DiagnosticRequest':
-            await this.handleDiagnosticRequest(signal);
+            await this.diagnosticsHub.handleDiagnosticRequest(signal);
             break;
           case 'DiagnosticResponse':
-            this.handleDiagnosticResponse(signal);
+            this.diagnosticsHub.handleDiagnosticResponse(signal);
             break;
           case 'ModuleState':
             this.handleModuleState(signal);
@@ -5954,7 +4981,7 @@ export class StreamsStore {
         }
         // Re-joining peer pinged us while we're sharing: start the screen
         // connection immediately rather than waiting for the pong cycle.
-        this._ensureOutgoingScreenShare(pubkeyB64);
+        this.screenShareLinks.ensureOutgoingScreenShare(pubkeyB64);
       }
     }
   }
@@ -6334,7 +5361,7 @@ export class StreamsStore {
         case 'hold': {
           if (decision.reason === 'already-open' && metaDataExt?.data.streamInfo) {
             // If the connection is already open, reconcile with our expected stream state
-            this.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
+            this.trackHealth.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
           }
           break;
         }
@@ -6387,7 +5414,7 @@ export class StreamsStore {
     // idempotent per pong, the FSM owns retry/timeout, and a failed link
     // cleared its slot so this re-enters. Guards (are we sharing, slot
     // exists, peer capability) live inside.
-    this._ensureOutgoingScreenShare(pubkeyB64);
+    this.screenShareLinks.ensureOutgoingScreenShare(pubkeyB64);
   }
 
   /**
@@ -6725,130 +5752,6 @@ export class StreamsStore {
     // session would show up under two different ids in the timeline.
     const localConnId = this.mediaTransport.getConnectionId(pubkeyB64) ?? parsed.connection_id;
     this._logSdpDataEvent(pubkeyB64, localConnId, `fsm-${sdpType}`);
-  }
-
-  /**
-   * Handle an SdpFsmScreen signal — feeds the two screen-share FSM
-   * transports (Phase 3 item 2).
-   *
-   * Routing is by the sender's declared role, not by connectionId: each
-   * side's FSM allocates its own connectionId, so the id on the wire is
-   * the *sender's* and cannot select a local transport. A signal from the
-   * peer's sharer side (`dir: 'sharer'`) belongs to our incoming-share
-   * transport; a signal from their viewer side answers our outgoing
-   * share. Mutual sharing is simply both matches at once on two
-   * independent connections.
-   *
-   * Like the media FSM path, the viewer needs no reservation: the first
-   * offer creates the acceptor FSM lazily, and the slot is installed by
-   * the `signaling` transition in `_subscribeScreenShareTransport`.
-   */
-  handleSdpFsmScreen(signal: Extract<RoomSignal, { type: 'Message' }>): void {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const parsedScreen = parseSignalPayload<{
-      connection_id: string;
-      peer_session_id?: number;
-      epoch?: number;
-      dir?: string;
-      data: unknown;
-    }>(signal.payload);
-    if (!parsedScreen.ok) {
-      console.warn(
-        `Dropped SdpFsmScreen from ${pubkeyB64.slice(0, 8)}: ${parsedScreen.error}`
-      );
-      return;
-    }
-    const parsed = parsedScreen.value;
-    // The routing rule is `decideScreenSignalRoute`
-    // (transport/screen-signal-policy.ts) — by the sender's role, never by
-    // connectionId, and drop-not-guess on anything malformed.
-    const routed = decideScreenSignalRoute(parsed.dir);
-    if (routed.route === 'drop') {
-      this.logger.logCustomMessage(
-        `Dropped SdpFsmScreen from ${pubkeyB64.slice(0, 8)}: ${routed.reason} dir=${String(parsed.dir)}`
-      );
-      return;
-    }
-    const transport =
-      routed.route === 'incoming-share'
-        ? this.screenShareInTransport
-        : this.screenShareOutTransport;
-    const data = parsed.data as { type?: string } | null;
-    const sdpType = data && typeof data === 'object' && 'type' in data && data.type
-      ? data.type
-      : 'candidate';
-    transport.processIncomingSignal({
-      from: pubkeyB64,
-      connectionId: parsed.connection_id,
-      peerSessionId: parsed.peer_session_id,
-      epoch: parsed.epoch,
-      data: parsed.data,
-    });
-    // Log under the LOCAL connectionId (see handleSdpFsm for why).
-    const localConnId = transport.getConnectionId(pubkeyB64) ?? parsed.connection_id;
-    this._logSdpDataEvent(pubkeyB64, localConnId, `screen-fsm-${sdpType}`);
-  }
-
-  /**
-   * Handle a DiagnosticRequest signal — gather recent logs and send back.
-   */
-  async handleDiagnosticRequest(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const allRecentEvents = this.logger.getRecentAgentEvents();
-    const flatEvents = Object.values(allRecentEvents).flat();
-    const recentCustomLogs = this.logger.getRecentCustomLogs();
-
-    // The size guard and its self-declaring truncation live in
-    // diagnostic-snapshot-policy.ts (Phase 5 item 2).
-    const { payload } = buildDiagnosticSnapshot({
-      fromAgent: this.myPubKeyB64,
-      sessionId: this.logger.sessionId,
-      agentEvents: flatEvents,
-      customLogs: recentCustomLogs,
-      generatedAt: this.clock.now(),
-    });
-    await this.deps.bus.sendMessage(
-      [signal.from_agent],
-      'DiagnosticResponse',
-      payload,
-    );
-  }
-
-  /**
-   * Handle a DiagnosticResponse signal — store the received logs.
-   */
-  handleDiagnosticResponse(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-
-    try {
-      const parsedSnapshot = parseSignalPayload<DiagnosticSnapshot>(signal.payload);
-      if (!parsedSnapshot.ok) {
-        console.warn(
-          `Dropped DiagnosticResponse from ${pubkeyB64.slice(0, 8)}: ${parsedSnapshot.error}`
-        );
-        return;
-      }
-      const snapshot = parsedSnapshot.value;
-      this._receivedDiagnosticLogs.update(current => ({ ...current, [pubkeyB64]: snapshot }));
-      this._pendingDiagnosticRequests.update(curr => {
-        const next = { ...curr };
-        delete next[pubkeyB64];
-        return next;
-      });
-      this._failedDiagnosticRequests.update(curr => {
-        if (!curr[pubkeyB64]) return curr;
-        const next = { ...curr };
-        delete next[pubkeyB64];
-        return next;
-      });
-      const truncationNote = snapshot.truncated
-        ? ` (TRUNCATED: ${snapshot.truncated.events} events, ${snapshot.truncated.customLogs} custom logs dropped at sender)`
-        : '';
-      this.logger.logCustomMessage(
-        `Received diagnostic logs from [${pubkeyB64.slice(0, 8)}]: ${snapshot.agentEvents.length} events, ${snapshot.customLogs.length} custom logs${truncationNote}`
-      );
-    } catch (e) {
-      console.warn('Failed to parse DiagnosticResponse:', e);
-    }
   }
 
 }

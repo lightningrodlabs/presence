@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { closeCleanupPlan } from '../close-cleanup-policy';
+import { closeCleanupPlan, closeGuardOutcome } from '../close-cleanup-policy';
 import type {
   CloseCleanupContext,
   CloseCleanupOutcome,
@@ -7,6 +7,7 @@ import type {
   CloseCleanupTarget,
   CloseCleanupVia,
 } from '../close-cleanup-policy';
+import type { SlotWrite } from '../media-event-policy';
 
 /**
  * Round 3 item 1 (as amended by review F2: errors are forensic-only and have no rows here) — every (target × via × outcome) cell answered, the key
@@ -315,5 +316,49 @@ describe('closeCleanupPlan — cross-table invariants', () => {
         expect(plan.recordReset, JSON.stringify(ctx)).not.toBe('screen-out-close');
       }
     }
+  });
+});
+
+describe('closeGuardOutcome — maps a decideSlotWrite result onto the (target × via × outcome) table\'s outcome axis', () => {
+  // A `closed` event's `decideSlotWrite` only ever produces 'clear' or
+  // 'none' (reason 'no-slot' | 'superseded') — see the `case 'closed'`
+  // arm in `../media-event-policy.ts`. The other SlotWrite variants
+  // ('install' / 'replace' / 'set-connected' / 'none' reason 'kept')
+  // belong to other event kinds; per the function's own doc comment
+  // reaching it with one is a programming error, but the function itself
+  // does not throw — it falls through to 'no-slot'. This table pins that
+  // actual fallthrough behavior, not just the reachable-from-`closed` arms.
+  const table: Array<[string, SlotWrite, CloseCleanupOutcome]> = [
+    ['clear', { write: 'clear' }, 'live'],
+    [
+      "none/superseded",
+      { write: 'none', reason: 'superseded', supersededBy: 'conn-2' },
+      'superseded',
+    ],
+    ['none/no-slot', { write: 'none', reason: 'no-slot' }, 'no-slot'],
+    ['none/kept (unreachable from closed, still no-slot)', { write: 'none', reason: 'kept' }, 'no-slot'],
+    [
+      'install (unreachable from closed, still no-slot)',
+      { write: 'install', slot: { connectionId: 'conn-1', connected: false } },
+      'no-slot',
+    ],
+    [
+      'replace (unreachable from closed, still no-slot)',
+      {
+        write: 'replace',
+        slot: { connectionId: 'conn-1', connected: false },
+        supersedes: 'conn-0',
+      },
+      'no-slot',
+    ],
+    [
+      'set-connected (unreachable from closed, still no-slot)',
+      { write: 'set-connected', slot: { connectionId: 'conn-1', connected: true } },
+      'no-slot',
+    ],
+  ];
+
+  it.each(table)('%s', (_label, write, expected) => {
+    expect(closeGuardOutcome(write)).toBe(expected);
   });
 });

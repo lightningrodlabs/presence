@@ -14,7 +14,9 @@
  * drop with a reason, never a guess: mis-routing an offer would create a
  * phantom connection on the wrong transport.
  *
- * Constrains `streams-store.ts:handleSdpFsmScreen`.
+ * Constrains
+ * `ui/src/screen-share-links.ts:ScreenShareLinks.handleSdpFsmScreen`
+ * (store-decomposition round two, Task 5).
  */
 
 export type ScreenSignalRoute =

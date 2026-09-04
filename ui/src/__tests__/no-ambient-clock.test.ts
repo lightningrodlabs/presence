@@ -97,6 +97,25 @@ const PINNED_FILES: Array<{
   // Task 3 (capture reconciler): takes `clock` via bindings and stamps
   // every retry attempt through it — no ambient time.
   { relPath: '../capture-reconciler.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 1 (PeerAudioLevels): no timing at
+  // all in this owner, but pinned per the round's pattern.
+  { relPath: '../peer-audio-levels.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 2 (MediaSettings): takes `now` via
+  // bindings; storage/mediaDevices reads stay live per-call, not snapshotted.
+  { relPath: '../media-settings.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 3 (DiagnosticsHub): the retry
+  // timer stamps `startedAt` and schedules its timeout through the
+  // `now`/`setTimeout` bindings, both late-bound onto the clock.
+  { relPath: '../diagnostics-hub.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 4 (TrackHealthMonitor): the
+  // reconcile cooldown and every peer-record timestamp write route
+  // through the `now` binding, late-bound onto the clock.
+  { relPath: '../track-health.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round two, Task 5 (ScreenShareLinks): the ICE-
+  // diagnostic timestamp and every Superseded/SupersededError/FsmError
+  // event stamp route through the `now` binding, late-bound onto the
+  // clock.
+  { relPath: '../screen-share-links.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {

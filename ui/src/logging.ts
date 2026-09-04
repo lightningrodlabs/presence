@@ -73,9 +73,9 @@ export type CustomLog = {
  * Serves two consumer families, both via the
  * `getRecentAgentEvents`/`getRecentCustomLogs` defaults (review F2):
  * the DiagnosticRequest/DiagnosticResponse wire snapshot
- * (`StreamsStore.handleDiagnosticRequest`, bounded above by the
+ * (`DiagnosticsHub.handleDiagnosticRequest`, bounded above by the
  * signal-size guard in `diagnostic-snapshot-policy.ts`) and the
- * merged-export paths (`StreamsStore.exportMergedLogs`/
+ * merged-export paths (`DiagnosticsHub.exportMergedLogs`/
  * `exportMergedLogsAll`), which combine the same local window with
  * received remote snapshots for download. 15 minutes is long enough to
  * capture a session of trial-and-error configuration changes when

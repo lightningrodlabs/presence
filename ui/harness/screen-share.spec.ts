@@ -8,8 +8,9 @@
  * relayed page-to-page in the production `SdpFsmScreen` envelope —
  * produced and parsed by the store's own glue — with Holochain's
  * fire-and-forget semantics. Outgoing shares are initiated by the store's
- * own pong-driven path (`_ensureOutgoingScreenShare`), capability-gated on
- * caps that travel in real pong metadata. Asserts, against a real network
+ * own pong-driven path (`ScreenShareLinks.ensureOutgoingScreenShare`,
+ * ui/src/screen-share-links.ts), capability-gated on caps that travel in
+ * real pong metadata. Asserts, against a real network
  * stack, the claims the Phase 3 port made that vitest mocks cannot
  * falsify — the three items the Phase 3.5 section specifies:
  *
@@ -23,8 +24,8 @@
  *      `dir` tag — connectionId cannot do it (each side allocates its
  *      own). Both directions must be connected AT THE SAME TIME with zero
  *      dropped signals. Plus the malformed-`dir` arm: a bogus envelope is
- *      dropped by the store's own `handleSdpFsmScreen` (visible in its
- *      forensic log) and creates no state.
+ *      dropped by the store's own `ScreenShareLinks.handleSdpFsmScreen`
+ *      (visible in its forensic log) and creates no state.
  *   3. Teardown and supersede: a sharer re-initiating at a higher epoch
  *      replaces the viewer's live FSM in place — the no-close-event route
  *      (§3.1(c)) — and the REAL slot ADOPTS the new connection (the

@@ -43,7 +43,9 @@ export type TransportPhaseInputs = {
  *   from an incoming offer without streams-store knowing in advance, so
  *   the slot has to be created here for later connect/stream events to
  *   have something to mutate. The initiator path creates it itself in
- *   `handleInitAccept` (video) / `_ensureOutgoingScreenShare` (screen).
+ *   `handleInitAccept` (video) /
+ *   `ScreenShareLinks.ensureOutgoingScreenShare` (screen,
+ *   ui/src/screen-share-links.ts).
  *
  * - `adopt` — a slot exists but holds a *different* connectionId, so the
  *   FSM behind it is gone. `ConnectionManager` replaces an FSM in place on

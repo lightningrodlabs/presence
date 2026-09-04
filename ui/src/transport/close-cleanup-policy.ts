@@ -72,10 +72,12 @@
  * item 1).
  *
  * Constrains `streams-store.ts:_applyCloseCleanup` and its callers
- * (`_handleMediaClosed`, `_handleScreenShareClosed`,
- * `_applyStaleTeardown`, `handleLeaveUi`).
+ * (`_handleMediaClosed`, `_applyStaleTeardown`, `handleLeaveUi`) and
+ * `ui/src/screen-share-links.ts:ScreenShareLinks._handleScreenShareClosed`
+ * (store-decomposition round two, Task 5).
  */
 import type { PeerRecordResetArm } from '../peer-record';
+import type { SlotWrite } from './media-event-policy';
 
 /** Which connection family is being torn down. */
 export type CloseCleanupTarget =
@@ -365,4 +367,23 @@ export function closeCleanupPlan(ctx: CloseCleanupContext): CloseCleanupPlan {
   // that through the nested breaks.
   const unreachable: never = ctx.outcome as never;
   return unreachable;
+}
+
+/**
+ * Map a `closed` `decideSlotWrite` result onto this table's outcome axis.
+ * Only the guard outcomes a `closed` event can produce appear here;
+ * `install`/`replace`/`set-connected` belong to other event kinds and
+ * reaching this with one is a programming error. (The log-only error
+ * handlers use `attributeSlotEvent` directly — they perform no slot write
+ * and never consult this table.) Shared by the media close handler
+ * (`streams-store.ts:_handleMediaClosed`) and the screen-share one
+ * (`ui/src/screen-share-links.ts:ScreenShareLinks._handleScreenShareClosed`)
+ * — moved here from `streams-store.ts` in store-decomposition round two,
+ * Task 5, so both call sites import the one authority instead of one
+ * defining it and the other reaching across modules for it.
+ */
+export function closeGuardOutcome(write: SlotWrite): CloseCleanupOutcome {
+  if (write.write === 'clear') return 'live';
+  if (write.write === 'none' && write.reason === 'superseded') return 'superseded';
+  return 'no-slot';
 }

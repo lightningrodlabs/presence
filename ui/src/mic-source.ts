@@ -88,19 +88,21 @@ export interface MicSourceBindings {
    *   - device change:(newTrack, oldTrack)
    *   - close:        (null,     oldTrack)
    *
-   * The store-level handler is responsible for keeping `mainStream`,
-   * `mainStreamClones`, and all open WebRTC peers in sync. This callback
-   * fires *before* per-consumer `onTrackChanged` callbacks so that the
-   * `replaceTrack` fanout happens before any consumer-local rebuild work.
+   * The store-level handler is responsible for keeping `mainStream` and
+   * all open WebRTC peers in sync. This callback fires *before*
+   * per-consumer `onTrackChanged` callbacks so that the `replaceTrack`
+   * fanout happens before any consumer-local rebuild work.
    */
   onTrackChange: (
     newTrack: MediaStreamTrack | null,
     oldTrack: MediaStreamTrack | null,
   ) => void;
   /**
-   * Called after `setMuted` flips the mute flag. Lets the store fan out
-   * the enabled/disabled state to `mainStreamClones` — see the (retired) simple-peer
-   * issue #606 for why clones need their own enable/disable passes.
+   * Called after `setMuted` flips the mute flag. The fanout this served —
+   * pushing enabled/disabled state out to `mainStreamClones` — was deleted
+   * as dead code (round two Task 6, `mainStreamClones` had zero writers).
+   * The store's binding is deliberately a no-op; `setMuted` itself already
+   * flips the primary track's `enabled` flag before calling this.
    */
   onMutedChange: (muted: boolean) => void;
   /** Fired on every `_setLifecycle` transition (wrapped in try/catch like
@@ -195,8 +197,8 @@ export class MicSource {
 
   /**
    * Set the mute state. Affects every consumer simultaneously — any
-   * consumer can mute, every consumer observes the same state via the
-   * store-level `onMutedChange` fanout.
+   * consumer can mute, and every consumer observes the same state because
+   * they all hold the same shared track and read its `enabled` flag.
    *
    * Semantics: `track.enabled = false` (fast re-enable, no WebRTC
    * renegotiation, keeps the RTCRtpSender open). This is distinct from
