@@ -68,8 +68,9 @@ export function statsForPeer(snap: PeerStatsSnapshot): PeerStats {
  * `presence-policy.ts`. Since the connection-thrash round the folded
  * value (the peer record's `signalsRttEwma`) feeds more than display: it is
  * `decideSignalsMediaCadence`'s `bestRttEwmaMs` input
- * (`signals-cadence-policy.ts`) and both `_computeSdpTimeout` and
- * `_computeSdpBackstopTimeout`'s RTT-scaled ceilings (`streams-store.ts`)
+ * (`signals-cadence-policy.ts`) and both `_computeSdpTimeout`
+ * (streams-store.ts, delegating to `media-links.ts`) and
+ * `_computeSdpBackstopTimeout`'s (media-links.ts) RTT-scaled ceilings
  * — cadence/timeout control and display, not display alone.
  */
 export const SIGNALS_RTT_PLAUSIBLE_MAX_MS = 60_000;

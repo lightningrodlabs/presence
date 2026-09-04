@@ -1,8 +1,9 @@
 /**
  * Phase 2b — pure decision logic for the pong-driven InitRequest send/retry.
  *
- * On every pong, `handlePongUi` decides whether to (re)send a video
- * InitRequest to the ponging peer.
+ * On every pong, `MediaLinks.drivePong` (media-links.ts, called from
+ * `handlePongUi`; store-decomposition round three, Task 4) decides
+ * whether to (re)send a video InitRequest to the ponging peer.
  *
  * Since Phase 3 this serves the video connection only: the screen-share
  * port replaced that path's InitRequest cadence with an idempotent
@@ -23,7 +24,7 @@
  * Not this function's problem: the `conversationActive` / per-peer
  * webrtc-disabled gate stays at the call site.
  *
- * Constrains `streams-store.ts:handlePongUi`.
+ * Constrains `media-links.ts:MediaLinks.drivePong`.
  */
 
 export type InitRetryInputs = {

@@ -24,11 +24,7 @@ import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { initialPeerRecord, prunePendingInits, type PeerRecord } from './peer-record';
 import { FsmTransport } from './transport';
 import type { PeerTransport } from './transport';
-import { routeTransportPhase } from './transport/media-event-policy';
-import {
-  computeSignalsTargets,
-  decideWebrtcEligibility,
-} from './transport/carrier-coverage';
+import { computeSignalsTargets } from './transport/carrier-coverage';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
 import {
   decideSignalsMediaCadence,
@@ -42,7 +38,6 @@ import type {
   CloseCleanupContext,
   CloseCleanupPlan,
 } from './transport/close-cleanup-policy';
-import { decideInitRetry } from './transport/init-retry-policy';
 import { decideModuleStateMerge } from './module-state-policy';
 import {
   derived,
@@ -51,13 +46,11 @@ import {
   writable,
   Writable,
 } from '@holochain-open-dev/stores';
-import { v4 as uuidv4 } from 'uuid';
 import {
   AgentInfo,
   ConnectionStatus,
   ConnectionStatuses,
   DiagnosticSnapshot,
-  InitPayload,
   OpenConnectionInfo,
   PongMetaData,
   PongMetaDataV1,
@@ -137,7 +130,8 @@ export const SDP_TIMEOUT_FLOOR_MS = 5000;
 
 /**
  * Ceiling for the store's tracked SDP-exchange backstop timer
- * (`_computeSdpBackstopTimeout`), NOT the same predicate as
+ * (`_computeSdpBackstopTimeout`, media-links.ts — store-decomposition
+ * round three, Task 4), NOT the same predicate as
  * `SDP_TIMEOUT_CEILING_MS`. The backstop is second-line cleanup for an
  * FSM that wedges without ever emitting a phase transition — it must
  * always leave the FSM's own per-attempt timeout (`_computeSdpTimeout`,
@@ -154,14 +148,14 @@ export const SDP_TIMEOUT_FLOOR_MS = 5000;
 export const SDP_BACKSTOP_CEILING_MS = 68_000;
 
 /** Multiplier applied to the per-attempt SDP timeout to get the store's
- *  tracked backstop timeout (`_computeSdpBackstopTimeout`) — kept at 2x
- *  so the backstop can never fire before the FSM's own timeout has had a
- *  chance to run its first in-place retry. */
+ *  tracked backstop timeout (`_computeSdpBackstopTimeout`, media-links.ts)
+ *  — kept at 2x so the backstop can never fire before the FSM's own
+ *  timeout has had a chance to run its first in-place retry. */
 export const SDP_BACKSTOP_MULTIPLIER = 2;
 
 /**
  * Headroom (ms) added on top of `SDP_BACKSTOP_MULTIPLIER * perAttempt` in
- * `_computeSdpBackstopTimeout`. At exactly 2x the per-attempt timeout, the
+ * `_computeSdpBackstopTimeout` (media-links.ts). At exactly 2x the per-attempt timeout, the
  * FSM's own attempt-2 deadline is `2 * perAttempt + retryDelay` (its first
  * in-place backoff retry, not `2 * perAttempt`) — `retryDelay` can run up
  * to `maxDelayMs` (7000) + `jitterMs` (1000) under the reconnect policy's
@@ -195,11 +189,6 @@ export const SDP_BACKSTOP_RETRY_HEADROOM_MS = 8_000;
 const ICE_DISCONNECTED_GRACE_MS = 15000;
 
 /**
- * If an InitRequest does not succeed within this duration (ms) another InitRequest will be sent
- */
-const INIT_RETRY_THRESHOLD = 5000;
-
-/**
  * TTL for pending handshake reservations — InitRequests we sent
  * (`PeerRecord.pendingInits`, keyed by `t0`). (`_pendingAccepts` and the
  * screen-share twins were retired in Phase 3: the FSM acceptor creates
@@ -207,9 +196,11 @@ const INIT_RETRY_THRESHOLD = 5000;
  * Serves the connection-establishment predicate: an entry older
  * than this belongs to a handshake that will never complete, and only
  * caps state growth — the retry loop is governed by
- * INIT_RETRY_THRESHOLD, which this deliberately exceeds by 4x so a live
- * retry cycle is never truncated. Swept from `pingAgents` on the ping
- * cadence. (Phase 2 item 7: previously only the accepts had this;
+ * `MediaLinks.INIT_RETRY_THRESHOLD_MS` (media-links.ts, store-
+ * decomposition round three, Task 4 — previously this file's
+ * `INIT_RETRY_THRESHOLD`), which this deliberately exceeds by 4x so a
+ * live retry cycle is never truncated. Swept from `pingAgents` on the
+ * ping cadence. (Phase 2 item 7: previously only the accepts had this;
  * pendingInits grew unboundedly against an unresponsive peer.)
  */
 const PENDING_HANDSHAKE_TTL_MS = 20000;
@@ -554,7 +545,6 @@ export class StreamsStore {
       screenShareConnectionsIncoming: () => this.screenShareLinks._screenShareConnectionsIncoming,
       updateScreenShareConnectionStatus: (peer, status) =>
         this.screenShareLinks.updateScreenShareConnectionStatus(peer, status),
-      updateConnectionStatus: (peer, status) => this.updateConnectionStatus(peer, status),
       othersConnectionStatuses: () => this._othersConnectionStatuses,
       webrtcStats: this.webrtcStats,
       peerRecord: k => this._peerRecord(k),
@@ -573,6 +563,30 @@ export class StreamsStore {
       refreshTracksForPeer: peer => this.trackHealth.refreshTracksForPeer(peer),
       noteConversationParticipant: peer => this.diagnosticsHub.noteConversationParticipant(peer),
       mainStream: () => this.mainStream,
+      // -- Establishment + pong drive (Task 4) --
+      myPubKeyB64: () => this.myPubKeyB64,
+      sendMessage: (agents, msgType, payload) =>
+        this.deps.bus.sendMessage(agents, msgType, payload),
+      connectionStatuses: () => this._connectionStatuses,
+      myModuleStates: () => this._myModuleStates,
+      peerModuleStates: () => this._peerModuleStates,
+      webrtcDisabled: peerB64 => this.webrtcDisabled(peerB64),
+      webrtcGloballyDisabled: () => this.webrtcGloballyDisabled,
+      webrtcAvailableFor: peerB64 => this.webrtcAvailableFor(peerB64),
+      nextConnectionEpoch: peer => this._nextConnectionEpoch(peer),
+      allMediaTransports: () => this._allMediaTransports(),
+      sendRtcAction: (message, peers) => this._sendRtcAction(message, peers),
+      sendImmediatePongToAll: () => this._sendImmediatePongToAll(),
+      reconcileVideoStreamState: (peer, streamAndTrackInfo) =>
+        this.trackHealth.reconcileVideoStreamState(peer, streamAndTrackInfo),
+      iceDisconnectedGraceMs: ICE_DISCONNECTED_GRACE_MS,
+      sdpTimeoutCeilingMs: SDP_TIMEOUT_CEILING_MS,
+      sdpTimeoutRttMultiplier: SDP_TIMEOUT_RTT_MULTIPLIER,
+      sdpTimeoutFloorMs: SDP_TIMEOUT_FLOOR_MS,
+      sdpExchangeTimeoutFallbackMs: SDP_EXCHANGE_TIMEOUT,
+      sdpBackstopCeilingMs: SDP_BACKSTOP_CEILING_MS,
+      sdpBackstopMultiplier: SDP_BACKSTOP_MULTIPLIER,
+      sdpBackstopRetryHeadroomMs: SDP_BACKSTOP_RETRY_HEADROOM_MS,
     });
 
     this._activeAgents = derived(
@@ -1802,51 +1816,14 @@ export class StreamsStore {
   }
 
   /**
-   * RTT-scaled SDP-exchange timeout (ms) for an FSM initiator connection,
-   * or undefined when no signaling-RTT sample exists yet — the FSM then
-   * falls back to its config default (15s), i.e. unchanged behaviour.
-   *
-   * The SDP exchange rides the same Holochain signal transport as
-   * ping/pong, so the signals-carrier RTT EWMA is the correct latency
-   * proxy. K is kept generous to absorb signal-relay retransmits; the
-   * floor avoids an over-tight timeout on very low-RTT links; the ceiling
-   * (`SDP_TIMEOUT_CEILING_MS`) is raised past today's fixed default —
-   * see that constant's comment for the field rationale. K/FLOOR are
-   * provisional — see docs/CONNECTION_LIFECYCLE_PLAN.md Phase 4A.
+   * RTT-scaled SDP-exchange timeout — moved to `mediaLinks.computeSdpTimeout`
+   * (store-decomposition round three, Task 4). Bare delegate kept because
+   * `ScreenShareLinks`'s `computeSdpTimeout` binding (constructed above)
+   * still calls this store method by name — `screen-share-links.ts`
+   * stays untouched by this round.
    */
   private _computeSdpTimeout(peerB64: AgentPubKeyB64): number | undefined {
-    const rtt = this._peerRecords.get(peerB64)?.signalsRttEwma;
-    if (rtt === undefined || rtt <= 0) return undefined;
-    return Math.min(
-      SDP_TIMEOUT_CEILING_MS,
-      Math.max(SDP_TIMEOUT_FLOOR_MS, Math.round(rtt * SDP_TIMEOUT_RTT_MULTIPLIER))
-    );
-  }
-
-  /**
-   * Timeout (ms) for the store's own tracked SDP-exchange backstop timer
-   * — second-line cleanup for an FSM that wedges without ever emitting a
-   * phase transition. Deliberately NOT the same value as
-   * `_computeSdpTimeout` (the FSM's own per-attempt timeout, passed as
-   * `sdpExchangeTimeoutMs`): the backstop must always leave that timeout
-   * and its first in-place backoff retry undisturbed, so it is pinned
-   * strictly greater — `SDP_BACKSTOP_MULTIPLIER` (2x) times the
-   * per-attempt timeout plus `SDP_BACKSTOP_RETRY_HEADROOM_MS`, capped at
-   * `SDP_BACKSTOP_CEILING_MS`. Sharing the per-attempt value was Task 9's
-   * original defect (review C1): the backstop fired in the same tick as
-   * the FSM's own timeout and destroyed its in-place recovery attempt
-   * instead of letting it run. The bare 2x multiplier without headroom
-   * was a second, narrower instance of the same defect (final-review wave
-   * F1): the FSM's attempt-2 deadline is `2 * perAttempt + retryDelay`,
-   * not `2 * perAttempt`, so the headroom covers that retry's own delay
-   * budget (see `SDP_BACKSTOP_RETRY_HEADROOM_MS`).
-   */
-  private _computeSdpBackstopTimeout(peerB64: AgentPubKeyB64): number {
-    const perAttempt = this._computeSdpTimeout(peerB64) ?? SDP_EXCHANGE_TIMEOUT;
-    return Math.min(
-      SDP_BACKSTOP_CEILING_MS,
-      perAttempt * SDP_BACKSTOP_MULTIPLIER + SDP_BACKSTOP_RETRY_HEADROOM_MS
-    );
+    return this.mediaLinks.computeSdpTimeout(peerB64);
   }
 
   async changeVideoInput(deviceId: string) {
@@ -2425,8 +2402,10 @@ export class StreamsStore {
    * The shared connection-teardown kernel and ICE/SDP forensics live on
    * `mediaLinks` (Task 3); these are bare forwards kept for every caller
    * that isn't `mediaLinks` itself — the ScreenShareLinks bindings,
-   * `handleLeaveUi`, the stale-connection supervisor sites, `pingAgents`,
-   * and (until Task 4) `handleSdpFsm`.
+   * `handleLeaveUi`, the stale-connection supervisor sites, and
+   * `pingAgents`. (`handleSdpFsm` moved onto `mediaLinks` itself in
+   * Task 4 and calls `logSdpDataEvent` directly, no longer through the
+   * `_logSdpDataEvent` bare delegate below.)
    */
   private _applyCloseCleanup(
     ctx: CloseCleanupContext,
@@ -2664,11 +2643,13 @@ export class StreamsStore {
    * an observation about the peer, not something intent can carry, so it
    * still reads their conversation payload). Either half being true is
    * sufficient — this is the ONE composition, read by both the
-   * eligibility conjunct (`handlePongUi`/`handleInitRequest`) and
-   * room-view's display (`_renderCarrierToggle`).
+   * eligibility conjunct (`mediaLinks.drivePong`/`mediaLinks.handleInitRequest`,
+   * media-links.ts — store-decomposition round three, Task 4, via the
+   * `webrtcDisabled` binding) and room-view's display
+   * (`_renderCarrierToggle`).
    *
    * Reads synchronously from the intent/module-state stores so it can
-   * gate the retry loop in `handlePongUi` without making that path async.
+   * gate the retry loop in `drivePong` without making that path async.
    */
   webrtcDisabled(peerB64: AgentPubKeyB64): boolean {
     // My own per-peer override — intent, not a re-parse of my broadcast
@@ -3393,78 +3374,12 @@ export class StreamsStore {
   //
   // ********************************************************************************************
 
-  updateConnectionStatus(pubKey: AgentPubKeyB64, status: ConnectionStatus) {
-    this._connectionStatuses.update(currentValue => {
-      const connectionStatuses = currentValue;
-      if (status.type === 'InitSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'InitSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'InitSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-
-      if (status.type === 'AcceptSent') {
-        const currentStatus = connectionStatuses[pubKey];
-        if (currentStatus && currentStatus.type === 'AcceptSent') {
-          // increase number of attempts by 1
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: currentStatus.attemptCount
-              ? currentStatus.attemptCount + 1
-              : 1,
-          };
-        } else {
-          connectionStatuses[pubKey] = {
-            type: 'AcceptSent',
-            attemptCount: 1,
-          };
-        }
-        return connectionStatuses;
-      }
-
-      if (status.type === 'SdpExchange') {
-        const currentStatus = connectionStatuses[pubKey];
-        // `currentStatus &&` is required, matching the InitSent and AcceptSent
-        // branches above. A peer can reach here with no entry: `pingAgents`
-        // seeds `_connectionStatuses` every 2s, but `handlePongUi` adds peers to
-        // `_knownAgents` from pong metadata without seeding a status. A peer
-        // learned via pong that sends SdpData before the next ping tick — or an
-        // incoming FSM offer — hits an undefined status, and the TypeError used
-        // to escape into handleSignal's drain.
-        if (currentStatus && currentStatus.type === 'Connected') {
-          // If already connected, don't change anything. SdpExchange
-          // is also expected to occur when turning on video when
-          // already connected.
-          return connectionStatuses;
-        }
-      }
-
-      connectionStatuses[pubKey] = status;
-      return connectionStatuses;
-    });
-
-    // When transitioning to Connected, send an immediate Pong to all known agents
-    // so their UI updates within milliseconds rather than waiting for the next ping cycle
-    if (status.type === 'Connected') {
-      this._sendImmediatePongToAll();
-    }
-  }
-
   /**
    * Send an immediate PongUi to all known agents. Used when connection status
-   * changes to Connected so other peers see green rings right away.
+   * changes to Connected so other peers see green rings right away. Reached
+   * by `mediaLinks.updateConnectionStatus` (store-decomposition round
+   * three, Task 4 moved `updateConnectionStatus` there) through the
+   * `sendImmediatePongToAll` binding.
    */
   private async _sendImmediatePongToAll() {
     const knownAgents = get(this._knownAgents);
@@ -3813,10 +3728,10 @@ export class StreamsStore {
             await this.handlePongUi(signal);
             break;
           case 'InitRequest':
-            await this.handleInitRequest(signal);
+            await this.mediaLinks.handleInitRequest(signal);
             break;
           case 'InitAccept':
-            await this.handleInitAccept(signal);
+            await this.mediaLinks.handleInitAccept(signal);
             break;
           case 'SdpData':
             // Retired wire flow (Phase 3): SdpData carried the SimplePeer
@@ -3829,7 +3744,7 @@ export class StreamsStore {
             );
             break;
           case 'SdpFsm':
-            this.handleSdpFsm(signal);
+            this.mediaLinks.handleSdpFsm(signal);
             break;
           case 'SdpFsmScreen':
             this.screenShareLinks.handleSdpFsmScreen(signal);
@@ -4076,7 +3991,7 @@ export class StreamsStore {
       );
     }
 
-    await this._drivePongMediaLink(pubkeyB64, signal.from_agent, metaDataExt, now);
+    await this.mediaLinks.drivePong(pubkeyB64, signal.from_agent, metaDataExt, now);
     this._drivePongScreenShare(pubkeyB64, now);
   }
 
@@ -4240,147 +4155,6 @@ export class StreamsStore {
   }
 
   /**
-   * Normal video/audio stream
-   *
-   * If our agent puglic key is alphabetically "higher" than the agent public key
-   * sending the pong and there is no open connection yet with this agent and there is
-   * no pending InitRequest from less than 5 seconds ago (and we therefore have to
-   * assume that a remote signal got lost), send an InitRequest.
-   *
-   * Only initiate if the conversation module is active (i.e., we want WebRTC).
-   */
-  private async _drivePongMediaLink(
-    pubkeyB64: AgentPubKeyB64,
-    fromAgent: AgentPubKey,
-    metaDataExt: PongMetaData<PongMetaDataV1> | undefined,
-    now: number
-  ): Promise<void> {
-    const conversationActive = !!get(this._myModuleStates)['conversation'];
-
-    // Per-peer WebRTC override: `webrtcDisabled` unions our own
-    // intent-sourced disable with the peer's broadcast disable (Task 4 —
-    // see its docblock for the composition). Skips the entire init/retry
-    // path; audio flows over Holochain remote signals automatically
-    // (Step 3 carrier routing).
-    const peerWebrtcDisabled = this.webrtcDisabled(pubkeyB64);
-    // Has the peer's conversation payload (and therefore their declared
-    // caps) arrived at all? Distinct from `peerHasSdpFsmCap` below — see
-    // `peerCapsKnown`'s docblock in carrier-coverage.ts (field incident D2).
-    const peerCapsKnown = get(this._peerModuleStates)[pubkeyB64]?.['conversation'] !== undefined;
-
-    // Clean up stale video connection if the underlying WebRTC is dead.
-    // This allows the normal initiation flow to proceed for a re-joining peer.
-    // The predicate lives in `transport/stale-connection-policy.ts` — it is
-    // the same rule the two screen-share sites below apply, and it is where
-    // the grace-window and one-recovery-controller rationale is written down.
-    const existingConn = get(this._openConnections)[pubkeyB64];
-    {
-      const activeTransport = this.mediaTransport;
-      const iceState = existingConn
-        ? activeTransport.getIceConnectionState(pubkeyB64)
-        : undefined;
-      const decision = decideStaleConnectionCleanup({
-        hasExistingConn: !!existingConn,
-        slotClaimsConnected: !!existingConn?.connected,
-        // The transport declares whether it recovers itself; we do not
-        // infer it from which transport this is.
-        carrierOwnsRecovery: activeTransport.ownsTransportRecovery,
-        iceState,
-        disconnectedAt: this._peerRecords.get(pubkeyB64)?.iceDisconnectedAt,
-        now: this.clock.now(),
-        graceMs: ICE_DISCONNECTED_GRACE_MS,
-      });
-      if (existingConn && decision.action === 'teardown') {
-        this.logger.logCustomMessage(`Stale cleanup [${pubkeyB64.slice(0, 8)}]: ICE=${iceState} ${decision.reason}`);
-        this.logger.logAgentEvent({
-          agent: pubkeyB64,
-          timestamp: this.clock.now(),
-          event: 'StaleCleanup',
-          connectionId: existingConn.connectionId,
-        });
-        this._applyStaleTeardown('media', pubkeyB64, iceState);
-      }
-    }
-
-    // alreadyOpen here does not include the case where SDP exchange is already ongoing
-    // but no actual connection has happened yet
-    const alreadyOpen = get(this._openConnections)[pubkeyB64];
-
-    // Only initiate/manage WebRTC video connections when eligible. The
-    // predicate (conversation module active, kill switch, per-peer
-    // disable, sdp-fsm capability) is `decideWebrtcEligibility` — the
-    // ONE composition of these conjuncts, shared with the acceptor arm
-    // in `handleInitRequest` (Round 3 item 2).
-    if (
-      decideWebrtcEligibility({
-        role: 'initiator',
-        conversationActive,
-        peerWebrtcDisabled,
-        webrtcGloballyDisabled: this.webrtcGloballyDisabled,
-        peerCapsKnown,
-        peerHasSdpFsmCap: this.webrtcAvailableFor(pubkeyB64),
-      }).eligible
-    ) {
-      const pendingInits = this._peerRecords.get(pubkeyB64)?.pendingInits;
-      const decision = decideInitRetry({
-        alreadyOpen: !!alreadyOpen,
-        myPubKeyB64: this.myPubKeyB64,
-        peerPubKeyB64: pubkeyB64,
-        pendingInitT0s: pendingInits?.map(init => init.t0),
-        now,
-        retryThresholdMs: INIT_RETRY_THRESHOLD,
-      });
-      switch (decision.action) {
-        case 'send-init': {
-          if (decision.reason === 'no-pending-init') {
-            const lastDisconnect = this._peerRecords.get(pubkeyB64)?.lastDisconnectTime;
-            if (lastDisconnect) {
-              const gap = this.clock.now() - lastDisconnect;
-              this.logger.logCustomMessage(
-                `Retry gap [${pubkeyB64.slice(0, 8)}]: ${gap}ms since last disconnect (initiator)`
-              );
-            }
-          }
-          const newConnectionId = uuidv4();
-          this._ensurePeerRecord(pubkeyB64).pendingInits = [
-            ...(pendingInits ?? []),
-            { connectionId: newConnectionId, t0: now },
-          ];
-          await this.deps.bus.sendMessage(
-            [fromAgent],
-            'InitRequest',
-            JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
-          );
-          this.updateConnectionStatus(pubkeyB64, { type: 'InitSent' });
-          break;
-        }
-        case 'await-peer-init':
-          this.updateConnectionStatus(pubkeyB64, { type: 'AwaitingInit' });
-          break;
-        case 'hold': {
-          if (decision.reason === 'already-open' && metaDataExt?.data.streamInfo) {
-            // If the connection is already open, reconcile with our expected stream state
-            this.trackHealth.reconcileVideoStreamState(pubkeyB64, metaDataExt.data.streamInfo);
-          }
-          break;
-        }
-        default: {
-          const exhaustive: never = decision;
-          void exhaustive;
-        }
-      }
-    }
-
-    // Check whether they have the right expectation of our audio state and if not,
-    // send an audio-off signal
-    if (alreadyOpen && metaDataExt?.data.audio) {
-      if (!this.mainStream?.getAudioTracks()[0]?.enabled) {
-        this._sendRtcAction('audio-off', [pubkeyB64]);
-      }
-    }
-  }
-
-  /**
    * Outgoing screen share stream
    *
    * If our screen share stream is active and there is no open outgoing
@@ -4417,342 +4191,4 @@ export class StreamsStore {
     // exists, peer capability) live inside.
     this.screenShareLinks.ensureOutgoingScreenShare(pubkeyB64);
   }
-
-  /**
-   * Handle an InitRequest signal
-   *
-   * @param signal
-   */
-  async handleInitRequest(
-    signal: Extract<RoomSignal, { type: 'Message' }>
-  ) {
-    const pubKey64 = encodeHashToBase64(signal.from_agent);
-    const parsedInit = parseSignalPayload<InitPayload>(signal.payload);
-    if (!parsedInit.ok) {
-      this.logger.logCustomMessage(
-        `Dropped InitRequest from ${pubKey64.slice(0, 8)}: ${parsedInit.error}`
-      );
-      return;
-    }
-    const { connection_id, connection_type } = parsedInit.value;
-    this.logger.logAgentEvent({
-      agent: pubKey64,
-      timestamp: this.clock.now(),
-      event: 'InitRequest',
-      connectionId: connection_id,
-    });
-
-    // Log retry gap if this is a reconnection attempt
-    const lastDisconnect = this._peerRecords.get(pubKey64)?.lastDisconnectTime;
-    if (lastDisconnect) {
-      const gap = this.clock.now() - lastDisconnect;
-      this.logger.logCustomMessage(
-        `Retry gap [${pubKey64.slice(0, 8)}]: ${gap}ms since last disconnect`
-      );
-    }
-
-    /**
-     * InitRequests for normal audio/video stream
-     *
-     * Only accept init requests from agents who's pubkey is alphabetically  "higher" than ours
-     */
-    if (connection_type === 'video' && pubKey64 > this.myPubKeyB64) {
-      // One eligibility predicate, shared with the initiator arm in
-      // `handlePongUi` (Round 3 item 2). Declared behavior change: the
-      // acceptor now requires `conversationActive` too — before this,
-      // a node with the conversation module inactive refused to initiate
-      // but would answer an inbound InitRequest and stand up a full
-      // connection. The decision and its reason live in the predicate's
-      // docblock (`decideWebrtcEligibility`, carrier-coverage.ts).
-      const eligibility = decideWebrtcEligibility({
-        role: 'acceptor',
-        conversationActive: !!get(this._myModuleStates)['conversation'],
-        // `webrtcDisabled` unions our own intent-sourced disable with the
-        // peer's broadcast disable — see the initiator arm's comment.
-        peerWebrtcDisabled: this.webrtcDisabled(pubKey64),
-        webrtcGloballyDisabled: this.webrtcGloballyDisabled,
-        peerCapsKnown: get(this._peerModuleStates)[pubKey64]?.['conversation'] !== undefined,
-        peerHasSdpFsmCap: this.webrtcAvailableFor(pubKey64),
-      });
-      if (!eligibility.eligible) {
-        const reason = eligibility.reason;
-        switch (reason) {
-          case 'conversation-inactive':
-            this.logger.logCustomMessage(
-              `Ignored video InitRequest from ${pubKey64.slice(0, 8)}: conversation module inactive (symmetric eligibility, §8 item 2)`
-            );
-            break;
-          case 'webrtc-globally-disabled':
-          case 'peer-webrtc-disabled':
-            break;
-          case 'peer-caps-unknown':
-            // The peer's conversation payload (and therefore their
-            // declared caps) has not arrived yet — distinct from actually
-            // lacking the capability (field incident D2). Never answer:
-            // the lure-warning below applies just as much to a peer we
-            // cannot yet confirm holds sdp-fsm. No parking is needed —
-            // this join's next pong re-evaluates eligibility once the
-            // payload lands (`decideInitRetry` is level-triggered).
-            this.logger.logCustomMessage(
-              `Dropped video InitRequest from ${pubKey64.slice(0, 8)}: peer caps not yet received`
-            );
-            break;
-          case 'peer-lacks-sdp-fsm-cap':
-            // A peer whose build cannot parse SdpFsm has no WebRTC path
-            // to us at all since Phase 3 deleted SimplePeer; answering
-            // their InitRequest would lure them into an SDP exchange we
-            // drop.
-            this.logger.logCustomMessage(
-              `Dropped video InitRequest from ${pubKey64.slice(0, 8)}: peer lacks sdp-fsm capability`
-            );
-            break;
-          default: {
-            const exhaustive: never = reason;
-            void exhaustive;
-          }
-        }
-        return;
-      }
-      // No reservation is needed on the acceptor side: the FSM creates
-      // per-peer state lazily from the incoming offer (SdpFsm), so the
-      // InitAccept is purely the initiator's go-signal. `_pendingAccepts`
-      // died with the SimplePeer SdpData path that consumed it.
-      await this.deps.bus.sendMessage(
-        [signal.from_agent],
-        'InitAccept',
-        JSON.stringify({ connection_id, connection_type }),
-      );
-      this.updateConnectionStatus(pubKey64, { type: 'AcceptSent' });
-    }
-
-    /**
-     * Screen-share InitRequests are a retired wire flow (Phase 3): the FSM
-     * screen path negotiates over `SdpFsmScreen` with no reservation
-     * handshake. Only a ≤ v0.14.8 peer still sends these — their
-     * SimplePeer screen share cannot interoperate with this build, so the
-     * request is dropped explicitly rather than silently.
-     */
-    if (connection_type === 'screen') {
-      this.logger.logCustomMessage(
-        `Dropped screen-share InitRequest from ${pubKey64.slice(0, 8)}: ` +
-          'peer build predates the FSM screen-share channel (SdpFsmScreen)'
-      );
-    }
-  }
-
-  /**
-   * Handle an InitAccept signal
-   *
-   * @param signal
-   */
-  async handleInitAccept(signal: Extract<RoomSignal, { type: 'Message' }>) {
-    const pubKey64 = encodeHashToBase64(signal.from_agent);
-    const parsedAccept = parseSignalPayload<InitPayload>(signal.payload);
-    if (!parsedAccept.ok) {
-      this.logger.logCustomMessage(
-        `Dropped InitAccept from ${pubKey64.slice(0, 8)}: ${parsedAccept.error}`
-      );
-      return;
-    }
-    const { connection_id, connection_type } = parsedAccept.value;
-    this.logger.logAgentEvent({
-      agent: pubKey64,
-      timestamp: this.clock.now(),
-      event: 'InitAccept',
-      connectionId: connection_id,
-    });
-    /**
-     * For normal video/audio connections
-     *
-     * If there is no open connection with this agent yet and the connectionId
-     * is one matching an InitRequest we sent earlier, create a Simple Peer
-     * Instance and add it to open connections, then delete all PendingInits
-     * for this agent.
-     *
-     */
-    if (connection_type === 'video') {
-      const agentPendingInits = this._peerRecords.get(pubKey64)?.pendingInits;
-      if (!Object.keys(get(this._openConnections)).includes(pubKey64)) {
-        if (!agentPendingInits) {
-          console.warn(
-            `Got a video InitAccept from an agent (${pubKey64}) for which we have no pending init stored.`
-          );
-          return;
-        }
-        if (
-          agentPendingInits
-            .map(pendingInit => pendingInit.connectionId)
-            .includes(connection_id)
-        ) {
-          // Measure signaling round-trip time
-          const matchingInit = agentPendingInits.find(
-            pi => pi.connectionId === connection_id
-          );
-          if (matchingInit) {
-            const rtt = this.clock.now() - matchingInit.t0;
-            this.logger.logCustomMessage(
-              `Signaling RTT [${pubKey64.slice(0, 8)}]: ${rtt}ms`
-            );
-          }
-
-          // Make sure the transport has the latest local stream cached
-          // so the initial offer includes our tracks. Set on both impls
-          // so a future swap doesn't lose the stream.
-          if (this.mainStream) {
-            for (const t of this._allMediaTransports()) t.setLocalStream(this.mainStream);
-            this.logger.logCustomMessage(
-              `addStream pre-SDP [${pubKey64.slice(0, 8)}]: ${this.mainStream.getTracks().length} tracks (initiator)`
-            );
-          }
-
-          // Route to the right transport for this peer. The FSM allocates
-          // its own connectionId (the InitAccept connectionId is ignored
-          // by FsmTransport); use the returned id as the source of truth
-          // for openConnections tracking.
-          //
-          // Allocate a fresh, monotonic connection epoch for this attempt. The
-          // initiator is the single allocator; the acceptor adopts the epoch
-          // from the offer the FSM transport stamps it on. This is the ordered,
-          // shared identity that survives teardown+recreate and lets a stale
-          // signal from a prior attempt be dropped deterministically instead of
-          // deadlocking reconnect. See docs/WEBRTC_RECONNECT_IDENTITY.md.
-          const transport = this.mediaTransport;
-          const effectiveConnId = transport.ensureConnection(pubKey64, {
-            initiator: true,
-            connectionId: connection_id,
-            sdpExchangeTimeoutMs: this._computeSdpTimeout(pubKey64),
-            epoch: this._nextConnectionEpoch(pubKey64),
-          });
-
-          // The slot write goes through the ONE slot policy — the same
-          // routeTransportPhase('signaling') + decideSlotWrite pair the
-          // transport event glue runs — instead of the hand-written
-          // `_openConnections.update` this replaces (§9 item 5). If the
-          // transport synchronously emitted `signaling` during
-          // ensureConnection the route resolves to `keep` and the write
-          // half is a no-op; against a transport that emits nothing this
-          // is the installer. (The old code also carried a supersede
-          // block here that could never run: it read the slot inside the
-          // no-open-connection guard, before ensureConnection, so its
-          // prior-slot capture was always undefined. The adopt arm of
-          // the shared apply now owns that path for real.)
-          const route = routeTransportPhase({
-            phase: 'signaling',
-            connectionId: effectiveConnId,
-            openConnectionId: get(this._openConnections)[pubKey64]?.connectionId,
-          });
-          if (route.handler === 'signaling') {
-            this.mediaLinks._applyMediaSignalingRoute(
-              pubKey64,
-              effectiveConnId,
-              route.slot,
-              'initiator',
-            );
-          }
-
-          { const r = this._peerRecords.get(pubKey64); if (r) r.pendingInits = undefined; }
-
-          // Second-line backstop: if the FSM wedges without ever emitting
-          // a phase transition, this store-level timer cleans up and lets
-          // the next ping/pong cycle retry. Deliberately NOT the same
-          // window as the FSM's own per-attempt SDP timeout above
-          // (`sdpExchangeTimeoutMs: _computeSdpTimeout(...)`) — it is
-          // `_computeSdpBackstopTimeout`, pinned strictly greater (2x plus
-          // `SDP_BACKSTOP_RETRY_HEADROOM_MS`, own ceiling) so it never
-          // preempts the FSM's own timeout and first in-place backoff
-          // retry (review C1; the headroom term closed a narrower
-          // instance of the same defect — final-review wave F1). The timer is
-          // ATTEMPT-scoped and TRACKED (§9 item 5): it may only tear down
-          // the attempt that armed it — a successor attempt's slot must
-          // survive this timer firing — and a new attempt for the same
-          // peer disarms the previous timer, as does disconnect().
-          const priorSdpTimer = this._peerRecords.get(pubKey64)?.sdpTimeoutTimer;
-          if (priorSdpTimer !== undefined) this.clock.clearTimeout(priorSdpTimer);
-          this._ensurePeerRecord(pubKey64).sdpTimeoutTimer = this.clock.setTimeout(() => {
-            { const r = this._peerRecords.get(pubKey64); if (r) r.sdpTimeoutTimer = undefined; }
-            const conn = get(this._openConnections)[pubKey64];
-            // A successor attempt owns the slot now: its own timer owns
-            // its deadline. (Pinned by the successor-survival wiring test.)
-            if (conn && conn.connectionId !== effectiveConnId) return;
-            const currentStatus = get(this._connectionStatuses)[pubKey64];
-            if (!currentStatus || currentStatus.type !== 'SdpExchange') return;
-            this.logger.logCustomMessage(
-              `SDP timeout [${pubKey64.slice(0, 8)}]: destroying stale connection`
-            );
-            if (conn && !conn.connected) {
-              this.mediaTransport.closeConnection(pubKey64, 'SDP exchange timeout');
-              this._openConnections.update(current => {
-                delete current[pubKey64];
-                return current;
-              });
-            }
-            this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
-          }, this._computeSdpBackstopTimeout(pubKey64));
-        }
-      }
-    }
-
-    /**
-     * Screen-share InitAccepts are a retired wire flow (Phase 3) — this
-     * build never sends the screen InitRequest they answer. Only a
-     * ≤ v0.14.8 peer can produce one (answering a request from its own
-     * lineage); drop explicitly.
-     */
-    if (connection_type === 'screen') {
-      this.logger.logCustomMessage(
-        `Dropped screen-share InitAccept from ${pubKey64.slice(0, 8)}: retired wire flow`
-      );
-    }
-  }
-
-  /**
-   * Handle an SdpFsm signal — feeds the FSM media transport.
-   *
-   * The FSM creates per-peer state on the first incoming offer (no pendingAccept
-   * dance is needed); subsequent offers/answers/candidates route to the
-   * existing FSM. The wire payload is `{ connection_id, peer_session_id, data: { type, payload } }`.
-   * The openConnections entry is created lazily in the connection-state-change
-   * handler when the FSM transitions to 'signaling' for a peer not already
-   * tracked. Initiator-side openConnections entries are still installed by
-   * handleInitAccept (with the FSM-allocated connectionId returned from
-   * ensureConnection).
-   */
-  handleSdpFsm(signal: Extract<RoomSignal, { type: 'Message' }>): void {
-    const pubkeyB64 = encodeHashToBase64(signal.from_agent);
-    const parsedFsm = parseSignalPayload<{
-      connection_id: string;
-      peer_session_id?: number;
-      epoch?: number;
-      data: unknown;
-    }>(signal.payload);
-    if (!parsedFsm.ok) {
-      console.warn(
-        `Dropped SdpFsm from ${pubkeyB64.slice(0, 8)}: ${parsedFsm.error}`
-      );
-      return;
-    }
-    const parsed = parsedFsm.value;
-    // Surface the sub-type so the FSM path is as readable in logs as
-    // the simplepeer path (which records 'offer'/'answer'/'candidate').
-    const data = parsed.data as { type?: string } | null;
-    const sdpType = data && typeof data === 'object' && 'type' in data && data.type
-      ? data.type
-      : 'candidate';
-    // processIncomingSignal first so a fresh-from-remote offer creates the
-    // local FSM before we ask for its connectionId.
-    this.mediaTransport.processIncomingSignal({
-      from: pubkeyB64,
-      connectionId: parsed.connection_id,
-      peerSessionId: parsed.peer_session_id,
-      epoch: parsed.epoch,
-      data: parsed.data,
-    });
-    // Log with the LOCAL FSM's connectionId so SdpData entries correlate
-    // with ICE, Connected, FsmClose etc. The wire payload's connection_id
-    // is the SENDER's local id; without this remapping a single FSM
-    // session would show up under two different ids in the timeline.
-    const localConnId = this.mediaTransport.getConnectionId(pubkeyB64) ?? parsed.connection_id;
-    this._logSdpDataEvent(pubkeyB64, localConnId, `fsm-${sdpType}`);
-  }
-
 }
