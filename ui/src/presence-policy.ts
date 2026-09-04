@@ -169,7 +169,7 @@ export type SignalCarrierState =
  * tell "nobody has answered yet" from "nobody is here", and refuses to
  * call either one channel death. (Call sites that exclude unstamped
  * peers before calling this, and what that forfeits, are documented at
- * the call site — see `streams-store.ts`'s `_emitPresenceForensics`.)
+ * the call site — see `presence-loop.ts`'s `_emitPresenceForensics`.)
  *
  * `downSince` is sticky across calls while still down (`prevDownSince`
  * carries the stamp from the first down evaluation forward) so the

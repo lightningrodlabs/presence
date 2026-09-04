@@ -8,17 +8,12 @@ import { Clock, systemClock } from './clock';
 import {
   computeActiveAgents,
   computePresentPeers,
-  decidePresenceSoundEvents,
-  decideSignalCarrier,
-  INITIAL_PRESENCE_SOUND_STATE,
   isMediaLive,
   lastSeenBucket,
   MEDIA_LIVE_WINDOW_MS,
   OBSERVER_FRESHNESS_MS,
   PING_INTERVAL,
-  PRESENCE_LEAVE_DWELL_MS,
   PRESENT_STALENESS_MS,
-  type PresenceSoundState,
 } from './presence-policy';
 import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { initialPeerRecord, prunePendingInits, type PeerRecord } from './peer-record';
@@ -26,10 +21,7 @@ import { FsmTransport } from './transport';
 import type { PeerTransport } from './transport';
 import { computeSignalsTargets } from './transport/carrier-coverage';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
-import {
-  decideSignalsMediaCadence,
-  SIGNALS_RTT_DEGRADED_MS,
-} from './transport/signals-cadence-policy';
+import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
 import { decideStaleConnectionCleanup } from './transport/stale-connection-policy';
@@ -86,6 +78,7 @@ import { DiagnosticsHub } from './diagnostics-hub';
 import { TrackHealthMonitor } from './track-health';
 import { ScreenShareLinks } from './screen-share-links';
 import { MediaLinks } from './media-links';
+import { PresenceLoop } from './presence-loop';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { getStreamInfo } from './utils';
@@ -489,6 +482,16 @@ export class StreamsStore {
    *  late-bound, so their own construction order is unaffected. */
   mediaLinks!: MediaLinks;
 
+  /** The ONE owner of the presence roster state, the signal-carrier-down
+   *  forensics authority, the per-ping-cycle roster sweep/merge
+   *  fragments, and the join/leave sound subscription (store-
+   *  decomposition round four, Task 1; see presence-loop.ts). Constructed
+   *  in the constructor body, immediately after `mediaLinks`, for the
+   *  same reason: `_activeAgents`/`_presentPeers`/`_signalsTargets`'s
+   *  `derived(...)` calls below read this owner's state through
+   *  delegating getters/accessors, so the owner must already exist. */
+  presenceLoop!: PresenceLoop;
+
   /**
    * WebRTC transports. Three instances by purpose:
    *  - mediaTransport: bidirectional mic+camera (one connection per peer).
@@ -589,6 +592,41 @@ export class StreamsStore {
       sdpBackstopCeilingMs: SDP_BACKSTOP_CEILING_MS,
       sdpBackstopMultiplier: SDP_BACKSTOP_MULTIPLIER,
       sdpBackstopRetryHeadroomMs: SDP_BACKSTOP_RETRY_HEADROOM_MS,
+    });
+
+    // Constructed immediately after `mediaLinks`, both before the derived
+    // stores below: the derived `_presentPeers` callback reads/writes
+    // `_signalCarrierDownSince`/`_lastComputedPresent` through delegating
+    // accessor pairs onto this owner (CAUTION: the accessors are
+    // prototype members, so they resolve correctly regardless of exactly
+    // when in the constructor this owner is built — but every OTHER
+    // binding into it stays late-bound, so this ordering is followed for
+    // consistency with `mediaLinks`, not because anything below strictly
+    // requires it).
+    this.presenceLoop = new PresenceLoop({
+      clock: this.clock,
+      logger: this.logger,
+      myPubKeyB64: () => this.myPubKeyB64,
+      allAgents: () => this.allAgents,
+      blockedAgents: () => this.blockedAgents,
+      eventCallback: e => this.eventCallback(e),
+      connectionStatuses: () => this._connectionStatuses,
+      presentPeers: () => this._presentPeers,
+      activeAgents: () => this._activeAgents,
+      signalsTargets: () => this._signalsTargets,
+      globalPresenceSet: () => this.globalPresenceSet(),
+      isPeerMediaLive: peerB64 => this.isPeerMediaLive(peerB64),
+      ensurePeerRecord: k => this._ensurePeerRecord(k),
+      setSignalsCadence: c => { this._signalsCadence = c; },
+      // -- pingAgents pipeline + presence tick (Task 2) --
+      sendMessage: (agents, msgType, payload) =>
+        this.deps.bus.sendMessage(agents, msgType, payload),
+      checkTrackHealth: () => this.trackHealth.checkTrackHealth(),
+      checkAudibilityOutages: () => this._checkAudibilityOutages(),
+      flushStaleSdpAggregates: () => this._flushStaleSdpAggregates(),
+      evaluateSignalsCadence: () => this._evaluateSignalsCadence(),
+      sweepPendingInits: now => this._sweepPendingInits(now),
+      mainStream: () => this.mainStream,
     });
 
     this._activeAgents = derived(
@@ -725,37 +763,39 @@ export class StreamsStore {
    * call exactly once, then disconnect() to tear down.
    */
   start(): void {
+    this._startSignalRouting();
+    this._startPresenceTicking();
+    this._startPersistedSettings();
+    this._startTransports();
+    this._startCaptureSources();
+    this._startMediaControllers();
+    this._startSignalsReconciliation();
+  }
+
+  /** Route incoming bus signals to `handleSignal`. */
+  private _startSignalRouting(): void {
     this.signalUnsubscribe = this.deps.bus.onSignal(async signal =>
       this.handleSignal(signal)
     );
+  }
 
+  /** Arm the presence-tick interval. */
+  private _startPresenceTicking(): void {
     // Drive the presence tick from the store clock so _activeAgents
     // re-evaluates staleness once per ping cadence even when no store
-    // write happens (Phase 2 item 4). _emitPresenceForensics() runs
-    // FIRST, in the same breath, so _signalCarrierDownSince is current
-    // before the tick bump triggers _presentPeers' recompute: carrier-
-    // down (SIGNAL_CARRIER_DOWN_MS) and a lone surviving peer's own
-    // ping-staleness (PRESENT_STALENESS_MS) are the same 3-tick window
-    // by design, so they cross on the SAME tick, and pingAgents() (the
-    // only other _emitPresenceForensics call site) is not guaranteed to
-    // run before this interval fires — without this, the carrier-hold
-    // (Task 8) reads a stale `undefined` on exactly the tick it needs
-    // to catch, and _lastComputedPresent gets wiped before the hold can
-    // apply. decideSignalCarrier's stickiness makes calling this from
-    // both sites idempotent: whichever call notices the transition
-    // first logs it, the other sees it already applied and no-ops.
-    // pingAgents() has the matching guard internally (forensics runs
-    // before ITS OWN `_knownAgents.set()` write, review C1) — the two
-    // fixes are independent because either evaluator can be the first
-    // to observe a given crossing.
+    // write happens (Phase 2 item 4). See `PresenceLoop.onPresenceTick`
+    // for the full rationale (forensics-first ordering, review C1) — the
+    // callback body lives there now (store-decomposition round four,
+    // Task 2); this just arms the interval.
     this._presenceTickInterval = this.clock.setInterval(
-      () => {
-        this._emitPresenceForensics();
-        this._presenceTick.update(n => n + 1);
-      },
+      () => this.presenceLoop.onPresenceTick(),
       PING_INTERVAL
     );
+  }
 
+  /** Load the blocked-agents list and the signal-delay override from
+   *  storage at start time. */
+  private _startPersistedSettings(): void {
     const blockedAgentsJson = this.deps.storage.session.getItem('blockedAgents');
     this.blockedAgents.set(
       blockedAgentsJson ? JSON.parse(blockedAgentsJson) : []
@@ -769,7 +809,11 @@ export class StreamsStore {
     if (signalDelay) {
       this.signalDelayMs = parseInt(signalDelay, 10) || 0;
     }
+  }
 
+  /** Construct the media and screen-share FSM transports and subscribe
+   *  their events to the application-level handlers. */
+  private _startTransports(): void {
     // Construct transports. iceServers / trickleICE are getters so the
     // transport always uses the current values (TURN credentials, trickle
     // toggle, etc. can change at runtime).
@@ -850,7 +894,11 @@ export class StreamsStore {
     this.mediaLinks.subscribe();
     this.screenShareLinks.subscribe(this.screenShareOutTransport, true);
     this.screenShareLinks.subscribe(this.screenShareInTransport, false);
+  }
 
+  /** Wire the device-change listener and construct the mic/camera
+   *  sources plus the capture reconciler that owns their lifecycle. */
+  private _startCaptureSources(): void {
     this.deps.mediaDevices.ondevicechange = e => {
       console.log('Got devide change: ', e);
     };
@@ -894,14 +942,23 @@ export class StreamsStore {
       log: message => this.logger.logCustomMessage(message),
       onCameraAcquired: () => this._attachCameraToPeers(),
     });
+  }
 
+  /** Bind the voice/filmstrip controllers so their receive side works
+   *  regardless of local mic/camera state. Unbind happens in disconnect(). */
+  private _startMediaControllers(): void {
     // Bind controllers permanently so the receive side (decoders /
     // playback) works regardless of whether the local mic / camera is
     // on. Send sides are gated by the reconcilers. Unbind happens in
     // disconnect().
     voiceController.bind(this);
     filmstripController.bind(this);
+  }
 
+  /** Subscribe to `_signalsTargets` to drive the per-tick signals-carrier
+   *  reconcilers (encoder retry cadence, intent diffs). Load-bearing —
+   *  see the inline comment for the encoder-retry wiring-test pin. */
+  private _startSignalsReconciliation(): void {
     // Subscribe to _signalsTargets changes. When the set transitions
     // between empty and non-empty while the mic / camera is held, start
     // or stop the corresponding signals-carrier encoder. The subscription
@@ -1365,6 +1422,19 @@ export class StreamsStore {
 
   disconnect(reason: string = 'unknown') {
     this._applyIntent({ type: 'session-end' });
+    this._teardownForensics(reason);
+    this._teardownNotifyPeers();
+    this._teardownTimers();
+    this._teardownSubscriptions();
+    this._teardownTransports();
+    this._teardownEncoders();
+    this._teardownCaptureAndSignals();
+    this._teardownState();
+  }
+
+  /** Log disconnect forensics (caller stack + page visibility) before any
+   *  teardown happens. */
+  private _teardownForensics(reason: string): void {
     // Forensics: capture WHO called disconnect (button vs. Lit lifecycle
     // unmount) so we can tell user-initiated leaves from DOM-remount leaves.
     // Stack is best-effort — useful when reason='unknown' to find a new caller.
@@ -1376,7 +1446,11 @@ export class StreamsStore {
     this.logger.logCustomMessage(
       `Disconnect reason=${reason} visibility=${visibility} ${stack}`
     );
+  }
 
+  /** Best-effort LeaveUi notification to every known peer before we tear
+   *  anything down. */
+  private _teardownNotifyPeers(): void {
     // Notify peers immediately before tearing down
     const agentsToNotify = Object.keys(get(this._knownAgents))
       .filter(a => a !== this.myPubKeyB64)
@@ -1384,7 +1458,11 @@ export class StreamsStore {
     if (agentsToNotify.length > 0) {
       this.deps.bus.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
     }
+  }
 
+  /** Clear the ping and presence-tick intervals, and the per-peer-record
+   *  timer/pending state (sdpTimeoutTimer, screenShareStream, pendingInits). */
+  private _teardownTimers(): void {
     if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
     if (this._presenceTickInterval !== undefined) {
       this.clock.clearInterval(this._presenceTickInterval);
@@ -1396,6 +1474,10 @@ export class StreamsStore {
       r.screenShareStream = undefined;
       r.pendingInits = undefined;
     }
+  }
+
+  /** Unsubscribe the signal, page-lifecycle, and all-agents subscriptions. */
+  private _teardownSubscriptions(): void {
     if (this.signalUnsubscribe) this.signalUnsubscribe();
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
@@ -1405,6 +1487,11 @@ export class StreamsStore {
       this._allAgentsUnsub();
       this._allAgentsUnsub = null;
     }
+  }
+
+  /** Destroy the three transports and release local video/audio output
+   *  state (videoOff/audioOff plus the keepalive track). */
+  private _teardownTransports(): void {
     // Close all connections and stop all streams. (A duplicated
     // `mediaTransport.destroy()` line lived here until Phase 6's
     // symmetry test asserted destroy-exactly-once per transport;
@@ -1417,6 +1504,10 @@ export class StreamsStore {
     // videoOff allocates a keepalive track if not already; on disconnect
     // there are no peers to swap it onto, so just release the resources.
     this._releaseVideoKeepalive();
+  }
+
+  /** Stop and unbind the voice/filmstrip signals-carrier controllers. */
+  private _teardownEncoders(): void {
     // Stop the voice encoder if running, then unbind the controller
     // (tears down both send and receive state).
     if (this._voiceEncoderRunning) {
@@ -1429,20 +1520,32 @@ export class StreamsStore {
       this._filmstripEncoderRunning = false;
     }
     filmstripController.unbind();
+  }
+
+  /** Unsubscribe the signals-targets subscription (kept here, not with
+   *  the other unsubs in `_teardownSubscriptions`, to preserve origin
+   *  teardown order — it sits between the encoder unbinds and the
+   *  capture-source release in the source body, and a phase boundary
+   *  cannot reorder statements relative to their origin neighbors),
+   *  disarm presence sounds, release the mic/camera capture sources, and
+   *  stop any outgoing/incoming screen share (`screenShareOff()` — itself
+   *  an indirect `_applyIntent` call site, via its own gesture method). */
+  private _teardownCaptureAndSignals(): void {
     if (this._signalsTargetsUnsub) {
       this._signalsTargetsUnsub();
       this._signalsTargetsUnsub = null;
     }
-    if (this._presentPeersUnsub) {
-      this._presentPeersUnsub();
-      this._presentPeersUnsub = null;
-    }
+    this.presenceLoop.disarmPresenceSounds();
     // Release both WebRTC acquire handles (Task 3: reconciler-owned;
     // releaseAll is disconnect-only cleanup), then force-close the sources.
     this.captureReconciler.releaseAll();
     this.micSource.dispose();
     this.cameraSource.dispose();
     this.screenShareOff();
+  }
+
+  /** Reset the remaining store-level stream/connection state. */
+  private _teardownState(): void {
     this.mainStream = null;
     this.screenShareStream = null;
     this._openConnections.set({});
@@ -1485,168 +1588,17 @@ export class StreamsStore {
     // that peer never chimed at all (PR #4 F6). Arming at registration
     // makes the first evaluation deterministic: whoever is present at
     // that instant is seeded silently, and every change after it sounds.
-    this._armPresenceSounds();
+    this.presenceLoop.armPresenceSounds();
   }
 
   /**
-   * Subscribe the join/leave sound decision to the present predicate.
-   * Keys off `_presentPeers` — NOT raw `_activeAgents` — so a pong gap
-   * with media still flowing produces no sound, and a genuine departure
-   * sounds only after the leave dwell. Replaces room-view's direct
-   * `_activeAgents` diff (the mechanism behind the leave-then-join chime
-   * blip). Fires on every `_presenceTick`, which is what expires the
-   * dwell. Idempotent: re-registering a callback re-uses the existing
-   * subscription and its accumulated state.
+   * Bare delegate onto `PresenceLoop.pingAgents()` (store-decomposition
+   * round four, Task 2) — kept under this name because callers are
+   * unchanged: `static connect`'s interval + await, both field harnesses,
+   * and the wiring-test suite.
    */
-  private _armPresenceSounds(): void {
-    if (this._presentPeersUnsub) return;
-    let seeded = false;
-    this._presentPeersUnsub = this._presentPeers.subscribe(present => {
-      // The subscribe() call itself delivers the current set. Adopt it as
-      // the baseline instead of chiming for peers who were already here
-      // when we started listening.
-      if (!seeded) {
-        seeded = true;
-        this._presenceSoundState = { sounded: [...present], pendingLeave: {} };
-        return;
-      }
-      const decision = decidePresenceSoundEvents({
-        state: this._presenceSoundState,
-        present,
-        now: this.clock.now(),
-        leaveDwellMs: PRESENCE_LEAVE_DWELL_MS,
-      });
-      this._presenceSoundState = decision.state;
-      for (const ev of decision.events) {
-        this.eventCallback({
-          type:
-            ev.kind === 'join' ? 'peer-joined-presence' : 'peer-left-presence',
-          pubKeyB64: ev.peer,
-        });
-      }
-    });
-  }
-
   async pingAgents() {
-    // Forensics FIRST, before the roster-merge write below: the merge
-    // only adds unstamped entries (new agents) or upgrades `type` for
-    // already-known agents while preserving their `lastSeen` — it never
-    // touches an existing `lastSeen` stamp, so `_emitPresenceForensics`
-    // reading the PRE-merge `_knownAgents` sees the identical
-    // `knownPeerLastSeen` input either way. Ordering here is NOT
-    // cosmetic: the merge's `_knownAgents.set()` below synchronously
-    // re-derives `_activeAgents` -> `_presentPeers` (Task 8's carrier
-    // hold reads `_signalCarrierDownSince` there), so if forensics ran
-    // after that write, the hold would see this cycle's carrier verdict
-    // one write too late on exactly the tick a lone surviving peer's
-    // own staleness crosses — review C1, reproduced with a mid-cycle
-    // crossing (pingAgents() as the FIRST evaluator after the flip,
-    // ahead of the next presence tick).
-    this._emitPresenceForensics();
-
-    this._applyPingRosterSweep();
-
-    await this._sendPings();
-
-    // Log our stream state
-    this.logger.logMyStreamInfo(getStreamInfo(this.mainStream));
-
-    // Sweep stale pending handshake reservations (PENDING_HANDSHAKE_TTL_MS).
-    // Accepts are connectionId reservations — the transport owns the peer
-    // lifecycle, so dropping the entry is the entire teardown. Inits are
-    // our sent-InitRequest records; without the sweep they grow one entry
-    // per 5s retry for as long as a peer stays unresponsive.
-    const now = this.clock.now();
-    this._sweepPendingInits(now);
-
-    // Health check for dead tracks (bytesReceived stall detection)
-    await this.trackHealth.checkTrackHealth();
-
-    // Scan for sustained audibility outages with a relay opportunity
-    this._checkAudibilityOutages();
-
-    // Flush any SdpData bursts that ended without a follow-up event.
-    this._flushStaleSdpAggregates();
-
-    // Forensics (signal-carrier liveness + presence-set membership)
-    // already ran at the top of this function, before the roster-merge
-    // write — see the comment there. Not repeated here (review C1: a
-    // second call this late would just be dead weight, since nothing
-    // between the two spots can change `_knownAgents`' lastSeen stamps).
-
-    // Signals media cadence: one evaluation per ping cycle, reading
-    // `_signalCarrierDownSince` from this cycle's forensics call above.
-    // `bestRttEwmaMs` is the min RTT EWMA over the CURRENT signals
-    // targets — the healthiest link bounds what the relay can still
-    // deliver; targets with no sample yet contribute nothing, and no
-    // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
-    // policy's declared design).
-    this._evaluateSignalsCadence();
-  }
-
-  private _applyPingRosterSweep(): void {
-    const knownAgents = get(this._knownAgents);
-    this.allAgents
-      .map(agent => encodeHashToBase64(agent))
-      .forEach(agentB64 => {
-        if (agentB64 !== this.myPubKeyB64) {
-          const alreadyKnown = knownAgents[agentB64];
-          if (alreadyKnown && alreadyKnown.type !== 'known') {
-            knownAgents[agentB64] = {
-              pubkey: agentB64,
-              type: 'known',
-              lastSeen: alreadyKnown.lastSeen,
-              appVersion: alreadyKnown.appVersion,
-            };
-          } else if (!alreadyKnown) {
-            knownAgents[agentB64] = {
-              pubkey: agentB64,
-              type: 'known',
-              lastSeen: undefined,
-              appVersion: undefined,
-            };
-          }
-        }
-      });
-    // NOTE: There is a minor chance that this._knownAgents changes as a result from code
-    // elsewhere while we looped through this.allAgents above and we're overwriting these
-    // changes from elsewhere here. But we consider this possibility negligible for now.
-    this._knownAgents.set(knownAgents);
-
-    // Update connection statuses with known people for which we do not yet have a connection status
-    this._connectionStatuses.update(currentValue => {
-      const connectionStatuses = currentValue;
-      Object.keys(get(this._knownAgents)).forEach(agentB64 => {
-        if (!connectionStatuses[agentB64]) {
-          if (get(this.blockedAgents).includes(agentB64)) {
-            connectionStatuses[agentB64] = {
-              type: 'Blocked',
-            };
-          } else {
-            connectionStatuses[agentB64] = {
-              type: 'Disconnected',
-            };
-          }
-        }
-      });
-      return connectionStatuses;
-    });
-  }
-
-  private async _sendPings(): Promise<void> {
-    // Ping known agents
-    // This could potentially be optimized by only pinging agents that are online according to Moss (which would only work in shared rooms though)
-    const agentsToPing = Object.keys(get(this._knownAgents))
-      .filter(agent => !get(this.blockedAgents).includes(agent))
-      .map(pubkeyB64 => decodeHashFromBase64(pubkeyB64));
-    // Include a send-side timestamp so peers can echo it back in their
-    // pong, letting us compute signals-carrier RTT on receipt without
-    // adding new messages. See handlePingUi / handlePongUi.
-    await this.deps.bus.sendMessage(
-      agentsToPing,
-      'PingUi',
-      JSON.stringify({ t0: this.clock.now() }),
-    );
+    return this.presenceLoop.pingAgents();
   }
 
   private _sweepPendingInits(now: number): void {
@@ -1699,122 +1651,6 @@ export class StreamsStore {
       if (!this._peerCaps(target).has(cap)) return false;
     }
     return true;
-  }
-
-  /**
-   * Per-ping-cycle forensics and the signal-carrier-down authority:
-   *
-   *  - SignalCarrierDown/Up — delegates to `decideSignalCarrier`
-   *    (`presence-policy.ts`), which is down when at least one known
-   *    peer has ponged before but none of those ponged-at-least-once
-   *    peers is fresh within `SIGNAL_CARRIER_DOWN_MS`. Makes signal-relay
-   *    outages visible in merged logs, and the resulting
-   *    `_signalCarrierDownSince` feeds `decideSignalsMediaCadence`
-   *    (Tasks 7-8) — this is no longer forensic-only.
-   *  - PresenceAdd/PresenceRemove — diff of `globalPresenceSet()` with the
-   *    reason a peer entered (media-live / ping-fresh / observer-reported),
-   *    so the pane-survival behaviour of `isPeerMediaLive` is observable.
-   */
-  private _emitPresenceForensics(): void {
-    const now = this.clock.now();
-
-    const known = get(this._knownAgents);
-    const blocked = get(this.blockedAgents);
-    const knownPeers = Object.keys(known).filter(
-      k => k !== this.myPubKeyB64 && !blocked.includes(k),
-    );
-    // Peers with no `lastSeen` yet are deliberately excluded here, not
-    // passed through as a value `decideSignalCarrier` could treat as
-    // "not fresh" — there are three paths that leave `lastSeen`
-    // undefined: initial roster seeding (`this._knownAgents.update` in
-    // the all-agents subscription, ~2474), a peer-leave clear
-    // (~5715), and a told-only agent we've never received a Pong from
-    // directly (~5877). Declared behavior change from the old inline
-    // predicate: it counted a known-but-never-ponged peer as
-    // "not fresh", so a relay that was dead from the very first tick
-    // (nobody had ponged yet) logged a spurious SignalCarrierDown on
-    // tick 1. `decideSignalCarrier` cannot distinguish "never ponged"
-    // from "not here" and refuses to call either one channel death, so
-    // that dead-from-start detection is forfeited on purpose — it survives
-    // as long as at least one peer has ponged at least once and then
-    // goes stale.
-    const knownPeerLastSeen = knownPeers
-      .map(k => known[k]?.lastSeen)
-      .filter((ls): ls is number => ls !== undefined);
-    const prevDownSince = this._signalCarrierDownSince;
-    const carrierState = decideSignalCarrier({
-      knownPeerLastSeen,
-      prevDownSince,
-      now,
-    });
-    this._signalCarrierDownSince = carrierState.down
-      ? carrierState.downSince
-      : undefined;
-    if (carrierState.down && prevDownSince === undefined) {
-      // Immediate back-off, in the same breath as the flip: the per-tick
-      // evaluation in pingAgents() would land on 'paused' anyway, but the
-      // senders must not get frames into a relay that just proved dead
-      // for however long a caller-ordering change could delay that
-      // evaluation. Recovery is NOT forced here — it rides the per-tick
-      // evaluation and the policy's one-level-per-tick hysteresis.
-      this._signalsCadence = { mode: 'paused', reason: 'carrier-down' };
-      this.logger.logCustomMessage(
-        `SignalCarrierDown: no pong from any of ${knownPeers.length} known peer(s)`,
-      );
-    } else if (!carrierState.down && prevDownSince !== undefined) {
-      const downMs = now - prevDownSince;
-      this.logger.logCustomMessage(
-        `SignalCarrierUp: pong path recovered after ${downMs}ms`,
-      );
-      // Reset the RTT EWMA for current signals targets to
-      // SIGNALS_RTT_DEGRADED_MS, not delete it (final-review wave F5,
-      // amended per re-review N2): a sample folded across the outage is
-      // evidence about the DEAD channel, not the one that just recovered
-      // — carrying it forward fed the cadence policy's one-level-per-tick
-      // hysteresis a stale collapsed reading and forced a ~20s walk-back
-      // (paused -> voice-only -> full) even once the link was fine again.
-      // A bare delete (no-sample) would have jumped straight to 'full' —
-      // resuming both voice AND filmstrip at full rate into a relay that
-      // JUST recovered, one tick ahead of any real evidence it can carry
-      // that load. Landing exactly at the degraded threshold instead
-      // means `decideSignalsMediaCadence` resumes at 'voice-only' on this
-      // tick (same one-tick honesty: no stale collapsed reading survives
-      // the flip), and the next real sample governs from there — a
-      // healthy pong decays the EWMA below half-degraded and walks it on
-      // to 'full' over the following ticks, same as any other recovery.
-      for (const target of get(this._signalsTargets)) {
-        this._ensurePeerRecord(target).signalsRttEwma = SIGNALS_RTT_DEGRADED_MS;
-      }
-    }
-
-    const current = this.globalPresenceSet();
-    const prev = this._lastPresenceSet;
-    for (const peer of current) {
-      if (peer === this.myPubKeyB64 || prev.has(peer)) continue;
-      this.logger.logAgentEvent({
-        agent: peer,
-        timestamp: now,
-        event: 'PresenceAdd',
-        detail: `reason=${this._presenceReason(peer)}`,
-      });
-    }
-    for (const peer of prev) {
-      if (peer === this.myPubKeyB64 || current.has(peer)) continue;
-      this.logger.logAgentEvent({
-        agent: peer,
-        timestamp: now,
-        event: 'PresenceRemove',
-        detail: 'reason=ping-stale+no-media',
-      });
-    }
-    this._lastPresenceSet = current;
-  }
-
-  /** Why a peer is currently in `globalPresenceSet()`. Forensics helper. */
-  private _presenceReason(peer: AgentPubKeyB64): string {
-    if (this.isPeerMediaLive(peer)) return 'media-live';
-    if (get(this._activeAgents)[peer]) return 'ping-fresh';
-    return 'observer-reported';
   }
 
   /**
@@ -2465,9 +2301,14 @@ export class StreamsStore {
    * Agents in the room that we know exist either because we saw their public key
    * linked from the ALL_AGENTS anchor ourselves or because we learnt via remote
    * signals from other peers that their public key is linked from the ALL_AGENTS
-   * anchor (in case this hasn't gossiped to us yet).
+   * anchor (in case this hasn't gossiped to us yet). Delegates to
+   * `presenceLoop` (store-decomposition round four, Task 1) — views
+   * (`room-view.ts`), the wiring/construction tests, and both field
+   * harnesses read/write this getter directly.
    */
-  _knownAgents: Writable<Record<AgentPubKeyB64, AgentInfo>> = writable({});
+  get _knownAgents(): Writable<Record<AgentPubKeyB64, AgentInfo>> {
+    return this.presenceLoop._knownAgents;
+  }
 
   /**
    * Agents that are actively present (recent pong within staleness threshold).
@@ -2483,9 +2324,12 @@ export class StreamsStore {
    * previously eviction waited for `pingAgents`' next write, making real
    * eviction latency 6–8s instead of the declared 6s (§3.2 note).
    * Public like the other underscore stores so tests can fire a tick
-   * without arming the interval (which lives in start()).
+   * without arming the interval (which lives in start()). Delegates to
+   * `presenceLoop`.
    */
-  _presenceTick: Writable<number> = writable(0);
+  get _presenceTick(): Writable<number> {
+    return this.presenceLoop._presenceTick;
+  }
 
   private _presenceTickInterval: number | undefined;
 
@@ -2500,20 +2344,20 @@ export class StreamsStore {
   /**
    * The previous tick's `computePresentPeers` output — what
    * `PRESENCE_CARRIER_HOLD_MAX_MS` holds alive while
-   * `_signalCarrierDownSince` is set. Updated at the end of every
-   * `_presentPeers` re-evaluation, so it is always exactly one
-   * evaluation stale by construction: the tick that reads it as
-   * `heldPresent` is deciding this tick's set from last tick's, never
-   * its own. Reset on `disconnect()` so a stale held set from a prior
-   * session can't leak into the next one.
+   * `_signalCarrierDownSince` is set. Lives on `presenceLoop`
+   * (store-decomposition round four, Task 1); this get/set accessor pair
+   * (not a bare getter — the field is a plain value reassigned in place,
+   * not a `Writable` mutated through `.set()`) is read and written by the
+   * derived `_presentPeers` callback below every tick, and reset from
+   * `disconnect()`.
    */
-  private _lastComputedPresent: AgentPubKeyB64[] = [];
+  private get _lastComputedPresent(): AgentPubKeyB64[] {
+    return this.presenceLoop._lastComputedPresent;
+  }
 
-  /** State of the join/leave sound decision; see decidePresenceSoundEvents. */
-  private _presenceSoundState: PresenceSoundState = INITIAL_PRESENCE_SOUND_STATE;
-
-  /** Unsubscribe from the _presentPeers sound subscription. */
-  private _presentPeersUnsub: (() => void) | null = null;
+  private set _lastComputedPresent(v: AgentPubKeyB64[]) {
+    this.presenceLoop._lastComputedPresent = v;
+  }
 
   /**
    * The statuses of WebRTC main stream connections to peers
@@ -2530,11 +2374,14 @@ export class StreamsStore {
 
   /**
    * Connection statuses of other peers from their perspective. Is sent to us
-   * via remote signals (as part of pingAgents())
+   * via remote signals (as part of pingAgents()). Delegates to
+   * `presenceLoop` — `room-view.ts` reads this getter directly.
    */
-  _othersConnectionStatuses: Writable<
+  get _othersConnectionStatuses(): Writable<
     Record<AgentPubKeyB64, OthersConnectionStatusEntry>
-  > = writable({});
+  > {
+    return this.presenceLoop._othersConnectionStatuses;
+  }
 
   // Diagnostic log request/response pipeline is owned by `diagnosticsHub`
   // (store-decomposition round two, Task 3; see diagnostics-hub.ts). The
@@ -3163,8 +3010,19 @@ export class StreamsStore {
    * forensic-only: this is the one field Tasks 7-8 (signals media
    * cadence) read to decide `carrierDown` for
    * `decideSignalsMediaCadence` (`transport/signals-cadence-policy.ts`).
+   * Lives on `presenceLoop` (store-decomposition round four, Task 1);
+   * this get/set accessor pair (not a bare getter — reassigned in place,
+   * not a `Writable`) is read by `_recomputeIntentDiffs` and
+   * `_evaluateSignalsCadence`, and read/written by the derived
+   * `_presentPeers` callback above.
    */
-  private _signalCarrierDownSince: number | undefined;
+  private get _signalCarrierDownSince(): number | undefined {
+    return this.presenceLoop._signalCarrierDownSince;
+  }
+
+  private set _signalCarrierDownSince(v: number | undefined) {
+    this.presenceLoop._signalCarrierDownSince = v;
+  }
 
   /**
    * The signals-carried media cadence — how much media the voice/filmstrip
@@ -3217,12 +3075,6 @@ export class StreamsStore {
   voiceBatchEligible(): boolean {
     return this._voiceBatchCapAllTargets;
   }
-
-  /**
-   * Last computed `globalPresenceSet()`, kept so the ping cycle can diff
-   * membership and emit PresenceAdd/PresenceRemove forensic events.
-   */
-  private _lastPresenceSet = new Set<AgentPubKeyB64>();
 
   /** View-surface delegate to `peerAudioLevels` (Task 1; see
    *  peer-audio-levels.ts). Called by the audio-level-meter element. */
@@ -3980,7 +3832,7 @@ export class StreamsStore {
       this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
       metaDataExt = metaData;
       this._applyPongStats(pubkeyB64, metaData);
-      this._applyPongRoster(pubkeyB64, metaData, now);
+      this.presenceLoop._applyPongRoster(pubkeyB64, metaData, now);
       this._applyPongModuleSweep(pubkeyB64, metaData);
     } catch (e) {
       // Not a parse failure — the payload is validated and returned on above.
@@ -4047,57 +3899,6 @@ export class StreamsStore {
         void exhaustive;
       }
     }
-  }
-
-  private _applyPongRoster(
-    pubkeyB64: AgentPubKeyB64,
-    metaData: PongMetaData<PongMetaDataV1>,
-    now: number
-  ): void {
-    this._othersConnectionStatuses.update(statuses => {
-      const newStatuses = statuses;
-      newStatuses[pubkeyB64] = {
-        lastUpdated: now,
-        statuses: metaData.data.connectionStatuses,
-        screenShareStatuses: metaData.data.screenShareConnectionStatuses,
-        knownAgents: metaData.data.knownAgents,
-        perceivedStreamInfo: metaData.data.streamInfo,
-        peerLinks: metaData.data.peerLinks,
-      };
-      return statuses;
-    });
-
-    // Update known agents based on the agents that they know
-    this._knownAgents.update(store => {
-      const knownAgents = store;
-      const maybeKnownAgent = knownAgents[pubkeyB64];
-      if (maybeKnownAgent) {
-        maybeKnownAgent.appVersion = metaData.data.appVersion;
-        maybeKnownAgent.lastSeen = this.clock.now();
-      } else {
-        knownAgents[pubkeyB64] = {
-          pubkey: pubkeyB64,
-          type: 'told',
-          lastSeen: this.clock.now(),
-          appVersion: metaData.data.appVersion,
-        };
-      }
-      if (metaData.data.knownAgents) {
-        Object.entries(metaData.data.knownAgents).forEach(
-          ([agentB64, agentInfo]) => {
-            if (!knownAgents[agentB64] && agentB64 !== this.myPubKeyB64) {
-              knownAgents[agentB64] = {
-                pubkey: agentB64,
-                type: 'told',
-                lastSeen: undefined, // We did not receive a Pong from them directly
-                appVersion: agentInfo.appVersion,
-              };
-            }
-          }
-        );
-      }
-      return knownAgents;
-    });
   }
 
   /**

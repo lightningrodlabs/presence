@@ -121,6 +121,12 @@ const PINNED_FILES: Array<{
   // routes through the `now`/`setTimeout`/`clearTimeout` bindings,
   // late-bound onto the clock.
   { relPath: '../media-links.ts', patterns: FULL_PATTERNS },
+  // Store-decomposition round four, Task 1 (PresenceLoop): every
+  // forensic timestamp and sound-decision `now` routes through the
+  // `clock` binding — an eager capture of the store's injected clock
+  // (`clock: this.clock`), assigned once in the constructor, not a
+  // late-bound arrow (the field itself is never reassigned).
+  { relPath: '../presence-loop.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
