@@ -112,6 +112,9 @@ store-resident, round-three decision reaffirmed), record accessors,
 
 ## Part 2 — composition-root split
 
+**Landed** — actual phase names recorded in the CLAUDE.md presence-loop
+bullet, not these indicative ones.
+
 `start()` splits into named store-private phases, verbatim bodies,
 order identical (names indicative; the plan fixes them from the actual
 body): `_startTransports`, `_startSignalRouting`,
