@@ -199,11 +199,13 @@ export type MediaLinksBindings = {
    *  connection is already open). */
   reconcileVideoStreamState: (peer: AgentPubKeyB64, streamAndTrackInfo: StreamAndTrackInfo) => void;
   /** `ICE_DISCONNECTED_GRACE_MS` (streams-store.ts), passed as a value —
-   *  not imported, to avoid a streams-store.ts -> media-links.ts import
-   *  edge on top of the existing media-links.ts -> streams-store.ts one
-   *  (the class import); the constant is also used by two store-resident
-   *  callers (`handlePingUi`, `_drivePongScreenShare`), so streams-store.ts
-   *  stays its one declaration site. */
+   *  not imported, to avoid ADDING a media-links.ts -> streams-store.ts
+   *  value-import edge on top of the existing streams-store.ts ->
+   *  media-links.ts one (the class import: streams-store.ts imports
+   *  `MediaLinks`; media-links.ts imports nothing from streams-store.ts);
+   *  the constant is also used by two store-resident callers
+   *  (`handlePingUi`, `_drivePongScreenShare`), so streams-store.ts stays
+   *  its one declaration site. */
   iceDisconnectedGraceMs: number;
   /** `SDP_TIMEOUT_CEILING_MS` (streams-store.ts, exported — the wiring
    *  suite imports it directly), passed as a value for the same reason
@@ -1417,7 +1419,7 @@ export class MediaLinks {
   }
 
   /**
-   * Timeout (ms) for the store's own tracked SDP-exchange backstop timer
+   * Timeout (ms) for this class's own tracked SDP-exchange backstop timer
    * — second-line cleanup for an FSM that wedges without ever emitting a
    * phase transition. Deliberately NOT the same value as
    * `computeSdpTimeout` (the FSM's own per-attempt timeout, passed as

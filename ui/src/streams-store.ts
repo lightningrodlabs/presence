@@ -108,9 +108,11 @@ declare const __APP_VERSION__: string;
 export const SDP_EXCHANGE_TIMEOUT = 15000;
 
 /**
- * Ceiling for the RTT-scaled SDP-exchange timeout (`_computeSdpTimeout`).
- * Serves the SDP-exchange predicate: how long an initiator's own attempt
- * may go unanswered before it is torn down and retried.
+ * Ceiling for the RTT-scaled SDP-exchange timeout (`_computeSdpTimeout`,
+ * now `MediaLinks.computeSdpTimeout`, media-links.ts; the store keeps a
+ * bare `_computeSdpTimeout` delegate onto it). Serves the SDP-exchange
+ * predicate: how long an initiator's own attempt may go unanswered before
+ * it is torn down and retried.
  *
  * Field observation (2026-08-11): 8 consecutive SDP timeouts sat at the
  * former 15s ceiling while measured signals RTT was 20-58s. At K=20 that
@@ -129,7 +131,7 @@ export const SDP_TIMEOUT_RTT_MULTIPLIER = 20;
 export const SDP_TIMEOUT_FLOOR_MS = 5000;
 
 /**
- * Ceiling for the store's tracked SDP-exchange backstop timer
+ * Ceiling for MediaLinks' tracked SDP-exchange backstop timer
  * (`_computeSdpBackstopTimeout`, media-links.ts — store-decomposition
  * round three, Task 4), NOT the same predicate as
  * `SDP_TIMEOUT_CEILING_MS`. The backstop is second-line cleanup for an
@@ -147,7 +149,7 @@ export const SDP_TIMEOUT_FLOOR_MS = 5000;
  */
 export const SDP_BACKSTOP_CEILING_MS = 68_000;
 
-/** Multiplier applied to the per-attempt SDP timeout to get the store's
+/** Multiplier applied to the per-attempt SDP timeout to get MediaLinks'
  *  tracked backstop timeout (`_computeSdpBackstopTimeout`, media-links.ts)
  *  — kept at 2x so the backstop can never fire before the FSM's own
  *  timeout has had a chance to run its first in-place retry. */
