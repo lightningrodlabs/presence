@@ -5086,156 +5086,23 @@ export class StreamsStore {
     // No need for a per-pong SimpleEvent entry — it just adds noise.
     // Update their connection statuses and the list of known agents
     let metaDataExt: PongMetaData<PongMetaDataV1> | undefined;
-    try {
-      const parsedMeta = parseSignalPayload<PongMetaData<PongMetaDataV1>>(
-        signal.payload
+    const parsedMeta = parseSignalPayload<PongMetaData<PongMetaDataV1>>(
+      signal.payload
+    );
+    if (!parsedMeta.ok) {
+      console.warn(
+        `Dropped PongUi meta from ${pubkeyB64.slice(0, 8)}: ${parsedMeta.error}`
       );
-      if (!parsedMeta.ok) {
-        console.warn(
-          `Dropped PongUi meta from ${pubkeyB64.slice(0, 8)}: ${parsedMeta.error}`
-        );
-        return;
-      }
-      const metaData = parsedMeta.value;
-      this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
-      metaDataExt = metaData;
+      return;
+    }
+    const metaData = parsedMeta.value;
+    this.logger.logAgentPongMetaData(pubkeyB64, metaData.data);
+    metaDataExt = metaData;
 
-      // The pong-echo RTT fold — plausibility bound, EWMA smoothing, and
-      // the emit gate — is one pure decision (`foldSignalsRtt`,
-      // carrier-stats-policy.ts, §9 item 4). This block only executes it.
-      const rttFold = foldSignalsRtt({
-        pingT0:
-          typeof metaData.data.pingT0 === 'number'
-            ? metaData.data.pingT0
-            : undefined,
-        now: this.clock.now(),
-        prevEwmaMs: this._peerRecords.get(pubkeyB64)?.signalsRttEwma,
-        slot: get(this._openConnections)[pubkeyB64],
-      });
-      switch (rttFold.action) {
-        case 'no-sample':
-          // Peer on old code — their pong doesn't echo pingT0 yet.
-          console.debug(
-            `[stats] No pingT0 in pong from ${pubkeyB64.slice(0, 8)} — remote may be on older code`
-          );
-          break;
-        case 'drop':
-          break;
-        case 'fold': {
-          this._ensurePeerRecord(pubkeyB64).signalsRttEwma = rttFold.ewmaMs;
-          const existing = this.signalsStats.get(pubkeyB64) ?? {
-            rttMs: null, jitterMs: null, lossPercent: null,
-          };
-          existing.rttMs = rttFold.ewmaMs;
-          this.signalsStats.set(pubkeyB64, existing);
-          if (rttFold.emitQualityCheck) {
-            this._maybeEmitQualityChange(
-              pubkeyB64,
-              'signals',
-              existing.rttMs,
-              existing.jitterMs,
-              existing.lossPercent,
-            );
-          }
-          break;
-        }
-        default: {
-          const exhaustive: never = rttFold;
-          void exhaustive;
-        }
-      }
-      this._othersConnectionStatuses.update(statuses => {
-        const newStatuses = statuses;
-        newStatuses[pubkeyB64] = {
-          lastUpdated: now,
-          statuses: metaData.data.connectionStatuses,
-          screenShareStatuses: metaData.data.screenShareConnectionStatuses,
-          knownAgents: metaData.data.knownAgents,
-          perceivedStreamInfo: metaData.data.streamInfo,
-          peerLinks: metaData.data.peerLinks,
-        };
-        return statuses;
-      });
-
-      // Update known agents based on the agents that they know
-      this._knownAgents.update(store => {
-        const knownAgents = store;
-        const maybeKnownAgent = knownAgents[pubkeyB64];
-        if (maybeKnownAgent) {
-          maybeKnownAgent.appVersion = metaData.data.appVersion;
-          maybeKnownAgent.lastSeen = this.clock.now();
-        } else {
-          knownAgents[pubkeyB64] = {
-            pubkey: pubkeyB64,
-            type: 'told',
-            lastSeen: this.clock.now(),
-            appVersion: metaData.data.appVersion,
-          };
-        }
-        if (metaData.data.knownAgents) {
-          Object.entries(metaData.data.knownAgents).forEach(
-            ([agentB64, agentInfo]) => {
-              if (!knownAgents[agentB64] && agentB64 !== this.myPubKeyB64) {
-                knownAgents[agentB64] = {
-                  pubkey: agentB64,
-                  type: 'told',
-                  lastSeen: undefined, // We did not receive a Pong from them directly
-                  appVersion: agentInfo.appVersion,
-                };
-              }
-            }
-          );
-        }
-        return knownAgents;
-      });
-      // Reconcile module states from the pong (late-joiner catch-up and
-      // lost-push healing). The per-module merge rule is
-      // `decideModuleStateMerge` (module-state-policy.ts, Round 3
-      // item 3) — the SAME rule the push path applies. The sweep stamp
-      // is the sender's `moduleStatesAt` (or, for legacy pongs, the max
-      // updatedAt across the pong's own entries), so an in-flight pong
-      // serialized before a fresh push cannot delete the pushed module —
-      // the ~2s module flicker this replaces.
-      {
-        const currentModules = get(this._peerModuleStates)[pubkeyB64] || {};
-        const prevSnapshot = { ...currentModules };
-        const incoming = metaData.data.moduleStates ?? {};
-        const incomingStamps = Object.values(incoming).map(e => e.updatedAt);
-        const sweepStamp =
-          metaData.data.moduleStatesAt ??
-          (incomingStamps.length ? Math.max(...incomingStamps) : undefined);
-        const merged = { ...currentModules };
-        let changed = false;
-        const allIds = new Set([
-          ...Object.keys(currentModules),
-          ...Object.keys(incoming),
-        ]);
-        for (const moduleId of allIds) {
-          const decision = decideModuleStateMerge({
-            current: currentModules[moduleId] ?? null,
-            incoming: incoming[moduleId] ?? null,
-            source: 'pong-sweep',
-            sweepStamp,
-          });
-          if (decision.action === 'set') {
-            merged[moduleId] = decision.envelope;
-            changed = true;
-          } else if (decision.action === 'delete') {
-            delete merged[moduleId];
-            changed = true;
-          }
-        }
-        if (changed) {
-          this._peerModuleStates.update(all => ({ ...all, [pubkeyB64]: merged }));
-          // Fire transition + payload-change callbacks for affected modules
-          for (const moduleId of allIds) {
-            const prevEnv = prevSnapshot[moduleId] || null;
-            const nextEnv = merged[moduleId] || null;
-            this._dispatchPeerModuleTransition(pubkeyB64, moduleId, prevEnv, nextEnv);
-            this._dispatchPeerModulePayloadChange(pubkeyB64, moduleId, prevEnv, nextEnv);
-          }
-        }
-      }
+    try {
+      this._applyPongStats(pubkeyB64, metaData);
+      this._applyPongRoster(pubkeyB64, metaData, now);
+      this._applyPongModuleSweep(pubkeyB64, metaData);
     } catch (e) {
       // Not a parse failure — the payload is validated and returned on above.
       // This block spans the RTT stats, presence merge and module-state
@@ -5246,16 +5113,185 @@ export class StreamsStore {
       );
     }
 
-    /**
-     * Normal video/audio stream
-     *
-     * If our agent puglic key is alphabetically "higher" than the agent public key
-     * sending the pong and there is no open connection yet with this agent and there is
-     * no pending InitRequest from less than 5 seconds ago (and we therefore have to
-     * assume that a remote signal got lost), send an InitRequest.
-     *
-     * Only initiate if the conversation module is active (i.e., we want WebRTC).
-     */
+    await this._drivePongMediaLink(pubkeyB64, signal.from_agent, metaDataExt, now);
+    this._drivePongScreenShare(pubkeyB64, now);
+  }
+
+  /**
+   * The pong-echo RTT fold — plausibility bound, EWMA smoothing, and
+   * the emit gate — is one pure decision (`foldSignalsRtt`,
+   * carrier-stats-policy.ts, §9 item 4). This block only executes it.
+   */
+  private _applyPongStats(
+    pubkeyB64: AgentPubKeyB64,
+    metaData: PongMetaData<PongMetaDataV1>
+  ): void {
+    const rttFold = foldSignalsRtt({
+      pingT0:
+        typeof metaData.data.pingT0 === 'number'
+          ? metaData.data.pingT0
+          : undefined,
+      now: this.clock.now(),
+      prevEwmaMs: this._peerRecords.get(pubkeyB64)?.signalsRttEwma,
+      slot: get(this._openConnections)[pubkeyB64],
+    });
+    switch (rttFold.action) {
+      case 'no-sample':
+        // Peer on old code — their pong doesn't echo pingT0 yet.
+        console.debug(
+          `[stats] No pingT0 in pong from ${pubkeyB64.slice(0, 8)} — remote may be on older code`
+        );
+        break;
+      case 'drop':
+        break;
+      case 'fold': {
+        this._ensurePeerRecord(pubkeyB64).signalsRttEwma = rttFold.ewmaMs;
+        const existing = this.signalsStats.get(pubkeyB64) ?? {
+          rttMs: null, jitterMs: null, lossPercent: null,
+        };
+        existing.rttMs = rttFold.ewmaMs;
+        this.signalsStats.set(pubkeyB64, existing);
+        if (rttFold.emitQualityCheck) {
+          this._maybeEmitQualityChange(
+            pubkeyB64,
+            'signals',
+            existing.rttMs,
+            existing.jitterMs,
+            existing.lossPercent,
+          );
+        }
+        break;
+      }
+      default: {
+        const exhaustive: never = rttFold;
+        void exhaustive;
+      }
+    }
+  }
+
+  private _applyPongRoster(
+    pubkeyB64: AgentPubKeyB64,
+    metaData: PongMetaData<PongMetaDataV1>,
+    now: number
+  ): void {
+    this._othersConnectionStatuses.update(statuses => {
+      const newStatuses = statuses;
+      newStatuses[pubkeyB64] = {
+        lastUpdated: now,
+        statuses: metaData.data.connectionStatuses,
+        screenShareStatuses: metaData.data.screenShareConnectionStatuses,
+        knownAgents: metaData.data.knownAgents,
+        perceivedStreamInfo: metaData.data.streamInfo,
+        peerLinks: metaData.data.peerLinks,
+      };
+      return statuses;
+    });
+
+    // Update known agents based on the agents that they know
+    this._knownAgents.update(store => {
+      const knownAgents = store;
+      const maybeKnownAgent = knownAgents[pubkeyB64];
+      if (maybeKnownAgent) {
+        maybeKnownAgent.appVersion = metaData.data.appVersion;
+        maybeKnownAgent.lastSeen = this.clock.now();
+      } else {
+        knownAgents[pubkeyB64] = {
+          pubkey: pubkeyB64,
+          type: 'told',
+          lastSeen: this.clock.now(),
+          appVersion: metaData.data.appVersion,
+        };
+      }
+      if (metaData.data.knownAgents) {
+        Object.entries(metaData.data.knownAgents).forEach(
+          ([agentB64, agentInfo]) => {
+            if (!knownAgents[agentB64] && agentB64 !== this.myPubKeyB64) {
+              knownAgents[agentB64] = {
+                pubkey: agentB64,
+                type: 'told',
+                lastSeen: undefined, // We did not receive a Pong from them directly
+                appVersion: agentInfo.appVersion,
+              };
+            }
+          }
+        );
+      }
+      return knownAgents;
+    });
+  }
+
+  /**
+   * Reconcile module states from the pong (late-joiner catch-up and
+   * lost-push healing). The per-module merge rule is
+   * `decideModuleStateMerge` (module-state-policy.ts, Round 3
+   * item 3) — the SAME rule the push path applies. The sweep stamp
+   * is the sender's `moduleStatesAt` (or, for legacy pongs, the max
+   * updatedAt across the pong's own entries), so an in-flight pong
+   * serialized before a fresh push cannot delete the pushed module —
+   * the ~2s module flicker this replaces.
+   */
+  private _applyPongModuleSweep(
+    pubkeyB64: AgentPubKeyB64,
+    metaData: PongMetaData<PongMetaDataV1>
+  ): void {
+    {
+      const currentModules = get(this._peerModuleStates)[pubkeyB64] || {};
+      const prevSnapshot = { ...currentModules };
+      const incoming = metaData.data.moduleStates ?? {};
+      const incomingStamps = Object.values(incoming).map(e => e.updatedAt);
+      const sweepStamp =
+        metaData.data.moduleStatesAt ??
+        (incomingStamps.length ? Math.max(...incomingStamps) : undefined);
+      const merged = { ...currentModules };
+      let changed = false;
+      const allIds = new Set([
+        ...Object.keys(currentModules),
+        ...Object.keys(incoming),
+      ]);
+      for (const moduleId of allIds) {
+        const decision = decideModuleStateMerge({
+          current: currentModules[moduleId] ?? null,
+          incoming: incoming[moduleId] ?? null,
+          source: 'pong-sweep',
+          sweepStamp,
+        });
+        if (decision.action === 'set') {
+          merged[moduleId] = decision.envelope;
+          changed = true;
+        } else if (decision.action === 'delete') {
+          delete merged[moduleId];
+          changed = true;
+        }
+      }
+      if (changed) {
+        this._peerModuleStates.update(all => ({ ...all, [pubkeyB64]: merged }));
+        // Fire transition + payload-change callbacks for affected modules
+        for (const moduleId of allIds) {
+          const prevEnv = prevSnapshot[moduleId] || null;
+          const nextEnv = merged[moduleId] || null;
+          this._dispatchPeerModuleTransition(pubkeyB64, moduleId, prevEnv, nextEnv);
+          this._dispatchPeerModulePayloadChange(pubkeyB64, moduleId, prevEnv, nextEnv);
+        }
+      }
+    }
+  }
+
+  /**
+   * Normal video/audio stream
+   *
+   * If our agent puglic key is alphabetically "higher" than the agent public key
+   * sending the pong and there is no open connection yet with this agent and there is
+   * no pending InitRequest from less than 5 seconds ago (and we therefore have to
+   * assume that a remote signal got lost), send an InitRequest.
+   *
+   * Only initiate if the conversation module is active (i.e., we want WebRTC).
+   */
+  private async _drivePongMediaLink(
+    pubkeyB64: AgentPubKeyB64,
+    fromAgent: AgentPubKey,
+    metaDataExt: PongMetaData<PongMetaDataV1> | undefined,
+    now: number
+  ): Promise<void> {
     const conversationActive = !!get(this._myModuleStates)['conversation'];
 
     // Per-peer WebRTC override: `webrtcDisabled` unions our own
@@ -5348,7 +5384,7 @@ export class StreamsStore {
             { connectionId: newConnectionId, t0: now },
           ];
           await this.deps.bus.sendMessage(
-            [signal.from_agent],
+            [fromAgent],
             'InitRequest',
             JSON.stringify({ connection_id: newConnectionId, connection_type: 'video' }),
           );
@@ -5379,19 +5415,21 @@ export class StreamsStore {
         this._sendRtcAction('audio-off', [pubkeyB64]);
       }
     }
+  }
 
-    /**
-     * Outgoing screen share stream
-     *
-     * If our screen share stream is active and there is no open outgoing
-     * screen share connection yet with this agent and there is no pending
-     * InitRequest from less than 5 seconds ago (and we therefore have to
-     * assume that a remote signal got lost), send an InitRequest.
-     *
-     * Also clean up stale outgoing screen share connections where the
-     * underlying WebRTC connection is no longer alive (e.g. peer left
-     * without a clean close event reaching us).
-     */
+  /**
+   * Outgoing screen share stream
+   *
+   * If our screen share stream is active and there is no open outgoing
+   * screen share connection yet with this agent and there is no pending
+   * InitRequest from less than 5 seconds ago (and we therefore have to
+   * assume that a remote signal got lost), send an InitRequest.
+   *
+   * Also clean up stale outgoing screen share connections where the
+   * underlying WebRTC connection is no longer alive (e.g. peer left
+   * without a clean close event reaching us).
+   */
+  private _drivePongScreenShare(pubkeyB64: AgentPubKeyB64, now: number): void {
     const outgoingScreenShare = get(this._screenShareConnectionsOutgoing)[pubkeyB64];
     if (outgoingScreenShare) {
       const iceState =
