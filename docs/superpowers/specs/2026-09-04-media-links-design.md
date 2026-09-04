@@ -54,7 +54,11 @@ transport glue as loose methods:
 4. **`_openConnections` moves into MediaLinks** (store keeps the
    delegating getter). Verified 2026-09-04: all its writers are the
    moving glue/establishment paths plus `disconnect()`'s wipe and
-   `_clearPendingWebrtcStatus`'s clear, which become owner calls.
+   `_clearPendingWebrtcStatus`'s clear — the latter two keep calling
+   `.set`/`.update` THROUGH the delegating getter (amended at
+   plan-writing: the getter returns the owner's `Writable` instance,
+   so non-moving writers need no owner calls — the round-two
+   screen-share precedent).
    `_connectionStatuses` STAYS on the store — presence (`pingAgents`'s
    status seed) and `handleLeaveUi` write it too, so moving it would
    drag non-media writers through bindings; the owner writes it via a
