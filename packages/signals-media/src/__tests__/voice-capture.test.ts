@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
+import { VoiceCapture } from '../voice-capture.js';
 
 /**
  * The AudioWorkletProcessor in `voice-capture-worklet.ts` is the ONE
@@ -101,5 +102,159 @@ describe('voice capture worklet: render quanta → 20 ms frames', () => {
     expect(p.process([[]])).toBe(true);
     expect(p.process([])).toBe(true);
     expect(posted).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Main-thread pump: graph construction must not reject
+// ---------------------------------------------------------------------------
+
+/**
+ * `VoiceCapture.start` is the caller's ONE failure signal: `VoiceCarrier`
+ * releases the mic handle and closes the encoder on a false return, and a
+ * REJECTION would skip that arm and strand the device open with no capture
+ * graph (Presence contained the same class of failure inside
+ * `buildTrackReader`). These cases pin that every graph-construction throw
+ * resolves false and leaves no nodes behind.
+ */
+
+class FakeAudioNode {
+  disconnects = 0;
+
+  connect(_dest: unknown): void {}
+
+  disconnect(): void {
+    this.disconnects += 1;
+  }
+}
+
+class FakeGainNode extends FakeAudioNode {
+  gain = { value: 1 };
+}
+
+class FakeWorkletNode extends FakeAudioNode {
+  port: { onmessage: ((e: { data: Float32Array }) => void) | null } = {
+    onmessage: null,
+  };
+}
+
+let workletNodeThrows = false;
+const workletNodes: FakeWorkletNode[] = [];
+
+const makeCtx = (failAt?: 'source' | 'gain' | 'addModule') => {
+  const created: FakeAudioNode[] = [];
+  const ctx = {
+    sampleRate: 48000,
+    destination: new FakeAudioNode(),
+    audioWorklet: {
+      addModule: async (_url: string) => {
+        if (failAt === 'addModule') throw new Error('module fetch failed');
+      },
+    },
+    createMediaStreamSource: (_stream: unknown) => {
+      if (failAt === 'source') throw new Error('InvalidStateError: context closed');
+      const n = new FakeAudioNode();
+      created.push(n);
+      return n;
+    },
+    createGain: () => {
+      if (failAt === 'gain') throw new Error('InvalidStateError: context closed');
+      const n = new FakeGainNode();
+      created.push(n);
+      return n;
+    },
+  };
+  return { ctx: ctx as unknown as AudioContext, created };
+};
+
+const noNodes = (cap: VoiceCapture): boolean => {
+  const c = cap as unknown as { src: unknown; node: unknown; sink: unknown };
+  return c.src === null && c.node === null && c.sink === null;
+};
+
+const silenceErrors = () => vi.spyOn(console, 'error').mockImplementation(() => {});
+
+describe('VoiceCapture.start containment', () => {
+  let errors: ReturnType<typeof silenceErrors>;
+
+  beforeEach(() => {
+    workletNodeThrows = false;
+    workletNodes.length = 0;
+    (globalThis as Record<string, unknown>).MediaStream = class {
+      constructor(_tracks: unknown[]) {}
+    };
+    (globalThis as Record<string, unknown>).AudioWorkletNode = class {
+      constructor(_ctx: unknown, _name: string, _opts: unknown) {
+        if (workletNodeThrows) throw new Error('unknown processor name');
+        const node = new FakeWorkletNode();
+        workletNodes.push(node);
+        return node as unknown as object;
+      }
+    };
+    errors = silenceErrors();
+  });
+
+  afterEach(() => {
+    errors.mockRestore();
+    delete (globalThis as Record<string, unknown>).MediaStream;
+    delete (globalThis as Record<string, unknown>).AudioWorkletNode;
+  });
+
+  const track = {} as MediaStreamTrack;
+
+  it('builds the graph and pumps worklet messages as 20 ms-spaced frames', async () => {
+    const cap = new VoiceCapture();
+    const frames: Array<{ pcm: Float32Array; ts: number }> = [];
+    const { ctx } = makeCtx();
+    await expect(
+      cap.start(ctx, track, (pcm, ts) => frames.push({ pcm, ts }), 'worklet.js')
+    ).resolves.toBe(true);
+
+    const block = new Float32Array(960);
+    workletNodes[0].port.onmessage!({ data: block });
+    workletNodes[0].port.onmessage!({ data: block });
+    expect(frames.map(f => f.ts)).toEqual([0, 20_000]);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('resolves false, does not reject, when createMediaStreamSource throws', async () => {
+    const cap = new VoiceCapture();
+    const { ctx } = makeCtx('source');
+    await expect(cap.start(ctx, track, () => {}, 'worklet.js')).resolves.toBe(false);
+    expect(noNodes(cap)).toBe(true);
+    expect(errors).toHaveBeenCalledWith(
+      'voice: failed to build the capture graph',
+      expect.anything()
+    );
+  });
+
+  it('resolves false and tears the partial graph down when the worklet node throws', async () => {
+    workletNodeThrows = true;
+    const cap = new VoiceCapture();
+    const { ctx, created } = makeCtx();
+    await expect(cap.start(ctx, track, () => {}, 'worklet.js')).resolves.toBe(false);
+    expect(noNodes(cap)).toBe(true);
+    // The source node built before the throw is disconnected, not stranded.
+    expect(created[0].disconnects).toBe(1);
+  });
+
+  it('resolves false when the sink cannot be created', async () => {
+    const cap = new VoiceCapture();
+    const { ctx } = makeCtx('gain');
+    await expect(cap.start(ctx, track, () => {}, 'worklet.js')).resolves.toBe(false);
+    expect(noNodes(cap)).toBe(true);
+  });
+
+  it('resolves false on a wrong sample rate and on an addModule failure', async () => {
+    const cap = new VoiceCapture();
+    const { ctx } = makeCtx();
+    (ctx as unknown as { sampleRate: number }).sampleRate = 44100;
+    await expect(cap.start(ctx, track, () => {}, 'worklet.js')).resolves.toBe(false);
+
+    const failing = makeCtx('addModule');
+    await expect(cap.start(failing.ctx, track, () => {}, 'worklet.js')).resolves.toBe(
+      false
+    );
+    expect(noNodes(cap)).toBe(true);
   });
 });

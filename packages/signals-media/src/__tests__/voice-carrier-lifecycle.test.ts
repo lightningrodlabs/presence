@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { VoiceCarrier } from '../voice-carrier.js';
 import { makeFakeHost } from './fake-host.js';
 import { ManualClock } from './manual-clock.js';
@@ -63,15 +63,21 @@ class StubEncodedAudioChunk {
 }
 
 class StubAudioEncoder {
+  static instances: StubAudioEncoder[] = [];
+
   state = 'configured';
 
-  constructor(_init: unknown) {}
+  constructor(_init: unknown) {
+    StubAudioEncoder.instances.push(this);
+  }
 
   configure(_config: unknown): void {}
 
   encode(_data: unknown): void {}
 
-  close(): void {}
+  close(): void {
+    this.state = 'closed';
+  }
 }
 
 class StubAudioData {
@@ -115,6 +121,8 @@ const packet = (): OpusPacket => ({
 });
 
 let voice: VoiceCarrier;
+
+const silenceErrors = () => vi.spyOn(console, 'error').mockImplementation(() => {});
 
 const bindHost = (clock: ManualClock) => {
   const fake = makeFakeHost({ targets: [peer], clock });
@@ -218,5 +226,107 @@ describe('VoiceCarrier bind/unbind symmetry', () => {
     clock.advance(1_000);
     voice.receiveFrame(peer, framePayload(2, 4242));
     expect(voice.peerLastRecvMs.get(peer)).toBe(6_000);
+  });
+});
+
+/**
+ * `VoiceCapture.start` returning false is the carrier's failure signal for
+ * the whole capture path — including every graph-construction throw, which
+ * `VoiceCapture` contains rather than rejecting. What must follow is a full
+ * teardown: the device handle released, the encoder closed, and the next
+ * attempt actually retrying (the `if (this.micHandle) return true` early
+ * return would otherwise report success over a dead pipeline).
+ * Constrains: src/voice-carrier.ts (`startCapture`), src/voice-capture.ts.
+ */
+describe('VoiceCarrier.startCapture failure arm', () => {
+  let errors: ReturnType<typeof silenceErrors>;
+
+  beforeEach(() => {
+    StubAudioEncoder.instances = [];
+    const g = globalThis as Record<string, unknown>;
+    g.AudioDecoder = StubAudioDecoder;
+    g.EncodedAudioChunk = StubEncodedAudioChunk;
+    g.AudioEncoder = StubAudioEncoder;
+    g.AudioData = StubAudioData;
+    g.AudioWorkletNode = class {
+      constructor(..._args: unknown[]) {}
+    };
+    errors = silenceErrors();
+    voice = new VoiceCarrier();
+  });
+
+  afterEach(() => {
+    errors.mockRestore();
+    const g = globalThis as Record<string, unknown>;
+    delete g.AudioDecoder;
+    delete g.EncodedAudioChunk;
+    delete g.AudioEncoder;
+    delete g.AudioData;
+    delete g.AudioWorkletNode;
+  });
+
+  const hostWithMicSpy = () => {
+    const releases: number[] = [];
+    let acquires = 0;
+    const fake = makeFakeHost({ clock: new ManualClock(1_000) });
+    const host: VoiceHost = {
+      ...fake.host,
+      acquireMic: async () => {
+        acquires += 1;
+        return {
+          track: { enabled: true } as MediaStreamTrack,
+          release: () => releases.push(acquires),
+        };
+      },
+    };
+    return { host, releases, acquireCount: () => acquires };
+  };
+
+  it('releases the mic and closes the encoder when capture.start resolves false, and retries next time', async () => {
+    const { host, releases, acquireCount } = hostWithMicSpy();
+    voice.bind(host);
+    let starts = 0;
+    (voice as any).capture = {
+      start: async () => {
+        starts += 1;
+        return false;
+      },
+      stop() {},
+      replaceTrack() {},
+    };
+
+    expect(await voice.startCapture()).toBe(false);
+    expect(starts).toBe(1);
+    expect(acquireCount()).toBe(1);
+    // Teardown ran: device released, encoder closed, no handle retained.
+    expect(releases).toEqual([1]);
+    expect(StubAudioEncoder.instances[0].state).toBe('closed');
+    expect((voice as any).micHandle).toBeNull();
+    expect((voice as any).encoder).toBeNull();
+
+    // The next attempt actually attempts — no `if (this.micHandle) return
+    // true` short-circuit over a dead pipeline.
+    expect(await voice.startCapture()).toBe(false);
+    expect(starts).toBe(2);
+    expect(acquireCount()).toBe(2);
+    expect(releases).toEqual([1, 2]);
+  });
+
+  it('succeeds and holds the handle when capture.start resolves true', async () => {
+    const { host, releases, acquireCount } = hostWithMicSpy();
+    voice.bind(host);
+    (voice as any).capture = {
+      start: async () => true,
+      stop() {},
+      replaceTrack() {},
+    };
+
+    expect(await voice.startCapture()).toBe(true);
+    expect(releases).toEqual([]);
+    expect((voice as any).micHandle).not.toBeNull();
+    // A second call is the idempotent no-op, not a second acquisition.
+    expect(await voice.startCapture()).toBe(true);
+    expect(acquireCount()).toBe(1);
+    expect(errors).not.toHaveBeenCalled();
   });
 });

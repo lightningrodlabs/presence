@@ -49,19 +49,32 @@ export class VoiceCapture {
       return false;
     }
     this.stop();
-    this.src = ctx.createMediaStreamSource(new MediaStream([track]));
-    this.node = new AudioWorkletNode(ctx, 'signals-media-voice-capture', {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      channelCount: 1,
-    });
-    // A zero-gain sink keeps the graph pulled on engines that only process
-    // connected nodes (WebKit).
-    this.sink = ctx.createGain();
-    this.sink.gain.value = 0;
-    this.src.connect(this.node);
-    this.node.connect(this.sink);
-    this.sink.connect(ctx.destination);
+    // Graph construction throws on a closed/closing context, an ended track,
+    // or an unregistered processor name. Contain it here — as Presence's
+    // `buildTrackReader` contained the MediaStreamTrackProcessor
+    // construction — so `start` RESOLVES false instead of rejecting: the
+    // caller's failure arm (`VoiceCarrier.startCapture`) is what releases the
+    // mic handle and closes the encoder, and a rejection would skip it and
+    // strand the device.
+    try {
+      this.src = ctx.createMediaStreamSource(new MediaStream([track]));
+      this.node = new AudioWorkletNode(ctx, 'signals-media-voice-capture', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: 1,
+      });
+      // A zero-gain sink keeps the graph pulled on engines that only process
+      // connected nodes (WebKit).
+      this.sink = ctx.createGain();
+      this.sink.gain.value = 0;
+      this.src.connect(this.node);
+      this.node.connect(this.sink);
+      this.sink.connect(ctx.destination);
+    } catch (e) {
+      console.error('voice: failed to build the capture graph', e);
+      this.stop();
+      return false;
+    }
     this.frames = 0;
     this.node.port.onmessage = e => {
       const pcm = e.data as Float32Array;
