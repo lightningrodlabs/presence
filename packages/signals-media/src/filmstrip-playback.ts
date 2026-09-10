@@ -74,11 +74,6 @@ export class FilmstripPlayback {
   private _queue: QueuedFrame[] = [];
   private _started = false;
   private _animTimer: number | null = null;
-  /** Wall-clock ms when `_animTimer` was (re)armed; pairs with `_animPaceMs`
-   *  so a burst arriving mid-wait can shorten (never lengthen) the
-   *  remaining wait — see `_maybeAccelerate`. */
-  private _animArmedAtMs = 0;
-  private _animPaceMs = 0;
 
   constructor(private readonly sinks: FilmstripPlaybackSinks) {}
 
@@ -123,13 +118,12 @@ export class FilmstripPlayback {
       // seen the freeze; pushing them through more wait is worse than
       // resuming with whatever just arrived.
       this._popAndSchedule();
-    } else {
-      // Already playing with a tick pending. A burst arriving mid-wait
-      // can push the queue past the framePaceMs threshold before the
-      // pending tick fires — shorten the wait so pacing reacts to the
-      // burst immediately rather than at the next tick boundary.
-      this._maybeAccelerate();
     }
+    // Else: already playing with a tick pending — this push just grows
+    // the queue. Pacing is re-evaluated only at the next pop (see
+    // _popAndSchedule), not mid-wait; a burst that arrives while a tick
+    // is pending doesn't speed up the CURRENT wait, only the ones after
+    // it. Verbatim element semantics — see the class doc comment.
   }
 
   clear(): void {
@@ -161,39 +155,10 @@ export class FilmstripPlayback {
     this.sinks.paint(next);
     this.sinks.depth(this._queue.length);
     const pace = framePaceMs(this._queue.length, next.count, next.periodMs);
-    this._armTimer(pace);
-  }
-
-  private _armTimer(paceMs: number): void {
     const timers = this.sinks.timers ?? globalThis;
-    this._animArmedAtMs = Date.now();
-    this._animPaceMs = paceMs;
     this._animTimer = timers.setTimeout(() => {
       this._animTimer = null;
       this._popAndSchedule();
-    }, paceMs);
-  }
-
-  /**
-   * Re-pace the pending tick if the frame now at the front of the queue
-   * would, were it popped this instant, compute a shorter pace than the
-   * one the pending timer was armed with. Only ever shortens the wait —
-   * a push that doesn't cross the framePaceMs threshold leaves the
-   * pending tick untouched, so steady-state (non-burst) arrivals never
-   * push the next paint further out than originally scheduled.
-   */
-  private _maybeAccelerate(): void {
-    if (this._animTimer === null) return;
-    const front = this._queue[0];
-    if (!front) return;
-    const newPace = framePaceMs(this._queue.length - 1, front.count, front.periodMs);
-    const elapsed = Date.now() - this._animArmedAtMs;
-    const currentRemaining = this._animPaceMs - elapsed;
-    const newRemaining = newPace - elapsed;
-    if (newRemaining >= currentRemaining) return;
-    const timers = this.sinks.timers ?? globalThis;
-    timers.clearTimeout(this._animTimer);
-    this._animTimer = null;
-    this._armTimer(Math.max(0, newRemaining));
+    }, pace);
   }
 }

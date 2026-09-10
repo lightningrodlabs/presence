@@ -62,11 +62,32 @@ describe('FilmstripPlayback', () => {
   });
 
   it('plays 25% fast while more than ~1.5 clips are queued (framePaceMs)', () => {
+    // Pace is chosen once per pop, from the queue depth AT THAT POP —
+    // not re-evaluated while a tick is pending (element-verbatim
+    // semantics; a burst arriving mid-wait speeds up later ticks, not
+    // the one already running).
+    //
+    // 4 single-frame clips pushed synchronously at t=0: the first pop
+    // (BUFFER_CLIPS = 1) happens inline inside the first push, before
+    // clips 2-4 arrive, so its pace is computed against an EMPTY queue
+    // -> framePaceMs(0, 1, 100) = 100 (targetDepth = 1, 0 is not > 1.5).
+    // Clips 2-4 then just enqueue (queue = [e2, e3, e4]) — a pending
+    // timer, so no accelerate-on-push per the ruling above.
+    //
+    // t=100: 2nd pop, queue depth after shift = 2 (e3, e4 remain) ->
+    // framePaceMs(2, 1, 100): 2 > 1.5 -> Math.round(100*0.75) = 75.
+    // t=175: 3rd pop, queue depth after shift = 1 (e4 remains) ->
+    // framePaceMs(1, 1, 100): 1 is not > 1.5 -> 100.
+    // t=275: 4th pop, queue empty.
     const painted: number[] = [];
     const p = new FilmstripPlayback({ paint: () => painted.push(Date.now()), depth: () => {} });
     vi.setSystemTime(0);
     for (let i = 0; i < 4; i++) p.push(frame(1, 100));
-    vi.advanceTimersByTime(75); expect(painted).toHaveLength(2); // paced at 75ms
+    expect(painted).toHaveLength(1); // the inline first pop, pace 100 next
+    vi.advanceTimersByTime(100); expect(painted).toHaveLength(2); // t=100, pace now 75
+    vi.advanceTimersByTime(75); expect(painted).toHaveLength(3); // t=175, pace now 100
+    vi.advanceTimersByTime(99); expect(painted).toHaveLength(3); // t=274, not yet
+    vi.advanceTimersByTime(1); expect(painted).toHaveLength(4); // t=275
   });
 
   it('clear drains the queue, stops the timer, and reports depth 0', () => {
