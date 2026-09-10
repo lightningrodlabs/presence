@@ -1,8 +1,12 @@
 /**
  * Public barrel for @lightningrodlabs/signals-media.
  *
- * Task 1 exports the host seam and the pure decision helpers copied out of
- * Presence; the carrier and playback classes land in Tasks 2 and 3.
+ * The host seam, the pure decision helpers copied out of Presence, and the
+ * voice carrier. The filmstrip carrier lands in Task 3.
+ *
+ * The WASM Opus backend is deliberately NOT exported here — it lives behind
+ * the `./opus-wasm` subpath so hosts that never target pre-Safari-26 WebKit
+ * never pull `libopus-wasm` (design spec decision 5b).
  */
 
 export type {
@@ -41,3 +45,19 @@ export {
 export type { SignalsMediaCadence } from './signals-cadence-policy.js';
 
 export { bytesToBase64, base64ToBytes } from './base64.js';
+
+export {
+  VoiceCarrier,
+  VOICE_BATCH_FRAMES,
+  packVoiceFrames,
+  unpackVoicePayload,
+} from './voice-carrier.js';
+export type { VoiceFrame, VoiceFramePayload } from './voice-carrier.js';
+
+export {
+  VoiceCapture,
+  VOICE_SAMPLE_RATE,
+  VOICE_FRAME_SAMPLES,
+} from './voice-capture.js';
+
+export { webCodecsOpus } from './opus-webcodecs.js';

@@ -80,14 +80,23 @@ export interface OpusDecoder {
   close(): void;
 }
 
+/**
+ * Both factories are SYNCHRONOUS and may throw. The receive path is
+ * synchronous end to end — `VoiceCarrier.receiveFrame` opens a peer and
+ * decodes its frames in the same tick, and `openPeer` returns null (frame
+ * dropped) when the decoder cannot be configured, exactly as Presence's
+ * `voice.ts` did. Anything genuinely asynchronous belongs in acquiring the
+ * BACKEND (`wasmOpus(): Promise<OpusCodec>` instantiates its WASM module),
+ * not in creating an encoder or decoder from an acquired one.
+ */
 export interface OpusCodec {
   name: 'webcodecs' | 'wasm' | string;
   createEncoder(
     onPacket: (p: OpusPacket) => void,
     onError: (e: unknown) => void
-  ): Promise<OpusEncoder>;
+  ): OpusEncoder;
   createDecoder(
     onPcm: (pcm: Float32Array, timestampUs: number) => void,
     onError: (e: unknown) => void
-  ): Promise<OpusDecoder>;
+  ): OpusDecoder;
 }
