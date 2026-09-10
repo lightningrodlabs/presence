@@ -2,7 +2,7 @@
  * Public barrel for @lightningrodlabs/signals-media.
  *
  * The host seam, the pure decision helpers copied out of Presence, and the
- * voice carrier. The filmstrip carrier lands in Task 3.
+ * voice and filmstrip carriers.
  *
  * The WASM Opus backend is deliberately NOT exported here — it lives behind
  * the `./opus-wasm` subpath so hosts that never target pre-Safari-26 WebKit
@@ -61,3 +61,23 @@ export {
 } from './voice-capture.js';
 
 export { webCodecsOpus } from './opus-webcodecs.js';
+
+export {
+  FilmstripCarrier,
+  FILMSTRIP_FPS_OPTIONS,
+  FILMSTRIP_CAPTURE_SIZES,
+  FILMSTRIP_RX_LOG_INTERVAL_MS,
+} from './filmstrip-carrier.js';
+export type {
+  FilmstripFps,
+  FilmstripCaptureSize,
+  FilmstripFrame,
+  VideoSignalsStats,
+} from './filmstrip-carrier.js';
+
+export { FilmstripSampler } from './filmstrip-sampler.js';
+
+export {
+  createInlineFilmstripWorker,
+  voiceWorkletModuleUrl,
+} from './inline-sources.js';
