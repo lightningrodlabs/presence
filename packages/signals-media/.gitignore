@@ -1,0 +1,6 @@
+dist/
+node_modules/
+testbed/node_modules/
+testbed/src-tauri/target/
+testbed/test-results/
+result

@@ -1,0 +1,66 @@
+{
+  "name": "@lightningrodlabs/signals-media",
+  "version": "0.1.0",
+  "description": "Opus voice and low-fps JPEG video between peers over any message channel (Holochain remote signals) — no WebRTC, works on WebKitGTK. Bring your own transport.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./filmstrip-worker": {
+      "import": "./dist/filmstrip-worker.js"
+    },
+    "./voice-capture-worklet": {
+      "import": "./dist/voice-capture-worklet.js"
+    },
+    "./opus-wasm": {
+      "types": "./dist/opus-wasm.d.ts",
+      "import": "./dist/opus-wasm.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/gen-inline-sources.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:browser": "playwright test -c testbed/playwright.config.ts",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "keywords": [
+    "holochain",
+    "opus",
+    "webcodecs",
+    "voice",
+    "p2p",
+    "signals",
+    "filmstrip",
+    "webkitgtk",
+    "tauri"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lightningrodlabs/signals-media"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "libopus-wasm": "^0.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}
