@@ -64,6 +64,9 @@ describe('FilmstripCarrier lifecycle', () => {
     carrier.unbind();
     vi.useRealTimers();
     vi.restoreAllMocks();
+    delete (globalThis as unknown as Record<string, unknown>).document;
+    delete (globalThis as unknown as Record<string, unknown>).MediaStream;
+    delete (globalThis as unknown as Record<string, unknown>).createImageBitmap;
   });
 
   it('is unbound until bind and bound after it', () => {
@@ -220,6 +223,64 @@ describe('FilmstripCarrier lifecycle', () => {
     const f = makeFakeHost({ targets: [PEER], cadence: 'full' });
     (carrier as any)._handleClipFromWorker(workerClip());
     expect(f.sent).toHaveLength(0);
+  });
+
+  it('startCapture unwinds — camera released, worker terminated — when the sampler cannot start', async () => {
+    // This is the one arm with no origin counterpart: Presence's
+    // `_sendTrackToWorker` logged and left the camera open behind a pump that
+    // would never produce a frame. Dropping the unwind must fail here.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const g = globalThis as unknown as Record<string, unknown>;
+    g.MediaStream = class {
+      constructor(public tracks: unknown[] = []) {}
+    };
+    g.createImageBitmap = () => Promise.resolve({ close: () => {} });
+    // A camera that opens fine, but an element that refuses to play — the
+    // real WebKit/autoplay failure mode the sampler resolves `false` on.
+    g.document = {
+      createElement: () => ({
+        muted: false,
+        playsInline: false,
+        srcObject: null,
+        videoWidth: 640,
+        play: () => Promise.reject(new Error('no autoplay')),
+        pause: () => {},
+      }),
+    };
+
+    const release = vi.fn();
+    const track = { kind: 'video', readyState: 'live' } as unknown as MediaStreamTrack;
+    const acquireCamera = vi.fn(async () => ({ track, release }));
+    const worker = {
+      postMessage: vi.fn(),
+      terminate: vi.fn(),
+      onmessage: null,
+      onerror: null,
+    };
+    const f = makeFakeHost({ targets: [PEER], cadence: 'full' });
+    carrier.bind({
+      ...f.host,
+      acquireCamera,
+      createWorker: () => worker as unknown as Worker,
+    });
+
+    expect(await carrier.startCapture()).toBe(false);
+
+    expect(acquireCamera).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(worker.terminate).toHaveBeenCalledTimes(1);
+    expect(worker.postMessage).toHaveBeenCalledWith({ type: 'stop' });
+    // Two expected lines: the sampler's own diagnosis, then the carrier's
+    // unwind. The carrier's is the one this test is about.
+    expect(
+      err.mock.calls.filter(c => c[0] === 'filmstrip: sampler failed to start')
+    ).toHaveLength(1);
+
+    // The camera handle was dropped, so a later attempt acquires again
+    // instead of short-circuiting on a stale handle.
+    expect(await carrier.startCapture()).toBe(false);
+    expect(acquireCamera).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledTimes(2);
   });
 
   it('fps and capture-side setters reject values outside the declared options', () => {
