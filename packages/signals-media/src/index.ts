@@ -78,6 +78,13 @@ export type {
 export { FilmstripSampler } from './filmstrip-sampler.js';
 
 export {
+  FilmstripPlayback,
+  BUFFER_CLIPS,
+  MAX_BUFFER_CLIPS,
+} from './filmstrip-playback.js';
+export type { QueuedFrame, FilmstripPlaybackSinks } from './filmstrip-playback.js';
+
+export {
   createInlineFilmstripWorker,
   voiceWorkletModuleUrl,
 } from './inline-sources.js';
