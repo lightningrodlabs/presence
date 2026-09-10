@@ -2,5 +2,7 @@ dist/
 node_modules/
 testbed/node_modules/
 testbed/src-tauri/target/
+testbed/src-tauri/gen/schemas/
 testbed/test-results/
+testbed/playwright-report/
 result

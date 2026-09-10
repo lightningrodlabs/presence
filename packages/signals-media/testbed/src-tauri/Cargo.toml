@@ -1,0 +1,31 @@
+[package]
+name = "signals-media-testbed"
+version = "0.0.0"
+description = "Tauri shell for the signals-media testbed page"
+edition = "2021"
+publish = false
+
+# Deliberately its own workspace root: the monorepo's top-level Cargo.toml is
+# the Holochain zome workspace (wasm32 targets, a pinned hdk), and this desktop
+# binary has nothing to do with it.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Controller ruling R5: pin the newest Tauri 2.x available at implementation
+# time. 2.11.5 was `max_stable_version` on crates.io on 2026-09-10 — the same
+# version the WebKitGTK media probe spike compiled against.
+tauri = { version = "2.11.5", features = [] }
+
+# The Linux webview settings + permission handler (see src/main.rs). Only
+# compiled on Linux; every other platform's webview needs neither.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0", features = ["v2_38"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

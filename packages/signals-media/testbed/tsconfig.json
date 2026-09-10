@@ -1,0 +1,17 @@
+{
+  "//": "Typechecks the two TypeScript files here. Playwright's own transform is esbuild — it strips types without checking them, so without this they would rot silently. Not part of the package's `typecheck` (whose tsconfig includes `src` only): that one runs in the repo-root `verify` gate, where the testbed's dependencies are not installed. This runs as `pretest`, i.e. inside the browser gate.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["playwright.config.ts", "testbed.spec.ts"]
+}
