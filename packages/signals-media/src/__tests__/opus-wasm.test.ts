@@ -224,3 +224,39 @@ describe('wasmOpus decoder', () => {
     got.forEach(g => expect(g.pcm).toHaveLength(VOICE_FRAME_SAMPLES));
   });
 });
+
+describe('wasmOpus queued facade — one shared implementation', () => {
+  it('tags the overflow warning with the calling facade\'s own kind', async () => {
+    // Both facades route their bounded pre-ready queue through the same
+    // `createQueuedFacade` helper (opus-wasm.ts) — this fails if either one
+    // regrew its own copy of the queue/overflow logic with the wrong label,
+    // or dropped the label entirely.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const codec = await wasmOpus();
+
+    const enc = codec.createEncoder(
+      () => {},
+      () => {}
+    );
+    for (let i = 0; i <= WASM_PENDING_MAX; i++) {
+      enc.encode(toneFrame(i % 20), i * 20_000);
+    }
+    await enc.flush();
+
+    const dec = codec.createDecoder(
+      () => {},
+      () => {}
+    );
+    const packet: OpusPacket = { type: 'key', timestampUs: 0, data: Uint8Array.from([1, 2, 3]) };
+    for (let i = 0; i <= WASM_PENDING_MAX; i++) {
+      dec.decode(packet);
+    }
+    await tick();
+
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(warnSpy.mock.calls[0][0]).toContain('encoder');
+    expect(warnSpy.mock.calls[1][0]).toContain('decoder');
+
+    warnSpy.mockRestore();
+  });
+});

@@ -80,61 +80,68 @@ interface QueuedEncode {
   timestampUs: number;
 }
 
-function encodeNow(
-  handle: OpusEncoderHandle,
-  pcm: Float32Array,
-  timestampUs: number,
-  onPacket: (p: OpusPacket) => void,
-  onError: (e: unknown) => void
-): void {
-  try {
-    const data = handle.encodeFloat(pcm);
-    onPacket({ type: 'key', timestampUs, data });
-  } catch (e) {
-    onError(e);
-  }
-}
-
-function decodeNow(
-  handle: OpusDecoderHandle,
-  packet: OpusPacket,
-  onPcm: (pcm: Float32Array, timestampUs: number) => void,
-  onError: (e: unknown) => void
-): void {
-  try {
-    const pcm = handle.decodeFloat(packet.data);
-    onPcm(pcm, packet.timestampUs);
-  } catch (e) {
-    onError(e);
-  }
-}
-
 function warnQueueOverflow(kind: 'encoder' | 'decoder'): void {
   console.warn(
     `voice: wasm ${kind} queue exceeded ${WASM_PENDING_MAX} frames before libopus-wasm was ready; dropping oldest`
   );
 }
 
-function createEncoderFacade(
-  onPacket: (p: OpusPacket) => void,
-  onError: (e: unknown) => void
-): OpusEncoder {
-  let handle: OpusEncoderHandle | null = null;
+interface QueuedFacadeConfig<THandle, TItem> {
+  /** The real (Promise-returning) `libopus-wasm` factory call. */
+  acquire: () => Promise<THandle>;
+  /** The real synchronous call for one item. May throw. */
+  dispatch: (handle: THandle, item: TItem) => void;
+  /** Defensive copy taken when an item must be queued past this tick. */
+  copy: (item: TItem) => TItem;
+  /** Releases the handle — called on close, or on resolve-after-close. */
+  free: (handle: THandle) => void;
+  onError: (e: unknown) => void;
+  warnKind: 'encoder' | 'decoder';
+}
+
+/**
+ * One synchronous facade (R6) over one Promise-returning `libopus-wasm`
+ * factory (R7): `push` queues items made before `acquire()` resolves —
+ * bounded by `WASM_PENDING_MAX`, oldest dropped with one `console.warn` per
+ * facade — and drains them through `dispatch`, in order, the moment the
+ * handle is ready; after that `push` calls `dispatch` directly. A rejected
+ * `acquire()` reports `onError` once, drops the queue, and makes every later
+ * `push` a no-op. `close()` is idempotent: clears the queue and frees the
+ * handle immediately if already resolved, or the moment it resolves
+ * afterward. Shared by both `createEncoderFacade` and `createDecoderFacade`
+ * — a second copy of this control flow is exactly the duplication this
+ * helper exists to prevent.
+ *
+ * Reentrancy invariant: `dispatch` must not call back into this facade's
+ * `push` synchronously — drain order is not preserved if it does.
+ */
+function createQueuedFacade<THandle, TItem>(
+  config: QueuedFacadeConfig<THandle, TItem>
+): { push: (item: TItem) => void; close: () => void; ready: Promise<THandle> } {
+  let handle: THandle | null = null;
   let closed = false;
   let failed = false;
   let warned = false;
-  const pending: QueuedEncode[] = [];
+  const pending: TItem[] = [];
 
-  const readyPromise = libCreateEncoder(ENCODER_OPTIONS);
-  readyPromise.then(
+  const runDispatch = (h: THandle, item: TItem): void => {
+    try {
+      config.dispatch(h, item);
+    } catch (e) {
+      config.onError(e);
+    }
+  };
+
+  const ready = config.acquire();
+  ready.then(
     h => {
       if (closed) {
-        h.free();
+        config.free(h);
         return;
       }
       handle = h;
-      for (const { pcm, timestampUs } of pending) {
-        encodeNow(h, pcm, timestampUs, onPacket, onError);
+      for (const item of pending) {
+        runDispatch(h, item);
       }
       pending.length = 0;
     },
@@ -142,45 +149,72 @@ function createEncoderFacade(
       if (closed) return;
       failed = true;
       pending.length = 0;
-      onError(e);
+      config.onError(e);
     }
   );
 
   return {
-    encode(pcm: Float32Array, timestampUs: number): void {
+    push(item: TItem): void {
       if (closed || failed) return;
       if (handle) {
-        encodeNow(handle, pcm, timestampUs, onPacket, onError);
+        runDispatch(handle, item);
         return;
       }
       if (pending.length >= WASM_PENDING_MAX) {
         pending.shift();
         if (!warned) {
           warned = true;
-          warnQueueOverflow('encoder');
+          warnQueueOverflow(config.warnKind);
         }
       }
-      pending.push({ pcm: pcm.slice(), timestampUs });
-    },
-    async flush(): Promise<void> {
-      // libopus-wasm's encoder handle has no flush() — awaiting readyPromise
-      // is what guarantees any pre-ready queue has drained (the drain
-      // callback above was attached first, so it always runs before this
-      // await resolves), which is the only flush semantics this backend has.
-      try {
-        await readyPromise;
-      } catch {
-        // already reported via onError above
-      }
+      pending.push(config.copy(item));
     },
     close(): void {
       if (closed) return;
       closed = true;
       pending.length = 0;
       if (handle) {
-        handle.free();
+        config.free(handle);
         handle = null;
       }
+    },
+    ready,
+  };
+}
+
+function createEncoderFacade(
+  onPacket: (p: OpusPacket) => void,
+  onError: (e: unknown) => void
+): OpusEncoder {
+  const facade = createQueuedFacade<OpusEncoderHandle, QueuedEncode>({
+    acquire: () => libCreateEncoder(ENCODER_OPTIONS),
+    dispatch: (handle, { pcm, timestampUs }) => {
+      const data = handle.encodeFloat(pcm);
+      onPacket({ type: 'key', timestampUs, data });
+    },
+    copy: ({ pcm, timestampUs }) => ({ pcm: pcm.slice(), timestampUs }),
+    free: handle => handle.free(),
+    onError,
+    warnKind: 'encoder',
+  });
+
+  return {
+    encode(pcm: Float32Array, timestampUs: number): void {
+      facade.push({ pcm, timestampUs });
+    },
+    async flush(): Promise<void> {
+      // libopus-wasm's encoder handle has no flush() — awaiting facade.ready
+      // is what guarantees any pre-ready queue has drained (the facade's own
+      // drain callback was attached first, so it always runs before this
+      // await resolves), which is the only flush semantics this backend has.
+      try {
+        await facade.ready;
+      } catch {
+        // already reported via onError above
+      }
+    },
+    close(): void {
+      facade.close();
     },
   };
 }
@@ -189,60 +223,24 @@ function createDecoderFacade(
   onPcm: (pcm: Float32Array, timestampUs: number) => void,
   onError: (e: unknown) => void
 ): OpusDecoder {
-  let handle: OpusDecoderHandle | null = null;
-  let closed = false;
-  let failed = false;
-  let warned = false;
-  const pending: OpusPacket[] = [];
-
-  libCreateDecoder(DECODER_OPTIONS).then(
-    h => {
-      if (closed) {
-        h.free();
-        return;
-      }
-      handle = h;
-      for (const packet of pending) {
-        decodeNow(h, packet, onPcm, onError);
-      }
-      pending.length = 0;
+  const facade = createQueuedFacade<OpusDecoderHandle, OpusPacket>({
+    acquire: () => libCreateDecoder(DECODER_OPTIONS),
+    dispatch: (handle, packet) => {
+      const pcm = handle.decodeFloat(packet.data);
+      onPcm(pcm, packet.timestampUs);
     },
-    e => {
-      if (closed) return;
-      failed = true;
-      pending.length = 0;
-      onError(e);
-    }
-  );
+    copy: packet => ({ type: packet.type, timestampUs: packet.timestampUs, data: packet.data.slice() }),
+    free: handle => handle.free(),
+    onError,
+    warnKind: 'decoder',
+  });
 
   return {
     decode(packet: OpusPacket): void {
-      if (closed || failed) return;
-      if (handle) {
-        decodeNow(handle, packet, onPcm, onError);
-        return;
-      }
-      if (pending.length >= WASM_PENDING_MAX) {
-        pending.shift();
-        if (!warned) {
-          warned = true;
-          warnQueueOverflow('decoder');
-        }
-      }
-      pending.push({
-        type: packet.type,
-        timestampUs: packet.timestampUs,
-        data: packet.data.slice(),
-      });
+      facade.push(packet);
     },
     close(): void {
-      if (closed) return;
-      closed = true;
-      pending.length = 0;
-      if (handle) {
-        handle.free();
-        handle = null;
-      }
+      facade.close();
     },
   };
 }
