@@ -17,6 +17,12 @@ name: nightly-harness
 #     real RTCPeerConnections — lazy viewer-side establishment on
 #     SdpFsmScreen, dir-routing under mutual share, malformed-dir drop,
 #     and slot/stream teardown on a silent peer drop.
+#   - packages/signals-media testbed.spec.ts — the signals carriers
+#     (Opus voice, JPEG filmstrip) against a real WebCodecs encoder, a
+#     real AudioWorklet and a real Worker, over a real WebSocket relay
+#     between two pages: selftest, both-direction room flow, voice
+#     restart/epoch adoption, target-set switch, cross-backend Opus.
+#     Same reason as the others — the vitest suites drive fakes.
 #
 # Deliberately NOT gated:
 #   - layout.spec.ts — its split-mode baseline is red by design (see
@@ -60,9 +66,24 @@ jobs:
 
       - run: npm run test:harness -w ui
 
+      # The signals-media testbed keeps its own dependency tree (its own
+      # Playwright must own both the runner and the module — see
+      # packages/signals-media/testbed/README.md), so `npm ci` above does not
+      # cover it. `npm run build:packages` already built the dist/ the
+      # testbed page consumes.
+      - run: npm install --no-audit --no-fund
+        working-directory: packages/signals-media/testbed
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: packages/signals-media/testbed
+
+      - run: npm run test:browser -w packages/signals-media
+
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: harness-results
-          path: ui/harness/__results__/
+          path: |
+            ui/harness/__results__/
+            packages/signals-media/testbed/test-results/
           retention-days: 14
