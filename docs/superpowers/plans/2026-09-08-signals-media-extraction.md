@@ -1,5 +1,9 @@
 # Signals-media extraction Implementation Plan
 
+**Status: LANDED on `signals-media`.** Tasks 1 through 7 executed and committed to that branch (`58bb355`..`5484d8d` plus this doc-sync commit; the code commits are confined to `packages/signals-media/`, with the root-glue commits — workspace registration, the nightly-harness step, and this round's drift alarm and `verify` wiring — separate, per spec decision 13). Merging `signals-media` into `main-0.7` is a pending human step; this document describes the branch, not `main-0.7`, until that merge lands. The corresponding `CLAUDE.md` "True today" bullet was added by the Task 7 doc-sync ("Signals-media extraction round facts"). Rulings R1–R17 are recorded in the SDD ledger and the ones that changed the spec are folded into it as landed-with-amendment markers.
+
+**Pending, by declaration:** Task 8 (the `git subtree split` extraction rehearsal); the Android on-device selftest and the Linux↔Android room run (ruling R14 — no device was attached; the debug APK is built and its permissions verified), which is what the Presence adoption round's trigger waits on; the macOS, iOS and Windows testbed runs (Volla's hardware, procedures written in `packages/signals-media/testbed/README.md`); and publishing (registry state is checked with `npm view @lightningrodlabs/signals-media version`, never trusted from prose).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish `@lightningrodlabs/signals-media` — Presence's Opus-voice and JPEG-filmstrip carrier as a transport-agnostic library with a portable (WebKitGTK-capable) capture path — and prove it with a standalone Tauri testbed — Linux and Android run here, Chromium under Playwright as the CI gate, macOS/iOS/Windows configured here and run by Volla — without touching Presence.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** TypeScript strict, tsc build, vitest 1.6 (node), npm workspaces, Tauri 2.x at the newest release whose wry is ≥ 0.56 (cross-platform permission API; `webkit2gtk` crate `v2_38` on Linux), `libopus-wasm` (optional dependency, WASM Opus for pre-Safari-26 WKWebView), node `ws`, Playwright, nix devshell (node 22) for the package; the `android-service-runtime` `main-0.7` devshell (@ `81193a9`) for the Linux and Android Tauri builds (WebKitGTK 2.52.5, Android SDK/NDK). macOS/iOS/Windows builds are configured here and run by Volla.
 
-**Spec:** `docs/superpowers/specs/2026-09-08-signals-media-extraction-design.md` (revised post-spike). Probe evidence: `spikes/webkitgtk-media-probe/FINDINGS.md` and its `main.rs`/`probe.js`, which Task 5 reuses.
+**Spec:** `docs/superpowers/specs/2026-09-08-signals-media-extraction-design.md` (revised post-spike). Probe evidence: `packages/signals-media/docs/webkitgtk-probe/FINDINGS.md` and its `main.rs`/`probe.js` (moved there with the package at Task 7), which Task 5 reuses.
 
 ## Global Constraints
 
@@ -322,7 +326,7 @@ export class FilmstripPlayback { constructor(sinks: FilmstripPlaybackSinks); pus
 
 **Files:**
 - Create: `testbed/relay.mjs`, `testbed/package.json`, `testbed/ui/{index.html,testbed.js,vite.config.js}`, `testbed/src-tauri/{Cargo.toml,build.rs,tauri.conf.json,capabilities/default.json,icons/icon.png,src/main.rs}`, `testbed/playwright.config.ts`, `testbed/testbed.spec.ts`, `testbed/README.md`
-- Reuse: `spikes/webkitgtk-media-probe/main.rs` (the WebKit settings + permission handler + `report`/exit plumbing) — copy the relevant functions, cite the spike.
+- Reuse: `packages/signals-media/docs/webkitgtk-probe/main.rs` (the WebKit settings + permission handler + `report`/exit plumbing) — copy the relevant functions, cite the spike.
 
 **Interfaces:**
 - Consumes: the package's `dist/` (the testbed's Vite config aliases `@lightningrodlabs/signals-media` → `../../src/index.ts` for dev, and the real `dist` for the Tauri build).
@@ -417,7 +421,7 @@ git commit -m "ci: run the signals-media Chromium testbed in the nightly harness
 - [ ] **Step 3: CHANGELOG** `## 0.1.0 — <date>` — initial release; copied from Presence `ab90584`; capture path change (AudioWorklet / video-element sampling) declared; wire-compatible with Presence 0.15.6.
 - [ ] **Step 4: `npm pack --dry-run`** in the package: `dist/` (index, worker, worklet, inline sources, `.d.ts`), README, CHANGELOG, LICENSE; no `src/`, no `testbed/`.
 - [ ] **Step 5: CLAUDE.md** "True today" bullet **Signals-media extraction round facts**: package/version/dir; the host seam names; that `ui/src/room/modules/{voice,video-filmstrip}.ts` and the four pure modules now have a DECLARED PARALLEL COPY in the package (working agreement 1), what retires it (the Presence adoption round, triggered by the testbed being green on Linux, Android, and Chromium — record the dates the three went green), and the drift alarm (the package's wire-fixture test reads Presence's sources); the capture-path difference (package: AudioWorklet + video-element sampling; Presence: `MediaStreamTrackProcessor`) as a declared divergence the adoption round resolves; the probe's facts with the file citation; registry state checked with `npm view @lightningrodlabs/signals-media version`. Mark the spec's decisions landed/not-landed; set this plan's status.
-- [ ] **Step 5b: Docs travel with the package.** `git mv spikes/webkitgtk-media-probe packages/signals-media/docs/webkitgtk-probe` (findings, sources, probe `main.rs`/`probe.js`); copy this spec to `packages/signals-media/docs/design.md` with a header line naming the monorepo original as the authoritative copy until extraction; `docs/README.md` indexes both plus `testbed/README.md`.
+- [ ] **Step 5b: Docs travel with the package.** ~~`git mv spikes/webkitgtk-media-probe packages/signals-media/docs/webkitgtk-probe`~~ — superseded by ruling R16: a `git mv` across the two trees would be a mixed commit, so the package-only commit COPIES `FINDINGS.md`/`main.rs`/`probe.js` into `packages/signals-media/docs/webkitgtk-probe/` and the root-glue commit deletes `spikes/webkitgtk-media-probe/`. Copy this spec to `packages/signals-media/docs/design.md` with a header line naming the monorepo original as the authoritative copy until extraction; `docs/README.md` indexes both plus `testbed/README.md`.
 - [ ] **Step 6: Gate + commits** (confined rule): package docs/fixture/README/CHANGELOG in one commit — `docs(signals-media): 0.1.0 README/CHANGELOG, wire fixture, design docs travel with the package`; root drift script + `verify` wiring + CLAUDE.md + spec/plan markers in a second — `build: signals-media drift alarm in verify; doc-sync for the extraction round`.
 
 ---

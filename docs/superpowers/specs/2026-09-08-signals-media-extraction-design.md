@@ -1,7 +1,14 @@
 # Signals-media extraction — design spec
 
+**Landed** on branch `signals-media` (2026-09-10), except where a decision says
+otherwise: each numbered decision below carries a one-line landed /
+landed-with-amendment / not-landed marker, and the "Carrier switching" section
+is corrected per ruling R13. Not landed: the macOS, iOS and Windows testbed
+runs (decision 9) and the extraction rehearsal (decision 13).
+
 Written 2026-09-08; revised the same day after the WebKitGTK media probe
-(`spikes/webkitgtk-media-probe/FINDINGS.md`) and on 2026-09-10 for the
+(`packages/signals-media/docs/webkitgtk-probe/FINDINGS.md`, moved there with
+the package on 2026-09-10) and on 2026-09-10 for the
 Apple/Windows targets. Built on `main-0.7`, branch `signals-media`.
 Purpose: lift the signals-based audio/video carrier out of `ui/src` into a
 published package that a third-party Holochain app (Volla Messages, a
@@ -46,7 +53,7 @@ Two things block reuse:
    `enable-webrtc` setting reads back true and the class still does not
    exist — WebKit's GTK port defaults `ENABLE_WEB_RTC` to
    `ENABLE_EXPERIMENTAL_FEATURES`, which nixpkgs and Ubuntu leave OFF;
-   corroborated in `spikes/webkitgtk-media-probe/FINDINGS.md`), so
+   corroborated in `packages/signals-media/docs/webkitgtk-probe/FINDINGS.md`), so
    on Linux Tauri the signals carrier is the only carrier; and the
    alternative capture path works there: AudioWorklet PCM →
    `AudioEncoder('opus')` → `AudioDecoder`, camera → `<video>` → canvas →
@@ -64,6 +71,9 @@ Two things block reuse:
    payload)` when a payload arrives. Rejected: a "signals session" object
    owning targets, cadence evaluation, and RTT — presence concerns, and
    Volla has its own roster.
+
+   _Landed._ The host record is `src/types.ts`; nothing in `src/` mentions Holochain, zomes, presence or rosters.
+
 2. **Copy, don't move — Presence is untouched this round, by
    declaration.** The two controllers and the pure helpers are COPIED into
    the package and adapted; nothing under `ui/src` changes. This is a
@@ -74,6 +84,9 @@ Two things block reuse:
    and Chromium. Until then the package's wire fixture (decision 8) is
    derived from Presence's shapes, so drift between the copies fails the
    package's tests. CLAUDE.md records the copy and its trigger.
+
+   _Landed, with one sentence superseded (ruling R17)._ `git diff --stat main-0.7 -- ui/` is empty across the branch, and CLAUDE.md carries the copy and its trigger. The drift check is NOT the package's wire-fixture test — that test reads only its own fixture, because the package must stay self-contained (decision 13). Drift between the copies is caught by the root `scripts/check-signals-media-drift.mjs`, which reads the fixture and Presence's two modules and runs inside the root `verify`; it is monorepo glue and is dropped on extraction. The adoption trigger still waits on Android (see decision 9).
+
 3. **Two carrier classes, `VoiceCarrier` and `FilmstripCarrier`, over
    injected `VoiceHost`/`FilmstripHost` bindings**, bodies taken from the
    controllers under a substitution table (`this.store.X` → `this.host.X`)
@@ -81,12 +94,18 @@ Two things block reuse:
    lifecycle is kept: "the receive side is live once bound" is a clean
    statement for a consumer, and Presence's adoption round can keep its
    singletons.
+
+   _Landed._ `src/voice-carrier.ts` and `src/filmstrip-carrier.ts`, bodies under the substitution table, `bind`/`unbind` kept.
+
 4. **The pure helpers ship in the package**: `decidePlayout`,
    `decideVoiceAdmission`/`nextVoiceEpoch`, `estimatePlayoutSenderTimeMs`/
    `framePaceMs`, `packVoiceFrames`/`unpackVoicePayload`,
    `decideSignalsMediaCadence`, plus a framework-free `FilmstripPlayback`
    extracted from `peer-filmstrip.ts` (queue, burst pacing, cap,
    first-clip start, underrun resume, depth reporting).
+
+   _Landed, amended by ruling R10._ All the named helpers ship. `FilmstripPlayback` (`src/filmstrip-playback.ts`) keeps the Lit element's pop-time pacing VERBATIM — the first cut added a burst-acceleration behavior to satisfy a plan-supplied test; the test was the defect and was rewritten to the element's actual timing. A pacing change is a later declared decision, not a side effect of extraction.
+
 5. **ONE portable capture path per medium; the `MediaStreamTrackProcessor`
    dependency is dropped.** Audio: `host.acquireMic()` track →
    `MediaStreamAudioSourceNode` → an `AudioWorkletProcessor` that
@@ -103,6 +122,9 @@ Two things block reuse:
    Chromium path returns as a declared second backend, not before.
    Encode/decode default to WebCodecs (WebKitGTK provides them over
    GStreamer; Chromium natively) behind the codec seam of decision 5b.
+
+   _Landed._ `src/voice-capture.ts` + `src/voice-capture-worklet.ts` and `src/filmstrip-sampler.ts`; no `MediaStreamTrackProcessor` anywhere in the package. No Chromium-specific second backend was added — the Chromium gate produced no measured reason for one.
+
 5b. **An Opus codec seam with two backends, because Apple WebKit has no
    WebCodecs audio before Safari 26.** `AudioEncoder`/`AudioDecoder` shipped
    in Safari 26.0 (macOS 26 / iOS 26, 2025); Safari 16.4–18.x expose only
@@ -122,21 +144,33 @@ Two things block reuse:
    interoperate, pinned by a cross-backend test in the Chromium gate. This
    is a second backend with a measured reason (the Safari version floor),
    consistent with decision 5's rule.
+
+   _Landed, amended by rulings R6 and R7._ `OpusCodec.createEncoder`/`createDecoder` are SYNCHRONOUS (the receive path must attach a decoder or drop the frame in the same tick); backend acquisition is the async half, `wasmOpus(): Promise<OpusCodec>`. Because `libopus-wasm` 0.3.0 creates its encoder/decoder asynchronously and does not export its internals, the WASM backend's factories return bounded queueing facades (`WASM_PENDING_MAX`, oldest dropped, drain in order on resolve). Cross-backend interop is pinned in the Chromium gate, both directions.
+
 6. **The host evaluates cadence and batch eligibility; the carriers read
    the verdicts.** `VoiceHost.cadence()` / `batchEligible()` mirror
    Presence's `signalsCadence()` / `voiceBatchEligible()`. The capability
    string `voice-batch-v1` stays host vocabulary; the package documents
    the `{ v: 2, frames }` format and that a host gates `batchEligible()` on
    its own capability declaration.
+
+   _Landed._ `MediaHost.cadence()`/`VoiceHost.batchEligible()`; `voice-batch-v1` appears nowhere in the package.
+
 7. **Clock rule unchanged.** Presence-relevant stamps (`peerLastRecvMs`,
    `peerLastSentMs`, `lastAcceptedMs`) ride `host.clock.now()`; wire stamps
    (`wts`, `t0`, `ts`, the capture epoch) stay `Date.now()`; display-hold
    and URL-revoke timers use `globalThis.setTimeout`.
+
+   _Landed._ Pinned by the copied suites and reviewed per task against the substitution table.
+
 8. **Wire format byte-identical to Presence 0.15.6, pinned by a golden
    fixture** (`src/__tests__/fixtures/wire.json`: voice v1 frame with `red`,
    voice v2 batch, filmstrip clip, filmstrip stop) with a test asserting
    parse and encode. Presence and package peers interoperate; Chromium and
    WebKitGTK peers interoperate.
+
+   _Landed._ `src/__tests__/fixtures/wire.json` + `src/__tests__/wire-fixture.test.ts`: exact key sets and order, `packVoiceFrames` byte-equality, `unpackVoicePayload` round-trips including the legacy single-frame arm. The test reads only the fixture; the cross-tree check is the root drift script.
+
 9. **A standalone Tauri testbed proves the library on real platforms.**
    `packages/signals-media/testbed/`: a Tauri 2 app with no Holochain, whose
    transport is a 40-line WebSocket broadcast relay (`testbed/relay.mjs`,
@@ -165,6 +199,9 @@ Two things block reuse:
    machines, following `testbed/README.md`'s per-platform procedure, which
    is written so a run yields a pass/fail stdout transcript they paste
    back. The `selftest` mode exists for exactly this hand-off.
+
+   _Landed for Linux, Chromium and the Android build; amended by rulings R11, R12 and R14; NOT LANDED for the macOS, iOS and Windows runs._ Linux WebKitGTK 2.52.5 selftest (default and inline) and a two-instance room passed 2026-09-10; the Chromium Playwright gate passed 2026-09-10 (including both cross-backend Opus directions, the carrier switch and restart admission). R11: the testbed consumes the built `dist/`, never `src/`. R12: the nightly step self-skips on a ref without the package. R14: no Android device was attached — the debug APK is built and its permissions verified (2026-09-10), the on-device selftest and the Linux↔Android room run are pending a device, and the adoption-round trigger of decision 2 waits on that run. macOS, iOS and Windows are configured with their permission plumbing and per-platform procedures; their runs are Volla's and have not happened.
+
 10. **Worker and worklet ship in the package, with bundler-proof
     fallbacks.** `dist/filmstrip-worker.js` and `dist/voice-capture-worklet.js`
     are referenced by `new URL(…, import.meta.url)` by default; both are
@@ -172,16 +209,25 @@ Two things block reuse:
     `createInlineFilmstripWorker()` / `voiceWorkletModuleUrl()` (Blob URLs
     — the probe loaded a Blob worklet on WebKitGTK). Hosts override via
     `FilmstripHost.createWorker?()` / `VoiceHost.workletModuleUrl?()`.
+
+    _Landed, with ruling R4 recorded._ `dist/filmstrip-worker.js`/`dist/voice-capture-worklet.js` plus `createInlineFilmstripWorker()`/`voiceWorkletModuleUrl()`; both paths exercised on WebKitGTK and Chromium. R4: `src/inline-sources.generated.ts` is checked in EMPTY and overwritten in `dist/` by the build, so in a source checkout the two inline helpers produce empty sources — stated in the package README.
+
 11. **Package name `@lightningrodlabs/signals-media`, version 0.1.0,
     directory `packages/signals-media`**, on the `webrtc-peer` scaffold
     (tsc → `dist/`, vitest node, ES2022, strict + `noUnused*`, `sideEffects:
     false`, MIT). The testbed and `docs/` are excluded from the npm
     tarball but travel with the directory (decision 13). The name is open
     to change before publish.
+
+    _Landed._ Name, version and directory as written; `testbed/` and `docs/` are outside the npm tarball (`npm pack --dry-run` lists `dist/`, README, CHANGELOG, LICENSE only).
+
 12. **Zero change to Presence is the definition of done for this round**
     (`git diff --stat main-0.7 -- ui/` empty). Root scripts gain the
     package in `build:packages`/`test:unit`/`typecheck`/`verify`; CI's
     `verify` job needs no edit.
+
+    _Landed._ `ui/` is byte-identical to `main-0.7` across the branch; the root scripts carry the package, and the only root-glue commits are the workspace registration and this round's drift-alarm wiring.
+
 13. **Built on a branch, and extractable into its own repository with one
     command.** All work lands on `signals-media` off `main-0.7` (worktree),
     merged `--no-ff` when done. Extractability is a property of the tree
@@ -213,6 +259,8 @@ Two things block reuse:
       scratch directory, `npm install && npm run verify` there under the
       package's own flake, and record the result — extractability is
       verified, not asserted.
+
+    _Landed for the tree and the commits; the extraction rehearsal is a separate task._ The directory carries its own flake, `docs/` (this spec, the probe, the testbed procedure) and an inert `.github/workflows/verify.yaml`; monorepo glue (workspace registration, root `verify` wiring, the nightly step, the drift alarm) lives outside it in its own commits. The `git subtree split` rehearsal is the plan's Task 8 and is not part of this doc-sync.
 
 ## The package
 
@@ -315,15 +363,26 @@ Chromium gate:
   is a host-side set change with no library call. A peer removed from the
   set stops receiving on the next frame; a peer added starts on the next
   frame.
+- **A target-set change does NOT restart capture** (corrected 2026-09-10,
+  ruling R13 — an earlier draft of this section and of the plan's
+  carrier-switch test said such a switch "resumes with an adopted
+  epoch", which is wrong and would have been a bug). Capture keeps
+  running, the epoch does not change, and the receiver records no
+  session adoption: continuity, not adoption, is what makes a
+  target-set switch gap-free. The Chromium gate asserts exactly this —
+  dropping a peer from the set stops its voice, re-adding it resumes on
+  the same session.
 - `startCapture()` is called when the set first becomes non-empty and
   `stopCapture()` when it empties (Presence's reconciler pattern). The
   host keeps the device handle across switches (the `acquireMic` handle
   is the host's; the carrier only holds its `TrackHandle`), the worklet
   module is loaded once per AudioContext, so a restart costs one encoder
-  configure — tens of milliseconds, measured in the testbed.
-- Every restart is a new capture-session epoch; `decideVoiceAdmission`
-  admits it immediately on the receiver (the 2026-08-26 deafness fix),
-  so a WebRTC→signals→WebRTC→signals sequence never deafens.
+  configure — 54–75 ms across Chromium gate runs, from `stopCapture()` +
+  `startCapture()` to the first frame handed to `host.send`.
+- Only a `stopCapture()`/`startCapture()` pair is a new capture-session
+  epoch; `decideVoiceAdmission` admits it immediately on the receiver
+  (the 2026-08-26 deafness fix), so a WebRTC→signals→WebRTC→signals
+  sequence that does tear capture down never deafens.
 - `cadence()` needs an RTT measure to be useful; a host without one
   returns `'full'`. The README shows the minimal ping/pong a host can run
   over its own channel to feed `decideSignalsMediaCadence`.
