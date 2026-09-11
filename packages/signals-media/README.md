@@ -504,6 +504,15 @@ npm run test:browser          # Playwright Chromium gate
 - [`docs/webkitgtk-probe/FINDINGS.md`](docs/webkitgtk-probe/FINDINGS.md) — why
   there is no WebRTC on WebKitGTK 2.52, and what the capture path needs at
   runtime. `main.rs` and `probe.js` beside it are the probe itself.
+- [`API.md`](API.md) — the reference: one section per exported symbol, with
+  its signature, its contract and what it does on failure. Checked against
+  `src/index.ts` by `src/__tests__/api-doc.test.ts`.
+- [`AGENTS.md`](AGENTS.md) — the short list for anyone about to modify or
+  embed this package: the invariants and what enforces each one, how to run
+  the gates, and the platform plumbing an embedder owes.
+- [`examples/`](examples/README.md) — two typechecked hosts (a minimal one
+  over a transport you supply, and the full Holochain one) plus the
+  coordinator-zome half.
 - [`testbed/README.md`](testbed/README.md) — how to run it on each platform,
   and what has actually been run.
 - `src/types.ts` — the host interfaces. Types are the authority; this README is

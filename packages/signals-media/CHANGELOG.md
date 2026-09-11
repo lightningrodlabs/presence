@@ -41,6 +41,11 @@ accident.
   `dist/voice-capture-worklet.js`, resolved by `new URL(…, import.meta.url)`,
   with Blob-URL fallbacks (`createInlineFilmstripWorker`,
   `voiceWorkletModuleUrl`) for bundlers that neither emit nor inline them.
+- Docs: `API.md` (one section per exported symbol, kept honest by
+  `src/__tests__/api-doc.test.ts`), `AGENTS.md` (invariants, gates, platform
+  plumbing, what not to do) and `examples/` (a minimal generic-transport host
+  and a full Holochain one, both typechecked by `tsconfig.examples.json`, with
+  the coordinator-zome half beside them).
 - A Tauri 2 testbed (`testbed/`, excluded from the npm tarball) with a
   WebSocket relay, a self-asserting `selftest` mode and an N-instance `room`
   mode; the same page is the package's Playwright Chromium gate.

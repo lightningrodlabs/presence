@@ -25,6 +25,9 @@
   },
   "files": [
     "dist",
+    "examples",
+    "API.md",
+    "AGENTS.md",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
@@ -32,7 +35,7 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/gen-inline-sources.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.examples.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "npm --prefix testbed test",
@@ -60,6 +63,7 @@
     "libopus-wasm": "^0.3.0"
   },
   "devDependencies": {
+    "@holochain/client": "^0.21.0",
     "typescript": "^5.4.0",
     "vitest": "^1.6.0"
   }
