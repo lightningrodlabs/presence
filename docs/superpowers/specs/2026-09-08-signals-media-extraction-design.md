@@ -3,8 +3,10 @@
 **Landed** on branch `signals-media` (2026-09-10), except where a decision says
 otherwise: each numbered decision below carries a one-line landed /
 landed-with-amendment / not-landed marker, and the "Carrier switching" section
-is corrected per ruling R13. Not landed: the macOS, iOS and Windows testbed
-runs (decision 9) and the extraction rehearsal (decision 13).
+is corrected per ruling R13. The extraction rehearsal (decision 13) landed
+2026-09-10 — three passes, the second and third after a real defect the first
+pass found. Not landed: the macOS, iOS and Windows testbed runs (decision 9)
+and the Android on-device runs (decision 9, ruling R14).
 
 Written 2026-09-08; revised the same day after the WebKitGTK media probe
 (`packages/signals-media/docs/webkitgtk-probe/FINDINGS.md`, moved there with
@@ -169,7 +171,9 @@ Two things block reuse:
    parse and encode. Presence and package peers interoperate; Chromium and
    WebKitGTK peers interoperate.
 
-   _Landed, with the claim narrowed to what is actually tested._ `src/__tests__/fixtures/wire.json` records the four shapes, derived by reading Presence's construction sites at `ab90584`; `src/__tests__/wire-fixture.test.ts` pins the fixture's own key sets, order and nesting AND drives `VoiceCarrier`/`FilmstripCarrier` through a fake host, asserting the payloads they hand to `host.send` carry exactly those keys in that order (mutation-checked: a field added to the voice frame literal or dropped from the clip literal reddens it), plus `packVoiceFrames` byte-equality and `unpackVoicePayload` round-trips including the legacy single-frame arm. NOT tested by any suite: a package peer against a real Presence peer. "Byte-identical to Presence 0.15.6" is therefore an inference from the fixture's provenance plus these sender assertions plus the root drift script's field-name check — the wording in the package README and CHANGELOG says so (corrected in the Task 7 fix round). The test reads only the fixture; the cross-tree check is the root drift script.
+   _Landed, with the claim narrowed to what is actually tested, and with one declared receive-side divergence._ `src/__tests__/fixtures/wire.json` records the four shapes, derived by reading Presence's construction sites at `ab90584`; `src/__tests__/wire-fixture.test.ts` pins the fixture's own key sets, order and nesting AND drives `VoiceCarrier`/`FilmstripCarrier` through a fake host, asserting the payloads they hand to `host.send` carry exactly those keys in that order (mutation-checked: a field added to the voice frame literal or dropped from the clip literal reddens it), plus `packVoiceFrames` byte-equality and `unpackVoicePayload` round-trips including the legacy single-frame arm. NOT tested by any suite: a package peer against a real Presence peer. "Byte-identical to Presence 0.15.6" is therefore an inference from the fixture's provenance plus these sender assertions plus the root drift script's field-name check — the wording in the package README and CHANGELOG says so (corrected in the Task 7 fix round). The test reads only the fixture; the cross-tree check is the root drift script.
+
+   _Declared divergence (ruling R20), receive side only, wire format unchanged._ `FilmstripCarrier.receiveFrame` validates clip GEOMETRY before touching any per-peer state: `n` must be an integer in `1..MAX_CLIP_FRAMES` (exported; 64) and `p` finite and positive, otherwise the clip is dropped and one `console.warn` is emitted per peer. Presence's `ui/src/room/modules/video-filmstrip.ts` passes both straight through to its playback loop, where `n` bounds the loop and `p` paces the timer chain — tolerable inside an app that only ever receives from its own build, not in a library whose hosts take remote input, and incompatible with the package README's promise that a malformed payload is dropped. Nothing an honest sender emits is affected (this package sends `n: 1`; the legacy batching senders the receive path still accepts stayed far below 64), so the wire format and the fixture are unchanged. The adoption round carries this validation into Presence.
 
 9. **A standalone Tauri testbed proves the library on real platforms.**
    `packages/signals-media/testbed/`: a Tauri 2 app with no Holochain, whose
@@ -260,7 +264,7 @@ Two things block reuse:
       package's own flake, and record the result — extractability is
       verified, not asserted.
 
-    _Landed for the tree and the commits; the extraction rehearsal is a separate task._ The directory carries its own flake, `docs/` (this spec, the probe, the testbed procedure) and an inert `.github/workflows/verify.yaml`; monorepo glue (workspace registration, root `verify` wiring, the nightly step, the drift alarm) lives outside it in its own commits. The `git subtree split` rehearsal is the plan's Task 8 and is not part of this doc-sync.
+    _Landed, including the extraction rehearsal._ The directory carries its own flake, `docs/` (this spec, the probe, the testbed procedure) and an inert `.github/workflows/verify.yaml`; monorepo glue (workspace registration, root `verify` wiring, the nightly step, the drift alarm) lives outside it in its own commits. The `git subtree split` rehearsal (the plan's Task 8) ran three times on 2026-09-10 and is what makes extractability verified rather than asserted: the FIRST pass found a real defect — `testbed/` resolved `@lightningrodlabs/signals-media` only through the monorepo's hoisted root `node_modules`, and `testbed/ui/vite.config.js` computed its `server.fs.allow` root by reaching up to the monorepo root, so standalone the browser gate could not even typecheck. Ruling R19 fixed it package-only (`testbed/package.json` declares a `file:..` dependency and the Vite config derives `fs.allow` from resolution); ruling R18 governs the rehearsal's scratch-tree-and-delete procedure. The second and third passes ran fully standalone with no monorepo access — install, typecheck, unit suites, build, `npm pack --dry-run` and the Playwright browser gate all green. The record, including the per-pass commands, the mixed-commit scan and the lockfile consequence for the extracted repo's first commit, is `packages/signals-media/docs/README.md`'s "Extraction rehearsal" section.
 
 ## The package
 
@@ -377,7 +381,8 @@ Chromium gate:
   host keeps the device handle across switches (the `acquireMic` handle
   is the host's; the carrier only holds its `TrackHandle`), the worklet
   module is loaded once per AudioContext, so a restart costs one encoder
-  configure — 54–75 ms across Chromium gate runs, from `stopCapture()` +
+  configure — 54–75 ms across recorded runs (the run records are in
+  `packages/signals-media/testbed/README.md`), from `stopCapture()` +
   `startCapture()` to the first frame handed to `host.send`.
 - Only a `stopCapture()`/`startCapture()` pair is a new capture-session
   epoch; `decideVoiceAdmission` admits it immediately on the receiver
