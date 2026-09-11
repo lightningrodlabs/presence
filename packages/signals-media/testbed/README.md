@@ -141,6 +141,11 @@ the receiver and its measured cost; the host dropping and re-adding a peer from
 `targets()` (the carrier-switch shape); and cross-backend Opus in both
 directions (WASM sender → WebCodecs receiver and the reverse).
 
+On that carrier switch the gate asserts **no** epoch adoption (controller
+ruling R13): dropping a peer from `targets()` never stops capture, so voice
+resumes on the *same* session epoch with a continuing `seq` — an adoption
+there would be a bug, not the expected behaviour.
+
 ## The Linux (WebKitGTK) plumbing
 
 Three things, all of which a real Tauri app would have to do too. The first two

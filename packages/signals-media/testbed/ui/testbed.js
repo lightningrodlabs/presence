@@ -45,6 +45,11 @@ import {
  * that never opened the page. Deliberately the FIRST statement after the
  * imports.
  */
+/**
+ * @param {string} step
+ * @param {boolean} ok
+ * @param {unknown} detail
+ */
 const invokeReport = (step, ok, detail) => {
   try {
     globalThis.__TAURI__?.core?.invoke('report', { step, ok, detail: String(detail) });
@@ -81,18 +86,46 @@ const me = params.get('peer') ?? `peer-${Math.random().toString(36).slice(2, 7)}
 // ---------------------------------------------------------------------------
 // Page furniture + reporting
 // ---------------------------------------------------------------------------
-const logEl = document.getElementById('log');
-const tilesEl = document.getElementById('tiles');
-const statsEl = document.getElementById('stats');
-const startBtn = document.getElementById('start');
-document.getElementById('who').textContent =
+/**
+ * `getElementById` with the null arm turned into a throw. These ids are in
+ * `index.html` by construction; a null is a broken build, not a runtime
+ * condition worth branching on at every call site.
+ *
+ * @param {string} id
+ * @returns {HTMLElement}
+ */
+function el(id) {
+  const node = document.getElementById(id);
+  if (!node) throw new Error(`testbed: #${id} is missing from index.html`);
+  return node;
+}
+
+/**
+ * Message of a thrown value, whatever it is.
+ * @param {unknown} e
+ * @returns {string}
+ */
+const errText = e => (e instanceof Error ? e.message : String(e));
+
+const logEl = el('log');
+const tilesEl = el('tiles');
+const statsEl = el('stats');
+const startBtn = /** @type {HTMLButtonElement} */ (el('start'));
+el('who').textContent =
   `${me} · mode=${mode} codec=${codecName}${inline ? ' inline' : ''}${tone ? ' tone' : ''} · ${durationS}s`;
 
-/** Everything `host.log` and the carriers' console noise produced, in order. */
+/**
+ * Everything `host.log` and the carriers' console noise produced, in order.
+ * @type {string[]}
+ */
 const logLines = [];
-/** console.error text only — the "no decoder error" assertion reads this. */
+/**
+ * console.error text only — the "no decoder error" assertion reads this.
+ * @type {string[]}
+ */
 const consoleErrors = [];
 
+/** @param {string} line */
 function logLine(line) {
   logLines.push(line);
   if (logLines.length > 800) logLines.shift();
@@ -114,9 +147,17 @@ window.addEventListener('error', e => {
   logLine(`ERR window.onerror: ${e.message}`);
 });
 
-/** step -> { ok, detail }; Playwright reads this as `__testbed.results`. */
+/**
+ * step -> { ok, detail }; Playwright reads this as `__testbed.results`.
+ * @type {import('./testbed-globals.js').TestbedResults}
+ */
 const results = {};
 
+/**
+ * @param {string} step
+ * @param {boolean} ok
+ * @param {unknown} detail
+ */
 function report(step, ok, detail) {
   results[step] = { ok, detail: String(detail) };
   logLine(`${ok ? 'OK  ' : 'FAIL'} ${step}: ${detail}`);
@@ -134,9 +175,15 @@ function report(step, ok, detail) {
 // ---------------------------------------------------------------------------
 // Peers seen, and the host's target set
 // ---------------------------------------------------------------------------
-/** peer -> wall-clock ms of its last `hello`. */
+/**
+ * peer -> wall-clock ms of its last `hello`.
+ * @type {Map<string, number>}
+ */
 const seen = new Map();
-/** Set by `__testbed.setTargets`; null = derive from `seen`. */
+/**
+ * Set by `__testbed.setTargets`; null = derive from `seen`.
+ * @type {string[] | null}
+ */
 let targetsOverride = null;
 
 const targets = () =>
@@ -161,36 +208,62 @@ const filmstrip = new FilmstripCarrier();
  * scope would take the whole page down with no diagnostic (the spike's
  * `FINDINGS.md` recorded exactly that failure on a devshell without the
  * plugin path).
+ *
+ * @type {AudioContext | null}
  */
 let ctx = null;
+/** @type {string | null} */
 let ctxError = null;
 
+/** @returns {AudioContext | null} */
 function audioContext() {
   if (ctx || ctxError) return ctx;
   try {
     ctx = new AudioContext({ sampleRate: 48000 });
   } catch (e) {
-    ctxError = e?.message ?? String(e);
+    ctxError = errText(e);
     invokeReport('audioContext.create', false, ctxError);
   }
   return ctx;
 }
 
-/** Resolved before `bind` when ?codec=wasm; see `resolveCodec()`. */
+/**
+ * Resolved before `bind` when ?codec=wasm; see `resolveCodec()`.
+ * @type {import('@lightningrodlabs/signals-media').OpusCodec | null}
+ */
 let wasmCodec = null;
 
 let voiceSent = 0;
 let clipsSent = 0;
 let epochAdopts = 0;
-/** peer -> highest voice session epoch seen from it. */
+/**
+ * peer -> highest voice session epoch seen from it.
+ * @type {Map<string, number>}
+ */
 const lastEpoch = new Map();
-/** performance.now() at `restartVoice()`, cleared by the first voice send. */
+/**
+ * performance.now() at `restartVoice()`, cleared by the first voice send.
+ * @type {number | null}
+ */
 let restartT0 = null;
+/** @type {number | null} */
 let restartCostMs = null;
-/** performance.now() when capture was started; reported, not asserted on. */
+/**
+ * performance.now() when capture was started; reported, not asserted on.
+ * @type {number | null}
+ */
 let captureStartedMs = null;
 let started = false;
 
+/**
+ * The embedder seam, in one object: this record satisfies BOTH host
+ * interfaces, exactly as a real embedder's would. The annotation is what
+ * makes a drift in the library's seam a compile error here (`npm run
+ * typecheck` in `pretest`) instead of a mystery failure in the nightly gate.
+ *
+ * @type {import('@lightningrodlabs/signals-media').VoiceHost &
+ *       import('@lightningrodlabs/signals-media').FilmstripHost}
+ */
 const host = {
   targets,
   cadence: () => 'full',
@@ -257,15 +330,25 @@ const host = {
     const track = s.getVideoTracks()[0];
     return { track, release: () => track.stop() };
   },
-
-  ...(inline
-    ? { workletModuleUrl: voiceWorkletModuleUrl, createWorker: createInlineFilmstripWorker }
-    : {}),
 };
 
+// The bundler-proof fallbacks, assigned rather than conditionally spread so
+// that the annotation on `host` actually constrains them: `workletModuleUrl`
+// is a FUNCTION returning a URL, not a URL.
+if (inline) {
+  host.workletModuleUrl = voiceWorkletModuleUrl;
+  host.createWorker = createInlineFilmstripWorker;
+}
+
 // The Opus backend seam: only defined when ?codec=wasm, so the default path
-// never touches the WASM subpath (and never loads libopus-wasm).
-if (codecName === 'wasm') host.codec = () => wasmCodec;
+// never touches the WASM subpath (and never loads libopus-wasm). The seam is
+// synchronous and non-null by contract (`OpusCodec`), hence the throw.
+if (codecName === 'wasm') {
+  host.codec = () => {
+    if (!wasmCodec) throw new Error('testbed: the WASM Opus backend never resolved');
+    return wasmCodec;
+  };
+}
 
 async function resolveCodec() {
   if (codecName !== 'wasm') return;
@@ -277,9 +360,31 @@ async function resolveCodec() {
 // ---------------------------------------------------------------------------
 // Tiles: one <img> per remote peer, painted by FilmstripPlayback
 // ---------------------------------------------------------------------------
-/** peer -> tile record. */
+/**
+ * @typedef {object} Tile
+ * @property {string} peer
+ * @property {HTMLImageElement} img
+ * @property {HTMLDivElement} meta
+ * @property {HTMLElement} levelBar
+ * @property {number} painted
+ * @property {number | null} firstPaintMs
+ * @property {number | null} lastPaintMs
+ * @property {number[]} paintTimes
+ * @property {number} depth
+ * @property {import('@lightningrodlabs/signals-media').FilmstripPlayback} playback
+ * @property {() => void} unsub
+ */
+
+/**
+ * peer -> tile record.
+ * @type {Map<string, Tile>}
+ */
 const tiles = new Map();
 
+/**
+ * @param {string} peer
+ * @returns {Tile}
+ */
 function ensureTile(peer) {
   const existing = tiles.get(peer);
   if (existing) return existing;
@@ -296,18 +401,14 @@ function ensureTile(peer) {
   wrap.append(img, level, meta);
   tilesEl.appendChild(wrap);
 
-  const tile = {
-    peer,
-    img,
-    meta,
-    levelBar,
-    painted: 0,
-    firstPaintMs: null,
-    lastPaintMs: null,
-    paintTimes: [],
-    depth: 0,
-  };
-  tile.playback = new FilmstripPlayback({
+  // Construction order matters twice over. The playback sinks close over
+  // `tile`, so `tile` is declared first and assigned before anything can call
+  // them; and `subscribe` fires its callback SYNCHRONOUSLY with the latest
+  // frame, so it must come after that assignment or the first paint would hit
+  // an unassigned `tile`. The subscriber closes over `playback`, never `tile`.
+  /** @type {Tile} */
+  let tile;
+  const playback = new FilmstripPlayback({
     paint: frame => {
       img.src = frame.url;
       const now = performance.now();
@@ -321,9 +422,23 @@ function ensureTile(peer) {
       filmstrip.setBufferDepth(peer, d);
     },
   });
+  tile = {
+    peer,
+    img,
+    meta,
+    levelBar,
+    painted: 0,
+    firstPaintMs: null,
+    lastPaintMs: null,
+    paintTimes: [],
+    depth: 0,
+    playback,
+    // Replaced on the next line; `subscribe` cannot run before `tile` exists.
+    unsub: () => {},
+  };
   tile.unsub = filmstrip.subscribe(peer, frame => {
-    if (frame) tile.playback.push(frame);
-    else tile.playback.clear();
+    if (frame) playback.push(frame);
+    else playback.clear();
   });
   tiles.set(peer, tile);
   return tile;
@@ -336,15 +451,22 @@ function ensureTile(peer) {
  * between 4 and 7 depending on where the sample lands, which made the room
  * assertion flap (observed 2026-09-10: 105 frames over 19 s read as
  * `fpsIn=4`).
+ *
+ * @param {Tile} tile
  */
 function fpsOf(tile) {
-  if (tile.painted < 2) return 0;
+  if (tile.painted < 2 || tile.firstPaintMs === null || tile.lastPaintMs === null) {
+    return 0;
+  }
   const spanMs = tile.lastPaintMs - tile.firstPaintMs;
   if (spanMs <= 0) return 0;
   return Number((((tile.painted - 1) * 1000) / spanMs).toFixed(2));
 }
 
-/** Trailing-5 s paint rate. Display only — see `fpsOf` for why. */
+/**
+ * Trailing-5 s paint rate. Display only — see `fpsOf` for why.
+ * @param {Tile} tile
+ */
 function fpsRecent(tile) {
   const now = performance.now();
   while (tile.paintTimes.length && now - tile.paintTimes[0] > 5000) {
@@ -356,7 +478,12 @@ function fpsRecent(tile) {
 // ---------------------------------------------------------------------------
 // Delivery
 // ---------------------------------------------------------------------------
+/**
+ * @param {string} peer
+ * @param {string} payload
+ */
 function noteEpoch(peer, payload) {
+  /** @type {import('@lightningrodlabs/signals-media').VoiceFramePayload[]} */
   let frames;
   try {
     frames = unpackVoicePayload(payload);
@@ -377,6 +504,17 @@ function noteEpoch(peer, payload) {
   }
 }
 
+/**
+ * One frame off the channel, in the relay's wire shape.
+ *
+ * @typedef {object} RelayFrame
+ * @property {string} from
+ * @property {string[] | null} [to]
+ * @property {'hello' | 'voice' | 'filmstrip'} kind
+ * @property {string} payload
+ */
+
+/** @param {RelayFrame} frame */
 function deliver({ from, kind, payload }) {
   if (kind === 'hello') {
     seen.set(from, Date.now());
@@ -395,8 +533,10 @@ function deliver({ from, kind, payload }) {
 // ---------------------------------------------------------------------------
 // Channel
 // ---------------------------------------------------------------------------
+/** @type {WebSocket | null} */
 let ws = null;
 
+/** @returns {Promise<boolean>} */
 function openChannel() {
   if (mode === 'selftest') {
     // One synthetic peer, kept fresh so `targets()` never empties.
@@ -406,24 +546,28 @@ function openChannel() {
     return Promise.resolve(true);
   }
   return new Promise(resolve => {
-    ws = new WebSocket(relayUrl);
-    ws.onopen = () => {
+    // A local binding, not the module-level `ws`, so the closures below do not
+    // have to re-prove it is non-null on every tick.
+    const sock = new WebSocket(relayUrl);
+    ws = sock;
+    sock.onopen = () => {
       report('channel', true, `relay ${relayUrl} open`);
       const hello = () =>
-        ws.readyState === 1 &&
-        ws.send(JSON.stringify({ from: me, to: null, kind: 'hello', payload: '' }));
+        sock.readyState === 1 &&
+        sock.send(JSON.stringify({ from: me, to: null, kind: 'hello', payload: '' }));
       hello();
       setInterval(hello, 1000);
       resolve(true);
     };
-    ws.onerror = () => {
+    sock.onerror = () => {
       report('channel', false, `relay ${relayUrl} error`);
       resolve(false);
     };
-    ws.onmessage = ev => {
+    sock.onmessage = ev => {
+      /** @type {RelayFrame} */
       let msg;
       try {
-        msg = JSON.parse(ev.data);
+        msg = JSON.parse(String(ev.data));
       } catch {
         return;
       }
@@ -437,10 +581,20 @@ function openChannel() {
 // ---------------------------------------------------------------------------
 // Stats surface
 // ---------------------------------------------------------------------------
-function mapObj(m, f = v => v) {
+/**
+ * @template V, R
+ * @param {Map<string, V>} m
+ * @param {(v: V) => R} f
+ * @returns {Record<string, R>}
+ */
+function mapObj(m, f) {
   return Object.fromEntries([...m].map(([k, v]) => [k, f(v)]));
 }
 
+/** @type {<T>(v: T) => T} */
+const identity = v => v;
+
+/** @returns {import('./testbed-globals.js').TestbedStats} */
 function stats() {
   return {
     me,
@@ -451,9 +605,9 @@ function stats() {
     clipsSent,
     voiceRecvPeers: [...voice.peerLastRecvMs.keys()],
     voiceSentPeers: [...voice.peerLastSentMs.keys()],
-    recvMs: mapObj(voice.peerLastRecvMs),
-    sentMs: mapObj(voice.peerLastSentMs),
-    audioLevel: mapObj(voice.peerAudioLevels),
+    recvMs: mapObj(voice.peerLastRecvMs, identity),
+    sentMs: mapObj(voice.peerLastSentMs, identity),
+    audioLevel: mapObj(voice.peerAudioLevels, identity),
     framesPainted: Object.fromEntries([...tiles].map(([p, t]) => [p, t.painted])),
     fpsIn: Object.fromEntries([...tiles].map(([p, t]) => [p, fpsOf(t)])),
     fpsRecent: Object.fromEntries([...tiles].map(([p, t]) => [p, fpsRecent(t)])),
@@ -469,7 +623,7 @@ function stats() {
       transitMs: s.transitMs,
     })),
     epochAdopts,
-    epochs: mapObj(lastEpoch),
+    epochs: mapObj(lastEpoch, identity),
     restartCostMs,
     targets: [...targets()],
     consoleErrors: consoleErrors.slice(-20),
@@ -565,7 +719,10 @@ async function start() {
 
   // `nav=reload` identifies the post-settings load under the Tauri shell,
   // which reloads the page after flipping WebKit's media settings.
-  const nav = performance.getEntriesByType?.('navigation')?.[0]?.type ?? 'unknown';
+  const navEntry = /** @type {PerformanceNavigationTiming | undefined} */ (
+    performance.getEntriesByType?.('navigation')?.[0]
+  );
+  const nav = navEntry?.type ?? 'unknown';
   report('env', true, `nav=${nav} ${navigator.userAgent}`);
   report(
     'env.features',
@@ -581,13 +738,13 @@ async function start() {
     await c.resume();
     report('audioContext', c.state === 'running', `state=${c.state} rate=${c.sampleRate}`);
   } catch (e) {
-    report('audioContext', false, e?.message ?? e);
+    report('audioContext', false, errText(e));
   }
 
   try {
     await resolveCodec();
   } catch (e) {
-    report('codec.wasm', false, e?.message ?? e);
+    report('codec.wasm', false, errText(e));
   }
 
   await openChannel();
@@ -605,14 +762,15 @@ async function start() {
 }
 
 startBtn.addEventListener('click', () => {
-  start().catch(e => report('start', false, e?.message ?? e));
+  start().catch(e => report('start', false, errText(e)));
 });
 setInterval(renderStats, 250);
 
 // ---------------------------------------------------------------------------
 // Automation surface
 // ---------------------------------------------------------------------------
-window.__testbed = {
+/** @type {import('./testbed-globals.js').TestbedApi} */
+const testbedApi = {
   me,
   mode,
   results,
@@ -645,6 +803,7 @@ window.__testbed = {
    * this peer off the signals carrier (WebRTC took over); `setTargets(null)`
    * hands control back to the `hello` roster.
    */
+  /** @param {string[] | null} list */
   setTargets(list) {
     targetsOverride = list === null ? null : [...list];
     return [...targets()];
@@ -652,5 +811,7 @@ window.__testbed = {
 
   carriers: { voice, filmstrip },
 };
+
+window.__testbed = testbedApi;
 
 if (auto) setTimeout(() => startBtn.click(), 500);

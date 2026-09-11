@@ -11,42 +11,14 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+// The automation surface has ONE declaration, shared with the page that
+// writes it (`ui/testbed.js`). This import also pulls in that file's
+// `declare global`, which is what types `window.__testbed` below. A local
+// re-declaration here would be a second copy of the same contract, checked
+// against nothing on the writing side.
+import type { TestbedStats } from './ui/testbed-globals.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-
-interface TestbedStats {
-  me: string;
-  started: boolean;
-  uptimeMs: number;
-  voiceSent: number;
-  clipsSent: number;
-  voiceRecvPeers: string[];
-  recvMs: Record<string, number>;
-  audioLevel: Record<string, number>;
-  framesPainted: Record<string, number>;
-  fpsIn: Record<string, number>;
-  epochAdopts: number;
-  restartCostMs: number | null;
-  targets: string[];
-  consoleErrors: string[];
-}
-
-interface TestbedResults {
-  [step: string]: { ok: boolean; detail: string };
-}
-
-declare global {
-  interface Window {
-    __testbed: {
-      results: TestbedResults;
-      done: boolean;
-      stats(): TestbedStats;
-      consoleErrors(): string[];
-      restartVoice(): Promise<number | null>;
-      setTargets(list: string[] | null): string[];
-    };
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Relay
@@ -280,9 +252,11 @@ test.describe.serial('room', () => {
       20_000,
       'b to resume receiving voice from a'
     );
-    // The capture session never stopped, so the resumed frames carry the SAME
-    // epoch and a continuing `seq`: admission takes them without a session
-    // adoption and without resetting a decoder.
+    // Controller ruling R13: the task brief's "resumes with an adopted epoch"
+    // was mis-specified — a target-set change never stops capture, so
+    // `VoiceCarrier`'s epoch is unchanged and the resumed frames carry the SAME
+    // `ep` with a continuing `seq`; admission takes them with no session
+    // adoption and no decoder reset, and an adoption here would be a bug.
     expect(resumed.epochAdopts).toBe(stalled.epochAdopts);
     expect(decoderErrors(resumed)).toEqual([]);
   });
