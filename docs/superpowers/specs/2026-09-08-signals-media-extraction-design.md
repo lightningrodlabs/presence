@@ -169,7 +169,7 @@ Two things block reuse:
    parse and encode. Presence and package peers interoperate; Chromium and
    WebKitGTK peers interoperate.
 
-   _Landed._ `src/__tests__/fixtures/wire.json` + `src/__tests__/wire-fixture.test.ts`: exact key sets and order, `packVoiceFrames` byte-equality, `unpackVoicePayload` round-trips including the legacy single-frame arm. The test reads only the fixture; the cross-tree check is the root drift script.
+   _Landed, with the claim narrowed to what is actually tested._ `src/__tests__/fixtures/wire.json` records the four shapes, derived by reading Presence's construction sites at `ab90584`; `src/__tests__/wire-fixture.test.ts` pins the fixture's own key sets, order and nesting AND drives `VoiceCarrier`/`FilmstripCarrier` through a fake host, asserting the payloads they hand to `host.send` carry exactly those keys in that order (mutation-checked: a field added to the voice frame literal or dropped from the clip literal reddens it), plus `packVoiceFrames` byte-equality and `unpackVoicePayload` round-trips including the legacy single-frame arm. NOT tested by any suite: a package peer against a real Presence peer. "Byte-identical to Presence 0.15.6" is therefore an inference from the fixture's provenance plus these sender assertions plus the root drift script's field-name check — the wording in the package README and CHANGELOG says so (corrected in the Task 7 fix round). The test reads only the fixture; the cross-tree check is the root drift script.
 
 9. **A standalone Tauri testbed proves the library on real platforms.**
    `packages/signals-media/testbed/`: a Tauri 2 app with no Holochain, whose
