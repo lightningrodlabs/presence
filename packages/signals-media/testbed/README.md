@@ -255,12 +255,14 @@ below is a procedure for Volla to run and report back, not something verified
 here.
 
 **Do not use `nix develop`.** The flake's `devShells` list includes
-`x86_64-darwin`/`aarch64-darwin`, but its `tauriDeps` (`webkitgtk_4_1`,
-`gtk3`, …) are pulled into `buildInputs` unconditionally — they are not
-gated behind `pkgs.stdenv.isLinux` — and those are Linux/GTK packages with no
-reason to exist on macOS. Whether that shell even evaluates on darwin has not
-been checked from here; the plain toolchain below is what Tauri itself
-documents for macOS and is what this procedure is built against. Prerequisites,
+`x86_64-darwin`/`aarch64-darwin`, but both its `tauriDeps`
+(`webkitgtk_4_1`, `gtk3`, …, pulled into `buildInputs`) and several entries
+in its plain `packages` list (`pipewire`, `gsettings-desktop-schemas`,
+`shared-mime-info`) are Linux-only and unconditional — none of them gated
+behind `pkgs.stdenv.isLinux` — with no reason to exist on macOS. Whether that
+shell even evaluates on darwin has not been checked from here; the plain
+toolchain below is what Tauri itself documents for macOS and is what this
+procedure is built against. Prerequisites,
 per Tauri's own guide: Xcode Command Line Tools (`xcode-select --install`),
 Rust via [rustup](https://rustup.rs) (this repo's `rust-toolchain.toml` pins
 `channel = "stable"` and rustup picks it up automatically from the directory —
@@ -358,9 +360,15 @@ Area → Activate Console) while the app runs. Report which one worked.
 `codec=wasm` is required below iOS 26 for the same reason as macOS — Safari
 26.0 is when `AudioEncoder`/`AudioDecoder` arrived — and the `codec=webcodecs`
 run is iOS 26+ only, same two-command pattern as the macOS section. Expected
-transcript shape and what to paste back: identical to the macOS section
-above, plus the device/simulator name and iOS version (`xcrun simctl list
-devices` for a simulator, Settings → General → About on a physical device).
+transcript shape and what to paste back: mostly identical to the macOS
+section above (the `[testbed] query`/`page`/per-step `OK` lines, the final
+`[testbed] OK   SUMMARY`, `navigator.userAgent`, iOS version, the double-
+prompt question), **except process exit.** The command above never sets
+`TESTBED_EXIT_ON_SUMMARY` — unlike desktop, whether an env var set on
+`tauri ios dev` even reaches the launched app process is unverified (see
+above), so, same as Android: the transcript is the verdict, and the process
+is expected to keep running past `SUMMARY` rather than exit — do not treat a
+still-running process as a hang.
 
 ### 8. Windows (WebView2)
 
@@ -417,8 +425,12 @@ Expected transcript shape: same shape as the Linux Results table —
 `[testbed] query: ?…`, one `[testbed] page …` pair, a `[testbed] OK` line per
 step, a final `[testbed] OK   SUMMARY`, process exit 0. Paste back: the full
 transcript, the Windows build (`winver`), and the WebView2 Runtime version
-(`Get-Item "$env:ProgramFiles(x86)\Microsoft\EdgeWebView\Application\*" |
-Select-Object -ExpandProperty Name`, or
+(`Get-Item "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application\*" |
+Select-Object -ExpandProperty Name` — note the `${env:Name}` brace form: a
+bare `$env:ProgramFiles(x86)` stops parsing the variable token at `(`, so it
+interpolates only `$env:ProgramFiles` and appends the literal text `(x86)`,
+producing `C:\Program Files(x86)\...` with no space — which does not match
+the real `C:\Program Files (x86)` folder, or
 `reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" /v pv`).
 
 ## The Android plumbing
