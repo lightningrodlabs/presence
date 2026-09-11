@@ -287,6 +287,8 @@ function pingTick(): void {
   cadenceMode = decideSignalsMediaCadence({
     // "Nothing has echoed back from anyone" is channel evidence, not peer
     // evidence — it pauses media, it does not decide that a peer is absent.
+    // The `lastPongAtMs !== 0` term keeps this false until the first pong
+    // ever arrives: no evidence yet is not evidence of down.
     carrierDown:
       callMembers.size > 0 &&
       lastPongAtMs !== 0 &&
@@ -392,14 +394,21 @@ async function resolveCodec(): Promise<OpusCodec> {
 
 /** Call from a click or tap: the AudioContext must be unlocked by a gesture. */
 export async function connect(): Promise<void> {
+  // FIRST, before any await. README, "The AudioContext": the context must be
+  // created and resumed INSIDE the user gesture. On WebKit (WKWebView and
+  // WebKitGTK) user activation does not survive an awaited call, so creating
+  // it after `AppWebsocket.connect()` leaves it `suspended` — and a suspended
+  // context still reports sampleRate 48000, so startCapture() succeeds, no
+  // audio is ever captured or played, and nothing is logged.
+  audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  await audioCtx.resume();
+
   client = await AppWebsocket.connect();
   client.on('signal', signal => {
     if (signal.type !== SignalType.App) return;
     handleSignal(signal.value.payload);
   });
 
-  audioCtx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
-  await audioCtx.resume();
   codec = await resolveCodec();
 
   // Bind before anything else: the receive side goes live here, and

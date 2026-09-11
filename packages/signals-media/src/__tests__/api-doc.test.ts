@@ -96,6 +96,13 @@ describe('API.md documents the public barrel', () => {
     );
   });
 
+  it('the barrel has no star re-export', () => {
+    // `export * from '…'` publishes names this file's parser cannot see, which
+    // would let an export slip past the forward check. Keep the barrel
+    // explicit; if a star is ever wanted, the parser has to grow first.
+    expect(indexSource).not.toMatch(/export\s+(?:type\s+)?\*/);
+  });
+
   it('every exported name has a section in API.md', () => {
     expect(undocumented(apiDoc, exports)).toEqual([]);
   });

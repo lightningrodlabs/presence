@@ -295,7 +295,10 @@ subscribe(
 
 Subscribe to one peer's frames. The callback fires immediately with that peer's
 latest frame if there is one, then on every receive. Returns the unsubscribe
-function. A callback that throws is caught and logged on the replay path.
+function. A callback that throws is caught and logged at all three call sites
+— the replay on subscribe, the per-receive broadcast, and the clear that
+delivers `null` — so one bad subscriber cannot starve the others or the
+receive path.
 
 #### `FilmstripCarrier.getLatest(peer)`
 
@@ -614,8 +617,9 @@ is replaced; the carrier rebinds without restarting the session.
 `audioContext()` must be a resumed 48 kHz context, shared with playout.
 `batchEligible()` must be true only when **every current target** parses a
 batch ([README, Batching and the capability gate](README.md#batching-and-the-capability-gate)).
-`codec()` is asked once per bind and cached until `unbind`; one that throws
-reads as "no codec".
+`codec()` is asked on first use and the answer cached until `unbind()` —
+`bind()` does not clear it, so a second `bind()` without an intervening
+`unbind()` keeps the first host's codec. One that throws reads as "no codec".
 
 ### `FilmstripHost`
 
