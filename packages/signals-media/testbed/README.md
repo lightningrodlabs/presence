@@ -13,7 +13,7 @@ Three things live here:
 |---|---|
 | `relay.mjs` | A dumb WebSocket broadcast relay. One text frame in, the same frame out to every other socket. Stands in for the Holochain remote-signal path. |
 | `ui/` | The testbed page. One host record drives BOTH carriers; `?mode=selftest` loops `host.send` back to itself, `?mode=room` addresses the relay. |
-| `src-tauri/` | A Tauri 2 desktop shell that opens the page on **WebKitGTK**, does the Linux media plumbing, prints every `report` line to stdout and exits on `SUMMARY`. |
+| `src-tauri/` | A Tauri 2 shell that opens the page on **WebKitGTK** (Linux) or the **Android WebView**, does each platform's media plumbing, prints every `report` line to stdout and exits on `SUMMARY` (desktop only). The app is `src/lib.rs`; `src/main.rs` is the desktop shim and `gen/android/` the Android project. |
 
 Plus `testbed.spec.ts` + `playwright.config.ts`: the automated Chromium gate.
 
@@ -43,6 +43,7 @@ string, so `src-tauri` injects the query as an initialization script).
 | `inline` | off | use `createInlineFilmstripWorker` / `voiceWorkletModuleUrl` instead of the `import.meta.url` references |
 | `tone` | off | drive voice from a 440 Hz oscillator instead of the mic — the deterministic path (a real mic in a quiet room is legitimately near-silent, so audio-level assertions only bind under `tone=1`) |
 | `codec` | `webcodecs` | `wasm` pulls the `./opus-wasm` subpath and passes it as `VoiceHost.codec` |
+| `gumretry` | `0` | seconds to keep retrying a rejected `getUserMedia`, once a second. `0` is one attempt and the rejection propagates — a missing device stays a fast failure. Set to `30` on Android, where the OS permission dialog races the first capture (see [The Android plumbing](#the-android-plumbing)) |
 
 `window.__testbed` is the automation surface: `stats()`, `results`, `done`,
 `consoleErrors()`, `logLines()`, `restartVoice()`, `setTargets(list)`.
@@ -146,10 +147,167 @@ ruling R13): dropping a peer from `targets()` never stops capture, so voice
 resumes on the *same* session epoch with a continuing `seq` — an adoption
 there would be a bug, not the expected behaviour.
 
+### 5. Android (WebView)
+
+Everything here runs in **this package's** devshell too: it is what carries
+`adb`, `cargo-ndk`, the Android SDK/NDK (`ANDROID_HOME`, `NDK_HOME`) and JDK
+17. The SDK licences are accepted by the flake
+(`android_sdk.accept_license = true`); nothing else has to be set by hand.
+
+```bash
+cd packages/signals-media
+nix develop
+
+# Once: generate src-tauri/gen/android (it is committed, so normally skip this)
+npm --prefix testbed exec tauri -- android init
+
+# Debug APK, with the page query baked in (see below)
+TESTBED_URL_QUERY='mode=selftest&auto=1&gumretry=30' \
+  npm --prefix testbed exec tauri -- android build --debug --apk --target aarch64
+```
+
+- **`--target aarch64`** builds only arm64-v8a, which is every current phone.
+  Omit it and the CLI builds all four ABIs — and calls `rustup target add` for
+  the ones `rust-toolchain.toml` does not list, which mutates the *user's*
+  rustup toolchain rather than the devshell's Rust. `rust-toolchain.toml`
+  carries `aarch64-linux-android` and `armv7-linux-androideabi`; pass
+  `--target aarch64 --target armv7` for both.
+- The APK lands at
+  `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`
+  — "universal" even with one ABI; the CLI's own last line names the path.
+- **Do not read the APK's size off an incremental rebuild.** AGP repacks the
+  zip in place and leaves the superseded entries as slack: one observed
+  rebuild produced a 260 MB file whose entries still totalled 141 MB.
+  `rm -rf src-tauri/gen/android/app/build` before measuring. (It installs and
+  runs either way — this is a measurement trap, not a correctness one.)
+
+Four things had to change for this to build at all, and each is a trap worth
+recognising rather than rediscovering:
+
+| Symptom | Fix, and where it lives |
+|---|---|
+| *"The default value `0.0.0` is not allowed for Android package"* | `tauri.conf.json` `"version": "0.0.1"` (Task 5 had `0.0.0`; desktop did not care) |
+| *"no library targets found in package `signals-media-testbed`"* | `[lib]` in `Cargo.toml` + the `lib.rs`/`main.rs` split — see the bottom of [The Android plumbing](#the-android-plumbing) |
+| *"Failed to install … build-tools;35.0.0 … The SDK directory is not writable"* | AGP **8.6.1** (from the template's 8.11.0) in `gen/android/build.gradle.kts` and `gen/android/buildSrc/build.gradle.kts`, plus `buildToolsVersion = "34.0.0"` in `app/build.gradle.kts`. 8.6.1 is the newest AGP whose minimum build-tools is 34.0.0, which is what the flake's SDK contains; a newer AGP silently ignores the pin and tries to download 35.0.0 into the read-only nix store. `android.suppressUnsupportedCompileSdk=36` in `gradle.properties` silences AGP 8.6's complaint about `compileSdk = 36` (the platform is present — the flake declares 34 and 36). Raising the flake's `buildToolsVersions` would let AGP move back up; that is a flake change, and this is not. |
+| *"npm error Missing script: `tauri`"* during `:app:rustBuild…` | a `"tauri": "tauri"` script in `testbed/package.json` — the rust gradle plugin shells back out to the CLI through it |
+- `tauri android init` regenerates the whole `gen/android` tree. Re-running it
+  **overwrites every file this target edits**: `app/src/main/AndroidManifest.xml`,
+  `app/src/main/java/.../MainActivity.kt`, `app/build.gradle.kts`,
+  `build.gradle.kts`, `buildSrc/build.gradle.kts` and `gradle.properties`.
+  `git diff` after an init shows exactly what to put back.
+
+#### Install, launch, watch
+
+```bash
+adb devices                                  # expect exactly one device
+adb install -r testbed/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+adb logcat -c                                # clear, so the transcript is this run's
+adb shell am start -n org.lightningrodlabs.signals_media_testbed/.MainActivity
+adb logcat | grep testbed                    # the [testbed] lines, via RustStdoutStderr
+```
+
+Android has no `TESTBED_EXIT_ON_SUMMARY`: the process does not exit on
+`SUMMARY`, the transcript is the verdict. Expect `[testbed] query: ?…`, one
+`[testbed] page …` pair, a `[testbed] OK` line per step and a final
+`[testbed] OK   SUMMARY`. On the very first launch the OS permission dialog
+appears before the page is interactive — tap Allow twice; later launches are
+silent.
+
+#### The Linux↔Android room
+
+Relay on the laptop, one Tauri instance beside it, the phone on the same
+Wi-Fi. `<laptop-ip>` is the laptop's LAN address (`ip -4 addr`), never
+`127.0.0.1` — that is the phone on the phone.
+
+```bash
+# laptop
+PORT=8765 HOST=0.0.0.0 node testbed/relay.mjs &
+DISPLAY=:1 TESTBED_EXIT_ON_SUMMARY=1 \
+  TESTBED_URL_QUERY='mode=room&auto=1&peer=linux&duration=30&relay=ws://<laptop-ip>:8765' \
+  testbed/src-tauri/target/debug/signals-media-testbed &
+
+# phone: rebuild with the room query baked in, then reinstall
+TESTBED_URL_QUERY='mode=room&auto=1&peer=android&duration=30&gumretry=30&relay=ws://<laptop-ip>:8765' \
+  npm --prefix testbed exec tauri -- android build --debug --apk --target aarch64
+adb install -r testbed/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+adb shell am start -n org.lightningrodlabs.signals_media_testbed/.MainActivity
+adb logcat | grep testbed
+```
+
+Pass: both transcripts end `OK   SUMMARY`, each side reports voice received
+from the other with 0% loss, and each side's filmstrip paints at ≥5 fps. Add
+`&tone=1` to both for an asserted audio level rather than a reported one.
+Record with the results:
+
+```bash
+adb shell getprop ro.product.model; adb shell getprop ro.build.version.release
+adb shell dumpsys package com.google.android.webview | grep versionName
+```
+
+`ws://` works because the **debug** build sets
+`android:usesCleartextTraffic="true"` (`app/build.gradle.kts`); a release APK
+would need `wss://` or a network-security config.
+
+## The Android plumbing
+
+Four things, and the first is the point: **almost none of it is ours.**
+
+1. **wry already grants camera and microphone.** Checked before writing any
+   Kotlin, per this task's step 1:
+   `~/.cargo/registry/src/*/wry-0.55.1/src/android/kotlin/RustWebChromeClient.kt`
+   **lines 94–119** override `onPermissionRequest`, map
+   `android.webkit.resource.AUDIO_CAPTURE` onto `RECORD_AUDIO` +
+   `MODIFY_AUDIO_SETTINGS` and `…VIDEO_CAPTURE` onto `CAMERA`, launch the OS
+   request through the activity's own `ActivityResultLauncher`, and call
+   `request.grant(request.resources)` when the user allows (`request.deny()`
+   otherwise). That is the brief's first case: **no `WebChromeClient`
+   subclass of ours, no `onPermissionRequest` override**. Android is the
+   opposite of Linux here — WebKitGTK's default denies and we had to write a
+   handler; the Android WebView's wry-supplied handler asks and grants.
+   (Note it does *not* check `hasPermissions` first: it launches its request
+   every time, which is why the pre-grant below can collide with it.)
+2. **Manifest** (`gen/android/app/src/main/AndroidManifest.xml`):
+   `RECORD_AUDIO`, `CAMERA`, `MODIFY_AUDIO_SETTINGS` added beside the
+   template's `INTERNET`, plus `uses-feature` for camera and microphone with
+   `required="false"` — a device missing either still runs the other half.
+   These are the functional requirement: wry's handler can only grant a
+   permission the package declares.
+3. **A pre-grant in `MainActivity.onCreate`**
+   (`ActivityCompat.requestPermissions` for the two dangerous ones, skipped
+   when already held). Not needed for correctness — it is there so the dialog
+   lands *before* the page is interactive instead of in the middle of an
+   `auto=1` run, and so every launch after the first is non-interactive. Its
+   one hazard: while that dialog is open, wry's own request can return denied
+   without being shown, and `getUserMedia` then rejects with
+   `NotAllowedError`. Hence `gumretry=30` on the page — the attempt after the
+   user taps Allow succeeds. Both halves are commented at their source.
+4. **The page query is baked at build time.** No env var reaches an app
+   process from `adb`, so `src-tauri/src/lib.rs`'s `page_query()` falls back
+   from the runtime `TESTBED_URL_QUERY` to `option_env!("TESTBED_URL_QUERY")`,
+   captured when the cdylib was compiled (`build.rs` declares
+   `rerun-if-env-changed` so a changed query actually rebuilds). Desktop
+   behaviour is unchanged — the runtime value still wins — with one footgun
+   worth knowing: a **desktop** binary compiled in a shell that exports
+   `TESTBED_URL_QUERY` bakes it too, so a later run with the variable unset
+   uses that query instead of the selftest default. `[testbed] query: ?…` on
+   the first line of every run says which query is in force. This keeps
+   `window.__TESTBED_QUERY` the single way a query reaches the page on every
+   platform; the `windows[0].url` route was not taken because the window is
+   built in Rust, not from `tauri.conf.json`'s (empty) `windows` array.
+
+One structural consequence of targeting Android at all: `src-tauri` is now a
+**library plus a three-line `main.rs`**. `tauri android build` runs `cargo
+build --lib` (the APK `System.loadLibrary`s a cdylib; there is no Rust
+`main`), and a bin-only crate fails with *"no library targets found in package
+`signals-media-testbed`"*. Everything moved to `src/lib.rs` behind
+`#[cfg_attr(mobile, tauri::mobile_entry_point)] pub fn run()`; apart from that
+signature and the added notes in the module header, the code is the file Task 5
+wrote (`git log --follow src-tauri/src/lib.rs` shows the rename).
+
 ## The Linux (WebKitGTK) plumbing
 
 Three things, all of which a real Tauri app would have to do too. The first two
-are in `src-tauri/src/main.rs`, copied from the spike at
+are in `src-tauri/src/lib.rs`, copied from the spike at
 `spikes/webkitgtk-media-probe/` in the Presence repo (read its `FINDINGS.md`
 for the evidence and the corroborating sources).
 
@@ -244,5 +402,43 @@ Notes on what those numbers mean:
 cost of the carrier switch the design spec claims is cheap; the receiver adopts
 the new session epoch and audio resumes without a decoder reset.
 
-Not covered anywhere yet: Android WebView, macOS/iOS WKWebView, sustained
-encode CPU under load, and echo cancellation quality.
+### Android — pending a device
+
+**No Android device was attached to the build machine** when this target was
+written (2026-09-10; `adb devices` empty), so the build is verified and the
+device runs are not. The APK builds; nothing below it has been observed.
+
+| Run | Result |
+|---|---|
+| `tauri android build --debug --apk --target aarch64`, query `mode=selftest&auto=1&gumretry=30` | **APK built**, exit 0 — `app/build/outputs/apk/universal/debug/app-universal-debug.apk`, **127.5 MiB** (133,713,031 bytes from a clean build), of which `lib/arm64-v8a/libsignals_media_testbed_lib.so` is 126,563,792: an unstripped debug cdylib with `ui/dist` embedded in it. `aapt dump permissions` reports INTERNET, RECORD_AUDIO, CAMERA, MODIFY_AUDIO_SETTINGS; the baked query is in the `.so` (`strings … \| grep gumretry`) |
+| `mode=selftest&auto=1&gumretry=30` on a device | **pending a device** — not run |
+| Linux↔Android room, `mode=room&relay=ws://<laptop-ip>:8765` | **pending a device** — not run |
+
+| Component | Version |
+|---|---|
+| Android Gradle plugin | 8.6.1 (template default 8.11.0 — see the trap table) |
+| Gradle / Kotlin plugin | 8.14.3 / 1.9.25 |
+| compileSdk / targetSdk / minSdk | 36 / 36 / 24 |
+| build-tools / NDK | 34.0.0 / 28.2.13676358 |
+| JDK | OpenJDK 17.0.20 |
+| wry (via tauri 2.11.5) | 0.55.1 |
+
+The exact commands for both pending rows are in [5. Android
+(WebView)](#5-android-webview) above. What a run must record, beside its
+verdict: device model and Android release, the WebView `versionName`, and for
+the room, per-direction loss and fps.
+
+Two things a device run is expected to falsify or confirm, and they are the
+reason it matters more than the build:
+
+- **The permission race.** The pre-grant dialog and wry's own request are not
+  ordered. `gumretry=30` is the mitigation, written against the reading of
+  wry's Kotlin rather than against an observed failure. A device run should
+  either show no `media.retry` lines at all (no race) or show them once on a
+  fresh install and then a successful capture.
+- **WebCodecs.** Android WebView has had `AudioEncoder`/`AudioDecoder` since
+  Chromium 94, so `codec=webcodecs` should work; if it does not, the `env`
+  report says so on the first line and `codec=wasm` is the fallback to try.
+
+Not covered anywhere yet: Android WebView **on a device**, macOS/iOS
+WKWebView, sustained encode CPU under load, and echo cancellation quality.

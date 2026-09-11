@@ -12,6 +12,8 @@
     "build": "vite build ui",
     "pretest": "npm --prefix .. run build && npm run typecheck",
     "test": "playwright test",
+    "//tauri": "Required by the Android build, not a convenience: gen/android's rust gradle plugin shells out to `npm run tauri android android-studio-script` to build the cdylib, and without this script the Gradle task dies with `npm error Missing script: \"tauri\"`.",
+    "tauri": "tauri",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {

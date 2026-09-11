@@ -6,9 +6,16 @@ edition = "2021"
 publish = false
 
 # Deliberately its own workspace root: the monorepo's top-level Cargo.toml is
-# the Holochain zome workspace (wasm32 targets, a pinned hdk), and this desktop
-# binary has nothing to do with it.
+# the Holochain zome workspace (wasm32 targets, a pinned hdk), and this app
+# has nothing to do with it.
 [workspace]
+
+# The app is a library so that Android can link it: `tauri android build` runs
+# `cargo build --lib` and the APK loads the cdylib from Java. `src/main.rs` is
+# the desktop shim over the same `run()`. `staticlib` is what iOS would link.
+[lib]
+name = "signals_media_testbed_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

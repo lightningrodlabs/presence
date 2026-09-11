@@ -24,9 +24,13 @@
  *   tone=1               feed voice from an oscillator instead of the real mic
  *                        (deterministic: a real mic may be silent)
  *   codec=webcodecs|wasm which Opus backend; wasm pulls the ./opus-wasm subpath
+ *   gumretry=<seconds>   retry a rejected getUserMedia once a second for this
+ *                        long; default 0 (one attempt, fail fast). Set on
+ *                        Android, where the OS permission dialog can race the
+ *                        first capture — see testbed/README.md.
  *
  * Under Tauri the query arrives as `window.__TESTBED_QUERY` (set from
- * TESTBED_URL_QUERY by src-tauri/src/main.rs) because the asset protocol URL
+ * TESTBED_URL_QUERY by src-tauri/src/lib.rs) because the asset protocol URL
  * carries no search string.
  */
 import {
@@ -82,6 +86,10 @@ const codecName = params.get('codec') ?? 'webcodecs';
 const durationS = Number(params.get('duration') ?? 8);
 const relayUrl = params.get('relay') ?? 'ws://127.0.0.1:8765';
 const me = params.get('peer') ?? `peer-${Math.random().toString(36).slice(2, 7)}`;
+// A non-numeric value is 0, not NaN: NaN would make every deadline
+// comparison false and turn the retry loop below into an infinite one.
+const gumRetryRaw = Number(params.get('gumretry') ?? 0);
+const gumRetryS = Number.isFinite(gumRetryRaw) ? gumRetryRaw : 0;
 
 // ---------------------------------------------------------------------------
 // Page furniture + reporting
@@ -318,19 +326,49 @@ const host = {
         },
       };
     }
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const s = await getUserMedia({ audio: true });
     const track = s.getAudioTracks()[0];
     return { track, release: () => track.stop() };
   },
 
   async acquireCamera() {
-    const s = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480 },
-    });
+    const s = await getUserMedia({ video: { width: 640, height: 480 } });
     const track = s.getVideoTracks()[0];
     return { track, release: () => track.stop() };
   },
 };
+
+/**
+ * `navigator.mediaDevices.getUserMedia`, optionally retried.
+ *
+ * With `gumretry=0` (the default, and what every desktop and Chromium run
+ * uses) this is one call and the rejection propagates unchanged — a missing
+ * device stays a fast, honest failure.
+ *
+ * `gumretry=<seconds>` exists for Android. The OS permission dialog and the
+ * capture attempt are not ordered there: `MainActivity.onCreate` asks for
+ * RECORD_AUDIO/CAMERA while the page is loading, wry's
+ * `RustWebChromeClient.onPermissionRequest` asks again from inside this call,
+ * and a request launched while the first dialog is still up can come back
+ * denied without being shown. Retrying once a second turns that race into a
+ * delay: the attempt after the user taps Allow succeeds.
+ *
+ * @param {MediaStreamConstraints} constraints
+ * @returns {Promise<MediaStream>}
+ */
+async function getUserMedia(constraints) {
+  const deadline = performance.now() + gumRetryS * 1000;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+      if (performance.now() >= deadline) throw e;
+      logLine(`getUserMedia attempt ${attempt} failed (${errText(e)}); retrying`);
+      invokeReport('media.retry', true, `attempt ${attempt}: ${errText(e)}`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+}
 
 // The bundler-proof fallbacks, assigned rather than conditionally spread so
 // that the annotation on `host` actually constrains them: `workletModuleUrl`
