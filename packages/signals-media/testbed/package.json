@@ -16,6 +16,9 @@
     "tauri": "tauri",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
+  "dependencies": {
+    "@lightningrodlabs/signals-media": "file:.."
+  },
   "devDependencies": {
     "@playwright/test": "1.59.1",
     "@tauri-apps/cli": "^2.5.0",
