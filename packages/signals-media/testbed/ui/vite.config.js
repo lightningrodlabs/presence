@@ -11,7 +11,7 @@
 // build first, so the alias target always exists and is current.
 import { defineConfig } from 'vite';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
+import fs from 'node:fs';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url)); // …/testbed/ui
@@ -26,16 +26,48 @@ const testbedRoot = path.resolve(here, '..'); // …/testbed
 // `libopus-wasm` is the `./opus-wasm` backend's optionalDependency and may be
 // hoisted to a monorepo root's node_modules OR installed directly under this
 // package — resolve wherever it actually landed rather than assuming either.
-const require = createRequire(import.meta.url);
-let libopusWasmDir;
-try {
-  libopusWasmDir = path.dirname(
-    require.resolve('libopus-wasm/package.json', { paths: [pkgRoot] }),
-  );
-} catch {
+//
+// Review round 2 finding: the round-1 fix (`require.resolve('libopus-wasm',
+// { paths: [pkgRoot] })`, i.e. the "." export) still throws
+// ERR_PACKAGE_PATH_NOT_EXPORTED ("No 'exports' main defined…") — verified
+// directly against the installed libopus-wasm@0.3.0. Its "." export lists
+// only the `types`/`browser`/`import` conditions; `require.resolve()` (which
+// `createRequire()` inherits) always resolves under the `require`/`node`/
+// `default` condition set and Node's public API gives no way to override
+// that, so an ESM-only export map can never satisfy it — not a bug in the
+// package, just a condition mismatch this file's resolver can't cross.
+// Fix: don't ask Node to resolve an entry FILE through `exports` at all —
+// walk `node_modules` directories directly, which is how Node locates a
+// package's directory in the first place, before it ever consults that
+// package's own `exports` map. This is exports-map-agnostic (works
+// regardless of what libopus-wasm exports, or whether it exports anything),
+// and answers exactly the question this file needs ("where is the
+// libopus-wasm directory on disk"), not "what file does importing it load".
+function findPackageDir(pkgName, fromDir) {
+  let dir = fromDir;
+  for (;;) {
+    const candidate = path.join(dir, 'node_modules', pkgName);
+    if (fs.existsSync(path.join(candidate, 'package.json'))) {
+      return candidate;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined; // bounded: stop at the filesystem root
+    dir = parent;
+  }
+}
+
+const libopusWasmDir = findPackageDir('libopus-wasm', pkgRoot);
+if (libopusWasmDir) {
+  // eslint-disable-next-line no-console -- visible at config load, not a runtime path
+  console.log(`[signals-media testbed] libopus-wasm resolved at ${libopusWasmDir}`);
+} else {
   // Optional dependency not installed on this platform (e.g. the wasm
-  // backend's postinstall was skipped) — nothing extra to allow.
-  libopusWasmDir = undefined;
+  // backend's postinstall was skipped) — nothing extra to allow. Visible,
+  // not silent (review round 1).
+  // eslint-disable-next-line no-console -- visible at config load, not a runtime path
+  console.warn(
+    '[signals-media testbed] libopus-wasm not found under any ancestor node_modules; omitting from server.fs.allow',
+  );
 }
 const fsAllow = [pkgRoot, testbedRoot, ...(libopusWasmDir ? [libopusWasmDir] : [])];
 
