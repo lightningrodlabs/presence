@@ -21,6 +21,27 @@
 //!    `true` and `RTCPeerConnection` still does not exist. Setting it would
 //!    only suggest it does something.
 //!
+//! **No equivalent handler exists here for macOS, iOS, or Windows, and none
+//! is needed.** wry has granted camera/microphone natively on those three
+//! since 0.22 — macOS/iOS via `WKUIDelegate`'s `requestMediaCapturePermission`,
+//! Windows via WebView2's own permission prompt when no handler is installed
+//! (its "block" answer is sticky per-origin: Tauri issue #5042, documented in
+//! `testbed/README.md`'s Windows section) — the same way wry's Android
+//! `WebChromeClient` already grants without any Kotlin of ours (see "The
+//! Android plumbing" in `testbed/README.md`). Checked at task 6b time
+//! (2026-09-10, controller ruling for Step 1): wry 0.56 added a genuinely
+//! cross-platform `WebViewBuilder::with_permission_handler` (macOS/iOS,
+//! Windows, Linux, Android all wired through one closure — confirmed via
+//! `docs.rs/wry/0.56.1`), but no Tauri 2.x release reaches it —
+//! `tauri-runtime-wry` tops out at 2.11.4, pinned to `wry ^0.55.0`
+//! (`cargo tree -p tauri-runtime-wry -i wry` against this crate's `Cargo.lock`
+//! confirms 0.55.1; the crates.io index for `tauri-runtime-wry` has no
+//! version requiring wry ≥ 0.56 as of 2026-09-10). The Linux-only
+//! `connect_permission_request` call below stays because it is the only
+//! platform that both needs a handler AND has one available through the
+//! Tauri version this crate depends on; re-check this note's crates.io claim
+//! before ever bumping `tauri` past 2.11.5.
+//!
 //! The page's URL query arrives as `window.__TESTBED_QUERY`, injected here
 //! from `TESTBED_URL_QUERY`, rather than as a real search string on the asset
 //! URL: `WebviewUrl::App` takes a path, and a query smuggled through it is

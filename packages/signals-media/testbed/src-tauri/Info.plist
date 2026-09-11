@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the CLI-generated Info.plist for both macOS and iOS bundles —
+  Tauri looks for an `Info.plist` next to `tauri.conf.json` and merges it with
+  the values it generates (tauri_utils::config::IosConfig::info_plist doc; the
+  same file-discovery applies to the macOS bundle). No explicit
+  `bundle.macOS.infoPlist` / `bundle.iOS.infoPlist` config key is needed for
+  that reason — only `bundle.macOS.entitlements` needs an explicit reference,
+  since entitlements are a codesigning input, not a bundle resource.
+
+  These two keys are the only reason this file exists: without
+  NSMicrophoneUsageDescription / NSCameraUsageDescription, `getUserMedia`
+  fails outright on both macOS and iOS — the OS refuses to even show a
+  permission prompt for an app with no usage-description string, regardless
+  of any wry/WebKit permission handler.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>The signals-media testbed needs the microphone to encode Opus voice frames for the selftest and room modes.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>The signals-media testbed needs the camera to sample low-fps JPEG video frames for the selftest and room modes.</string>
+</dict>
+</plist>

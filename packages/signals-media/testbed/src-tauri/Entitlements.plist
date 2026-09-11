@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS only (`bundle.macOS.entitlements` in tauri.conf.json). Applied at
+  codesign time under hardened runtime (`bundle.macOS.hardenedRuntime`,
+  default true): without these two keys, hardened runtime blocks device
+  access outright and `getUserMedia` fails before any WebKit permission
+  prompt is shown, independent of Info.plist's usage-description strings or
+  the NSMicrophoneUsageDescription/NSCameraUsageDescription keys there. iOS
+  has no equivalent entitlements file — app sandbox device access there is
+  governed by Info.plist usage descriptions and the provisioning profile
+  alone, so `bundle.iOS` carries no entitlements reference.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

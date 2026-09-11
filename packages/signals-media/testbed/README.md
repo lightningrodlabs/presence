@@ -248,6 +248,179 @@ adb shell dumpsys package com.google.android.webview | grep versionName
 `android:usesCleartextTraffic="true"` (`app/build.gradle.kts`); a release APK
 would need `wss://` or a network-security config.
 
+### 6. macOS (WKWebView)
+
+This machine cannot build or run this section — no Apple hardware. Everything
+below is a procedure for Volla to run and report back, not something verified
+here.
+
+**Do not use `nix develop`.** The flake's `devShells` list includes
+`x86_64-darwin`/`aarch64-darwin`, but its `tauriDeps` (`webkitgtk_4_1`,
+`gtk3`, …) are pulled into `buildInputs` unconditionally — they are not
+gated behind `pkgs.stdenv.isLinux` — and those are Linux/GTK packages with no
+reason to exist on macOS. Whether that shell even evaluates on darwin has not
+been checked from here; the plain toolchain below is what Tauri itself
+documents for macOS and is what this procedure is built against. Prerequisites,
+per Tauri's own guide: Xcode Command Line Tools (`xcode-select --install`),
+Rust via [rustup](https://rustup.rs) (this repo's `rust-toolchain.toml` pins
+`channel = "stable"` and rustup picks it up automatically from the directory —
+its `targets` list is Linux/Android-only, which is harmless extra download on
+macOS, not a blocker), and Node ≥ 20 (this repo measured Node 22.23.1 on
+Linux — see the Results table).
+
+```bash
+cd packages/signals-media
+npm --prefix testbed install
+npm --prefix testbed run build                        # builds dist/ then ui/dist/
+cargo build --manifest-path testbed/src-tauri/Cargo.toml
+
+TESTBED_EXIT_ON_SUMMARY=1 \
+  TESTBED_URL_QUERY='mode=selftest&auto=1&codec=wasm' \
+  ./testbed/src-tauri/target/debug/signals-media-testbed
+```
+
+Run it from Terminal.app (or another terminal emulator) — launch it by
+double-clicking the binary in Finder instead and its stdout goes nowhere,
+because it is a plain executable, not an `.app` bundle. `TESTBED_URL_QUERY` is
+read at **runtime** here (`page_query()`, `src-tauri/src/lib.rs`); unlike
+Android, no rebuild is needed between queries on desktop.
+
+`codec=wasm` (above) is **required** below macOS 26: Apple WebKit gained
+`AudioEncoder`/`AudioDecoder` only in Safari 26.0 (macOS 26) — `codec=webcodecs`,
+the page default, fails the `env` step on every earlier macOS.
+`MediaStreamTrackProcessor` shipped in Safari 18 but is video-only and this
+library never calls it (voice and filmstrip both use the AudioWorklet/canvas
+capture path — see "The Linux (WebKitGTK) plumbing" below), so its Safari
+version does not gate anything here. On macOS 26+, run the `wasm` command
+above **and** this one, and report both transcripts:
+
+```bash
+# macOS 26+ only, in addition to the codec=wasm run above
+TESTBED_EXIT_ON_SUMMARY=1 \
+  TESTBED_URL_QUERY='mode=selftest&auto=1&codec=webcodecs' \
+  ./testbed/src-tauri/target/debug/signals-media-testbed
+```
+
+Expected transcript shape (values will differ from the Linux Results table —
+a real mic/camera, a different WebKit build): a `[testbed] query: ?…` line,
+one `[testbed] page …` pair, a `[testbed] OK` line per step (`env`, `voice`,
+`filmstrip`, …), and a final `[testbed] OK   SUMMARY`, process exit 0. Two
+GUI prompts (camera, then microphone) appear on first launch — **macOS 14 is
+known to show the `getUserMedia` prompt twice** (wry issue #1195, open as of
+this writing): expected behaviour on macOS 14, not a `FAIL` line and not
+something to retry around. Paste back: the full `[testbed]` transcript for
+each command run (`webcodecs` only on macOS 26+), the `env` step's reported
+`navigator.userAgent`, `sw_vers -productVersion`, and whether the double
+prompt was observed.
+
+### 7. iOS (WKWebView)
+
+Also unverified from here — no Apple hardware. Xcode (the full app, not just
+the Command Line Tools — `tauri ios init` needs the iOS SDK) is Volla's first
+step. `testbed/src-tauri/gen/apple` is not committed (see "Files" in the task
+that added this section) — `tauri ios init` generates it locally, picking up
+`Info.plist` automatically the same way the macOS build does (there is no
+separate `Entitlements.plist` for iOS — see "The Apple (WKWebView) plumbing"
+below for why).
+
+```bash
+cd packages/signals-media
+npm --prefix testbed install
+npm --prefix testbed exec tauri -- ios init      # generates src-tauri/gen/apple
+
+TESTBED_URL_QUERY='mode=selftest&auto=1&codec=wasm' \
+  npm --prefix testbed exec tauri -- ios dev
+```
+
+`tauri ios dev` is documented (Tauri's "Run on iOS" guide) to try a connected
+device first and fall back to prompting for a simulator — a simulator needs no
+Apple Developer Team and is the easier first run; a physical device needs one,
+set via the `APPLE_DEVELOPMENT_TEAM` environment variable or Xcode's signing
+settings (`tauri_utils::config::IosConfig::development_team`). Same env-var
+baking pattern as Android: set `TESTBED_URL_QUERY` on the build/dev command
+itself, not only at runtime — Android needed this because `adb` cannot hand an
+app process an environment variable at all, and whether the iOS launch path
+(simulator or device) propagates a runtime-set var the way desktop does has
+not been checked from here, so baking it is the safe default. Report which one
+actually worked.
+
+**Where the `[testbed]` lines land is unverified from here too.** They are
+plain `println!`s; on iOS this is normally readable in Xcode's own console
+pane the way plain stdout is on desktop, but whether `tauri ios dev` running
+from a terminal also mirrors them into that terminal (the way it does not need
+special handling on desktop, and the way `adb logcat` surfaces them on
+Android) has not been observed. First try reading them straight from the
+terminal that ran `tauri ios dev`; if nothing shows there, run
+`npm --prefix testbed exec tauri -- ios dev --open` instead, which opens the
+project in Xcode, and read the lines from Xcode's Console pane (View → Debug
+Area → Activate Console) while the app runs. Report which one worked.
+
+`codec=wasm` is required below iOS 26 for the same reason as macOS — Safari
+26.0 is when `AudioEncoder`/`AudioDecoder` arrived — and the `codec=webcodecs`
+run is iOS 26+ only, same two-command pattern as the macOS section. Expected
+transcript shape and what to paste back: identical to the macOS section
+above, plus the device/simulator name and iOS version (`xcrun simctl list
+devices` for a simulator, Settings → General → About on a physical device).
+
+### 8. Windows (WebView2)
+
+Also unverified from here — no Windows machine. Nothing in `tauri.conf.json`
+is Windows-specific; WebView2 prompts for camera/microphone natively with no
+handler installed (see "The Windows (WebView2) plumbing" below — only Linux
+needed the `connect_permission_request` code in `src/lib.rs`). Prerequisites,
+per Tauri's own Windows guide: the Microsoft C++ Build Tools ("Desktop
+development with C++" workload), Rust via [rustup](https://rustup.rs) (same
+`rust-toolchain.toml` as above), the WebView2 Runtime (preinstalled on
+Windows 11 and recent Windows 10 updates; if `cargo build` succeeds but the
+window shows nothing, install it from Microsoft first — this repo ships no
+installer, so there is no Evergreen bootstrapper to do that step
+automatically), and Node ≥ 20.
+
+```powershell
+cd packages\signals-media
+npm --prefix testbed install
+npm --prefix testbed run build
+cargo build --manifest-path testbed\src-tauri\Cargo.toml
+
+$env:TESTBED_EXIT_ON_SUMMARY = "1"
+$env:TESTBED_URL_QUERY = "mode=selftest&auto=1&codec=webcodecs"
+.\testbed\src-tauri\target\debug\signals-media-testbed.exe
+```
+
+`codec=webcodecs` (the page default, used explicitly above for clarity) is
+correct on Windows: WebView2 is Chromium-based and Chromium has shipped
+`AudioEncoder`/`AudioDecoder` since version 94, long before any WebView2
+Runtime in current use — there is no wasm-fallback requirement here the way
+there is on pre-26 Apple.
+
+Run it from a console (`cmd.exe` or PowerShell), not by double-clicking the
+`.exe` in Explorer. Nothing under `src-tauri` sets
+`#![windows_subsystem = "windows"]` (grepped: no hits), so this binary links
+with Rust's default **console** subsystem: launched from an existing console
+its `[testbed]` lines print straight there; launched by double-click it opens
+its own console window, so the lines are visible either way — a console you
+started is just easier to copy from.
+
+Camera/microphone prompts appear on first launch, handled entirely by
+WebView2 — no Tauri or app code is involved. **The "block" answer is sticky
+per app** (Tauri issue #5042): once denied, WebView2 never re-prompts, because
+the answer lives in the WebView2 user-data folder, not any per-run state. To
+reset it: close the app, delete
+`%LOCALAPPDATA%\org.lightningrodlabs.signals-media-testbed\EBWebView` (the
+whole folder — other cached state under it can carry the same stale answer,
+not just `Default\Preferences`), and relaunch; a fresh prompt appears.
+(That path is Tauri's default WebView2 user-data-folder location, keyed to
+this app's `identifier` in `tauri.conf.json` — confirm the exact path on the
+test machine if it differs.)
+
+Expected transcript shape: same shape as the Linux Results table —
+`[testbed] query: ?…`, one `[testbed] page …` pair, a `[testbed] OK` line per
+step, a final `[testbed] OK   SUMMARY`, process exit 0. Paste back: the full
+transcript, the Windows build (`winver`), and the WebView2 Runtime version
+(`Get-Item "$env:ProgramFiles(x86)\Microsoft\EdgeWebView\Application\*" |
+Select-Object -ExpandProperty Name`, or
+`reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" /v pv`).
+
 ## The Android plumbing
 
 Four things, and the first is the point: **almost none of it is ours.**
@@ -337,6 +510,82 @@ One Tauri configuration trap, learned here: leaving `build.devUrl` in
 `frontendDist`, so the window silently shows a dead `http://localhost:5173`.
 `tauri.conf.json` has no `devUrl`; `beforeDevCommand` builds the frontend
 instead.
+
+## The Apple (WKWebView) plumbing
+
+Zero Rust code, on purpose — the opposite of the Linux section above, and the
+same shape as Android's "almost none of it is ours." The
+`connect_permission_request`/`WebKitSettings` block in `src/lib.rs` is
+`#[cfg(target_os = "linux")]`-gated and compiles out entirely on `macos` and
+`ios` targets; nothing replaces it there because nothing needs to. wry's
+`WKUIDelegate` implementation has called `requestMediaCapturePermission` —
+the native camera/microphone prompt — since wry 0.22, on both macOS and iOS.
+
+Two config files instead:
+
+1. **`Info.plist`** (`testbed/src-tauri/Info.plist`, this task):
+   `NSMicrophoneUsageDescription` + `NSCameraUsageDescription`. Tauri merges
+   it into the generated bundle Info.plist automatically because it sits next
+   to `tauri.conf.json` — no `bundle.macOS.infoPlist`/`bundle.iOS.infoPlist`
+   config key needed (`tauri_utils::config::IosConfig::info_plist` docs this
+   file-discovery for iOS explicitly; Tauri's own macOS bundling guide
+   describes the same "create `Info.plist` in `src-tauri/`, it gets merged"
+   behaviour for the desktop bundle). Without these two keys `getUserMedia`
+   fails outright with **no prompt at all** — iOS/macOS refuse to show a
+   permission dialog for an app carrying no usage-description string, which
+   is a harder failure than a denied prompt and easy to mistake for a wry or
+   WebKit bug.
+2. **`Entitlements.plist`** (`testbed/src-tauri/Entitlements.plist`, this
+   task, macOS only — referenced by `bundle.macOS.entitlements` in
+   `tauri.conf.json`): `com.apple.security.device.audio-input` +
+   `com.apple.security.device.camera`. These are required under Hardened
+   Runtime (`bundle.macOS.hardenedRuntime: true`, the default) independent of
+   App Sandbox — Apple's Hardened Runtime documentation: a hardened-runtime
+   app's camera/mic calls fail outright, again with no prompt, if the
+   corresponding entitlement is absent. iOS has no entitlements file for this
+   at all — device access there is governed by Info.plist plus the
+   provisioning profile, so `bundle.iOS` carries no entitlements reference.
+   `bundle.iOS.frameworks` is likewise left unset: this library's capture
+   path (AudioWorklet + WebCodecs + `<video>`/canvas sampling — see "The
+   Linux (WebKitGTK) plumbing" above) uses only APIs WKWebView already
+   exposes, nothing that needs an extra bundled iOS framework.
+3. **Codec support is OS-version-gated**, unlike WebKitGTK's flat
+   present/absent split: Apple WebKit gained `AudioEncoder`/`AudioDecoder`
+   only in Safari 26.0 (macOS 26 / iOS 26) — `codec=wasm` is required on
+   every earlier release, `codec=webcodecs` only on 26+ (see the macOS/iOS
+   procedures above). Safari 18's `MediaStreamTrackProcessor` is video-only
+   and this library never calls it, on any platform, so its availability
+   does not affect anything here.
+4. **macOS 14 shows the `getUserMedia` prompt twice.** Open upstream (wry
+   issue #1195) as of this writing — expected behaviour, not a `FAIL` line,
+   and nothing in this codebase works around it.
+
+Checking a newer Tauri/wry pin was this task's Step 1 (see the note in
+`src/lib.rs`'s module doc, right after the WebKitGTK section): wry 0.56 added
+a cross-platform `WebViewBuilder::with_permission_handler` that would also
+cover macOS/iOS/Windows/Android through one closure, but no published Tauri
+2.x release reaches wry 0.56 yet (`tauri-runtime-wry` tops out at 2.11.4, on
+`wry ^0.55.0`) — re-check that claim before ever bumping `tauri` past 2.11.5,
+since it would change everything in this section.
+
+## The Windows (WebView2) plumbing
+
+Also zero Rust code. `tauri.conf.json` has no Windows-specific keys at all —
+WebView2 prompts for camera/microphone natively the moment `getUserMedia` is
+called, with no handler installed; the same reasoning as the Apple section
+above (only Linux needed `connect_permission_request` — see `src/lib.rs`'s
+module doc for why Windows, like macOS/iOS/Android, needs none). WebView2 is
+Chromium-based and has shipped `AudioEncoder`/`AudioDecoder` since Chromium
+94, so `codec=webcodecs` (the page default) is correct out of the box — no
+wasm-fallback story here.
+
+The one thing worth knowing before it surprises someone: **a "block" answer
+to the permission prompt is sticky per app** (Tauri issue #5042). WebView2
+persists it in that app's WebView2 user-data folder — by Tauri's default,
+`%LOCALAPPDATA%\<identifier>\EBWebView` — and never asks again once denied,
+independent of reinstalling the page or the app binary. There is no in-app
+recovery; the reset procedure (delete that folder, relaunch) is in the
+Windows section above, where a tester actually needs it.
 
 ## Results
 
@@ -440,5 +689,55 @@ reason it matters more than the build:
   Chromium 94, so `codec=webcodecs` should work; if it does not, the `env`
   report says so on the first line and `codec=wasm` is the fallback to try.
 
-Not covered anywhere yet: Android WebView **on a device**, macOS/iOS
-WKWebView, sustained encode CPU under load, and echo cancellation quality.
+### macOS / iOS — pending hardware
+
+**No Apple hardware exists on the machine that wrote this section**
+(2026-09-10), so none of it — build, run, or prompt behaviour — has been
+observed; unlike Android, not even the build has been exercised, since
+`cargo build` for `target_os = "macos"`/`"ios"` cannot run on Linux. Config
+(`Info.plist`, `Entitlements.plist`, the `bundle.macOS` block in
+`tauri.conf.json`) is written and reasoned from Apple's own documentation
+(cited in "The Apple (WKWebView) plumbing" above), not from an observed run.
+
+| Run | Result |
+|---|---|
+| macOS, `mode=selftest&auto=1&codec=wasm` | **pending hardware** — not run |
+| macOS, `mode=selftest&auto=1&codec=webcodecs` (macOS 26+ only) | **pending hardware** — not run |
+| iOS, `mode=selftest&auto=1&codec=wasm` | **pending hardware** — not run |
+| iOS, `mode=selftest&auto=1&codec=webcodecs` (iOS 26+ only) | **pending hardware** — not run |
+
+The exact commands are in [6. macOS (WKWebView)](#6-macos-wkwebview) and
+[7. iOS (WKWebView)](#7-ios-wkwebview) above, including what each run must
+record. Three things a run is expected to falsify or confirm:
+
+- **The two config files are sufficient.** Whether `Info.plist` and
+  `Entitlements.plist` actually produce a working prompt-then-grant flow, as
+  opposed to a silent `NotAllowedError`, is unverified — the reasoning is
+  from Apple's Hardened Runtime and Info.plist documentation, not from a
+  build that ran.
+- **The macOS 14 double-prompt.** Whether it is observed as described (wry
+  issue #1195) or has changed shape since.
+- **Where `[testbed]` output lands on iOS.** Terminal (via `tauri ios dev`)
+  or Xcode's Console pane only — see the iOS section above; this determines
+  how future Apple runs should be scripted.
+
+### Windows — pending hardware
+
+**No Windows machine exists on the machine that wrote this section**
+(2026-09-10) either; same caveat as the Apple row above — config only,
+nothing built or run.
+
+| Run | Result |
+|---|---|
+| `mode=selftest&auto=1&codec=webcodecs` | **pending hardware** — not run |
+
+The exact command is in [8. Windows (WebView2)](#8-windows-webview2) above.
+What a run is expected to falsify or confirm: that WebView2 prompts and
+grants with zero Tauri-side configuration (as documented, `tauri.conf.json`
+carries no Windows-specific keys at all), and that the sticky-block reset
+procedure (delete the `EBWebView` folder) actually works as described from
+Tauri issue #5042 rather than from a run.
+
+Not covered anywhere yet: Android WebView, macOS WKWebView, iOS WKWebView,
+and Windows WebView2 **on real hardware**; sustained encode CPU under load;
+and echo cancellation quality.
