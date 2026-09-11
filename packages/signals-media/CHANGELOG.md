@@ -61,11 +61,17 @@ accident.
 
 ### Wire compatibility
 
-Byte-identical to **Presence 0.15.6**. The four payload shapes (voice per-frame
-with RED, voice `{ v: 2, frames }` batch, filmstrip clip, filmstrip stop) are
-recorded in `src/__tests__/fixtures/wire.json` and asserted by
-`wire-fixture.test.ts`, including `packVoiceFrames` byte-equality. Package peers
-and Presence peers interoperate, and so do Chromium and WebKitGTK peers.
+Intended to be byte-identical to **Presence 0.15.6**. What is tested:
+`src/__tests__/fixtures/wire.json` records the four payload shapes (voice
+per-frame with RED, voice `{ v: 2, frames }` batch, filmstrip clip, filmstrip
+stop), derived by reading Presence's construction sites at `ab90584`, and
+`wire-fixture.test.ts` drives this package's carriers through a fake host and
+asserts the emitted payloads carry exactly those keys in that order, plus
+`packVoiceFrames` byte-equality and `unpackVoicePayload` round-trips. No suite
+runs a package peer against a Presence peer, so package↔Presence interop is an
+inference from those checks, not a tested property. Chromium↔WebKitGTK interop
+is likewise inferred; what the testbed did exercise for real is the cross-backend
+Opus pair (WASM sender → WebCodecs receiver and the reverse) under Chromium.
 
 ### Known limitations
 
