@@ -1,0 +1,46 @@
+{
+  "origin": "Presence 0.15.6 — ui/src/room/modules/voice.ts and ui/src/room/modules/video-filmstrip.ts at ab90584",
+  "note": [
+    "Golden wire fixture (design spec decision 8). Each case records the exact",
+    "JSON a Presence sender puts on the wire, the exact top-level key ORDER (so",
+    "the recorded `json` is byte-reproducible from the parsed value), and the",
+    "nested key sets. The `data` payloads are short stand-ins — this fixture",
+    "pins the envelope, not decodable media.",
+    "The package test reads only this file. The cross-tree check — whether",
+    "Presence's own copies still carry these field names — is the monorepo's",
+    "scripts/check-signals-media-drift.mjs, which is dropped on extraction."
+  ],
+  "cases": {
+    "voiceFrameV1": {
+      "origin": "ui/src/room/modules/voice.ts",
+      "description": "Per-frame voice payload (the shape every released build parses), carrying a RED block of the two preceding frames.",
+      "fields": ["seq", "ts", "type", "data", "wts", "ep", "red"],
+      "nested": { "red": ["seq", "ts", "type", "data", "wts", "ep"] },
+      "json": "{\"seq\":7,\"ts\":140000,\"type\":\"delta\",\"data\":\"+PgA\",\"wts\":1757548800143,\"ep\":3,\"red\":[{\"seq\":5,\"ts\":100000,\"type\":\"key\",\"data\":\"+PoA\",\"wts\":1757548800103,\"ep\":3},{\"seq\":6,\"ts\":120000,\"type\":\"delta\",\"data\":\"+PsA\",\"wts\":1757548800123,\"ep\":3}]}"
+    },
+    "voiceBatchV2": {
+      "origin": "ui/src/room/modules/voice.ts",
+      "description": "Batched voice payload — `packVoiceFrames` output: VOICE_BATCH_FRAMES frames under a { v: 2, frames } envelope. The RED block rides the batch's first frame only.",
+      "fields": ["v", "frames"],
+      "nested": {
+        "frames": ["seq", "ts", "type", "data", "wts", "ep", "red"],
+        "red": ["seq", "ts", "type", "data", "wts", "ep"]
+      },
+      "json": "{\"v\":2,\"frames\":[{\"seq\":8,\"ts\":160000,\"type\":\"delta\",\"data\":\"+PwA\",\"wts\":1757548800163,\"ep\":3,\"red\":[{\"seq\":6,\"ts\":120000,\"type\":\"delta\",\"data\":\"+PsA\",\"wts\":1757548800123,\"ep\":3},{\"seq\":7,\"ts\":140000,\"type\":\"delta\",\"data\":\"+PgA\",\"wts\":1757548800143,\"ep\":3}]},{\"seq\":9,\"ts\":180000,\"type\":\"delta\",\"data\":\"+P0A\",\"wts\":1757548800183,\"ep\":3},{\"seq\":10,\"ts\":200000,\"type\":\"delta\",\"data\":\"+P4A\",\"wts\":1757548800203,\"ep\":3}]}"
+    },
+    "filmstripClip": {
+      "origin": "ui/src/room/modules/video-filmstrip.ts",
+      "description": "A filmstrip clip as sent. `kind` is omitted by the sender (clip is the default); a receiver also accepts an explicit 'clip'.",
+      "fields": ["seq", "ts", "w", "h", "n", "p", "t0", "data"],
+      "nested": {},
+      "json": "{\"seq\":12,\"ts\":1757548800500,\"w\":128,\"h\":96,\"n\":1,\"p\":167,\"t0\":1757548800333,\"data\":\"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAE=\"}"
+    },
+    "filmstripStop": {
+      "origin": "ui/src/room/modules/video-filmstrip.ts",
+      "description": "The explicit stop payload sent when the sender turns video off, so the receiver clears its display without waiting for the inactivity TTL.",
+      "fields": ["kind", "seq", "ts"],
+      "nested": {},
+      "json": "{\"kind\":\"stop\",\"seq\":13,\"ts\":1757548801000}"
+    }
+  }
+}

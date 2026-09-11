@@ -8,7 +8,7 @@
 //!    `SUMMARY` — that is what makes a run scriptable.
 //!
 //! 2. **The Linux (WebKitGTK) media plumbing.** Copied from the spike at
-//!    `spikes/webkitgtk-media-probe/main.rs` (findings in `FINDINGS.md`
+//!    the package's `docs/webkitgtk-probe/main.rs` (findings in `FINDINGS.md`
 //!    beside it): `enable_media_stream` + `enable_media_capabilities` on the
 //!    `WebKitSettings`, a `permission-request` handler that allows (WebKit's
 //!    default handler DENIES, which is why `getUserMedia` fails with
@@ -140,7 +140,7 @@ pub fn run() {
                 .build()?;
 
             // --- Linux (WebKitGTK) media plumbing; see the module header and
-            // --- spikes/webkitgtk-media-probe/main.rs.
+            // --- the package docs/webkitgtk-probe/main.rs.
             win.with_webview(|w| {
                 #[cfg(target_os = "linux")]
                 {

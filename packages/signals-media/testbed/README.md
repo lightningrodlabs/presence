@@ -493,7 +493,7 @@ wrote (`git log --follow src-tauri/src/lib.rs` shows the rename).
 
 Three things, all of which a real Tauri app would have to do too. The first two
 are in `src-tauri/src/lib.rs`, copied from the spike at
-`spikes/webkitgtk-media-probe/` in the Presence repo (read its `FINDINGS.md`
+`../docs/webkitgtk-probe/` (read its `FINDINGS.md`
 for the evidence and the corroborating sources).
 
 1. **Webview settings**: `set_enable_media_stream(true)` and
