@@ -67,6 +67,7 @@ export {
   FILMSTRIP_FPS_OPTIONS,
   FILMSTRIP_CAPTURE_SIZES,
   FILMSTRIP_RX_LOG_INTERVAL_MS,
+  MAX_CLIP_FRAMES,
 } from './filmstrip-carrier.js';
 export type {
   FilmstripFps,

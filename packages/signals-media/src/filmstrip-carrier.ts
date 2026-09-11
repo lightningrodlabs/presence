@@ -110,6 +110,15 @@ interface FilmstripStopPayload {
 type FilmstripPayload = FilmstripClipPayload | FilmstripStopPayload;
 
 /**
+ * Upper bound on a clip's declared frame count (`n`) that the receive
+ * path will act on. Senders here emit n=1 (per-frame clips); the legacy
+ * batching senders the receive path still accepts topped out around a
+ * clip length at the highest fps, so 64 is far above any honest value
+ * and far below a count that could wedge the playback loop.
+ */
+export const MAX_CLIP_FRAMES = 64;
+
+/**
  * How long the receiver displays a peer's last clip with no new clips
  * arriving before falling back to "no video" (clears the bg-image so
  * the avatar shows through). 5 s is far longer than any clip cadence
@@ -282,6 +291,14 @@ export class FilmstripCarrier {
   private lastRxLogMs = new Map<PeerId, number>();
 
   /**
+   * Peers we have already warned about invalid clip geometry — one line
+   * per peer per bind, so a sender emitting bad clips at capture rate
+   * cannot flood the console. Cleared in `unbind` with the rest of the
+   * receive-side state.
+   */
+  private _badGeometryLogged = new Set<PeerId>();
+
+  /**
    * Per-peer signals-video stats. Updated by `receiveFrame` on a ~1 s
    * rolling window. A host's stats surface reads this map; display
    * elements publish their buffer depth here via `setBufferDepth`.
@@ -342,6 +359,7 @@ export class FilmstripCarrier {
     this.peerLastSentMs.clear();
     this.peerLastRecvMs.clear();
     this.lastRxLogMs.clear();
+    this._badGeometryLogged.clear();
     this.signalsVideoStats.clear();
     this.host = null;
     this._clock = systemClock;
@@ -357,9 +375,21 @@ export class FilmstripCarrier {
     if (!this.host) return false;
     if (this.cameraHandle) return true;
 
-    const handle = await this.host.acquireCamera((newTrack: MediaStreamTrack) => {
-      this.sampler.replaceTrack(newTrack);
-    });
+    let handle: TrackHandle | null;
+    try {
+      handle = await this.host.acquireCamera((newTrack: MediaStreamTrack) => {
+        this.sampler.replaceTrack(newTrack);
+      });
+    } catch (e) {
+      // A host that REJECTS (a denied permission prompt, a host that
+      // throws rather than resolving null) must not take `startCapture`
+      // with it: the caller's contract is a boolean, and an escaping
+      // rejection would skip every caller's own unwind. Nothing is held
+      // at this point — no handle, no worker, no sampler — so the null
+      // arm's bare `return false` is the whole unwind.
+      console.error('filmstrip: acquireCamera failed', e);
+      return false;
+    }
     if (!handle) {
       console.error('filmstrip: acquireCamera failed');
       return false;
@@ -573,6 +603,36 @@ export class FilmstripCarrier {
       payload = JSON.parse(chunk);
     } catch {
       return;
+    }
+
+    // The ONE declared divergence from Presence's
+    // ui/src/room/modules/video-filmstrip.ts receive path (design spec
+    // decision 8, ruling R20). `payload` is remote input: `n` and `p`
+    // reach `FilmstripPlayback`'s frame loop and the CSS step animator
+    // untouched, where a non-integer, zero, negative or absurd `n` or a
+    // non-positive `p` is an unbounded loop or a division by zero rather
+    // than a dropped frame. The README promises a malformed payload is
+    // dropped; this is where that promise is kept. Geometry is checked
+    // before ANY state mutation, so a malformed clip leaves no per-peer
+    // record and does not stamp `peerLastRecvMs`.
+    if (payload.kind !== 'stop') {
+      const { n, p } = payload as FilmstripClipPayload;
+      if (
+        !Number.isInteger(n) ||
+        n < 1 ||
+        n > MAX_CLIP_FRAMES ||
+        !Number.isFinite(p) ||
+        p <= 0
+      ) {
+        if (!this._badGeometryLogged.has(peer)) {
+          this._badGeometryLogged.add(peer);
+          console.warn(
+            `filmstrip: dropping clip with invalid geometry from ${peer.slice(0, 8)} ` +
+            `(n=${String(n)}, p=${String(p)})`
+          );
+        }
+        return;
+      }
     }
 
     let state = this.peers.get(peer);

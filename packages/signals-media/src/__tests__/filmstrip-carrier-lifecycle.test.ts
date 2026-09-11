@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { FilmstripCarrier } from '../filmstrip-carrier.js';
+import { FilmstripCarrier, MAX_CLIP_FRAMES } from '../filmstrip-carrier.js';
 import { makeFakeHost } from './fake-host.js';
 
 /**
@@ -283,6 +283,45 @@ describe('FilmstripCarrier lifecycle', () => {
     expect(release).toHaveBeenCalledTimes(2);
   });
 
+  it('contains an acquireCamera REJECTION — resolves false, holds nothing, retries next time', async () => {
+    // A denied permission prompt reaches the carrier as a rejection, not
+    // as a resolved null. `startCapture`'s contract is a boolean; an
+    // escaping rejection would skip every caller's own unwind (and, under
+    // vitest, surface as an unhandled rejection).
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const acquireCamera = vi.fn(async () => {
+      throw new Error('NotAllowedError: permission denied');
+    });
+    const worker = {
+      postMessage: vi.fn(),
+      terminate: vi.fn(),
+      onmessage: null,
+      onerror: null,
+    };
+    const f = makeFakeHost({ targets: [PEER], cadence: 'full' });
+    carrier.bind({
+      ...f.host,
+      acquireCamera: acquireCamera as never,
+      createWorker: () => worker as unknown as Worker,
+    });
+
+    await expect(carrier.startCapture()).resolves.toBe(false);
+
+    expect(acquireCamera).toHaveBeenCalledTimes(1);
+    // Nothing downstream of acquisition ran, and nothing is held.
+    expect(worker.postMessage).not.toHaveBeenCalled();
+    expect((carrier as any).cameraHandle).toBeNull();
+    expect((carrier as any).worker).toBeNull();
+    expect(err).toHaveBeenCalledWith(
+      'filmstrip: acquireCamera failed',
+      expect.any(Error)
+    );
+
+    // The failure did not latch a handle: the next attempt acquires again.
+    await expect(carrier.startCapture()).resolves.toBe(false);
+    expect(acquireCamera).toHaveBeenCalledTimes(2);
+  });
+
   it('fps and capture-side setters reject values outside the declared options', () => {
     carrier.setFps(3);
     expect(carrier.getFps()).toBe(3);
@@ -293,5 +332,120 @@ describe('FilmstripCarrier lifecycle', () => {
     expect(carrier.getCaptureSide()).toBe(96);
     carrier.setCaptureSide(1000 as never);
     expect(carrier.getCaptureSide()).toBe(96);
+  });
+});
+
+/**
+ * Clip geometry is remote input that reaches `FilmstripPlayback`'s frame
+ * loop untouched (`n` bounds the loop, `p` paces it), so the receive path
+ * validates it before any state mutation — ruling R20, the ONE declared
+ * divergence from Presence's video-filmstrip.ts receive path, and what
+ * makes the README's "a malformed payload is dropped" true.
+ * Constrains: src/filmstrip-carrier.ts (`receiveFrame`, MAX_CLIP_FRAMES).
+ */
+const silenceWarnings = () =>
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+describe('FilmstripCarrier clip-geometry validation', () => {
+  let carrier: FilmstripCarrier;
+  let warn: ReturnType<typeof silenceWarnings>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    (URL as unknown as Record<string, unknown>).createObjectURL = vi.fn(
+      () => 'blob:fake'
+    );
+    (URL as unknown as Record<string, unknown>).revokeObjectURL = vi.fn();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    warn = silenceWarnings();
+    carrier = new FilmstripCarrier();
+  });
+
+  afterEach(() => {
+    carrier.unbind();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const geo = (over: Record<string, unknown>) =>
+    JSON.stringify({
+      seq: 1,
+      ts: 0,
+      t0: 0,
+      data: 'eA==',
+      n: 1,
+      p: 167,
+      w: 64,
+      h: 64,
+      ...over,
+    });
+
+  for (const [label, over] of [
+    ['n = 0', { n: 0 }],
+    ['n far above MAX_CLIP_FRAMES', { n: 100000000 }],
+    ['a non-integer n', { n: 1.5 }],
+    ['p = 0', { p: 0 }],
+  ] as const) {
+    it(`drops a clip with ${label}`, () => {
+      const f = makeFakeHost();
+      carrier.bind(f.host);
+      const seen: unknown[] = [];
+      carrier.subscribe(PEER, frame => seen.push(frame));
+
+      carrier.receiveFrame(PEER, geo(over));
+
+      expect(seen).toHaveLength(0);
+      // Dropped before ANY state mutation: no arrival stamp, no per-peer
+      // record for a sender that has only ever sent garbage.
+      expect(carrier.peerLastRecvMs.has(PEER)).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  it('warns once per peer however many bad clips arrive', () => {
+    const f = makeFakeHost();
+    carrier.bind(f.host);
+
+    carrier.receiveFrame(PEER, geo({ seq: 1, n: 0 }));
+    carrier.receiveFrame(PEER, geo({ seq: 2, n: -3 }));
+    carrier.receiveFrame(PEER, geo({ seq: 3, p: -1 }));
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    carrier.receiveFrame(OTHER, geo({ seq: 1, n: 0 }));
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    // The warned set is receive-side state: unbind clears it.
+    carrier.unbind();
+    carrier.bind(f.host);
+    carrier.receiveFrame(PEER, geo({ seq: 1, n: 0 }));
+    expect(warn).toHaveBeenCalledTimes(3);
+  });
+
+  it('passes the boundary values n = 1 and n = MAX_CLIP_FRAMES', () => {
+    const f = makeFakeHost();
+    carrier.bind(f.host);
+    const seen: unknown[] = [];
+    carrier.subscribe(PEER, frame => seen.push(frame));
+
+    carrier.receiveFrame(PEER, geo({ seq: 1, n: 1 }));
+    carrier.receiveFrame(PEER, geo({ seq: 2, n: MAX_CLIP_FRAMES }));
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({ frameCount: MAX_CLIP_FRAMES });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a stop payload is never subject to clip geometry', () => {
+    const f = makeFakeHost();
+    carrier.bind(f.host);
+    carrier.receiveFrame(PEER, clip(1, 0));
+    const seen: unknown[] = [];
+    carrier.subscribe(PEER, frame => seen.push(frame));
+
+    carrier.receiveFrame(PEER, stop(2, 10));
+
+    expect(seen[seen.length - 1]).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
   });
 });

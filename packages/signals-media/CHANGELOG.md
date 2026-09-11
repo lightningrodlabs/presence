@@ -58,6 +58,25 @@ accident.
 - Presence's store coupling, room-module registration, `@mdi/js` icons and
   `@holochain-open-dev/stores` dependencies are gone; the store members the
   controllers reached into are the `MediaHost` seam.
+- **Clip geometry is validated on receive — a declared divergence from
+  Presence's `video-filmstrip.ts` receive path** (design spec decision 8,
+  ruling R20). `FilmstripCarrier.receiveFrame` drops a clip whose frame count
+  `n` is not an integer in `1..MAX_CLIP_FRAMES` (exported; 64) or whose
+  playback period `p` is not finite and positive, before any per-peer state is
+  touched, and warns once per peer. Presence passed both straight through to
+  its playback loop, where a hostile or corrupt sender could bound a loop or
+  pace a timer chain with them; a library taking remote input from arbitrary
+  hosts cannot. Honest senders are unaffected — this package sends `n: 1`, and
+  the legacy batching senders the receive path still accepts stayed far below
+  64. The adoption round carries this divergence into Presence.
+- **Host callbacks that throw are contained, not propagated.** A rejecting
+  `acquireMic`/`acquireCamera` (a denied permission prompt reaching the carrier
+  as a rejection rather than a resolved `null`) now resolves `startCapture()`
+  to `false` and logs, matching the documented boolean contract instead of
+  rejecting out of it. A `VoiceHost.codec()` that throws on probe reads as "no
+  codec": `openPeer` drops the frame and logs once per peer, `startCapture()`
+  returns `false`. `codec()` is also now asked once per bind rather than once
+  per peer (the resolved backend is cached until `unbind`).
 
 ### Wire compatibility
 

@@ -152,3 +152,10 @@ monorepo.
 
 Cleanup: the scratch tree and the local `signals-media-standalone` branch
 were deleted after this pass as well.
+
+**Consequence for the real extraction:** no lockfile exists for this package
+inside the monorepo (the root workspace lockfile covers it), so each rehearsal
+pass generated one with `npm install` and threw it away with the scratch tree.
+The extracted repository's first commit must add the lockfile that `npm
+install` generates — the package's own `.github/workflows/verify.yaml` runs
+`npm ci`, which fails outright without one.

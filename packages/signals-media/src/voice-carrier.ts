@@ -383,11 +383,23 @@ export class VoiceCarrier {
     // Acquire the mic from the host. The device may already be open for
     // another consumer (Presence shares it with WebRTC), in which case both
     // consumers get the same track.
-    const handle = await this.host.acquireMic((newTrack: MediaStreamTrack) => {
-      this.onMicTrackChanged(newTrack).catch(e =>
-        console.error('voice: onMicTrackChanged failed', e)
-      );
-    });
+    let handle: TrackHandle | null;
+    try {
+      handle = await this.host.acquireMic((newTrack: MediaStreamTrack) => {
+        this.onMicTrackChanged(newTrack).catch(e =>
+          console.error('voice: onMicTrackChanged failed', e)
+        );
+      });
+    } catch (e) {
+      // A host that REJECTS (a denied permission prompt, a host that
+      // throws rather than resolving null) must not take `startCapture`
+      // with it: the caller's contract is a boolean, and an escaping
+      // rejection would skip every caller's own unwind. Nothing is held
+      // at this point — the epoch bump above is deliberately disposable —
+      // so the null arm's bare `return false` is the whole unwind.
+      console.error('voice: acquireMic failed', e);
+      return false;
+    }
     if (!handle) {
       console.error('voice: acquireMic failed');
       return false;
@@ -465,9 +477,24 @@ export class VoiceCarrier {
   }
 
   /** The host's backend if it supplies one, else WebCodecs (null on an
-   *  engine with neither). */
+   *  engine with neither). Cached for the life of the bind (cleared in
+   *  `unbind`), so a host is asked once per bind rather than once per
+   *  peer. */
   private resolveCodec(): OpusCodec | null {
-    this.codec = this.host?.codec?.() ?? webCodecsOpus();
+    if (this.codec) return this.codec;
+    try {
+      this.codec = this.host?.codec?.() ?? webCodecsOpus();
+    } catch (e) {
+      // A third-party backend that throws on probe is a "no codec"
+      // answer, not a failure of the caller: `openPeer` takes its
+      // existing null arm (this frame dropped, one log per peer) and
+      // `startCapture` takes its existing "no codec" false arm. An
+      // escaping throw would instead reject `startCapture` and take down
+      // `receiveFrame`'s caller.
+      console.error('voice: host.codec() threw', e);
+      this.codec = null;
+      return null;
+    }
     return this.codec;
   }
 

@@ -312,6 +312,48 @@ describe('VoiceCarrier.startCapture failure arm', () => {
     expect(releases).toEqual([1, 2]);
   });
 
+  it('contains an acquireMic REJECTION — resolves false, holds nothing, retries next time', async () => {
+    // A denied permission prompt reaches the carrier as a rejection, not
+    // as a resolved null. `startCapture`'s contract is a boolean; an
+    // escaping rejection would skip every caller's own unwind (and, under
+    // vitest, surface as an unhandled rejection).
+    const fake = makeFakeHost({ clock: new ManualClock(1_000) });
+    let acquires = 0;
+    const host: VoiceHost = {
+      ...fake.host,
+      audioContext: () => fakeAudioContext(),
+      acquireMic: async () => {
+        acquires += 1;
+        throw new Error('NotAllowedError: permission denied');
+      },
+    };
+    voice.bind(host);
+    let starts = 0;
+    (voice as any).capture = {
+      start: async () => {
+        starts += 1;
+        return true;
+      },
+      stop() {},
+      replaceTrack() {},
+    };
+
+    await expect(voice.startCapture()).resolves.toBe(false);
+    expect(acquires).toBe(1);
+    // Nothing downstream of acquisition ran, and nothing is held.
+    expect(starts).toBe(0);
+    expect((voice as any).micHandle).toBeNull();
+    expect((voice as any).encoder).toBeNull();
+    expect(errors).toHaveBeenCalledWith(
+      'voice: acquireMic failed',
+      expect.any(Error)
+    );
+
+    // The failure did not latch a handle: the next attempt acquires again.
+    await expect(voice.startCapture()).resolves.toBe(false);
+    expect(acquires).toBe(2);
+  });
+
   it('succeeds and holds the handle when capture.start resolves true', async () => {
     const { host, releases, acquireCount } = hostWithMicSpy();
     voice.bind(host);
@@ -328,5 +370,103 @@ describe('VoiceCarrier.startCapture failure arm', () => {
     expect(await voice.startCapture()).toBe(true);
     expect(acquireCount()).toBe(1);
     expect(errors).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `VoiceHost.codec` is host-supplied and SYNCHRONOUS (types.ts documents
+ * both factories as throwing-allowed), so a third-party backend that throws
+ * on probe must read as "no codec" — `openPeer`'s existing null arm (frame
+ * dropped, one log per peer) and `startCapture`'s existing false arm — never
+ * as a throw escaping `receiveFrame` or a rejected `startCapture`.
+ * Constrains: src/voice-carrier.ts (`resolveCodec`).
+ */
+describe('VoiceCarrier codec-probe containment', () => {
+  let errors: ReturnType<typeof silenceErrors>;
+
+  beforeEach(() => {
+    const g = globalThis as Record<string, unknown>;
+    g.AudioWorkletNode = class {
+      constructor(..._args: unknown[]) {}
+    };
+    errors = silenceErrors();
+    voice = new VoiceCarrier();
+  });
+
+  afterEach(() => {
+    errors.mockRestore();
+    delete (globalThis as Record<string, unknown>).AudioWorkletNode;
+  });
+
+  const throwingCodecHost = () => {
+    let probes = 0;
+    const fake = makeFakeHost({ clock: new ManualClock(1_000) });
+    const host: VoiceHost = {
+      ...fake.host,
+      audioContext: () => fakeAudioContext(),
+      codec: () => {
+        probes += 1;
+        throw new Error('backend unavailable');
+      },
+    };
+    return { host, probeCount: () => probes };
+  };
+
+  it('receiveFrame does not throw and opens no peer when host.codec throws', () => {
+    const { host, probeCount } = throwingCodecHost();
+    voice.bind(host);
+
+    expect(() => voice.receiveFrame(peer, framePayload(1, 1))).not.toThrow();
+    expect(probeCount()).toBe(1);
+    // No decoder, no per-peer record — the frame was dropped, not half-applied.
+    expect((voice as any).peers.size).toBe(0);
+    expect(errors).toHaveBeenCalledWith(
+      'voice: host.codec() threw',
+      expect.any(Error)
+    );
+  });
+
+  it('startCapture resolves false when host.codec throws', async () => {
+    const { host } = throwingCodecHost();
+    voice.bind(host);
+
+    await expect(voice.startCapture()).resolves.toBe(false);
+    expect((voice as any).micHandle).toBeNull();
+  });
+
+  it('asks the host for a codec once per bind, not once per peer', () => {
+    let probes = 0;
+    const decoders: unknown[] = [];
+    const codec = {
+      name: 'wasm' as const,
+      createEncoder: () => ({ encode() {}, flush: async () => {}, close() {} }),
+      createDecoder: () => {
+        const d = { decode() {}, close() {} };
+        decoders.push(d);
+        return d;
+      },
+    };
+    const fake = makeFakeHost({ clock: new ManualClock(1_000) });
+    const host: VoiceHost = {
+      ...fake.host,
+      audioContext: () => fakeAudioContext(),
+      codec: () => {
+        probes += 1;
+        return codec;
+      },
+    };
+    voice.bind(host);
+
+    voice.receiveFrame(peer, framePayload(1, 1));
+    voice.receiveFrame('uhCAk_second_peer', framePayload(1, 1));
+
+    expect(decoders).toHaveLength(2);
+    expect(probes).toBe(1);
+
+    // The cache is per bind: a rebind asks again.
+    voice.unbind();
+    voice.bind(host);
+    voice.receiveFrame(peer, framePayload(1, 1));
+    expect(probes).toBe(2);
   });
 });

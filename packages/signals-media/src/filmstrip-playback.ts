@@ -84,6 +84,15 @@ export class FilmstripPlayback {
   push(frame: FilmstripFrame): void {
     // Push N entries (one per frame) into the queue. The setTimeout
     // chain consumes them at periodMs intervals.
+    //
+    // This loop trusts `frameCount` and `periodMs`: it does NOT re-check
+    // them. The single validation site is FilmstripCarrier.receiveFrame
+    // (filmstrip-carrier.ts, the MAX_CLIP_FRAMES geometry check), which
+    // drops any clip whose `n` is not an integer in 1..MAX_CLIP_FRAMES or
+    // whose `p` is not finite and positive — so a remote sender cannot
+    // reach this loop with a count that never terminates or a period
+    // that makes the setTimeout chain spin. A host that constructs
+    // `FilmstripFrame`s from some other source owns that check itself.
     for (let i = 0; i < frame.frameCount; i++) {
       this._queue.push({
         url: frame.url,

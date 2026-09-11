@@ -11,6 +11,13 @@
 declare const AudioWorkletProcessor: any;
 declare function registerProcessor(n: string, c: any): void;
 
+// Must equal `VOICE_FRAME_SAMPLES` in voice-capture.ts (960 samples = 20 ms
+// at VOICE_SAMPLE_RATE), and with it the `20_000` µs timestamp step that
+// file advances per block: the encoder's frame duration and this buffer's
+// length are the same number seen from two sides. A worklet module is
+// evaluated in the AudioWorklet global scope and cannot import, so this
+// comment is the only link between the two constants — change one, change
+// both.
 const FRAME = 960;
 
 class VoiceCaptureProcessor extends AudioWorkletProcessor {

@@ -658,7 +658,12 @@ Notes on what those numbers mean:
 ✓ 6 cross-backend Opus: webcodecs sender → wasm receiver (1.6s)
 ```
 
-**Measured restart cost: 67–75 ms** across runs — from `stopCapture()` +
+**Measured restart cost: 54–75 ms** across recorded runs — 67 ms in the
+transcript above, 74 ms and 75 ms on two repeats of the same gate, and 54 ms
+running the gate from inside the package's own devshell
+(`nix develop -c npm run test:browser` with `packages/signals-media` as the
+working directory). This file is the source for that figure; the package
+README and `docs/design.md` cite it. From `stopCapture()` +
 `startCapture()` to the first voice frame handed to `host.send`. That is the
 cost of the carrier switch the design spec claims is cheap; the receiver adopts
 the new session epoch and audio resumes without a decoder reset.

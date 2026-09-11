@@ -44,7 +44,7 @@ dependency reached through the `./opus-wasm` subpath and nothing else).
 |---|---|---|---|
 | **Chromium** — Chrome, Edge, Electron, Android WebView, WebView2 | AudioWorklet + `<video>`/`createImageBitmap` | WebCodecs | Full support. The Playwright gate runs here. |
 | **WebKitGTK 2.52+** — Linux Tauri/GTK | same | WebCodecs (over GStreamer) | Works, and is the *only* carrier: no WebRTC. Needs the three runtime pieces below. |
-| **WKWebView** — macOS / iOS | same | WebCodecs from Safari 26 / macOS 26 / iOS 26; `wasmOpus()` before that | `AudioEncoder`/`AudioDecoder` shipped in Safari 26. Older OSes need the WASM backend. |
+| **WKWebView** — macOS / iOS | same (untested here) | WebCodecs from Safari 26 / macOS 26 / iOS 26; `wasmOpus()` before that | `AudioEncoder`/`AudioDecoder` shipped in Safari 26. Older OSes need the WASM backend. |
 | **WebView2** — Windows | same | WebCodecs | Chromium; same support as Chromium, plus WebView2's `PermissionRequested`. |
 
 There is **one capture path per medium** and it is the portable one:
@@ -98,9 +98,9 @@ cheap. The contract:
   empties. The device handle is the host's (`acquireMic` hands back a
   `TrackHandle` the carrier releases; the host can keep the underlying device
   open), and the worklet module is loaded once per `AudioContext`, so a restart
-  costs about one encoder configure. **Measured 54–75 ms** across Chromium gate
-  runs, from `stopCapture()` + `startCapture()` to the first voice frame handed
-  to `host.send`.
+  costs about one encoder configure. **Measured 54–75 ms across recorded runs**
+  (see `testbed/README.md` for the run records), from `stopCapture()` +
+  `startCapture()` to the first voice frame handed to `host.send`.
 - **A restart is admitted immediately by the receiver.** Every capture session
   stamps a new `ep` on its frames and restarts `seq` at 1;
   `decideVoiceAdmission` admits the new session against the old high-water
@@ -224,7 +224,14 @@ that is what Presence does.
 
 `receiveFrame` is synchronous end to end: it opens the peer's decoder and
 decodes in the same tick, and drops the frame if a decoder cannot be
-configured. A malformed payload is dropped silently.
+configured. A malformed payload is dropped silently: unparseable JSON on
+either carrier, and — on filmstrip — a clip whose geometry could not have
+come from an honest sender. A clip's frame count `n` must be an integer in
+`1..MAX_CLIP_FRAMES` (exported; 64) and its playback period `p` finite and
+positive, otherwise the clip is dropped before any per-peer state is touched
+and one `console.warn` is emitted per peer. `n` and `p` reach
+`FilmstripPlayback`'s frame loop untouched, so this is the check that keeps a
+remote sender from wedging it.
 
 ### The AudioContext
 

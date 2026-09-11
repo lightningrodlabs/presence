@@ -61,7 +61,9 @@ export interface VoiceRxStats {
  * Codec seam (design spec decision 5b). The library speaks raw Opus packets;
  * a backend is either WebCodecs (`name: 'webcodecs'`) or the WASM fallback
  * (`name: 'wasm'`). Encoders are configured 48 kHz mono, 20 ms frames, with a
- * 24 kbps target — those constants live in `voice-capture.ts`.
+ * 24 kbps target. The 48 kHz rate and the 960-sample (20 ms) frame live in
+ * `voice-capture.ts` (`VOICE_SAMPLE_RATE`, `VOICE_FRAME_SAMPLES`); the bitrate
+ * is each backend's own — `opus-webcodecs.ts` and `opus-wasm.ts`.
  */
 export interface OpusPacket {
   type: 'key' | 'delta';

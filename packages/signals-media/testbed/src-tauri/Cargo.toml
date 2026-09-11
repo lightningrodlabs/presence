@@ -26,7 +26,7 @@ tauri-build = { version = "2", features = [] }
 # version the WebKitGTK media probe spike compiled against.
 tauri = { version = "2.11.5", features = [] }
 
-# The Linux webview settings + permission handler (see src/main.rs). Only
+# The Linux webview settings + permission handler (see src/lib.rs). Only
 # compiled on Linux; every other platform's webview needs neither.
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0", features = ["v2_38"] }
