@@ -66,18 +66,25 @@ jobs:
 
       - run: npm run test:harness -w ui
 
-      # The signals-media testbed keeps its own dependency tree (its own
-      # Playwright must own both the runner and the module — see
-      # packages/signals-media/testbed/README.md), so `npm ci` above does not
-      # cover it. `npm run build:packages` already built the dist/ the
-      # testbed page consumes.
-      - run: npm install --no-audit --no-fund
-        working-directory: packages/signals-media/testbed
-
-      - run: npx playwright install --with-deps chromium
-        working-directory: packages/signals-media/testbed
-
-      - run: npm run test:browser -w packages/signals-media
+      # The signals-media Chromium testbed. One step, and it skips itself on a
+      # ref that has no `packages/signals-media`: this workflow checks out the
+      # shipped 0.6 line (see the `ref:` above), and the package lands there
+      # only with the adoption round. A shell guard rather than a YAML `if:`
+      # because the condition is repo state, which `if:` cannot see, and a
+      # missing `working-directory:` fails the step before its script runs —
+      # hence no `working-directory:` here either.
+      #
+      # The testbed keeps its own dependency tree (its own Playwright must own
+      # both the runner and the module — see
+      # packages/signals-media/testbed/README.md), so the `npm ci` above does
+      # not cover it.
+      - name: signals-media Chromium testbed
+        run: |
+          if [ ! -d packages/signals-media ]; then echo "signals-media not on this ref — skipping"; exit 0; fi
+          npm run build -w packages/signals-media
+          npm install --no-audit --no-fund --prefix packages/signals-media/testbed
+          npm --prefix packages/signals-media/testbed exec -- playwright install --with-deps chromium
+          npm run test:browser -w packages/signals-media
 
       - uses: actions/upload-artifact@v4
         if: failure()
