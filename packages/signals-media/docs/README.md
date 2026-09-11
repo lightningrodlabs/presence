@@ -86,3 +86,69 @@ git log --stat --oneline <split-branch> \
 
 Cleanup: the scratch tree and the local `signals-media-standalone` branch
 were deleted after each pass.
+
+**2026-09-10 (re-run after a review finding).** An adversarial review of the
+R19 fix above (fix round 1 of 5) raised one Important finding against
+`testbed/ui/vite.config.js:231-239`: the `libopusWasmDir` derivation was
+dead code. `require.resolve('libopus-wasm/package.json', { paths: [pkgRoot]
+})` unconditionally threw `ERR_PACKAGE_PATH_NOT_EXPORTED` — the installed
+`libopus-wasm@0.3.0`'s `exports` map declares only `"."` and `"./discordjs"`,
+no `"./package.json"` — so the try/catch's "present" branch could never be
+taken, on any platform, and the `✨ new dependencies optimized: libopus-wasm`
+Vite log line cited as evidence in the prior write-up was esbuild
+pre-bundling, unrelated to `server.fs.allow`.
+
+Fix (commit `2f35860`, package-only). The review's suggested literal
+replacement — `require.resolve('libopus-wasm', { paths: [pkgRoot] })`, i.e.
+the `"."` export — was tried first and **also throws**, with a different
+message (`No "exports" main defined…`, still `ERR_PACKAGE_PATH_NOT_EXPORTED`),
+verified directly against the same installed copy. The package's `"."`
+export lists only the `types`/`browser`/`import` conditions; `require.resolve()`
+(and `createRequire().resolve()`, which inherits it) always resolves under
+the `require`/`node`/`default` condition set, and Node's public API has no
+way to add `import` to that set for a plain `require.resolve()` call — an
+ESM-only export map can never satisfy it, independent of this repo. The
+committed fix instead walks `node_modules` directories directly (the phase
+of Node's own resolution algorithm that runs *before* a package's `exports`
+map is ever consulted): starting at `pkgRoot`, check
+`<dir>/node_modules/libopus-wasm/package.json`; if absent, go to the parent
+directory; repeat, bounded by the filesystem root. This answers exactly the
+question the file needs ("where is the libopus-wasm directory"), not "what
+file would importing it load", so it is unaffected by whatever the package's
+`exports` map says. The config now `console.log`s the resolved directory
+once at load (or `console.warn`s once if not found) — verified live in both
+layouts:
+
+- **Monorepo layout:** `[signals-media testbed] libopus-wasm resolved at
+  <worktree>/node_modules/libopus-wasm` — the repo-root, hoisted location,
+  confirmed both by direct `node --input-type=module -e "import(...)"` of
+  the config file and by the line appearing in `npm run test:browser`'s
+  Vite dev-server output.
+- **Standalone layout (rehearsal, below):** `[signals-media testbed]
+  libopus-wasm resolved at <scratch-tree>/node_modules/libopus-wasm` — one
+  level up from the package root, since in this layout the package root
+  *is* the repo root.
+
+Monorepo regression check before re-rehearsing: `nix develop -c npm run
+test:browser` (package devshell, all 6 Playwright specs green) and `nix
+develop -c npm run verify` from the worktree root (924 unit tests + three
+clean typechecks + the drift alarm) — both green.
+
+Third pass, from the new HEAD (`git subtree split` tip `f5676ed4`,
+19-commit standalone history — mixed-commit scan re-run clean at 25
+commits, `mixed=0`; the tightened leak-grep from the second pass, unchanged,
+still clean). Ran fully standalone, no monorepo access: `npm install`
+(same resolution as before: `typescript` 5.9.3, `vitest` 1.6.1,
+`libopus-wasm` 0.3.0, 126 lockfile entries) — **passed**; `npm --prefix
+testbed install` — **passed**; `npm run typecheck` — **passed**; `npm run
+test` (146/146) — **passed**; `npm run build` — **passed**; `npm pack
+--dry-run` (76 files, 81.1 kB, shasum byte-identical to both prior passes —
+the fix touches only `testbed/`, which isn't packed) — **passed**; `npm run
+test:browser` (Playwright, Chromium, `DISPLAY=:1`) — **passed**, all 6
+specs green, with the `libopus-wasm resolved at
+<scratch>/node_modules/libopus-wasm` line present in the Vite dev-server
+log, confirming the fix resolves correctly standalone too, not just in the
+monorepo.
+
+Cleanup: the scratch tree and the local `signals-media-standalone` branch
+were deleted after this pass as well.
