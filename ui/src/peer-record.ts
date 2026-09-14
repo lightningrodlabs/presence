@@ -11,6 +11,7 @@
  * peer (the leave reset keeps `connectionEpoch` — monotonic for the
  * session, see docs/WEBRTC_RECONNECT_IDENTITY.md).
  */
+import type { DirectPathRecord } from './transport/direct-signal-policy';
 import type { PendingInit } from './types';
 
 export type PeerRecord = {
@@ -92,6 +93,16 @@ export type PeerRecord = {
    * from jitter on individual ping/pong round trips.
    */
   signalsRttEwma?: number;
+  /**
+   * Per-peer state of the `direct-path-usable` predicate
+   * (`transport/direct-signal-policy.ts`): has a direct signal to this peer
+   * been observed to arrive and be answered? Absent means never probed,
+   * which `decideSignalPath` reads as "use the zome carrier". Cleared on
+   * peer-leave, because a rejoining agent may be a different build on a
+   * different conductor and must re-prove the path; a media close does NOT
+   * clear it — the carrier is not the media link.
+   */
+  directPath?: DirectPathRecord;
   // — session survivor: never reset
   /**
    * Monotonic per-peer connection generation ("epoch"). Allocated by the
@@ -147,6 +158,7 @@ export function resetPeerRecord(r: PeerRecord, arm: PeerRecordResetArm): PeerRec
         ...r, videoStream: undefined, pendingInits: undefined,
         qualityBucket: undefined, lastDisconnectTime: undefined,
         lastReconcileTime: undefined, signalsRttEwma: undefined,
+        directPath: undefined,
       };
     case 'screen-out-close':
       return { ...r, screenShareIceDisconnectedAt: undefined };

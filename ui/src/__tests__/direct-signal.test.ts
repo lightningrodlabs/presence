@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { encode } from '@msgpack/msgpack';
 
 import {
+  cellIdForRole,
   type DirectSignalCellId,
   directSignalPortFor,
   nativeDirectSignalPort,
@@ -242,5 +243,40 @@ describe('directSignalPortFor', () => {
     ['a non-object client', null],
   ])('returns null for %s', (_label, client) => {
     expect(directSignalPortFor(client, CELL)).toBeNull();
+  });
+});
+
+describe('cellIdForRole', () => {
+  const appInfo = {
+    cell_info: {
+      presence: [
+        { type: 'provisioned', value: { cell_id: [DNA, ME] } },
+      ],
+      other: [{ type: 'provisioned', value: { cell_id: [PEER, ME] } }],
+    },
+  };
+
+  it('finds the provisioned cell for a role', () => {
+    expect(cellIdForRole(appInfo, 'presence')).toEqual([DNA, ME]);
+  });
+
+  it('matches a clone by its clone id, not its role key', () => {
+    const withClone = {
+      cell_info: {
+        presence: [
+          { type: 'cloned', value: { cell_id: [DNA, PEER], clone_id: 'presence.0' } },
+        ],
+      },
+    };
+    expect(cellIdForRole(withClone, 'presence.0')).toEqual([DNA, PEER]);
+    expect(cellIdForRole(withClone, 'presence')).toBeNull();
+  });
+
+  it.each([
+    ['an unknown role', appInfo, 'nope'],
+    ['a malformed cell id', { cell_info: { presence: [{ type: 'provisioned', value: { cell_id: [DNA] } }] } }, 'presence'],
+    ['no cell info at all', { cell_info: {} }, 'presence'],
+  ])('returns null for %s', (_label, info, role) => {
+    expect(cellIdForRole(info as Parameters<typeof cellIdForRole>[0], role)).toBeNull();
   });
 });

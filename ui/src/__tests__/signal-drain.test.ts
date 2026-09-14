@@ -116,7 +116,9 @@ describe('handleSignal drain', () => {
     });
 
     // Two signals arrive before the drain runs; the first one throws.
-    store._signalQueue.push(sig('bad'));
+    // Queue items carry the carrier they arrived on (`via`) since the
+    // direct-signal carrier landed — `handlePingUi` answers on it.
+    store._signalQueue.push({ signal: sig('bad'), via: 'zome' });
     await store.handleSignal(sig('queued-behind'));
 
     expect(seen).toEqual(['queued-behind']);

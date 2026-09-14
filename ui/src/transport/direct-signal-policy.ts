@@ -72,8 +72,13 @@ export function initialDirectPathRecord(): DirectPathRecord {
   return { state: 'unknown', probeSentAt: null, lastResultAt: null, attempts: 0 };
 }
 
+/** Which of the two holochain signal carriers a message takes. Distinct
+ *  from `decideSignalCarrier` (`presence-policy.ts`), which is about
+ *  whether the signal channel is up at all. */
+export type SignalPath = 'direct' | 'zome';
+
 export type SignalPathDecision = {
-  path: 'direct' | 'zome';
+  path: SignalPath;
   reason: string;
 };
 

@@ -175,6 +175,9 @@ const deps: StreamsStoreDeps = {
       }),
     }),
   mediaDevices: navigator.mediaDevices,
+  // No conductor in the harness: the BroadcastChannel bus IS the
+  // carrier, so there is no direct-signal port (declared stand-in).
+  directSignalPort: null,
 };
 
 const timeline: TimelineEntry[] = [];

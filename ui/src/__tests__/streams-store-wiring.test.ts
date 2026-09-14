@@ -12,6 +12,7 @@ import {
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
 import type { FakeDeps, FakeTransport } from '../store-deps.testing';
+import type { FakeDirectSignalPort } from '../store-deps.testing';
 import {
   PING_INTERVAL,
   PRESENT_STALENESS_MS,
@@ -22,7 +23,16 @@ import {
   SIGNALS_RTT_COLLAPSED_MS,
   SIGNALS_RTT_DEGRADED_MS,
 } from '../transport/signals-cadence-policy';
-import { CAP_VOICE_BATCH } from '../transport/wire-contract';
+import { CAP_DIRECT_SIGNAL, CAP_VOICE_BATCH } from '../transport/wire-contract';
+import {
+  decodeDirectEnvelope,
+  encodeDirectEnvelope,
+} from '../transport/direct-envelope';
+import {
+  DIRECT_PROBE_RETRY_MS,
+  DIRECT_PROBE_TIMEOUT_MS,
+  DIRECT_SIGNAL_MAX_PAYLOAD_BYTES,
+} from '../transport/direct-signal-policy';
 import { encodeRtcAction } from '../rtc-message-policy';
 import {
   CAPTURE_REOPEN_MIN_INTERVAL_MS,
@@ -2539,5 +2549,200 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       mode: 'full',
       reason: 'no-sample',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The direct-signal carrier (DIRECT_SIGNALS_PLAN.md §4 phases 1-2)
+// ---------------------------------------------------------------------------
+
+describe('direct-signal carrier wiring', () => {
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  /** A ModuleState declaring `caps` for `from`, the one capability read. */
+  function capsFrom(from: AgentPubKey, caps: string[]): RoomSignal {
+    return message(
+      from,
+      'ModuleState',
+      JSON.stringify({
+        moduleId: 'conversation',
+        active: true,
+        payload: JSON.stringify({ caps }),
+        updatedAt: 1,
+      })
+    );
+  }
+
+  /** Decode what the store handed the direct port. */
+  function directEnvelopes(port: FakeDirectSignalPort) {
+    return port.sent.map(s => {
+      const decoded = decodeDirectEnvelope(s.bytes);
+      if (!decoded.ok) throw new Error(`undecodable direct send: ${decoded.error}`);
+      return { to: s.to, msgType: decoded.value.msgType, payload: decoded.value.payload };
+    });
+  }
+
+  /** Drive one ping cycle, then answer the direct probe it sent to `peer`
+   *  the way that peer's own `handlePingUi` would: a PongUi echoing the
+   *  probe's `t0`, delivered over the direct carrier. */
+  async function proveDirectPath(
+    started: Started,
+    peerKey: AgentPubKey,
+    peerB64: string
+  ): Promise<void> {
+    const { store, directPort } = started;
+    await store.pingAgents();
+    const probe = directEnvelopes(directPort).find(
+      e => e.msgType === 'PingUi' && e.to.includes(peerB64)
+    );
+    if (!probe) throw new Error('no direct probe was sent');
+    const t0 = JSON.parse(probe.payload).t0 as number;
+    directPort.deliver(
+      peerKey,
+      encodeDirectEnvelope({
+        from: peerKey,
+        msgType: 'PongUi',
+        payload: JSON.stringify({
+          formatVersion: 1,
+          // `moduleStatesAt: 1` matches the suite's other pong fixtures: a
+          // pong carrying no `moduleStates` with a stamp NEWER than the
+          // stored entry legitimately sweeps that module away
+          // (`decideModuleStateMerge`), which would delete the caps
+          // declaration this test just made.
+          data: { connectionStatuses: {}, pingT0: t0, moduleStatesAt: 1 },
+        }),
+      })
+    );
+    await flush();
+  }
+
+  it('probes a capable peer once per cycle and routes nothing direct until the probe is answered', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, directPort } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsFrom(peerAKey, [CAP_DIRECT_SIGNAL]));
+
+    await store.pingAgents();
+
+    // Exactly one direct send, and it is the probe ping.
+    expect(directEnvelopes(directPort)).toEqual([
+      { to: [peerA], msgType: 'PingUi', payload: expect.stringContaining('"t0"') },
+    ]);
+
+    // Until it is answered, real traffic stays on the zome carrier.
+    bus.sent.length = 0;
+    directPort.sent.length = 0;
+    await store.sendModuleData('voice', 'chunk');
+    expect(bus.sent.map(s => s.msgType)).toContain('ModuleData');
+    expect(directEnvelopes(directPort)).toEqual([]);
+  });
+
+  it('routes a capable, proven peer direct and an undeclared peer zome, from one send', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, directPort } = started;
+    store._knownAgents.set(knownFresh(clock, peerA, peerB));
+    await bus.deliver(capsFrom(peerAKey, [CAP_DIRECT_SIGNAL]));
+    await proveDirectPath(started, peerAKey, peerA);
+
+    bus.sent.length = 0;
+    directPort.sent.length = 0;
+    await store.sendModuleData('voice', 'chunk');
+
+    expect(directEnvelopes(directPort)).toEqual([
+      { to: [peerA], msgType: 'ModuleData', payload: expect.stringContaining('voice') },
+    ]);
+    const zome = bus.sent.filter(s => s.msgType === 'ModuleData');
+    expect(zome).toHaveLength(1);
+    expect(zome[0].to).toEqual([peerB]);
+  });
+
+  it('an oversize payload rides the zome carrier even on a proven path', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, directPort } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsFrom(peerAKey, [CAP_DIRECT_SIGNAL]));
+    await proveDirectPath(started, peerAKey, peerA);
+
+    bus.sent.length = 0;
+    directPort.sent.length = 0;
+    await store.sendModuleData('voice', 'x'.repeat(DIRECT_SIGNAL_MAX_PAYLOAD_BYTES + 1));
+
+    expect(directEnvelopes(directPort)).toEqual([]);
+    expect(bus.sent.map(s => s.msgType)).toContain('ModuleData');
+  });
+
+  it('an inbound direct signal reaches the normal handlers and is answered on the direct carrier', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, directPort } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    bus.sent.length = 0;
+
+    // peerA pings US over the direct carrier. Our pong must go back over
+    // the direct carrier, or their probe could never complete.
+    directPort.deliver(
+      peerAKey,
+      encodeDirectEnvelope({
+        from: peerAKey,
+        msgType: 'PingUi',
+        payload: JSON.stringify({ t0: clock.now() }),
+      })
+    );
+    await flush();
+
+    expect(directEnvelopes(directPort)).toEqual([
+      { to: [peerA], msgType: 'PongUi', payload: expect.stringContaining('formatVersion') },
+    ]);
+    expect(bus.sent.filter(s => s.msgType === 'PongUi')).toEqual([]);
+  });
+
+  it('an unanswered probe expires and the peer stays on the zome carrier, re-probed after the retry window', async () => {
+    const started = makeStarted();
+    const { store, clock, bus, directPort } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await bus.deliver(capsFrom(peerAKey, [CAP_DIRECT_SIGNAL]));
+
+    await store.pingAgents();
+    expect(directEnvelopes(directPort)).toHaveLength(1);
+
+    // Nobody answers. The probe expires on a later cycle…
+    clock.advance(DIRECT_PROBE_TIMEOUT_MS);
+    await store.pingAgents();
+    expect(directEnvelopes(directPort)).toHaveLength(1);
+
+    // …and traffic is on the zome carrier.
+    bus.sent.length = 0;
+    await store.sendModuleData('voice', 'chunk');
+    expect(bus.sent.map(s => s.msgType)).toContain('ModuleData');
+
+    // The retry window reopens, so a peer that commits its capability grant
+    // later in the session recovers without a reload.
+    clock.advance(DIRECT_PROBE_RETRY_MS);
+    await store.pingAgents();
+    expect(directEnvelopes(directPort)).toHaveLength(2);
+  });
+
+  it('disconnect() releases the direct subscription exactly once and stops delivery', async () => {
+    const started = makeStarted();
+    const { store, clock, directPort } = started;
+    store._knownAgents.set(knownFresh(clock, peerA));
+    expect(directPort.subscriberCount).toBe(1);
+
+    await store.disconnect('test');
+
+    expect(directPort.unsubscribeCount).toBe(1);
+    expect(directPort.subscriberCount).toBe(0);
+
+    // A signal delivered after teardown reaches nothing.
+    directPort.sent.length = 0;
+    directPort.deliver(
+      peerAKey,
+      encodeDirectEnvelope({
+        from: peerAKey,
+        msgType: 'PingUi',
+        payload: JSON.stringify({ t0: clock.now() }),
+      })
+    );
+    await flush();
+    expect(directPort.sent).toEqual([]);
   });
 });

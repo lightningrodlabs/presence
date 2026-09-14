@@ -62,12 +62,25 @@ import {
   parseConversationPayload,
 } from './room/modules/conversation';
 import {
+  CAP_DIRECT_SIGNAL,
   CAP_SDP_FSM,
   CAP_VOICE_BATCH,
   isSignalMsgType,
+  type SignalMsgType,
 } from './transport/wire-contract';
 import { RoomStore } from './room/room-store';
 import type { StreamsStoreDeps } from './store-deps';
+import { cellIdForRole, directSignalPortFor } from './direct-signal';
+import { decodeDirectEnvelope, encodeDirectEnvelope } from './transport/direct-envelope';
+import {
+  applyDirectProbeResult,
+  decideDirectProbeAction,
+  decideSignalPath,
+  initialDirectPathRecord,
+  markDirectProbeSent,
+  type DirectPathRecord,
+  type SignalPath,
+} from './transport/direct-signal-policy';
 import { PresenceLogger } from './logging';
 import { MicSource } from './mic-source';
 import { CameraSource } from './camera-source';
@@ -377,7 +390,15 @@ export class StreamsStore {
    */
   signalDelayMs = 0;
 
-  private _signalQueue: RoomSignal[] = [];
+  /** Queued inbound signals, each tagged with the carrier it arrived on —
+   *  `handlePingUi` answers on the same carrier, which is what lets each
+   *  side's direct-path probe prove its own send direction (see
+   *  `_driveDirectProbes`). */
+  private _signalQueue: Array<{ signal: RoomSignal; via: SignalPath }> = [];
+
+  /** Release for the direct-carrier subscription; null when this
+   *  environment has no port. */
+  private _directUnsub: (() => void) | null = null;
 
   private _processingSignal = false;
 
@@ -571,7 +592,7 @@ export class StreamsStore {
       // -- Establishment + pong drive (Task 4) --
       myPubKeyB64: () => this.myPubKeyB64,
       sendMessage: (agents, msgType, payload) =>
-        this.deps.bus.sendMessage(agents, msgType, payload),
+        this._sendMessage(agents, msgType, payload),
       connectionStatuses: () => this._connectionStatuses,
       myModuleStates: () => this._myModuleStates,
       peerModuleStates: () => this._peerModuleStates,
@@ -620,9 +641,10 @@ export class StreamsStore {
       setSignalsCadence: c => { this._signalsCadence = c; },
       // -- pingAgents pipeline + presence tick (Task 2) --
       sendMessage: (agents, msgType, payload) =>
-        this.deps.bus.sendMessage(agents, msgType, payload),
+        this._sendMessage(agents, msgType, payload),
       checkTrackHealth: () => this.trackHealth.checkTrackHealth(),
       checkAudibilityOutages: () => this._checkAudibilityOutages(),
+      driveDirectProbes: () => this._driveDirectProbes(),
       flushStaleSdpAggregates: () => this._flushStaleSdpAggregates(),
       evaluateSignalsCadence: () => this._evaluateSignalsCadence(),
       sweepPendingInits: now => this._sweepPendingInits(now),
@@ -706,7 +728,7 @@ export class StreamsStore {
     );
     this.diagnosticsHub = new DiagnosticsHub({
       sendMessage: (agents, msgType, payload) =>
-        this.deps.bus.sendMessage(agents, msgType, payload),
+        this._sendMessage(agents, msgType, payload),
       logger: this.logger,
       now: () => this.clock.now(),
       setTimeout: (fn, ms) => this.clock.setTimeout(fn, ms),
@@ -777,6 +799,27 @@ export class StreamsStore {
     this.signalUnsubscribe = this.deps.bus.onSignal(async signal =>
       this.handleSignal(signal)
     );
+
+    // The direct carrier joins the SAME queue and the same handlers: the
+    // envelope mirrors `RoomSignal`'s Message shape precisely so that
+    // nothing downstream of `handleSignal` knows which carrier a signal
+    // took. Only the `via` tag differs, and only `handlePingUi` reads it.
+    const port = this.deps.directSignalPort;
+    if (!port) return;
+    this._directUnsub = port.subscribe(({ bytes }) => {
+      const decoded = decodeDirectEnvelope(bytes);
+      if (!decoded.ok) {
+        this.logger.logCustomMessage(`Dropped direct signal: ${decoded.error}`);
+        return;
+      }
+      const { from, msgType, payload } = decoded.value;
+      const peerB64 = encodeHashToBase64(from);
+      if (msgType === 'PongUi') this._noteDirectPong(peerB64, payload);
+      this.handleSignal(
+        { type: 'Message', from_agent: from, msg_type: msgType, payload },
+        'direct',
+      ).catch(() => {});
+    });
   }
 
   /** Arm the presence-tick interval. */
@@ -837,7 +880,7 @@ export class StreamsStore {
           },
           onOutgoingSignal: (signal) => {
             const toAgent = decodeHashFromBase64(signal.to);
-            this.deps.bus.sendMessage(
+            this._sendMessage(
               [toAgent],
               'SdpFsmScreen',
               JSON.stringify({
@@ -876,7 +919,7 @@ export class StreamsStore {
       },
       onOutgoingSignal: (signal) => {
         const toAgent = decodeHashFromBase64(signal.to);
-        this.deps.bus.sendMessage(
+        this._sendMessage(
           [toAgent],
           'SdpFsm',
           JSON.stringify({
@@ -1341,6 +1384,25 @@ export class StreamsStore {
     // Storage objects, not snapshots), the bus adapts RoomClient, and
     // the factory yields FsmTransport for all three purposes.
     const roomClient = roomStore.client;
+
+    // The direct carrier, when this environment has one. Resolving the cell
+    // needs an appInfo round trip (the client ships only the inverse
+    // lookup), and a failure here is not fatal: no port means every signal
+    // takes the zome carrier, which is the declared fallback.
+    let directSignalPort: StreamsStoreDeps['directSignalPort'] = null;
+    try {
+      const appInfo = await roomClient.client.appInfo();
+      const cellId = appInfo
+        ? cellIdForRole(
+            appInfo as unknown as Parameters<typeof cellIdForRole>[0],
+            roomClient.roleName,
+          )
+        : null;
+      if (cellId) directSignalPort = directSignalPortFor(roomClient.client, cellId);
+    } catch (e) {
+      console.warn('No direct-signal carrier available:', e);
+    }
+
     const deps: StreamsStoreDeps = {
       clock: systemClock,
       storage: {
@@ -1355,6 +1417,7 @@ export class StreamsStore {
       },
       transportFactory: (_purpose, options) => new FsmTransport(options),
       mediaDevices: navigator.mediaDevices,
+      directSignalPort,
     };
     const streamsStore = new StreamsStore(
       deps,
@@ -1456,7 +1519,7 @@ export class StreamsStore {
       .filter(a => a !== this.myPubKeyB64)
       .map(b64 => decodeHashFromBase64(b64));
     if (agentsToNotify.length > 0) {
-      this.deps.bus.sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
+      this._sendMessage(agentsToNotify, 'LeaveUi').catch(() => {});
     }
   }
 
@@ -1479,6 +1542,10 @@ export class StreamsStore {
   /** Unsubscribe the signal, page-lifecycle, and all-agents subscriptions. */
   private _teardownSubscriptions(): void {
     if (this.signalUnsubscribe) this.signalUnsubscribe();
+    if (this._directUnsub) {
+      this._directUnsub();
+      this._directUnsub = null;
+    }
     if (this._pageLifecycleUnsub) {
       this._pageLifecycleUnsub();
       this._pageLifecycleUnsub = null;
@@ -1923,6 +1990,166 @@ export class StreamsStore {
   private _peerCaps(peerB64: AgentPubKeyB64): ReadonlySet<string> {
     return conversationPayloadCaps(
       get(this._peerModuleStates)[peerB64]?.['conversation'] ?? null,
+    );
+  }
+
+  // ------------------------------------------------------------------
+  //   The two carriers
+  // ------------------------------------------------------------------
+
+  /** This peer's `direct-path-usable` state; absent means never probed. */
+  private _directPathFor(peerB64: AgentPubKeyB64): DirectPathRecord {
+    return this._peerRecord(peerB64)?.directPath ?? initialDirectPathRecord();
+  }
+
+  private _setDirectPath(peerB64: AgentPubKeyB64, record: DirectPathRecord): void {
+    this._ensurePeerRecord(peerB64).directPath = record;
+  }
+
+  /**
+   * The ONE outgoing-signal seam. Every room signal this build sends goes
+   * through here, and this is the only place the carrier is chosen — per
+   * peer, per message, by `decideSignalPath`
+   * (`transport/direct-signal-policy.ts`).
+   *
+   * `via: 'direct'` forces the direct carrier for one send: the
+   * reply-on-the-arrival-carrier rule that `handlePingUi` uses. It is
+   * load-bearing rather than an optimisation. Each side can only learn that
+   * its OWN sends are delivered by getting an answer back over the direct
+   * carrier (holochain #5974 grants the RECEIVER's permission, so us→peer
+   * depends on the peer's grant and peer→us on ours). If a direct ping were
+   * answered over the zome path, neither probe could ever complete and both
+   * sides would sit on the fallback forever. A forced direct send whose
+   * recipient cannot receive it is simply dropped by their conductor — which
+   * is exactly the outcome the pinger's probe timeout reads.
+   *
+   * Direct sends are fire-and-forget by conductor semantics; a rejection
+   * from the app websocket is logged and does NOT re-send over the zome
+   * path, because path state belongs to the probe, not to one send.
+   */
+  private async _sendMessage(
+    toAgents: AgentPubKey[],
+    msgType: SignalMsgType,
+    payload?: string,
+    opts?: { via?: SignalPath },
+  ): Promise<void> {
+    const port = this.deps.directSignalPort;
+    if (toAgents.length === 0) return;
+
+    if (port && opts?.via === 'direct') {
+      await this._sendDirect(port, toAgents, msgType, payload);
+      return;
+    }
+
+    if (!port) {
+      await this.deps.bus.sendMessage(toAgents, msgType, payload);
+      return;
+    }
+
+    // One envelope serves the whole fan-out, so its size is per-message,
+    // not per-peer: encode once and let every peer's decision read it.
+    const payloadBytes = this._directEnvelope(msgType, payload).byteLength;
+
+    const direct: AgentPubKey[] = [];
+    const zome: AgentPubKey[] = [];
+    for (const agent of toAgents) {
+      const peerB64 = encodeHashToBase64(agent);
+      const decision = decideSignalPath({
+        capDeclared: this._peerCaps(peerB64).has(CAP_DIRECT_SIGNAL),
+        record: this._directPathFor(peerB64),
+        payloadBytes,
+        portAvailable: true,
+      });
+      (decision.path === 'direct' ? direct : zome).push(agent);
+    }
+
+    const sends: Array<Promise<void>> = [];
+    if (direct.length > 0) sends.push(this._sendDirect(port, direct, msgType, payload));
+    if (zome.length > 0) sends.push(this.deps.bus.sendMessage(zome, msgType, payload));
+    await Promise.all(sends);
+  }
+
+  /** The wire bytes for one outgoing signal on the direct carrier. */
+  private _directEnvelope(msgType: SignalMsgType, payload?: string): Uint8Array {
+    return encodeDirectEnvelope({
+      from: this.deps.bus.myPubKey,
+      msgType,
+      payload: payload ?? '',
+    });
+  }
+
+  /** Hand one envelope to the direct carrier. */
+  private async _sendDirect(
+    port: NonNullable<StreamsStoreDeps['directSignalPort']>,
+    toAgents: AgentPubKey[],
+    msgType: SignalMsgType,
+    payload?: string,
+  ): Promise<void> {
+    try {
+      await port.send(toAgents, this._directEnvelope(msgType, payload));
+    } catch (e) {
+      this.logger.logCustomMessage(
+        `Direct send failed (${msgType}): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  /**
+   * Prove or disprove the direct path to each peer that declares the
+   * carrier capability, once per presence tick.
+   *
+   * A declaration says the peer's build speaks the carrier; only an
+   * observed round trip says their conductor delivers it (see
+   * `direct-signal-policy.ts` for why, and for the retry window that lets a
+   * peer which commits its capability grant later recover). The probe is an
+   * ordinary `PingUi` whose `t0` is the probe stamp, so the peer's normal
+   * pong — which echoes `pingT0` — is the answer; no new signal type and no
+   * new wire surface.
+   */
+  private _driveDirectProbes(): void {
+    const port = this.deps.directSignalPort;
+    if (!port) return;
+    const now = this.clock.now();
+
+    for (const peerB64 of Object.keys(get(this._knownAgents))) {
+      if (peerB64 === this.myPubKeyB64) continue;
+      const record = this._directPathFor(peerB64);
+      const decision = decideDirectProbeAction({
+        now,
+        capDeclared: this._peerCaps(peerB64).has(CAP_DIRECT_SIGNAL),
+        portAvailable: true,
+        record,
+      });
+
+      if (decision.action === 'send-probe') {
+        const sent = markDirectProbeSent(record, now);
+        this._setDirectPath(peerB64, sent);
+        this._sendMessage(
+          [decodeHashFromBase64(peerB64)],
+          'PingUi',
+          JSON.stringify({ t0: now }),
+          { via: 'direct' },
+        ).catch(() => {});
+      } else if (decision.action === 'expire-probe') {
+        this._setDirectPath(peerB64, applyDirectProbeResult(record, { now, outcome: 'timeout' }));
+      }
+    }
+  }
+
+  /**
+   * A pong arrived over the direct carrier. If it echoes the `t0` of the
+   * probe we have in flight for that peer, the full round trip is observed
+   * and the path is proven (`applyDirectProbeResult`).
+   */
+  private _noteDirectPong(peerB64: AgentPubKeyB64, payload: string): void {
+    const record = this._directPathFor(peerB64);
+    if (record.probeSentAt === null) return;
+    const parsed = parseSignalPayload<PongMetaData<PongMetaDataV1>>(payload);
+    if (!parsed.ok) return;
+    if (parsed.value.data?.pingT0 !== record.probeSentAt) return;
+    this._setDirectPath(
+      peerB64,
+      applyDirectProbeResult(record, { now: this.clock.now(), outcome: 'answered' }),
     );
   }
 
@@ -2472,7 +2699,7 @@ export class StreamsStore {
           .map(a => decodeHashFromBase64(a));
     if (agentsToNotify.length > 0) {
       try {
-        await this.deps.bus.sendMessage(
+        await this._sendMessage(
           agentsToNotify,
           'ModuleData',
           JSON.stringify({ moduleId, chunk })
@@ -3211,7 +3438,7 @@ export class StreamsStore {
       .map(a => decodeHashFromBase64(a));
     if (agentsToNotify.length > 0) {
       try {
-        await this.deps.bus.sendMessage(
+        await this._sendMessage(
           agentsToNotify,
           'ModuleState',
           JSON.stringify(envelope)
@@ -3261,7 +3488,7 @@ export class StreamsStore {
         },
       };
       try {
-        await this.deps.bus.sendMessage(
+        await this._sendMessage(
           [decodeHashFromBase64(agentB64)],
           'PongUi',
           JSON.stringify(metaData),
@@ -3510,8 +3737,8 @@ export class StreamsStore {
   //
   // ********************************************************************************************
 
-  async handleSignal(signal: RoomSignal) {
-    this._signalQueue.push(signal);
+  async handleSignal(signal: RoomSignal, via: SignalPath = 'zome') {
+    this._signalQueue.push({ signal, via });
     if (this._processingSignal) return;
 
     // `_processingSignal` is a latch, not a flag: the early return at the top of
@@ -3531,13 +3758,13 @@ export class StreamsStore {
     this._processingSignal = true;
     try {
       while (this._signalQueue.length > 0) {
-        const nextSignal = this._signalQueue.shift()!;
+        const { signal: nextSignal, via } = this._signalQueue.shift()!;
         if (this.signalDelayMs > 0) {
           const delay = Math.floor(Math.random() * this.signalDelayMs);
           await new Promise<void>(resolve => this.clock.setTimeout(resolve, delay));
         }
         try {
-          await this._processSignal(nextSignal);
+          await this._processSignal(nextSignal, via);
         } catch (e) {
           const label =
             nextSignal.type === 'Message'
@@ -3560,7 +3787,7 @@ export class StreamsStore {
     }
   }
 
-  private async _processSignal(signal: RoomSignal) {
+  private async _processSignal(signal: RoomSignal, via: SignalPath) {
     switch (signal.type) {
       case 'Message': {
         // Narrow the wire string to the declared union
@@ -3576,7 +3803,7 @@ export class StreamsStore {
         }
         switch (msgType) {
           case 'PingUi':
-            await this.handlePingUi(signal);
+            await this.handlePingUi(signal, via);
             break;
           case 'PongUi':
             await this.handlePongUi(signal);
@@ -3635,7 +3862,10 @@ export class StreamsStore {
    *
    * @param signal
    */
-  async handlePingUi(signal: Extract<RoomSignal, { type: 'Message' }>) {
+  async handlePingUi(
+    signal: Extract<RoomSignal, { type: 'Message' }>,
+    via: SignalPath = 'zome',
+  ) {
     const pubkeyB64 = encodeHashToBase64(signal.from_agent);
     if (get(this.blockedAgents).includes(pubkeyB64)) return;
     // console.log(`Got PingUi from ${pubkeyB64}: `, signal);
@@ -3672,10 +3902,14 @@ export class StreamsStore {
           moduleStatesAt: this.clock.now(),
         },
       };
-      await this.deps.bus.sendMessage(
+      // Answer on the carrier the ping arrived on: a direct ping answered
+      // over the zome path would leave the pinger's probe unresolved, and
+      // both sides would sit on the fallback forever (see `_sendMessage`).
+      await this._sendMessage(
         [signal.from_agent],
         'PongUi',
         JSON.stringify(metaData),
+        { via },
       );
 
       // If we have an active screen share, check whether we need to

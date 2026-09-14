@@ -225,6 +225,39 @@ export function nativeDirectSignalPort(deps: NativePortDeps): DirectSignalPort {
 }
 
 /**
+ * The provisioned or cloned cell id for one role, out of an `AppInfo`.
+ *
+ * The client ships the inverse (`roleNameForCellId`,
+ * `@holochain-open-dev/utils`) but not this direction, and the direct
+ * carrier needs it: `SendDirectSignal` takes a `dna_hash` and inbound
+ * `app_direct` signals are filtered by full `cell_id`, neither of which the
+ * role name gives us. Shaped as a pure function over `AppInfo` so it is
+ * tested without a conductor.
+ */
+export function cellIdForRole(
+  appInfo: {
+    cell_info: Record<
+      string,
+      Array<{ type: string; value?: { cell_id?: unknown; clone_id?: string } }>
+    >;
+  },
+  roleName: string
+): DirectSignalCellId | null {
+  for (const [role, cells] of Object.entries(appInfo.cell_info ?? {})) {
+    for (const cell of cells ?? []) {
+      const id = cell?.value?.cell_id;
+      if (!Array.isArray(id) || id.length !== 2) continue;
+      const dna = asBytes(id[0]);
+      const agent = asBytes(id[1]);
+      if (!dna || !agent) continue;
+      const name = cell.type === 'cloned' ? cell.value?.clone_id : role;
+      if (name === roleName) return [dna, agent];
+    }
+  }
+  return null;
+}
+
+/**
  * Pick the port this environment can actually use.
  *
  * The casts here are the ONE place the app reaches past the client's declared

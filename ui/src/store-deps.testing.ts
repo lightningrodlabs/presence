@@ -42,6 +42,7 @@ import type {
   StreamsStoreDeps,
   TransportPurpose,
 } from './store-deps';
+import type { IncomingDirectSignal } from './direct-signal';
 import type { PresenceLogger } from './logging';
 
 /** Map-backed KeyValueStore with the Web Storage API subset. */
@@ -380,7 +381,45 @@ export type FakeDeps = {
   session: FakeKeyValueStore;
   /** Transports created by start(), keyed by purpose. Empty until start(). */
   transports: Partial<Record<TransportPurpose, FakeTransport>>;
+  /** The direct-signal carrier the store was given. */
+  directPort: FakeDirectSignalPort;
 };
+
+/**
+ * Recording direct-signal port. `deliver()` pushes bytes through whatever
+ * handler the store subscribed — the real inbound glue (decode, probe
+ * bookkeeping, `handleSignal`).
+ */
+export class FakeDirectSignalPort {
+  /** Every send, in order; recipients base64-encoded for assertions. */
+  readonly sent: Array<{ to: AgentPubKeyB64[]; bytes: Uint8Array }> = [];
+
+  /** How many times the store released its subscription. */
+  unsubscribeCount = 0;
+
+  private handlers = new Set<(signal: IncomingDirectSignal) => void>();
+
+  async send(agents: AgentPubKey[], bytes: Uint8Array): Promise<void> {
+    this.sent.push({ to: agents.map(a => encodeHashToBase64(a)), bytes });
+  }
+
+  subscribe(handler: (signal: IncomingDirectSignal) => void): () => void {
+    this.handlers.add(handler);
+    return () => {
+      this.unsubscribeCount += 1;
+      this.handlers.delete(handler);
+    };
+  }
+
+  /** Deliver one inbound direct signal to the store. */
+  deliver(fromAgent: AgentPubKey | null, bytes: Uint8Array): void {
+    for (const handler of [...this.handlers]) handler({ fromAgent, bytes });
+  }
+
+  get subscriberCount(): number {
+    return this.handlers.size;
+  }
+}
 
 /**
  * Build a full fake deps record. Transports are created lazily when the
@@ -397,6 +436,7 @@ export function makeFakeDeps(
   const session = new FakeKeyValueStore();
   const storage: StorageDep = { local, session };
   const transports: Partial<Record<TransportPurpose, FakeTransport>> = {};
+  const directPort = new FakeDirectSignalPort();
   const deps: StreamsStoreDeps = {
     clock,
     storage,
@@ -410,6 +450,7 @@ export function makeFakeDeps(
       enumerateDevices: async () => [],
       ondevicechange: null,
     },
+    directSignalPort: directPort,
   };
-  return { deps, clock, bus, local, session, transports };
+  return { deps, clock, bus, local, session, transports, directPort };
 }

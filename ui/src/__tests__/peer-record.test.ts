@@ -8,6 +8,7 @@ describe('initialPeerRecord', () => {
     expect(r.pendingInits).toBeUndefined();
     expect(r.videoStream).toBeUndefined();
     expect(r.lastDisconnectTime).toBeUndefined();
+    expect(r.directPath).toBeUndefined();
   });
 });
 
@@ -21,6 +22,7 @@ function fullRecord(): PeerRecord {
     outageState: { startedAt: 9, emitted: true },
     screenShareStream: { id: 'screen' } as unknown as MediaStream, screenShareIceDisconnectedAt: 10,
     lastDisconnectTime: 11, lastReconcileTime: 12, signalsRttEwma: 13,
+    directPath: { state: 'usable', probeSentAt: null, lastResultAt: 15, attempts: 1 },
     connectionEpoch: 14,
   };
 }
@@ -53,6 +55,10 @@ describe('resetPeerRecord', () => {
       videoStream: undefined, pendingInits: undefined,
       qualityBucket: undefined, lastDisconnectTime: undefined,
       lastReconcileTime: undefined, signalsRttEwma: undefined,
+      // The direct-signal carrier's proven-path state goes with the
+      // departed session: a rejoining agent may be a different build on a
+      // different conductor and must re-prove the path.
+      directPath: undefined,
       // iceDisconnectedAt survives this row alone — the nested close row
       // (media-close-full, applied first by the executor) did the rest.
     });

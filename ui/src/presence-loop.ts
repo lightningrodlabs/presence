@@ -154,6 +154,11 @@ export type PresenceLoopBindings = {
   /** StreamsStore._checkAudibilityOutages, late-bound — stays
    *  store-resident per the design's round-four list. */
   checkAudibilityOutages: () => void;
+  /** StreamsStore._driveDirectProbes, late-bound — proves or disproves
+   *  each capable peer's direct signal path once per ping cycle
+   *  (`transport/direct-signal-policy.ts`). Store-resident because the
+   *  carrier seam (`_sendMessage`) and the peer records it writes are. */
+  driveDirectProbes: () => void;
   /** StreamsStore._flushStaleSdpAggregates, late-bound — a bare delegate
    *  onto `MediaLinks.flushStaleSdpAggregates` (`ui/src/media-links.ts`,
    *  the media-links round), not a store-resident implementation. */
@@ -573,6 +578,12 @@ export class PresenceLoop {
     // samples at all reads as `undefined` ('no-sample' ⇒ full, by the
     // policy's declared design).
     this.bindings.evaluateSignalsCadence();
+
+    // Carrier probes: one evaluation per ping cycle, after the roster
+    // sweep above so a peer that appeared this cycle is probed on it.
+    // Store-resident (the carrier seam owns both paths); reached here as
+    // a binding like the other per-cycle fragments.
+    this.bindings.driveDirectProbes();
   }
 
   private async _sendPings(): Promise<void> {

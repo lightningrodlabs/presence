@@ -37,6 +37,7 @@ import type { Clock } from './clock';
 import type { RoomSignal } from './types';
 import type { SignalMsgType } from './transport/wire-contract';
 import type { PeerTransport, FsmTransportOptions } from './transport';
+import type { DirectSignalPort } from './direct-signal';
 
 /** The subset of the Web Storage API the store uses. */
 export type KeyValueStore = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
@@ -91,4 +92,16 @@ export type StreamsStoreDeps = {
   bus: SignalBus;
   transportFactory: TransportFactory;
   mediaDevices: MediaDevicesDep;
+  /**
+   * The direct-signal carrier, or `null` where this environment has none.
+   *
+   * `null` is a normal, expected state, not an error: a Tauri transport or
+   * a Moss applet shim whose websocket is not reachable yields no port, and
+   * the store then sends every signal over `bus` — the declared zome
+   * fallback (working agreement 1). `bus` remains the ONLY zome-carrier
+   * path; this is the only other carrier, and `decideSignalPath`
+   * (`transport/direct-signal-policy.ts`) is the one place the choice is
+   * made per peer per message.
+   */
+  directSignalPort: DirectSignalPort | null;
 };
