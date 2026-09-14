@@ -116,6 +116,22 @@ describe('room DNA on holochain 0.7', () => {
         expect(typeof joinedAt).toBe('number');
         expect(joinedAt).toBeGreaterThan(0);
       }
+
+      // A second anchor link for the same agent (a re-created cell whose
+      // older link is still in the DHT) must not move them: one row per
+      // agent, earliest link wins.
+      const aliceB64 = encodeHashToBase64(alice.agentPubKey);
+      const firstJoin = byAgent.get(aliceB64);
+      await new Promise((r) => setTimeout(r, 5));
+      await call(alice, 'add_agent_to_anchor', null);
+      const again = await call<Array<{ agent: Uint8Array; joined_at: number }>>(
+        alice,
+        'get_all_agents',
+        { input: null, local: true }
+      );
+      const aliceRows = again.filter((a) => encodeHashToBase64(a.agent) === aliceB64);
+      expect(aliceRows).toHaveLength(1);
+      expect(aliceRows[0].joined_at).toBe(firstJoin);
     });
   });
 

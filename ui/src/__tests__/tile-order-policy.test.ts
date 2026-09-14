@@ -87,6 +87,7 @@ describe('room-view renders the grid through orderTiles', () => {
 
   it('keys one repeat() on the ordered tile list and keeps no separate phantom block', () => {
     expect(src).toContain('orderTiles({');
+    expect(src).toMatch(/repeat\(\s*this\._orderedTiles\(\)/);
     // The two-segment shape this policy replaces: a present repeat over
     // _visiblePeers() followed by a phantom-only block appended after it.
     expect(src).not.toMatch(/repeat\(\s*this\._visiblePeers\(\)/);

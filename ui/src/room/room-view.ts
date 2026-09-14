@@ -146,13 +146,11 @@ export class RoomView extends LitElement {
 
   _customLogTimestamp: number | undefined;
 
-  _allAgentsFromAnchor = new StoreSubscriber(
-    this,
-    () => this.roomStore.allAgents,
-    () => [this.roomStore]
-  );
-
-  /** Anchor-link join times — the grid-order key read by _orderedTiles. */
+  /**
+   * Anchor-link join times — the grid-order key read by _orderedTiles.
+   * Replaces the never-read `_allAgentsFromAnchor` subscriber, whose only
+   * effect was keeping the same anchor poll warm.
+   */
   _agentJoinedAt = new StoreSubscriber(
     this,
     () => this.roomStore.agentJoinedAt,

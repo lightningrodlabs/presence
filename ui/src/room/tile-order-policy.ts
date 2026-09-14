@@ -8,8 +8,10 @@ import type { AgentPubKeyB64 } from '@holochain/client';
  * Key: the agent's ALL_AGENTS anchor-link timestamp, committed once per
  * cell by the room zome's `init` (dnas/presence/zomes/coordinator/room/src/
  * all_agents.rs) and read from the DHT by every participant. Because the
- * value is stored, not measured, every screen sorts the same numbers and
- * clock skew is irrelevant; the room keeps the same seating across calls.
+ * value is stored, not measured, every screen sorts the same numbers, so
+ * clock skew cannot make two viewers disagree (a skewed author's clock
+ * still seats them consistently for everyone); the room keeps the same
+ * seating across calls.
  *
  * Present tiles and phantom tiles ("reported in room by others, not
  * reachable by you") interleave on that key, so a peer moving between the
