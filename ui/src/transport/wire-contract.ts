@@ -102,10 +102,23 @@ export const CAP_SDP_FSM_SCREEN = 'sdp-fsm-screen';
  *  (`unpackVoicePayload`). */
 export const CAP_VOICE_BATCH = 'voice-batch-v1';
 
+/** The peer's build can send and receive room signals over the conductor's
+ *  `SendDirectSignal` app request instead of the `send_message` zome call
+ *  (`docs/DIRECT_SIGNALS_PLAN.md` §4 phases 1-2). NOT a signal-type gate:
+ *  every `SignalMsgType` keeps its own row and its own cap, and the
+ *  envelope carries the same `msg_type`/`payload` the zome path does — this
+ *  declares only that the CARRIER is understood. Declaring it is necessary
+ *  but not sufficient: `decideSignalPath`
+ *  (`transport/direct-signal-policy.ts`) additionally requires an observed
+ *  direct round trip, because a conductor enforcing holochain PR #5974's
+ *  capability grant drops an ungranted signal without telling the sender. */
+export const CAP_DIRECT_SIGNAL = 'direct-signal';
+
 export type WireCap =
   | typeof CAP_SDP_FSM
   | typeof CAP_SDP_FSM_SCREEN
-  | typeof CAP_VOICE_BATCH;
+  | typeof CAP_VOICE_BATCH
+  | typeof CAP_DIRECT_SIGNAL;
 
 /** The capabilities this build declares in its conversation payload
  *  (`ConversationPayload.caps`). A future wire feature adds a string here —
@@ -114,6 +127,7 @@ export const WIRE_CAPS = [
   CAP_SDP_FSM,
   CAP_SDP_FSM_SCREEN,
   CAP_VOICE_BATCH,
+  CAP_DIRECT_SIGNAL,
 ] as const satisfies readonly WireCap[];
 
 // ---------------------------------------------------------------------------
