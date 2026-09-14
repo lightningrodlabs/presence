@@ -283,7 +283,24 @@ Consequences applied to the phases below:
   for every receiving agent (§1.1 item 3) or every direct-path test silently reads as 0%
   delivery.
 
-### Phase 1 — client adapter (`ui/src/direct-signal.ts`)
+### Phase 1 — client adapter (`ui/src/direct-signal.ts`) — LANDED 2026-09-14
+
+Landed as three modules on `wip/direct-signals`, shaped as planned with one
+addition: the port is an interface (`DirectSignalPort`) with two constructors, so
+the switch from the raw-wire escape hatch to real client support is a runtime pick
+(`directSignalPortFor`) rather than an edit.
+
+- `ui/src/direct-signal.ts` — `DirectSignalPort`, `rawDirectSignalPort` (0.21.0's
+  public `request` + an `addEventListener` on the socket, which coexists with the
+  stock client's `onmessage` assignment), `nativeDirectSignalPort` (for a client
+  that ships the feature — the one that survives), `directSignalPortFor`, and
+  `cellIdForRole`. The ONE home of raw-wire knowledge; `cap_secret` always `null`.
+- `ui/src/transport/direct-envelope.ts` — the msgpack envelope
+  `{ v: 1, from, msgType, payload }`, total decode.
+- `ui/src/transport/direct-signal-policy.ts` — the `direct-path-usable` predicate
+  (see phase 2).
+
+The original sketch of this phase follows, for the reasoning:
 
 One module owning the raw-wire knowledge, shaped for deletion when upstream support ships:
 
@@ -307,7 +324,27 @@ The `from_agent` issue this section proposed filing is closed: upstream filed #5
 in #5945, on the 0.8 line only (§1.1 item 2). The adapter's envelope keeps `from` regardless —
 it is what 0.7.1 has — and gains a *check* against the delivered value on 0.8.
 
-### Phase 2 — carrier switch behind a capability
+### Phase 2 — carrier switch behind a capability — LANDED 2026-09-14
+
+Landed with one change the sketch below did not foresee, and it is load-bearing:
+**inbound signals carry the carrier they arrived on, and `handlePingUi` answers on
+it.** #5974 grants the RECEIVER's permission, so `us→peer` depends on the peer's
+grant and `peer→us` on ours; each side learns its own send direction works only by
+getting an answer back over the direct carrier. A direct ping answered over the
+zome path would leave both probes unresolved forever. So `_signalQueue` items are
+`{ signal, via }` and `_processSignal` passes `via` to the `PingUi` arm — the only
+handler-visible change; every other handler is untouched, as planned.
+
+Also as built: `StreamsStore._sendMessage` is the one outgoing seam (every former
+`deps.bus.sendMessage` call site routes through it), `PeerRecord.directPath` holds
+per-peer path state (cleared by `resetPeerRecord`'s `media-leave-residue` arm), and
+the probe runs once per ping cycle from `PresenceLoop` via a binding, reusing the
+ordinary `PingUi`/`PongUi` pair with `t0` as the probe stamp — no new signal type.
+Pinned by `ui/src/__tests__/streams-store-wiring.test.ts`'s
+`direct-signal carrier wiring` block (six tests, five mutation checks recorded in
+the commit message).
+
+The original sketch of this phase follows, for the reasoning:
 
 - New cap `direct-signal` in `conversationPayload` caps beside `CAP_SDP_FSM`
   (`wire-contract.ts`); wire-contract table row + compat-corpus fixture for the new
@@ -367,6 +404,13 @@ no log on the send path. Put it on the 0.8 upgrade's release gate, not on a back
   presence machinery can see. Cheap: PingUi/PongUi already run every tick.
 - Rig consequence: the tryorama rig must commit grants for receiving agents before any
   direct-path measurement on a 0.8 conductor (phase 0 results, re-measurement bullet).
+
+**What phases 1-2 already did for this (landed 2026-09-14).** The app-side half of
+this phase is done and needs no revisiting when the grant lands: because the carrier
+switch requires an *observed* round trip, a peer whose conductor drops our signals
+for want of a grant simply never proves usable and stays on the zome carrier, and
+`DIRECT_PROBE_RETRY_MS` re-probes so a peer that commits its grant later recovers
+in-session. What remains here is strictly the zome work plus its release gate.
 
 ### Phase 3 — spend the new budget (separate branches, only after phase 0/2 numbers)
 
