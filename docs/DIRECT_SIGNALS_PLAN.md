@@ -5,6 +5,13 @@ Written 2026-08-06 against holochain `develop` at `d49786ad3c` (feature commit `
 and the presence `main-0.7` working tree. Per working agreement 3, file:line citations into
 `../holochain` are pinned to those revisions; citations into this repo are living.
 
+Updated 2026-09-14: this branch is rebased onto `main-0.7`, and §1 is corrected against three
+upstream changes that postdate the original writing — see §1.1, which is where the citations
+into `../holochain` are re-pinned (`upstream/develop` at `b740fc8c4a`, `upstream/main-0.7` at
+`a0f7880494`, and PR #5974's head `60a2297c0e` = `upstream/direct-signal-cap-grants`). Which
+release an upstream commit is in is checked with `git tag --contains <commit>` and
+`git branch -r --contains <commit>`, never trusted from this file.
+
 ## 1. What the feature is
 
 Holochain 0.7 adds `AppRequest::SendDirectSignal`
@@ -14,8 +21,8 @@ to a set of peers with **no WASM execution on either side**:
 
 - **Send path** (`holochain/src/conductor/conductor.rs:2944-3004` `send_direct_signal`):
   validates the DNA belongs to the calling app, enforces
-  `DIRECT_SIGNAL_MAX_SIZE = 1 MiB` (`holochain_types/src/signal.rs:78`; but see the phase 0
-  results below — under lair the practical ceiling is ~8 KB), signs the payload
+  `DIRECT_SIGNAL_MAX_SIZE = 1 MiB` (`holochain_types/src/signal.rs:78`; the ~8 KB lair
+  ceiling phase 0 measured was a signing bug, fixed upstream — §1.1), signs the payload
   **once** with the app agent's key, then fans out per agent over kitsune2 notify
   (`holochain_p2p/src/spawn/actor.rs:1870-1945`). Fire-and-forget: per-peer send errors are
   debug-logged and swallowed; an agent missing from the peer store is **silently skipped**;
@@ -25,15 +32,17 @@ to a set of peers with **no WASM execution on either side**:
   size check, signature verify against the wire-level `from_agent`, then pushes
   `Signal::AppDirect { cell_id, signal: Vec<u8> }` (`holochain_types/src/signal.rs:25-32`)
   straight onto the app-interface signal broadcaster. No `recv_remote_signal`, no
-  `emit_signal`, no cap-grant check (bypassing the grant mechanism is documented in the
-  request's doc comment).
+  `emit_signal`, and — on the 0.7 line — no cap-grant check (bypassing the grant mechanism is
+  documented in the request's doc comment). PR #5974 reverses that on the 0.8 line: §1.1.
 
 Two properties that shape everything below:
 
-- **Provenance is verified but not delivered.** The conductor checks that `from_agent`
-  signed the payload, then delivers only `{ cell_id, signal }` — the receiving app never
-  sees `from_agent`. Sender identity must ride inside the payload, unauthenticated at the
-  app layer. This is **not a regression** for presence: today's `recv_remote_signal`
+- **Provenance is verified but not delivered — on the 0.7 line only.** The conductor checks
+  that `from_agent` signed the payload, then delivers only `{ cell_id, signal }` — the
+  receiving app never sees `from_agent` (`holochain_types/src/signal.rs:26-32` @
+  `a0f7880494`). Sender identity must ride inside the payload, unauthenticated at the
+  app layer. Fixed on 0.8 by #5945 (§1.1). This is **not a regression** for presence:
+  today's `recv_remote_signal`
   (`dnas/presence/zomes/coordinator/room/src/remote_signals.rs:25`) also never reads
   provenance — `from_agent` in `SignalPayload` is sender-self-declared, and the cap grant is
   unrestricted, so any network member can already claim any identity. Trust level: equal.
@@ -51,6 +60,72 @@ receiver a full inbound zome call (signature verify + WASM `recv_remote_signal` 
 verify on each receiving conductor. At voice's ~50 messages/sec
 (`ui/src/room/modules/voice.ts`) plus filmstrip's 6-7/sec, that is the bulk of the
 signals-carrier CPU on both conductors, and the removed hops are the bulk of its latency.
+
+## 1.1 Upstream state (checked 2026-09-14) — three changes since §1 was written
+
+| change | commit | first tag | on the 0.7 line? |
+| --- | --- | --- | --- |
+| *(baseline)* direct signals | #5818 `9c604f0df1` | `holochain-0.7.0` | yes |
+| sign a hash of the envelope, not the raw payload | #5956 `28628f6333` | `holochain-0.8.0-dev.3` | **yes** — backport batch #5983 `ae9a4ffd3a`, first in `holochain-0.7.1-rc.0` |
+| deliver the verified sender as `from_agent` | #5945 `b14368dfae` | `holochain-0.8.0-dev.3` | **no** |
+| gate receiving behind a `Capability::DirectSignal` grant | #5974, OPEN and marked draft, head `60a2297c0e` | unreleased | **no** |
+
+**1. The ~8 KB payload ceiling is gone, by conductor version.** `send_direct_signal` now signs
+`sha2_512` of the encoded envelope instead of streaming the payload through lair
+(`holochain/src/conductor/conductor.rs:3508` @ `a0f7880494`), so the declared
+`DIRECT_SIGNAL_MAX_SIZE = 1 MiB` is real. The receive-side pre-decode bound is
+`DIRECT_SIGNAL_MAX_SIZE + 5` on the 0.7 line (`holochain/src/conductor/cell.rs:435` @
+`a0f7880494`) and becomes
+`DIRECT_SIGNAL_MAX_ENCODED_SIZE = MAX + 128` under #5974 (`holochain_types/src/signal.rs:91` @
+`60a2297c0e`), to
+cover the `cap_secret` field. Phase 0's ceiling result is therefore a property of the conductor
+build, not of the feature — and **presence's own devshell still has the old behavior**:
+`flake.lock` pins holochain `84cdce7d4d` (the 0.7.0 release commit, 2026-07-30), which predates
+the backport. Check before re-measuring: `nix develop -c holochain --version`, and
+`git merge-base --is-ancestor 28628f6333 <pinned rev>` in `../holochain`; lift it with
+`nix flake update holonix`.
+
+**2. On 0.8, provenance is delivered.** `Signal::AppDirect { cell_id, from_agent, signal }`
+(`holochain_types/src/signal.rs:28-37` @ `b740fc8c4a`) — the issue §4 phase 1 proposed filing
+was filed and fixed upstream (#5938 → #5945). Not backported to 0.7. So the envelope's
+self-declared `from` stays load-bearing on 0.7.1, and on 0.8 it becomes *checkable* against a
+conductor-verified value — the first sender authentication this app's signals carrier has ever
+had, since the zome path never carried provenance either. Treat that as a phase-3 item
+(check-and-reject on mismatch, log-only first), not a blocker.
+
+**3. On 0.8, receiving requires a committed capability grant.** PR #5974 (still draft, pending
+its hdi/hdk dependency releases) makes the receiving conductor look up a
+`Capability::DirectSignal` grant on the recipient's own source chain and drop the signal if none
+matches (`holochain/src/conductor/cell.rs:459-478`, `holochain_state/src/dht_store/reads.rs:2390`
+`valid_direct_signal_grant`, both @ `60a2297c0e`). Properties that matter here, each asserted by
+a test on that branch (`holochain_state/src/source_chain.rs` `direct_signal_grant_validity`,
+and the e2e suite `holochain/tests/tests/signals/direct.rs`):
+
+- **No implicit access, not even for the recipient's own key**, and **a zome-call grant never
+  authorizes a signal** — presence's existing `init` grant for `recv_remote_signal` buys nothing
+  here.
+- The grant must be **committed by a coordinator zome** (`CapGrant::new_direct_signal_grant(tag,
+  constraint)` → `create_cap_grant`, `holochain_integrity_types/src/capability/grant.rs:97` @
+  `60a2297c0e`); the request gains `cap_secret: Option<CapSecret>`
+  (`holochain_conductor_api/src/app_interface.rs:355`), which travels *inside* the signed
+  bytes so a relaying peer cannot strip or swap it.
+- `GrantConstraint::Unrestricted` + `cap_secret: None` needs no secret distribution and matches
+  the trust level presence already runs at. Gotcha for any later tightening: offering a secret
+  narrows matching to secret-bearing grants only, so a mixed population needs one request per
+  distinct secret.
+- **A recipient with no matching grant drops the signal and the sender is never told** — the
+  send is best-effort either way. There is no error to route on; the failure is silent and total.
+- The omitted-`cap_secret` wire case is serde-defaulted, so a client that predates the field
+  still talks to a #5974 conductor (that file's
+  `send_direct_signal_request_defaults_omitted_cap_secret` test) — the *send* side needs no
+  change for 0.8; only the receiver's grant does.
+
+The grant work is §4 phase 2.5 below. It cannot be written against presence's current SDK: the
+`Capability`/`CapGrant` constructors are develop-only (the PR's upstream deps are hdi
+`0.9.0-dev.7` and an unreleased hdk), while presence's zomes are on hdk 0.7.0 / hdi 0.8.0, whose
+API is `CapGrantEntry::new(tag, access, GrantedFunctions)`
+(`dnas/presence/zomes/coordinator/room/src/lib.rs` `init`). Whether #5974 is ever backported to
+the 0.7 line is checked with `git branch -r --contains 60a2297c0e`, not assumed.
 
 ## 2. Client support status (measured 2026-08-06, re-verify before phase 1)
 
@@ -81,8 +156,16 @@ Workable without forking, because the escape hatches are public API:
   `setupAppClient`). Cost under an unpatched host client: one unhandled-rejection log line
   per received direct signal from the stock handler.
 
-The clean fix is an upstream PR to holochain-client-js; that track is now planned in the
-client-js repo itself (`SEND_DIRECT_SIGNAL_PLAN.md` there, 2026-08-07): based on
+The clean fix is an upstream PR to holochain-client-js. That track has a first cut already
+written in the client-js repo: local branch `feat/send-direct-signal`, commit `1eaf66f`
+("feat(signal)!: add direct signal support from holochain 0.7"), on top of its `main-0.7` —
+unpushed, with its `SEND_DIRECT_SIGNAL_PLAN.md` still uncommitted. That cut predates §1.1's
+changes and needs three edits before it goes upstream: `cap_secret?: CapSecret` on
+`SendDirectSignalRequest`, `from_agent: AgentPubKey` on `AppDirectSignal` (and in
+`isWellFormedAppDirectValue`, which currently requires only `cell_id`/`signal`), and deletion of
+the ~8 KB lair caveat its doc comments carry on `sendDirectSignal`. Whether it targets the 0.7 or
+0.8 client line is now a real decision, because `from_agent` only exists on 0.8. The original
+track notes stand: based on
 `main-0.7` (the 0.7 maintenance line — upstream has no `develop`; a stale local
 remote-tracking ref will claim otherwise), separate from and landing **before** the open
 `feat/tauri-direct-app-calls` branch, whose overlap is textual only (`decode.ts`,
@@ -165,7 +248,9 @@ loss is not reproduced):**
 - **Delivery:** 100% on both paths at 10/20/50 msg/sec × 10 s on loopback. The field's
   10–50% voice-frame loss is not reproducible in this environment; re-measure delivery in
   the nightly/field once phase 2 lands.
-- **The declared 1 MiB limit is not real under lair.** `send_direct_signal` signs the RAW
+- **The declared 1 MiB limit is not real under lair** — *retired 2026-09-14 by #5956 and its
+  0.7.1 backport (§1.1); true of conductors at or before `holochain-0.7.0`, which is still what
+  this repo's `flake.lock` pins.* `send_direct_signal` signs the RAW
   payload through the lair keystore (`conductor.rs:2985-2991`), and lair's IPC frames are
   hard-capped at 8 KiB (`lair_keystore_api` 0.6.3, `sodium_secretstream/framed.rs`
   `MAX_FRAME = 8192`): an 8000 B payload sends, 8192 B fails with `FrameOverflow` before
@@ -178,15 +263,25 @@ Consequences applied to the phases below:
 
 - Verdict: **proceed** — the latency delta is large, delivery is no worse, and the CPU
   savings (unmeasured by this rig) come on top.
-- Phase 2's send seam must route by **size as well as capability**: payloads over the
-  direct ceiling go via the zome path. Today's filmstrip frames (4–10 KB after base64)
-  straddle 8 KB, so without this a naive carrier switch would break video.
-- Phase 3 item 1 (binary frames) gains urgency: dropping base64 + double-JSON is what
-  brings filmstrip frames reliably under the ceiling.
-- Phase 3 item 3 (real VideoEncoder over large signals) is **gated on an upstream
-  holochain fix**: `send_direct_signal` should sign a hash of the payload, as the classic
-  remote-signal path does, instead of streaming the full payload through lair. File this
-  as a holochain issue alongside the `from_agent` one.
+- Phase 2's send seam must route by **size as well as capability** *while any peer may be on a
+  pre-0.7.1 conductor*: payloads over that peer's ceiling go via the zome path. Today's
+  filmstrip frames (4–10 KB after base64) straddle 8 KB, so without this a naive carrier switch
+  would break video. The conductor build is not observable from the app, so the size route is
+  either kept unconditionally or folded into the `direct-signal` capability declaration — the
+  declaring side knows its own conductor version (`AdminWebsocket`/`AppInfo` do not carry it;
+  settle how at phase 2, and if the answer is "not cheaply", keep the size route
+  unconditionally).
+- Phase 3 item 1 (binary frames) keeps its value on byte count alone, but is no longer what
+  makes filmstrip fit: on a 0.7.1+ conductor the ceiling is 1 MiB.
+- Phase 3 item 3 (real VideoEncoder over large signals) is **no longer gated on an upstream
+  fix** — #5956 landed it and #5983 backported it (§1.1). It is now gated on lifting this
+  repo's holonix pin to a 0.7.1 build and re-measuring RTT at 100 KB–1 MiB payloads, which
+  phase 0's rig cannot answer today (its 50 KB cap was the UI guard; the zome path carried
+  50 KB at 25 ms RTT in the same run).
+- Re-measurement owed, and its shape depends on the conductor: on 0.7.1 re-run the rig as-is
+  against the lifted pin; on 0.8 the rig must first commit a `Capability::DirectSignal` grant
+  for every receiving agent (§1.1 item 3) or every direct-path test silently reads as 0%
+  delivery.
 
 ### Phase 1 — client adapter (`ui/src/direct-signal.ts`)
 
@@ -208,15 +303,17 @@ settles the `Vec<u8>` encoding question phase 0 also needs, so whichever runs fi
 the other. The upstream PR does not gate phases 0-2 here (the adapter keeps presence
 independent of review and release latency); it DOES gate the Moss deployment path, since
 Moss's applet-iframe bundles its own client and only a released version fixes it there.
-Also worth an issue against holochain core: deliver the verified `from_agent` in
-`Signal::AppDirect` — the conductor holds it at the verify site (`cell.rs:449-461`) and
-dropping it forces every app into self-declared sender identity.
+The `from_agent` issue this section proposed filing is closed: upstream filed #5938 and fixed it
+in #5945, on the 0.8 line only (§1.1 item 2). The adapter's envelope keeps `from` regardless —
+it is what 0.7.1 has — and gains a *check* against the delivered value on 0.8.
 
 ### Phase 2 — carrier switch behind a capability
 
 - New cap `direct-signal` in `conversationPayload` caps beside `CAP_SDP_FSM`
   (`wire-contract.ts`); wire-contract table row + compat-corpus fixture for the new
-  envelope (the contract tests trip on this by design).
+  envelope (the contract tests trip on this by design). What the cap declares is settled in
+  phase 2.5: on a #5974 conductor it must mean "my grant is committed", not "my client speaks
+  the protocol", and the per-peer switch wants an observed direct round trip on top of it.
 - Pure policy `decideSignalPath(peerCaps) → { path: 'direct' | 'zome', reason }` in
   `ui/src/transport/` — the ONE place the choice is made, replacing nothing (new decision)
   but consumed by the one send closure.
@@ -234,6 +331,43 @@ Field validation before merge: the Phase 6.5 harnesses drive the store over the 
 with BroadcastChannel semantics, so they validate the partition/merge glue in node; the
 nightly real-RTC harness plus a manual two-conductor session validate the real path.
 
+### Phase 2.5 — the receive-side cap grant (#5974)
+
+Sequenced by the conductor version, not by phase number.
+
+Required the moment presence's conductor crosses onto a #5974 build (0.8 line today). Not
+writable before presence moves off hdk 0.7.0 (§1.1 item 3), and **blocking on the 0.8 upgrade in
+the other direction**: if phases 1–2 ship on 0.7.1 and the conductor is later lifted to 0.8
+without this, every direct signal stops being delivered, silently, with no sender-side error and
+no log on the send path. Put it on the 0.8 upgrade's release gate, not on a backlog.
+
+- Commit `CapGrant::new_direct_signal_grant("Receiving direct signals",
+  GrantConstraint::Unrestricted)` beside the existing zome-call grant in the room coordinator's
+  `init` (`dnas/presence/zomes/coordinator/room/src/lib.rs`). Unrestricted + `cap_secret: None`
+  is the matching trust level: presence's `recv_remote_signal` grant is already unrestricted and
+  its envelope `from` is already self-declared, so this grants no new authority to anyone (§1's
+  "trust level: equal" argument survives #5974 intact).
+- **`init` alone is not enough.** `init` runs once per agent, so every already-initialized agent
+  — i.e. every existing user — would have no grant. Needs an idempotent extern
+  (`grant_direct_signal`) called at app start / room join, committing only when a query of the
+  agent's own `CapGrant` entries finds no live unrestricted direct-signal grant (verify at
+  implementation time that `query` over `EntryType::CapGrant` returns private own-chain entries
+  on the SDK version in use; if it does not, the fallback is an idempotence marker of our own).
+  Duplicate unrestricted grants are harmless to matching ("if *any* grant is valid") but write
+  chain entries, so guard the commit, not the call.
+- Coordinator-only change ⇒ integrity zomes and the DNA hash are untouched, happ bytes change ⇒
+  a declared `HAPP_CHANGE=1` release, the same shape as the stable-tile-order round.
+- **Capability declaration must mean "grant committed", not "client supports it".** Because a
+  missing grant is a silent total drop, the `direct-signal` cap in `conversationPayload`
+  (phase 2) is only sound if a peer declares it *after* its own grant commit is confirmed.
+- **And gate the per-peer switch on an observed round trip, not on the declaration alone.** Send
+  PingUi over the direct path and require a direct-carried PongUi before routing that peer's
+  ModuleData direct; fall back to the zome path on no answer. This is what converts #5974's
+  silent drop — and any other single-direction carrier failure — into something the existing
+  presence machinery can see. Cheap: PingUi/PongUi already run every tick.
+- Rig consequence: the tryorama rig must commit grants for receiving agents before any
+  direct-path measurement on a 0.8 conductor (phase 0 results, re-measurement bullet).
+
 ### Phase 3 — spend the new budget (separate branches, only after phase 0/2 numbers)
 
 Ordered by expected return:
@@ -247,11 +381,17 @@ Ordered by expected return:
    against 10-50% loss through the zome path. If phase 0 shows materially better delivery,
    lower redundancy or raise the 24 kbps opus bitrate inside the same byte budget.
 3. **Real video over signals.** Replace the JPEG filmstrip with a WebCodecs `VideoEncoder`
-   (VP8/AV1 at 100-300 kbps, keyframe-on-join) riding large direct signals — gated on the
-   upstream lair-ceiling fix per the phase 0 results. This is the
+   (VP8/AV1 at 100-300 kbps, keyframe-on-join) riding large direct signals — the lair-ceiling
+   fix it was gated on has landed (§1.1 item 1), so the remaining gate is the holonix pin and
+   large-payload measurement. This is the
    "close to WebRTC UX" candidate and is a phase of its own with its own plan — a third
    signals-carried media type is already flagged as a phase-by-declaration in the
    dormant-until-trigger list (CLAUDE.md).
+4. **Authenticate the envelope's sender** (0.8 conductors only). Compare the envelope's
+   self-declared `from` against the conductor-verified `from_agent` (§1.1 item 2); log-only
+   first, reject on mismatch once the field confirms no false positives. This is strictly new
+   security, not a fix — neither carrier has ever had it — so it lands on its own and never
+   gates a carrier switch.
 
 ### Phase 4 — retire what the field says is dead
 
@@ -264,7 +404,13 @@ declaration under working agreement 1.
 
 ## 5. Deployment gates
 
-- **Conductor 0.7.0+** everywhere. Presence `main-0.7` already pins holonix `main-0.7`.
+- **Conductor 0.7.0+** everywhere for the feature to exist at all; **0.7.1+** for payloads over
+  ~8 KB (§1.1 item 1). Presence `main-0.7` pins holonix `main-0.7`, but the pinned holochain rev
+  is the 0.7.0 release commit — lifting the pin is a prerequisite of any large-payload phase,
+  not a formality.
+- **Conductor 0.8 (once #5974 lands) requires phase 2.5's cap grant.** No grant ⇒ every direct
+  signal is silently dropped by the recipient. This is the one gate that fails invisibly, so it
+  belongs on the 0.8 upgrade's release checklist rather than here alone.
 - **Moss**: presence-under-Moss needs the *host* conductor on 0.7 before any of this
   activates in that environment; the raw-socket adapter functions under an unpatched Moss
   applet-iframe client (with rejection-log noise), but the real fix is Moss bumping its
