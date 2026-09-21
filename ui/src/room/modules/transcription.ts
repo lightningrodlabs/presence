@@ -476,6 +476,7 @@ class TranscriptionController {
     this.framesPushed = 0;
     this.framesSkippedMuted = 0;
     this.finalsReceived = 0;
+    this.seq = 0;
 
     // Subscribe to our own module states so we can react to mic
     // mute/unmute transitions. The conversation module's `micMuted`
@@ -877,6 +878,9 @@ class TranscriptionController {
    */
   async stopAndAnnounce(): Promise<void> {
     if (!this.store) return;
+    // Finish capture first: the closing commit may add a last frame, and
+    // finalSeq has to cover it or peers record the transcript as a gap.
+    await this.stopCapture();
     const current = parseTranscriptionPayload(
       get(this.store._myModuleStates)['transcription'] ?? null,
     );
@@ -955,10 +959,17 @@ class TranscriptionController {
       finals: this.finalsReceived,
     });
 
-    // Stop the pump if running. Do this BEFORE close() so the final
-    // end-of-utterance signal + any pending finals round-trip before
-    // Moss tears down.
+    // Stop the pump first so the end-of-utterance signal reaches Moss
+    // before close(). Moss commits that audio while closing and delivers
+    // the resulting finals before close() resolves, so the listeners
+    // stay attached until then or the last utterance is lost.
     await this.stopPump();
+
+    if (this.session) {
+      const s = this.session;
+      this.session = null;
+      try { await s.close(); } catch {}
+    }
 
     if (this.sessionOffFinal) { try { this.sessionOffFinal(); } catch {} }
     if (this.sessionOffError) { try { this.sessionOffError(); } catch {} }
@@ -967,14 +978,7 @@ class TranscriptionController {
     this.sessionOffError = null;
     this.sessionOffPartial = null;
 
-    if (this.session) {
-      const s = this.session;
-      this.session = null;
-      try { await s.close(); } catch {}
-    }
-
     this.isCapturing.set(false);
-    this.seq = 0;
   }
 
   /**
