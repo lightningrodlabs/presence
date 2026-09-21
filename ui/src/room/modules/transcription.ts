@@ -10,6 +10,13 @@ import { readLocalStorage } from '../../utils';
 import { parseConversationPayload } from './conversation';
 
 export const AUTO_ACCEPT_KEY = 'autoAcceptTranscriptionRequests';
+/**
+ * localStorage flag. When "true", every PCM frame pushed to Moss is also
+ * kept in memory and downloaded as a WAV when capture stops, so the audio
+ * that left Presence can be compared against what Moss committed
+ * (moss `yarn asr:diagnose --reference <that wav>`).
+ */
+export const DEBUG_RECORD_KEY = 'transcriptionDebugRecord';
 
 /**
  * Structured diagnostic log for the transcription pipeline. Emits
@@ -207,6 +214,8 @@ class TranscriptionController {
    *  mute state, so this counter stays at 0 in healthy operation. */
   private framesPushed = 0;
   private framesSkippedMuted = 0;
+  /** Frames pushed since the pump started, kept only under DEBUG_RECORD_KEY. */
+  private debugRecording: Int16Array[] = [];
   private finalsReceived = 0;
   private statsInterval: number | null = null;
   /**
@@ -624,11 +633,41 @@ class TranscriptionController {
     try { this.micHandle.release(); } catch {}
     this.micHandle = null;
 
+    this.flushDebugRecording();
+
     this.isCapturing.set(false);
     txLog('pump-stopped', {
       pushed: this.framesPushed,
       finals: this.finalsReceived,
     });
+  }
+
+  private get debugRecordEnabled(): boolean {
+    return readLocalStorage<boolean | string>(DEBUG_RECORD_KEY, false) === true
+      || readLocalStorage<boolean | string>(DEBUG_RECORD_KEY, false) === 'true';
+  }
+
+  /** Download what was pushed to Moss during this pump as a 48 kHz mono WAV. */
+  private flushDebugRecording(): void {
+    const frames = this.debugRecording;
+    this.debugRecording = [];
+    if (frames.length === 0) return;
+    const total = frames.reduce((n, f) => n + f.length, 0);
+    const pcm = new Int16Array(total);
+    let off = 0;
+    for (const f of frames) {
+      pcm.set(f, off);
+      off += f.length;
+    }
+    const blob = new Blob([pcm16ToWav(pcm, 48_000, 1)], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    a.href = url;
+    a.download = `presence-mic-${ts}.wav`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    txLog('debug-recording-saved', { frames: frames.length, ms: Math.round((total / 48_000) * 1000) });
   }
 
   /**
@@ -735,6 +774,7 @@ class TranscriptionController {
           try {
             await this.session.pushAudio(pcm16, forceFlush);
             this.framesPushed += 1;
+            if (this.debugRecordEnabled) this.debugRecording.push(pcm16.slice());
             if (forceFlush) {
               txLog('forced-flush', { bufferMs, reason: flushReason });
               this.lastCommitOrFlushMs = now;
@@ -1035,6 +1075,28 @@ class TranscriptionController {
  * amplitude dip to split a very long turn at. O(samples) — a
  * single 10 ms frame at 48 kHz is 480 samples, negligible cost.
  */
+function pcm16ToWav(pcm: Int16Array, sampleRate: number, channels: number): ArrayBuffer {
+  const dataLength = pcm.length * 2;
+  const buf = new ArrayBuffer(44 + dataLength);
+  const v = new DataView(buf);
+  const ascii = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ascii(0, 'RIFF');
+  v.setUint32(4, 36 + dataLength, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, channels, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * channels * 2, true);
+  v.setUint16(32, channels * 2, true);
+  v.setUint16(34, 16, true);
+  ascii(36, 'data');
+  v.setUint32(40, dataLength, true);
+  new Int16Array(buf, 44).set(pcm);
+  return buf;
+}
+
 function pcm16Rms(pcm: Int16Array): number {
   if (pcm.length === 0) return 0;
   let sum = 0;
