@@ -224,9 +224,11 @@ is already the file CLAUDE.md rule 8 warns about):
    resolve `null`.
 4. Open the picker window (`selectaudiosources.html`, a Lit element
    modelled on `selectmediasource.ts`): checkbox list — "All system
-   output (except Moss)" first, then `processes()` entries by `name`
-   (pids never leave main; the picker gets `{ id, name, isOutputActive }`);
-   when `perApp` is false only the first row shows. Confirm → the
+   output (except Moss)" first, then `processes()` entries (pids never
+   leave main; the picker gets `{ id, name, isOutputActive }`) **sorted
+   with currently-playing apps first** (`isOutputActive` true → false →
+   unknown, then by name) and each row marked playing / silent (decided
+   2026-09-22); when `perApp` is false only the first row shows. Confirm → the
    chosen ids; cancel/close → `null`. One picker at a time, like
    `SELECT_SCREEN_OR_WINDOW_WINDOW`.
 5. Open the streams: `kind:'system'` with `excludePids = mossProcessTree()`
@@ -260,22 +262,26 @@ path calls one `endGrant(grantId, reason)` that stops the capture,
 closes `port1`, and notifies the renderer; `endGrant` is idempotent.
 
 **Chip**: while ≥1 grant is active the Moss top bar shows
-"Sharing audio with <tool name>" with a stop button (one chip per grant).
+"<tool name> is using system audio" with a stop button (one chip per grant).
 
-**Settings**: a new top-level tab **Tool Affordances** in
-`moss-settings.ts` (`TabsState.ToolAffordances`), rendering
-`<moss-tool-affordances-settings>` which owns a sub-tab bar. First
-sub-tab **Audio Sources** (`self/settings/tool-affordances/audio-sources-settings.ts`):
+**Settings**: a new top-level tab **Tool Permissions** (name proposed
+2026-09-22 in place of the brainstorm's "Tool Affordances": the pane is
+per-tool grants with revoke plus a capability readout, which users know
+as "permissions" from phones and browsers) in `moss-settings.ts`
+(`TabsState.ToolPermissions`), rendering `<moss-tool-permissions-settings>`
+which owns a sub-tab bar. First sub-tab **Audio Sources**
+(`self/settings/tool-permissions/audio-sources-settings.ts`):
 
 - persisted enable switch (`persistedStore.audioSourcesEnabled`,
   default **on** — the picker is itself an explicit per-request
-  consent, so the switch is a kill switch, not the consent);
+  consent, so the switch is a kill switch, not the consent), labelled
+  "Allow tools to request audio sources";
 - capability readout from `capabilities()` (backend, per-app,
   excludes-Moss, reason);
 - active grants: tool name, label, started-at, Stop.
 
 The `ai-transcription` branch's Local AI tab is not on `main-0.7`
-today; when that branch lands it becomes a second sub-tab here (noted
+today; when that branch lands it becomes the second sub-tab here (noted
 for that merge, not done by this work).
 
 **Tests**: `audioSources.test.ts` (grant table: request → picker
@@ -432,8 +438,10 @@ Each step is one branch, one intent, adversarially reviewed
   `@lightningrodlabs/flexaudio` until upstream publishes.
 - PulseAudio-only Linux hosts are unsupported (declared; consequence of
   adopting flexaudio, which has no PulseAudio backend).
-- Settings: new "Tool Affordances" tab with sub-tabs; "Audio Sources"
-  is the first sub-tab.
+- Settings: new "Tool Permissions" tab (renamed from "Tool Affordances"
+  2026-09-22) with sub-tabs; "Audio Sources" is the first sub-tab.
+- Picker shows `isOutputActive` per app and sorts playing apps first
+  (decided 2026-09-22).
 - Grants session-scoped, not persisted.
 - v1 requires the mic to be held; system audio rides the mic track.
 - Mute silences the mixed track as a whole (declared here, not asked).
