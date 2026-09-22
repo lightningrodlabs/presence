@@ -234,6 +234,10 @@ class TranscriptionController {
 
   bind(store: StreamsStore) {
     this.store = store;
+    // Frame numbering is per speaker per room: receivers drop a repeated
+    // (transcriber, seq), so every capture session in this room must
+    // continue the count, and only a new room starts over.
+    this.seq = 0;
   }
 
   unbind() {
@@ -485,7 +489,6 @@ class TranscriptionController {
     this.framesPushed = 0;
     this.framesSkippedMuted = 0;
     this.finalsReceived = 0;
-    this.seq = 0;
 
     // Subscribe to our own module states so we can react to mic
     // mute/unmute transitions. The conversation module's `micMuted`
