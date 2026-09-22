@@ -8,6 +8,8 @@ import type { StreamsStore } from '../../streams-store';
 import type { MicAcquireResult } from '../../mic-source';
 import { readLocalStorage } from '../../utils';
 import { parseConversationPayload } from './conversation';
+import { transcriptId, type StoredTranscript, type TranscriptStore } from '../transcripts/store';
+import type { LabelFor } from '../transcripts/export';
 
 export const AUTO_ACCEPT_KEY = 'autoAcceptTranscriptionRequests';
 /**
@@ -232,18 +234,129 @@ class TranscriptionController {
   private sessionOffPartial: (() => void) | null = null;
   private seq = 0;
 
+  /**
+   * The call visit being recorded: one StoredTranscript from bind to
+   * endVisit, holding every frame from every speaker. Written to the
+   * store at most once per VISIT_WRITE_INTERVAL_MS while frames arrive,
+   * and once more when the visit ends.
+   */
+  private visit: StoredTranscript | null = null;
+  private visitStore: TranscriptStore | null = null;
+  private visitDirty = false;
+  private visitWriteTimer: ReturnType<typeof setTimeout> | null = null;
+  private labelFor: LabelFor | null = null;
+  private static readonly VISIT_WRITE_INTERVAL_MS = 2000;
+  /** The live visit for the transcripts dialog; null outside a room. */
+  readonly liveVisit: Writable<StoredTranscript | null> = writable(null);
+
   bind(store: StreamsStore) {
     this.store = store;
     // Frame numbering is per speaker per room: receivers drop a repeated
     // (transcriber, seq), so every capture session in this room must
     // continue the count, and only a new room starts over.
     this.seq = 0;
+    this.openVisit(store);
   }
 
   unbind() {
-    this.stopCapture().catch(() => {});
+    // The closing commit's final is delivered during stopCapture, so the
+    // visit ends only after capture has fully stopped.
+    const stopped = this.stopCapture().catch(() => {});
     this.pendingRequests.set(new Set());
     this.store = null;
+    void stopped.then(() => this.endVisit());
+  }
+
+  /** Display name for the visit, learned by room-view once room info loads. */
+  setVisitRoomName(name: string): void {
+    if (this.visit && this.visit.roomName !== name) {
+      this.visit.roomName = name;
+      this.markVisitDirty();
+    }
+  }
+
+  /** Nickname lookup used to freeze speaker labels when the visit ends. */
+  setSpeakerLabelResolver(fn: LabelFor | null): void {
+    this.labelFor = fn;
+  }
+
+  private openVisit(store: StreamsStore): void {
+    const t = store.transcripts;
+    if (!t) return;
+    const startedAt = Date.now();
+    this.visitStore = t.store;
+    this.visit = {
+      id: transcriptId(t.roomKey, startedAt),
+      roomKey: t.roomKey,
+      roomName: '',
+      startedAt,
+      frames: [],
+      labels: {},
+    };
+    this.liveVisit.set(this.visit);
+    this.markVisitDirty();
+  }
+
+  private appendToVisit(frame: TranscriptFrame): void {
+    const v = this.visit;
+    if (!v) return;
+    if (v.frames.some(f => f.transcriber === frame.transcriber && f.seq === frame.seq)) return;
+    v.frames.push({ ...frame });
+    // A fresh object reference so subscribers re-render on every frame.
+    this.liveVisit.set({ ...v });
+    this.markVisitDirty();
+  }
+
+  private markVisitDirty(): void {
+    this.visitDirty = true;
+    if (this.visitWriteTimer !== null) return;
+    this.visitWriteTimer = setTimeout(() => {
+      this.visitWriteTimer = null;
+      void this.writeVisit();
+    }, TranscriptionController.VISIT_WRITE_INTERVAL_MS);
+  }
+
+  private async writeVisit(): Promise<void> {
+    if (!this.visit || !this.visitStore || !this.visitDirty) return;
+    this.visitDirty = false;
+    try {
+      await this.visitStore.put(this.visit);
+    } catch (e) {
+      console.error('transcription: visit write failed', e);
+    }
+  }
+
+  /**
+   * Close the visit: freeze speaker labels, stamp the end, and write it.
+   * A visit that never received a frame is removed instead, so the
+   * transcripts list only shows calls with content.
+   */
+  async endVisit(): Promise<void> {
+    const v = this.visit;
+    const s = this.visitStore;
+    this.visit = null;
+    this.visitStore = null;
+    this.liveVisit.set(null);
+    if (this.visitWriteTimer !== null) {
+      clearTimeout(this.visitWriteTimer);
+      this.visitWriteTimer = null;
+    }
+    this.visitDirty = false;
+    if (!v || !s) return;
+    try {
+      if (v.frames.length === 0) {
+        await s.delete(v.id);
+        return;
+      }
+      v.endedAt = Date.now();
+      for (const pk of new Set(v.frames.map(f => f.speaker))) {
+        const label = this.labelFor?.(pk);
+        if (label) v.labels[pk] = label;
+      }
+      await s.put(v);
+    } catch (e) {
+      console.error('transcription: visit close failed', e);
+    }
   }
 
   /**
@@ -981,6 +1094,7 @@ class TranscriptionController {
       nextLog.set(frame.speaker, next);
       return nextLog;
     });
+    this.appendToVisit(frame);
   }
 
   async stopCapture(): Promise<void> {

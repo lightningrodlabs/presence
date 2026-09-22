@@ -83,6 +83,7 @@ import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
 import { transcriptionController } from './room/modules/transcription';
 import type { TranscriptEntry } from './room/modules/transcription';
+import { getTranscriptStore } from './room/transcripts/store';
 import type { LocalModelsApi, WeaveClient } from '@theweave/api';
 import { getStreamInfo } from './utils';
 import { parseSignalPayload } from './signal-payload';
@@ -537,6 +538,8 @@ export class StreamsStore {
    * case transcription reports itself unavailable rather than failing.
    */
   readonly localModels: LocalModelsApi | undefined;
+  /** Transcript persistence for this room; undefined when not wired. */
+  readonly transcripts: StreamsStoreDeps['transcripts'];
 
   constructor(
     deps: StreamsStoreDeps,
@@ -548,6 +551,7 @@ export class StreamsStore {
     this.logger = logger;
     this.clock = deps.clock;
     this.localModels = deps.localModels;
+    this.transcripts = deps.transcripts;
     this.myPubKeyB64 = encodeHashToBase64(deps.bus.myPubKey);
     this._localIntent = writable(initialLocalIntent(this.deps.storage.local));
     this.mediaSettings = new MediaSettings({
@@ -1360,7 +1364,8 @@ export class StreamsStore {
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
     logger: PresenceLogger,
-    weaveClient?: Pick<WeaveClient, 'localModels'>
+    weaveClient?: Pick<WeaveClient, 'localModels'>,
+    roomKey?: string
   ): Promise<StreamsStore> {
     // The production deps record — the ONE place the ambient world is
     // bound to the store. It reproduces the pre-Phase-6 ambient reads
@@ -1383,6 +1388,7 @@ export class StreamsStore {
       transportFactory: (_purpose, options) => new FsmTransport(options),
       mediaDevices: navigator.mediaDevices,
       localModels: weaveClient?.localModels,
+      transcripts: roomKey ? { store: getTranscriptStore(), roomKey } : undefined,
     };
     const streamsStore = new StreamsStore(
       deps,
