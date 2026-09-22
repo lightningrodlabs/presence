@@ -1117,7 +1117,31 @@ class TranscriptionController {
     this.appendToVisit(frame);
   }
 
+  /**
+   * In-flight stopCapture promise, shared across concurrent callers.
+   * `StreamsStore.disconnect()` has no re-entry guard and runs up to
+   * three times per room leave (the quit button, then teardown from
+   * both room-view and room-container), and every call reaches this
+   * method via unbind(). A second call must wait on the same close()
+   * Moss is already running rather than start a fresh no-op stop that
+   * would resolve before the real one delivers the closing commit —
+   * unbind()'s deferred store-clear/endVisit would then run too early
+   * and drop that final.
+   */
+  private stopInFlight: Promise<void> | null = null;
+
   async stopCapture(): Promise<void> {
+    if (this.stopInFlight) return this.stopInFlight;
+    const p = this._doStopCapture();
+    this.stopInFlight = p;
+    try {
+      await p;
+    } finally {
+      this.stopInFlight = null;
+    }
+  }
+
+  private async _doStopCapture(): Promise<void> {
     // Unsubscribe first so state changes during teardown don't trigger
     // a new startPump after we've started closing the session.
     if (this.statesUnsub) {

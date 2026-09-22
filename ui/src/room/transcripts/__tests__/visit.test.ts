@@ -264,4 +264,40 @@ describe('transcript visit lifecycle races (fix round 1)', () => {
 
     expect(get(transcriptionController.liveVisit)?.roomKey).toBe('room-b');
   });
+
+  it('repeated unbind() calls before the closing commit settles do not drop it (fix round 2)', async () => {
+    const store = new MemoryTranscriptStore();
+    const host = fakeHost();
+    transcriptionController.bind(fakeStoreWithHost(store, 'room-a', host, 'me'));
+
+    expect(await transcriptionController.startCapture()).toBe(true);
+
+    transcriptionController.unbind();
+    await host.sessions[0].closeStarted;
+    // StreamsStore.disconnect() has no re-entry guard and runs up to
+    // three times per room leave (the quit button, then teardown from
+    // both room-view and room-container); every call reaches unbind()
+    // while the first close() is still in flight. Without a shared
+    // in-flight stop, each of these would see `this.session` already
+    // null and resolve its own stopCapture immediately, settling long
+    // before the real close() below — which is exactly the drop this
+    // test guards against, so the flush here is load-bearing: it lets
+    // an unshared second/third stop (and its store/visit teardown) run
+    // to completion before the real closing commit ever arrives.
+    transcriptionController.unbind();
+    transcriptionController.unbind();
+    await flush();
+
+    // Moss delivers the closing commit only now, strictly before the
+    // real close() resolves.
+    host.sessions[0].emit({ text: 'closing words', tStart: 0, tEnd: 500 });
+    host.sessions[0].resolveClose();
+    await flush();
+
+    const list = await store.listForRoom('room-a');
+    expect(list).toHaveLength(1);
+    expect(list[0].frames.map(f => f.text)).toEqual(['closing words']);
+    expect(typeof list[0].endedAt).toBe('number');
+    expect(get(transcriptionController.liveVisit)).toBeNull();
+  });
 });
