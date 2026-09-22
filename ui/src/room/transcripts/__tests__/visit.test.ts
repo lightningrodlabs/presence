@@ -109,6 +109,7 @@ describe('transcript visit lifecycle', () => {
   });
   afterEach(() => {
     transcriptionController.unbind();
+    transcriptionController.setSpeakerLabelResolver(null);
     vi.useRealTimers();
   });
 
@@ -119,19 +120,22 @@ describe('transcript visit lifecycle', () => {
     transcriptionController.setSpeakerLabelResolver((pk) => (pk === 'alice' ? 'Alice' : undefined));
     await vi.runOnlyPendingTimersAsync();
 
+    // A visit becomes a record on its first frame.
     let list = await store.listForRoom('room-a');
-    expect(list).toHaveLength(1);
-    expect(list[0].startedAt).toBe(1_000_000);
-    expect(list[0].endedAt).toBeUndefined();
-    expect(get(transcriptionController.liveVisit)?.id).toBe(list[0].id);
+    expect(list).toHaveLength(0);
+    expect(get(transcriptionController.liveVisit)?.startedAt).toBe(1_000_000);
 
     ingest('alice', frame('alice', 0, 'hello', 1_001_000));
     ingest('bob', frame('bob', 0, 'hi', 1_002_000));
     ingest('alice', frame('alice', 0, 'hello again', 1_001_000)); // duplicate (transcriber, seq)
     list = await store.listForRoom('room-a');
-    expect(list[0].frames).toHaveLength(0); // not written yet: writes are coalesced
+    expect(list).toHaveLength(0); // not written yet: writes are coalesced
     await vi.advanceTimersByTimeAsync(2_000);
     list = await store.listForRoom('room-a');
+    expect(list).toHaveLength(1);
+    expect(list[0].id).toBe(get(transcriptionController.liveVisit)?.id);
+    expect(list[0].startedAt).toBe(1_000_000);
+    expect(list[0].endedAt).toBeUndefined();
     expect(list[0].frames.map((f) => f.text)).toEqual(['hello', 'hi']);
     expect(list[0].roomName).toBe('Main Room');
 
@@ -143,11 +147,12 @@ describe('transcript visit lifecycle', () => {
     expect(get(transcriptionController.liveVisit)).toBeNull();
   });
 
-  it('deletes a visit that received no frames', async () => {
+  it('never stores a visit that received no frames', async () => {
     const store = new MemoryTranscriptStore();
     transcriptionController.bind(fakeStore(store, 'room-a'));
-    await vi.runOnlyPendingTimersAsync();
-    expect(await store.listForRoom('room-a')).toHaveLength(1);
+    transcriptionController.setVisitRoomName('Main Room'); // marks the visit dirty
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await store.listForRoom('room-a')).toHaveLength(0);
     await transcriptionController.endVisit();
     expect(await store.listForRoom('room-a')).toHaveLength(0);
   });
@@ -181,6 +186,7 @@ describe('transcript visit lifecycle races (fix round 1)', () => {
   });
   afterEach(() => {
     transcriptionController.unbind();
+    transcriptionController.setSpeakerLabelResolver(null);
     vi.useRealTimers();
     g.MediaStreamTrackProcessor = savedProcessor;
     g.window = savedWindow;
@@ -241,11 +247,37 @@ describe('transcript visit lifecycle races (fix round 1)', () => {
 
     expect(get(transcriptionController.liveVisit)?.roomKey).toBe('room-b');
 
-    // B's own coalesced write lands normally — it was never touched by
-    // A's deferred close.
+    // B's own coalesced write lands normally once it has a frame — it
+    // was never touched by A's deferred close.
+    ingest('bob', frame('bob', 0, 'hi', 1_002_000));
     await vi.advanceTimersByTimeAsync(2_000);
     const listB = await storeB.listForRoom('room-b');
     expect(listB).toHaveLength(1);
+  });
+
+  it('labels the closed visit through the resolver set at unbind time, not one set while the close is pending', async () => {
+    const store = new MemoryTranscriptStore();
+    const host = fakeHost();
+    transcriptionController.bind(fakeStoreWithHost(store, 'room-a', host, 'me'));
+    transcriptionController.setSpeakerLabelResolver((pk) => (pk === 'alice' ? 'Alice in A' : undefined));
+
+    expect(await transcriptionController.startCapture()).toBe(true);
+    ingest('alice', frame('alice', 0, 'hello', 1_001_000));
+
+    transcriptionController.unbind();
+    await host.sessions[0].closeStarted;
+
+    // The next room's room-view installs its own resolver before the
+    // old visit's deferred close has run.
+    transcriptionController.setSpeakerLabelResolver((pk) => (pk === 'alice' ? 'Alice in B' : undefined));
+
+    host.sessions[0].resolveClose();
+    await flush();
+
+    const list = await store.listForRoom('room-a');
+    expect(list).toHaveLength(1);
+    expect(typeof list[0].endedAt).toBe('number');
+    expect(list[0].labels).toEqual({ alice: 'Alice in A' });
   });
 
   it('a second bind without an intervening unbind closes the first visit before opening the second', async () => {

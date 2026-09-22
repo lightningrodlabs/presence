@@ -519,6 +519,13 @@ export class RoomView extends LitElement {
         console.error('transcription: stopAndAnnounce on quit failed', e);
       }
     }
+    // One more lookup for every speaker of this visit, so the labels the
+    // controller freezes into the record at the visit's end are current.
+    try {
+      await this._refreshSpeakerLabels(Array.from(this._transcriptLog.value?.keys() ?? []));
+    } catch (e) {
+      console.error('transcription: speaker label lookup on quit failed', e);
+    }
     this.streamsStore.disconnect('quitRoom-button');
     this.streamsStore.logger.endSession();
     this.dispatchEvent(
@@ -532,6 +539,26 @@ export class RoomView extends LitElement {
    * lazy profiles store being hot at the exact moment they render.
    */
   private _speakerLabels: Map<AgentPubKeyB64, string> = new Map();
+
+  /** Speakers whose nickname has been asked for during this call. */
+  private _speakerLabelsRequested: Set<AgentPubKeyB64> = new Set();
+
+  /**
+   * Looks up the nickname of each speaker the transcript log has gained
+   * since the last render, so labels are known before the visit ends
+   * whether or not the transcripts dialog is ever opened.
+   */
+  private _requestNewSpeakerLabels(): void {
+    const log = this._transcriptLog.value;
+    if (!log || !this._profilesStore) return;
+    const fresh: AgentPubKeyB64[] = [];
+    for (const pk of log.keys()) {
+      if (this._speakerLabels.has(pk) || this._speakerLabelsRequested.has(pk)) continue;
+      this._speakerLabelsRequested.add(pk);
+      fresh.push(pk);
+    }
+    if (fresh.length > 0) void this._refreshSpeakerLabels(fresh);
+  }
 
   /**
    * Bulk-refresh nicknames for the given pubkeys via a direct zome
@@ -808,6 +835,7 @@ export class RoomView extends LitElement {
         .roomKey=${transcripts.roomKey}
         .live=${this._liveVisit.value ?? null}
         .labelFor=${(pk: AgentPubKeyB64) => this._speakerLabels.get(pk)}
+        .refreshLabels=${(pks: AgentPubKeyB64[]) => this._refreshSpeakerLabels(pks)}
         @transcripts-close=${() => (this._transcriptsOpen = false)}
       ></transcripts-dialog>
     `;
@@ -1155,6 +1183,7 @@ export class RoomView extends LitElement {
     }
     this._updateGrid();
     this._ensurePeerVideoStreams();
+    this._requestNewSpeakerLabels();
   }
 
   /**
@@ -1378,6 +1407,7 @@ export class RoomView extends LitElement {
     this._releaseResizeListeners?.();
     if (this._unsubscribe) this._unsubscribe();
     this.removeEventListener('click', this.sideClickListener);
+    this._speakerLabelsRequested.clear();
     this.streamsStore.disconnect('room-view-disconnectedCallback');
     // The super call is what runs hostDisconnected on the reactive
     // controllers — without it every StoreSubscriber on this element

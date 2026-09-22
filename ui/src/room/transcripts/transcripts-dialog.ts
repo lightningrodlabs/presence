@@ -1,10 +1,13 @@
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { localized, msg } from '@lit/localize';
+import { localized, msg, str } from '@lit/localize';
 import { mdiArrowLeft, mdiDeleteOutline, mdiDownloadOutline, mdiEyeOutline } from '@mdi/js';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
 
+import type { AgentPubKeyB64 } from '@holochain/client';
+
 import type { StoredTranscript, TranscriptStore } from './store';
+import { describeDuration, selectTranscriptRows } from './dialog-policy';
 import {
   formatOffset,
   renderTranscriptMarkdown,
@@ -14,6 +17,14 @@ import {
   wordCount,
   type LabelFor,
 } from './export';
+
+function countSpeakers(n: number): string {
+  return n === 1 ? msg('1 speaker') : msg(str`${n} speakers`);
+}
+
+function countWords(n: number): string {
+  return n === 1 ? msg('1 word') : msg(str`${n} words`);
+}
 
 /**
  * Overlay listing this room's stored transcripts with view, download and
@@ -29,6 +40,8 @@ export class TranscriptsDialog extends LitElement {
   /** The visit in progress, or null. Rendered first and marked live. */
   @property({ attribute: false }) live: StoredTranscript | null = null;
   @property({ attribute: false }) labelFor: LabelFor = () => undefined;
+  /** Looks up nicknames so that `labelFor` can answer for the given speakers. */
+  @property({ attribute: false }) refreshLabels: ((pks: AgentPubKeyB64[]) => Promise<void>) | null = null;
 
   @state() private _entries: StoredTranscript[] = [];
   @state() private _loading = true;
@@ -50,17 +63,29 @@ export class TranscriptsDialog extends LitElement {
     } finally {
       this._loading = false;
     }
+    await this._refreshUnlabelledSpeakers(this._entries);
   }
 
   /**
-   * Stored entries with the live visit substituted for its own stored
-   * copy. The live visit is withheld until it has produced a frame, so
-   * joining a call with transcription off does not show an empty row.
+   * A record stores labels only for the speakers its visit could name at
+   * the end; look up the rest so the list and view show nicknames.
    */
+  private async _refreshUnlabelledSpeakers(entries: StoredTranscript[]) {
+    const pks = new Set<AgentPubKeyB64>();
+    for (const t of entries) {
+      for (const f of t.frames) if (!(f.speaker in t.labels)) pks.add(f.speaker);
+    }
+    if (pks.size === 0 || !this.refreshLabels) return;
+    try {
+      await this.refreshLabels(Array.from(pks));
+      this.requestUpdate();
+    } catch (e) {
+      console.error('transcripts: label lookup failed', e);
+    }
+  }
+
   private _rows(): StoredTranscript[] {
-    const live = this.live && this.live.frames.length > 0 ? this.live : null;
-    const stored = this._entries.filter((t) => !live || t.id !== live.id);
-    return live ? [live, ...stored] : stored;
+    return selectTranscriptRows(this.live, this._entries);
   }
 
   private _close() {
@@ -88,18 +113,17 @@ export class TranscriptsDialog extends LitElement {
     await this._reload();
   }
 
-  /**
-   * "live" is reserved for the visit currently being recorded — a
-   * stored entry with no `endedAt` (a page killed mid-call) instead
-   * shows the span it managed to capture, or a dash if it captured
-   * nothing.
-   */
   private _duration(t: StoredTranscript): string {
-    if (this.live?.id === t.id) return msg('live');
-    if (t.endedAt) return formatOffset(t.endedAt - t.startedAt);
-    if (t.frames.length === 0) return '—';
-    const lastFrameAt = Math.max(...t.frames.map((f) => f.committedAtMs));
-    return formatOffset(lastFrameAt - t.startedAt);
+    const d = describeDuration(t, this.live?.id ?? null);
+    switch (d.kind) {
+      case 'live':
+        return msg('live');
+      case 'ended':
+      case 'open':
+        return formatOffset(d.ms);
+      case 'empty':
+        return '—';
+    }
   }
 
   private _renderRow(t: StoredTranscript) {
@@ -110,7 +134,7 @@ export class TranscriptsDialog extends LitElement {
         <div class="column meta">
           <div class="when">${new Date(t.startedAt).toLocaleString()}</div>
           <div class="facts">
-            ${this._duration(t)} · ${speakerCount(t)} ${msg('speakers')} · ${wordCount(t)} ${msg('words')}
+            ${this._duration(t)} · ${countSpeakers(speakerCount(t))} · ${countWords(wordCount(t))}
           </div>
         </div>
         <div class="row actions">

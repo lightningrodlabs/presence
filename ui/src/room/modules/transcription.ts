@@ -272,11 +272,15 @@ class TranscriptionController {
     // during this pending teardown opens its own visit and must not
     // have it swept by this one.
     const v = this.visit;
+    // The resolver belongs to the room-view that is leaving; a room-view
+    // for the next room replaces it on firstUpdated, possibly before this
+    // close runs, and must not label this visit's speakers.
+    const labelFor = this.labelFor;
     const stopped = this.stopCapture().catch(() => {});
     this.pendingRequests.set(new Set());
     void stopped.then(() => {
       if (this.store === store) this.store = null;
-      if (this.visit === v) void this.endVisit();
+      if (this.visit === v) void this.endVisit(labelFor);
     });
   }
 
@@ -314,7 +318,6 @@ class TranscriptionController {
       labels: {},
     };
     this.liveVisit.set(this.visit);
-    this.markVisitDirty();
   }
 
   private appendToVisit(frame: TranscriptFrame): void {
@@ -338,6 +341,9 @@ class TranscriptionController {
 
   private async writeVisit(): Promise<void> {
     if (!this.visit || !this.visitStore || !this.visitDirty) return;
+    // The store only holds visits with content; a visit becomes a record
+    // on its first frame.
+    if (this.visit.frames.length === 0) return;
     this.visitDirty = false;
     try {
       await this.visitStore.put(this.visit);
@@ -347,11 +353,11 @@ class TranscriptionController {
   }
 
   /**
-   * Close the visit: freeze speaker labels, stamp the end, and write it.
-   * A visit that never received a frame is removed instead, so the
-   * transcripts list only shows calls with content.
+   * Close the visit: freeze speaker labels through `labelFor`, stamp the
+   * end, and write it. A visit that never received a frame is never
+   * written; the delete makes sure no record of it remains.
    */
-  async endVisit(): Promise<void> {
+  async endVisit(labelFor: LabelFor | null = this.labelFor): Promise<void> {
     const v = this.visit;
     const s = this.visitStore;
     this.visit = null;
@@ -370,7 +376,7 @@ class TranscriptionController {
       }
       v.endedAt = Date.now();
       for (const pk of new Set(v.frames.map(f => f.speaker))) {
-        const label = this.labelFor?.(pk);
+        const label = labelFor?.(pk);
         if (label) v.labels[pk] = label;
       }
       await s.put(v);
