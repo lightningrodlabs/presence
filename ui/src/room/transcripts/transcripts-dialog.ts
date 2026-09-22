@@ -1,0 +1,226 @@
+import { LitElement, css, html, nothing } from 'lit';
+import { customElement, property, state } from 'lit/decorators.js';
+import { localized, msg } from '@lit/localize';
+import { mdiArrowLeft, mdiDeleteOutline, mdiDownloadOutline, mdiEyeOutline } from '@mdi/js';
+import { wrapPathInSvg } from '@holochain-open-dev/elements';
+
+import type { StoredTranscript, TranscriptStore } from './store';
+import {
+  formatOffset,
+  renderTranscriptMarkdown,
+  speakerCount,
+  transcriptFileName,
+  transcriptLines,
+  wordCount,
+  type LabelFor,
+} from './export';
+
+/**
+ * Overlay listing this room's stored transcripts with view, download and
+ * delete, plus the live visit at the top while a call is in progress.
+ *
+ * Events: `transcripts-close`.
+ */
+@localized()
+@customElement('transcripts-dialog')
+export class TranscriptsDialog extends LitElement {
+  @property({ attribute: false }) store!: TranscriptStore;
+  @property({ type: String }) roomKey = '';
+  /** The visit in progress, or null. Rendered first and marked live. */
+  @property({ attribute: false }) live: StoredTranscript | null = null;
+  @property({ attribute: false }) labelFor: LabelFor = () => undefined;
+
+  @state() private _entries: StoredTranscript[] = [];
+  @state() private _loading = true;
+  @state() private _viewing: StoredTranscript | null = null;
+  @state() private _confirmDelete: string | null = null;
+
+  connectedCallback() {
+    super.connectedCallback();
+    void this._reload();
+  }
+
+  private async _reload() {
+    this._loading = true;
+    try {
+      this._entries = await this.store.listForRoom(this.roomKey);
+    } catch (e) {
+      console.error('transcripts: list failed', e);
+      this._entries = [];
+    } finally {
+      this._loading = false;
+    }
+  }
+
+  /** Stored entries with the live visit substituted for its own stored copy. */
+  private _rows(): StoredTranscript[] {
+    const live = this.live;
+    const stored = this._entries.filter((t) => !live || t.id !== live.id);
+    return live ? [live, ...stored] : stored;
+  }
+
+  private _close() {
+    this.dispatchEvent(new CustomEvent('transcripts-close', { bubbles: true, composed: true }));
+  }
+
+  private _download(t: StoredTranscript) {
+    const blob = new Blob([renderTranscriptMarkdown(t, this.labelFor)], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = transcriptFileName(t);
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  private async _delete(id: string) {
+    this._confirmDelete = null;
+    try {
+      await this.store.delete(id);
+    } catch (e) {
+      console.error('transcripts: delete failed', e);
+    }
+    if (this._viewing?.id === id) this._viewing = null;
+    await this._reload();
+  }
+
+  private _duration(t: StoredTranscript): string {
+    if (!t.endedAt) return msg('live');
+    return formatOffset(t.endedAt - t.startedAt);
+  }
+
+  private _renderRow(t: StoredTranscript) {
+    const isLive = this.live?.id === t.id;
+    const confirming = this._confirmDelete === t.id;
+    return html`
+      <div class="row entry ${isLive ? 'live' : ''}">
+        <div class="column meta">
+          <div class="when">${new Date(t.startedAt).toLocaleString()}</div>
+          <div class="facts">
+            ${this._duration(t)} · ${speakerCount(t)} ${msg('speakers')} · ${wordCount(t)} ${msg('words')}
+          </div>
+        </div>
+        <div class="row actions">
+          ${confirming
+            ? html`
+                <span class="confirm">${msg('Delete this transcript?')}</span>
+                <button class="danger" @click=${() => this._delete(t.id)}>${msg('Yes')}</button>
+                <button class="secondary" @click=${() => (this._confirmDelete = null)}>${msg('No')}</button>
+              `
+            : html`
+                <button class="icon" title=${msg('View')} @click=${() => (this._viewing = t)}>
+                  <sl-icon .src=${wrapPathInSvg(mdiEyeOutline)}></sl-icon>
+                </button>
+                <button class="icon" title=${msg('Download')} @click=${() => this._download(t)}>
+                  <sl-icon .src=${wrapPathInSvg(mdiDownloadOutline)}></sl-icon>
+                </button>
+                ${isLive
+                  ? nothing
+                  : html`<button class="icon" title=${msg('Delete')} @click=${() => (this._confirmDelete = t.id)}>
+                      <sl-icon .src=${wrapPathInSvg(mdiDeleteOutline)}></sl-icon>
+                    </button>`}
+              `}
+        </div>
+      </div>
+    `;
+  }
+
+  private _renderList() {
+    const rows = this._rows();
+    return html`
+      <div class="headline">${msg('Transcripts')}</div>
+      ${this.store.degraded
+        ? html`<div class="warning">${msg('Transcripts cannot be stored in this browser; only the current call is available.')}</div>`
+        : nothing}
+      ${this._loading
+        ? html`<div class="body">${msg('Loading…')}</div>`
+        : rows.length === 0
+          ? html`<div class="body">${msg('No transcripts yet. Start transcription during a call and it will appear here.')}</div>`
+          : rows.map((t) => this._renderRow(t))}
+      <div class="row actions end">
+        <button class="secondary" @click=${() => this._close()}>${msg('Close')}</button>
+      </div>
+    `;
+  }
+
+  private _renderView(t: StoredTranscript) {
+    // The live visit is re-read from `live` so the view grows with the call.
+    const current = this.live?.id === t.id ? this.live : t;
+    const lines = transcriptLines(current, this.labelFor);
+    const t0 = lines.length > 0 ? lines[0].ts : current.startedAt;
+    return html`
+      <div class="row center-content" style="gap: 8px;">
+        <button class="icon" title=${msg('Back')} @click=${() => (this._viewing = null)}>
+          <sl-icon .src=${wrapPathInSvg(mdiArrowLeft)}></sl-icon>
+        </button>
+        <div class="headline">${new Date(current.startedAt).toLocaleString()} · ${this._duration(current)}</div>
+        <span style="flex: 1;"></span>
+        <button class="icon" title=${msg('Download')} @click=${() => this._download(current)}>
+          <sl-icon .src=${wrapPathInSvg(mdiDownloadOutline)}></sl-icon>
+        </button>
+      </div>
+      <div class="transcript">
+        ${lines.length === 0
+          ? html`<div class="body">${msg('No utterances yet.')}</div>`
+          : lines.map(
+              (l) => html`
+                <p>
+                  <span class="offset">[${formatOffset(l.ts - t0)}]</span>
+                  <b>${l.label}:</b> ${l.text}
+                </p>
+              `,
+            )}
+      </div>
+    `;
+  }
+
+  render() {
+    return html`
+      <div class="dialog" @click=${() => this._close()}>
+        <div class="panel" @click=${(e: Event) => e.stopPropagation()} @keypress=${() => undefined}>
+          <div class="column" style="gap: 12px;">
+            ${this._viewing ? this._renderView(this._viewing) : this._renderList()}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  static styles = css`
+    :host { display: contents; }
+    .dialog {
+      position: fixed; inset: 0; z-index: 25;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0, 0, 0, 0.35);
+    }
+    .panel {
+      background: white; color: #222; border-radius: 12px;
+      padding: 18px 20px; width: min(720px, 92vw); max-height: 85vh;
+      overflow: auto; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+      font-family: 'Ubuntu', sans-serif;
+    }
+    .row { display: flex; flex-direction: row; align-items: center; }
+    .column { display: flex; flex-direction: column; }
+    .center-content { align-items: center; }
+    .headline { font-size: 18px; font-weight: 600; }
+    .body { font-size: 14px; color: #444; }
+    .warning { font-size: 13px; color: #8a5a00; background: #fff4d6; padding: 6px 10px; border-radius: 6px; }
+    .entry { justify-content: space-between; padding: 8px 4px; border-bottom: 1px solid #eee; gap: 12px; }
+    .entry.live .when::after { content: ' · live'; color: #09b500; font-weight: 600; }
+    .when { font-size: 14px; font-weight: 500; }
+    .facts { font-size: 12px; color: #666; }
+    .actions { gap: 6px; }
+    .actions.end { justify-content: flex-end; margin-top: 6px; }
+    .confirm { font-size: 13px; margin-right: 4px; }
+    .transcript { max-height: 60vh; overflow: auto; font-size: 14px; line-height: 1.45; }
+    .transcript p { margin: 0 0 10px; }
+    .offset { color: #888; font-family: monospace; font-size: 12px; margin-right: 6px; }
+    button { border: none; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+    button.icon { background: transparent; padding: 4px; font-size: 18px; color: #333; }
+    button.icon:hover { background: #eee; }
+    button.secondary { background: #eee; }
+    button.secondary:hover { background: #ddd; }
+    button.danger { background: #d23030; color: white; }
+    button.danger:hover { background: #b02020; }
+  `;
+}

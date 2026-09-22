@@ -29,6 +29,7 @@ import {
   mdiTransitConnectionVariant,
   mdiCloudDownloadOutline,
   mdiSubtitlesOutline,
+  mdiTextBoxMultipleOutline,
   mdiVideo,
   mdiVideoOff,
   mdiSwapHorizontal,
@@ -77,6 +78,7 @@ import {
 } from './modules/video-filmstrip';
 import './elements/transcription-request-dialog';
 import './elements/save-transcript-dialog';
+import './transcripts/transcripts-dialog';
 import './logs-graph';
 import {
   downloadJson,
@@ -299,6 +301,16 @@ export class RoomView extends LitElement {
     () => this.streamsStore._transcriptLog,
     () => [this.streamsStore],
   );
+
+  /** The visit being recorded, for the live row of the transcripts dialog. */
+  _liveVisit = new StoreSubscriber(
+    this,
+    () => transcriptionController.liveVisit,
+    () => [this.streamsStore],
+  );
+
+  @state()
+  private _transcriptsOpen = false;
 
   /**
    * Save-transcript-dialog visibility state. Set by quitRoom when
@@ -1010,6 +1022,45 @@ export class RoomView extends LitElement {
     `;
   }
 
+  private _renderTranscriptsButton() {
+    const transcripts = this.streamsStore.transcripts;
+    if (!transcripts) return html``;
+    const tooltip = transcripts.store.degraded
+      ? msg('Transcripts (not stored in this browser)')
+      : msg('Transcripts');
+    return html`
+      <sl-tooltip content=${tooltip} hoist>
+        <div
+          class="toggle-btn"
+          tabindex="0"
+          @click=${() => (this._transcriptsOpen = true)}
+          @keypress=${(e: KeyboardEvent) => {
+            if (e.key === 'Enter') this._transcriptsOpen = true;
+          }}
+        >
+          <sl-icon class="toggle-btn-icon" .src=${wrapPathInSvg(mdiTextBoxMultipleOutline)}></sl-icon>
+        </div>
+      </sl-tooltip>
+    `;
+  }
+
+  private _renderTranscriptsDialog() {
+    const transcripts = this.streamsStore.transcripts;
+    if (!this._transcriptsOpen || !transcripts) return html``;
+    // Freeze labels for peers whose profiles are loaded, so the dialog
+    // shows nicknames without waiting on the lazy profiles store.
+    void this._refreshSpeakerLabels(Array.from(this._transcriptLog.value?.keys() ?? []));
+    return html`
+      <transcripts-dialog
+        .store=${transcripts.store}
+        .roomKey=${transcripts.roomKey}
+        .live=${this._liveVisit.value ?? null}
+        .labelFor=${(pk: AgentPubKeyB64) => this._speakerLabels.get(pk)}
+        @transcripts-close=${() => (this._transcriptsOpen = false)}
+      ></transcripts-dialog>
+    `;
+  }
+
   private _handleTranscriptionButtonClick() {
     if (!this._asrAvailable) {
       this.notifyError(
@@ -1260,6 +1311,9 @@ export class RoomView extends LitElement {
     // while media kept flowing.
 
     this._roomInfo = await this.roomStore.client.getRoomInfo();
+
+    transcriptionController.setVisitRoomName(this.roomName());
+    transcriptionController.setSpeakerLabelResolver(pk => this._speakerLabels.get(pk));
 
     // _unsubscribe is cleared in disconnectedCallback; without retaining
     // it here the callback keeps firing requestUpdate() on the detached
@@ -2726,6 +2780,8 @@ export class RoomView extends LitElement {
 
         ${this._renderTranscriptionToolbarButton()}
 
+        ${this._renderTranscriptsButton()}
+
         <sl-tooltip content="${msg('Leave Call')}" hoist>
           <div
             class="btn-stop"
@@ -3645,6 +3701,7 @@ export class RoomView extends LitElement {
         ${this.roomName()}
       </div>
       ${this._renderTranscriptionRequestPrompt()}
+      ${this._renderTranscriptsDialog()}
       ${this._renderSaveTranscriptDialog()}
       ${(() => {
         // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
