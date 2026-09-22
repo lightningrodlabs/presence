@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-22-audio-source-capture-design.md` (Presence repo), Section 1 and the Platform matrix.
 
+> **Status (2026-09-22): EXECUTED.** All tasks landed on `lightningrodlabs/flexaudio` `main` (`dd3659e` at this note); `@lightningrodlabs/flexaudio@0.3.0-lrl.1` published (manually, OTP; the workflow's real publish path is unexercised — its dry run 35781012733 is green); upstream PRs Studio-Sadola/flexaudio#3 and #4 open. Deviations from the text below, each recorded as a ruling in the run's ledger (copy in the session scratchpad): Task 2 was redesigned mid-task (registry `global` props omit `application.process.id`; nodes are bound and the pid read from `info` props; `info_seen` gates Exclude linking); a controller-added Task 5b fixed a pre-existing fan-in half-link defect the smoke test exposed; the Task 1 smoke test scopes both captures to its own sink via `deviceId`; `--tag latest` is required for a prerelease publish; crates.io/PyPI release workflows are gated to upstream's repo on the fork.
+
 ## Global Constraints
 
 - Work happens in `../flexaudio` (`/home/eric/code/metacurrency/holochain/flexaudio`), remotes `origin` = `lightningrodlabs/flexaudio`, `upstream` = `Studio-Sadola/flexaudio`; base commit `e36ca9f` (upstream `main` at fork time).

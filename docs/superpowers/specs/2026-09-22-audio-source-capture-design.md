@@ -173,6 +173,28 @@ session. Below the floor the picker is not offered.
 win x64/arm64, darwin arm64) retargeted to our scope; darwin x64 added
 because Moss ships `build:mac-x64`. Moss pins an exact version.
 
+**Landed (2026-09-22; plan `docs/superpowers/plans/2026-09-22-flexaudio-fork.md`).**
+`@lightningrodlabs/flexaudio@0.3.0-lrl.1` is on the npm registry (root + six
+platform packages, `dist-tags.latest`; verify with
+`npm view @lightningrodlabs/flexaudio version`, never from this line), built
+from fork commit `27e2d19` (tag `v0.3.0-lrl.1`), published manually with OTP
+because trusted publishing cannot bootstrap a new package. Fix 1 and Fix 2
+are upstream PRs Studio-Sadola/flexaudio#3 and #4. Two things the evaluation
+did not predict and this section's text above does not describe: (a) the
+registry `global` event omits `application.process.id`, so Fix 1 binds each
+stream node and reads it from the bound `info` props, gating Exclude-mode
+linking on that info having arrived; (b) the smoke test exposed a pre-existing
+upstream fan-in defect (a node latched after pairing whatever ports had
+arrived → one channel silent), fixed with a channel-aware completeness
+predicate over the bound node's `n_output_ports`. Consumers must pin the
+version exactly (`"0.3.0-lrl.1"`; a `^0.3.0` range does not match a
+prerelease). Field limits Moss must design around: macOS resolves pids to
+Core Audio objects once at `start` (a helper with no audio object yet is not
+excluded — start the capture while already playing, or reopen); Windows
+honours one process tree (`excludeSelf` = the addon host's tree); the `.node`
+NEEDs `libpipewire-0.3.so.0` at load; a declared PipeWire output port that
+never surfaces as a registry global leaves that node unlinked (no timeout).
+
 ## Section 2 — Moss
 
 Branch `feat/audio-source-capture` off `main-0.7`.
