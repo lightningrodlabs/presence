@@ -1,12 +1,19 @@
 import { LitElement, css, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { AgentPubKey, AppClient, CellId, ClonedCell } from '@holochain/client';
+import {
+  AgentPubKey,
+  AppClient,
+  CellId,
+  ClonedCell,
+  encodeHashToBase64,
+} from '@holochain/client';
 import { localized, msg } from '@lit/localize';
 import { NULL_HASH, WeaveClient } from '@theweave/api';
 
 import '@shoelace-style/shoelace/dist/components/input/input';
 import '@shoelace-style/shoelace/dist/components/icon/icon';
 import '../shared/wal-to-pocket-btn';
+import '../room/transcripts/transcripts-button';
 
 import { consume } from '@lit/context';
 import { sharedStyles } from '../sharedStyles';
@@ -15,6 +22,7 @@ import { RoomClient } from '../room/room-client';
 import { RoomInfo, weaveClientContext } from '../types';
 import { getCellTypes, groupRoomNetworkSeed } from '../utils';
 import { GroupRoomInfo } from '../presence-app';
+import { roomTranscriptKey } from '../room/transcripts/store';
 
 import '../room/room-container';
 import './list-online-agents';
@@ -180,6 +188,42 @@ export class SharedRoomCard extends LitElement {
     `;
   }
 
+  /** The room's cell, once it exists on this device. */
+  private roomCell(): { dna: CellId[0]; roleName: string; name: string } | undefined {
+    if (this.isMainRoom) {
+      return this.mainRoomCellId
+        ? { dna: this.mainRoomCellId[0], roleName: 'presence', name: msg('Main Room') }
+        : undefined;
+    }
+    return this._myCell
+      ? {
+          dna: this._myCell.cell_id[0],
+          roleName: this._myCell.clone_id,
+          name: this._roomInfo?.name ?? '[unknown]',
+        }
+      : undefined;
+  }
+
+  renderPocketButton() {
+    const cell = this.roomCell();
+    if (!cell) return '';
+    return html`<wal-to-pocket-btn
+      class="pocket-btn"
+      .wal=${{ hrl: [cell.dna, NULL_HASH] }}
+      .weaveClient=${this._weaveClient}
+    ></wal-to-pocket-btn>`;
+  }
+
+  renderTranscriptsButton() {
+    const cell = this.roomCell();
+    if (!cell) return '';
+    return html`<transcripts-button
+      class="transcripts-btn"
+      .roomKey=${roomTranscriptKey(encodeHashToBase64(cell.dna), cell.roleName)}
+      .roomName=${cell.name}
+    ></transcripts-button>`;
+  }
+
   render() {
     return html`
       <div
@@ -199,20 +243,9 @@ export class SharedRoomCard extends LitElement {
               ? this._roomInfo.name
               : '[unknown]'}
           </div>
+          ${this.renderPocketButton()}
           <span style="display: flex; flex: 1;"></span>
-          ${this.isMainRoom && this.mainRoomCellId
-            ? html`<wal-to-pocket-btn
-                class="pocket-btn"
-                .wal=${{ hrl: [this.mainRoomCellId[0], NULL_HASH] }}
-                .weaveClient=${this._weaveClient}
-              ></wal-to-pocket-btn>`
-            : this._myCell
-            ? html`<wal-to-pocket-btn
-                class="pocket-btn"
-                .wal=${{ hrl: [this._myCell.cell_id[0], NULL_HASH] }}
-                .weaveClient=${this._weaveClient}
-              ></wal-to-pocket-btn>`
-            : ''}
+          ${this.renderTranscriptsButton()}
           <button
             @click=${() => this.handleOpenRoom()}
             class="enter-room-btn secondary-font"
@@ -265,6 +298,13 @@ export class SharedRoomCard extends LitElement {
       }
 
       .pocket-btn {
+        margin-left: 10px;
+        --bg-color: #2a4a8f;
+        --bg-color-hover: #3558a0;
+        color: #fff0f0;
+      }
+
+      .transcripts-btn {
         margin-right: 10px;
         --bg-color: #2a4a8f;
         --bg-color-hover: #3558a0;

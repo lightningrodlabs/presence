@@ -29,7 +29,6 @@ import {
   mdiTransitConnectionVariant,
   mdiCloudDownloadOutline,
   mdiSubtitlesOutline,
-  mdiTextBoxMultipleOutline,
   mdiVideo,
   mdiVideoOff,
   mdiSwapHorizontal,
@@ -77,7 +76,9 @@ import {
   FilmstripCaptureSize,
 } from './modules/video-filmstrip';
 import './elements/transcription-request-dialog';
-import './transcripts/transcripts-dialog';
+import './transcripts/transcript-view';
+import { transcriptLines } from './transcripts/export';
+import { SpeakerLabels, profileNicknameFetcher } from './transcripts/speaker-labels';
 import './logs-graph';
 import {
   downloadJson,
@@ -101,7 +102,6 @@ import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-shar
 import {
   AUTO_ACCEPT_KEY,
   DEFAULT_TRANSCRIPTION_PAYLOAD,
-  TranscriptEntry,
   TranscriptionPayload,
   parseTranscriptionPayload,
   transcriptionController,
@@ -300,15 +300,12 @@ export class RoomView extends LitElement {
     () => [this.streamsStore],
   );
 
-  /** The visit being recorded, for the live row of the transcripts dialog. */
+  /** The visit being recorded, shown in the connection-details pane. */
   _liveVisit = new StoreSubscriber(
     this,
     () => transcriptionController.liveVisit,
     () => [this.streamsStore],
   );
-
-  @state()
-  private _transcriptsOpen = false;
 
   _audioInputDevices = new StoreSubscriber(
     this,
@@ -519,10 +516,11 @@ export class RoomView extends LitElement {
         console.error('transcription: stopAndAnnounce on quit failed', e);
       }
     }
-    // One more lookup for every speaker of this visit, so the labels the
-    // controller freezes into the record at the visit's end are current.
+    // One more lookup for every speaker of this visit still unlabelled, so
+    // the labels the controller freezes into the record at the visit's end
+    // are as complete as they can be.
     try {
-      await this._refreshSpeakerLabels(Array.from(this._transcriptLog.value?.keys() ?? []));
+      await this._speakerLabels.refresh(Array.from(this._transcriptLog.value?.keys() ?? []));
     } catch (e) {
       console.error('transcription: speaker label lookup on quit failed', e);
     }
@@ -534,119 +532,51 @@ export class RoomView extends LitElement {
   }
 
   /**
-   * Cached pubkey → nickname map. Populated via `_refreshSpeakerLabels`,
-   * so the transcripts dialog and the live pane don't depend on the
-   * lazy profiles store being hot at the exact moment they render.
+   * Nicknames of this call's speakers, so the connection-details pane
+   * and the labels frozen into the visit record don't depend on the lazy
+   * profiles store being hot at the moment they are read.
    */
-  private _speakerLabels: Map<AgentPubKeyB64, string> = new Map();
-
-  /** Speakers whose nickname has been asked for during this call. */
-  private _speakerLabelsRequested: Set<AgentPubKeyB64> = new Set();
+  private _speakerLabels = new SpeakerLabels(pk => {
+    const store = this._profilesStore;
+    if (!store) return Promise.reject(new Error('profiles store not available'));
+    return profileNicknameFetcher(store)(pk);
+  });
 
   /**
    * Looks up the nickname of each speaker the transcript log has gained
-   * since the last render, so labels are known before the visit ends
-   * whether or not the transcripts dialog is ever opened.
+   * since the last render, so labels are known before the visit ends.
    */
   private _requestNewSpeakerLabels(): void {
     const log = this._transcriptLog.value;
     if (!log || !this._profilesStore) return;
-    const fresh: AgentPubKeyB64[] = [];
-    for (const pk of log.keys()) {
-      if (this._speakerLabels.has(pk) || this._speakerLabelsRequested.has(pk)) continue;
-      this._speakerLabelsRequested.add(pk);
-      fresh.push(pk);
-    }
-    if (fresh.length > 0) void this._refreshSpeakerLabels(fresh);
+    void this._speakerLabels.refresh(Array.from(log.keys()));
   }
 
   /**
-   * Bulk-refresh nicknames for the given pubkeys via a direct zome
-   * call (`profilesStore.client.getAgentProfile`). Bypasses the lazy
-   * `profilesStore.profiles.get()` readable — that store only starts
-   * fetching on first subscription, and a transient `get()` on it
-   * while nothing else is subscribing can return a pending value and
-   * leave the label as a pubkey prefix. The direct call is a Promise
-   * and always returns the current DHT value.
-   */
-  private async _refreshSpeakerLabels(pubkeys: AgentPubKeyB64[]): Promise<void> {
-    const store = this._profilesStore;
-    if (!store) return;
-    await Promise.all(
-      pubkeys.map(async pk => {
-        try {
-          const record = await store.client.getAgentProfile(
-            decodeHashFromBase64(pk),
-          );
-          const nickname = record?.entry?.nickname;
-          if (nickname) this._speakerLabels.set(pk, nickname);
-        } catch {
-          // leave cache untouched; the fallback pubkey prefix kicks in.
-        }
-      }),
-    );
-  }
-
-  /**
-   * Live diagnostic pane for the transcription pipeline. Visible only
-   * while "connection details" is toggled on. Shows the tail of the
-   * committed-utterance stream with a short wall-clock stamp and
-   * speaker label, so we can watch finals land in real time without
-   * saving the full transcript. Auto-scrolls to bottom on update — see
-   * the scroll logic in `updated()`.
+   * Live transcript of the visit in progress, from every speaker,
+   * rendered by the same `transcript-view` the transcripts dialog uses.
+   * Visible only while "connection details" is toggled on. Auto-scrolls
+   * to bottom on update — see the scroll logic in `updated()`.
    */
   private _renderTranscriptionPane() {
     if (!this._showConnectionDetails) return html``;
-    const log =
-      this._transcriptLog.value ??
-      new Map<AgentPubKeyB64, TranscriptEntry[]>();
-    // Self-only view. Phase 1 is self-transcription per speaker, so
-    // the only utterances we author land under our own key. Peers
-    // broadcast their own which we also accumulate, but for this
-    // live diagnostic we only care about what our pipeline committed.
-    const myKey = this.streamsStore.myPubKeyB64;
-    const entries = log.get(myKey) ?? [];
-    type PaneLine = { ts: number; text: string };
-    const lines: PaneLine[] = [];
-    for (const e of entries) {
-      const text = e.text.trim();
-      if (!text) continue;
-      if (/^\[[^\]]*\]\.?$/.test(text)) continue;
-      lines.push({ ts: e.committedAtMs, text });
-    }
-    lines.sort((a, b) => a.ts - b.ts);
-    const RECENT_LIMIT = 80;
-    const recent = lines.slice(-RECENT_LIMIT);
+    const visit = this._liveVisit.value ?? null;
+    const labelFor = (pk: AgentPubKeyB64) => this._speakerLabels.get(pk);
+    const count = visit ? transcriptLines(visit, labelFor).length : 0;
     return html`
       <div class="transcription-pane">
         <div class="transcription-pane-title">
           <sl-icon .src=${wrapPathInSvg(mdiSubtitlesOutline)}></sl-icon>
-          <span>Transcription (${lines.length})</span>
+          <span>Transcription (${count})</span>
         </div>
         <div class="transcription-pane-body">
-          ${recent.length === 0
-            ? html`<div class="transcription-empty">
-                ${msg('No utterances yet.')}
-              </div>`
-            : recent.map(
-                l => html`
-                  <div class="transcription-line">
-                    <span class="transcription-ts"
-                      >${this._formatClockShort(l.ts)}</span
-                    >
-                    <span class="transcription-text">${l.text}</span>
-                  </div>
-                `,
-              )}
+          <transcript-view
+            .transcript=${visit}
+            .labelFor=${labelFor}
+          ></transcript-view>
         </div>
       </div>
     `;
-  }
-
-  private _formatClockShort(ts: number): string {
-    const d = new Date(ts);
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
   /**
@@ -790,54 +720,6 @@ export class RoomView extends LitElement {
             : html``}
         </div>
       </sl-tooltip>
-    `;
-  }
-
-  /**
-   * Refreshes the speaker-label cache once, then opens the transcripts
-   * dialog. Kept out of the render path: room-view re-renders on every
-   * live frame and every other subscribed store, and each refresh is
-   * one profile-zome call per speaker.
-   */
-  private _openTranscripts() {
-    void this._refreshSpeakerLabels(Array.from(this._transcriptLog.value?.keys() ?? []));
-    this._transcriptsOpen = true;
-  }
-
-  private _renderTranscriptsButton() {
-    const transcripts = this.streamsStore.transcripts;
-    if (!transcripts) return html``;
-    const tooltip = transcripts.store.degraded
-      ? msg('Transcripts (not stored in this browser)')
-      : msg('Transcripts');
-    return html`
-      <sl-tooltip content=${tooltip} hoist>
-        <div
-          class="toggle-btn"
-          tabindex="0"
-          @click=${() => this._openTranscripts()}
-          @keypress=${(e: KeyboardEvent) => {
-            if (e.key === 'Enter') this._openTranscripts();
-          }}
-        >
-          <sl-icon class="toggle-btn-icon" .src=${wrapPathInSvg(mdiTextBoxMultipleOutline)}></sl-icon>
-        </div>
-      </sl-tooltip>
-    `;
-  }
-
-  private _renderTranscriptsDialog() {
-    const transcripts = this.streamsStore.transcripts;
-    if (!this._transcriptsOpen || !transcripts) return html``;
-    return html`
-      <transcripts-dialog
-        .store=${transcripts.store}
-        .roomKey=${transcripts.roomKey}
-        .live=${this._liveVisit.value ?? null}
-        .labelFor=${(pk: AgentPubKeyB64) => this._speakerLabels.get(pk)}
-        .refreshLabels=${(pks: AgentPubKeyB64[]) => this._refreshSpeakerLabels(pks)}
-        @transcripts-close=${() => (this._transcriptsOpen = false)}
-      ></transcripts-dialog>
     `;
   }
 
@@ -1216,7 +1098,14 @@ export class RoomView extends LitElement {
       const pane = this.shadowRoot?.querySelector(
         '.transcription-pane-body',
       ) as HTMLElement | null;
-      if (pane) pane.scrollTop = pane.scrollHeight;
+      if (pane) {
+        pane.scrollTop = pane.scrollHeight;
+        // transcript-view renders in its own update cycle, after this one.
+        const view = pane.querySelector('transcript-view') as LitElement | null;
+        void view?.updateComplete.then(() => {
+          pane.scrollTop = pane.scrollHeight;
+        });
+      }
     }
   }
 
@@ -1407,7 +1296,6 @@ export class RoomView extends LitElement {
     this._releaseResizeListeners?.();
     if (this._unsubscribe) this._unsubscribe();
     this.removeEventListener('click', this.sideClickListener);
-    this._speakerLabelsRequested.clear();
     this.streamsStore.disconnect('room-view-disconnectedCallback');
     // The super call is what runs hostDisconnected on the reactive
     // controllers — without it every StoreSubscriber on this element
@@ -2551,8 +2439,6 @@ export class RoomView extends LitElement {
 
         ${this._renderTranscriptionToolbarButton()}
 
-        ${this._renderTranscriptsButton()}
-
         <sl-tooltip content="${msg('Leave Call')}" hoist>
           <div
             class="btn-stop"
@@ -3472,7 +3358,6 @@ export class RoomView extends LitElement {
         ${this.roomName()}
       </div>
       ${this._renderTranscriptionRequestPrompt()}
-      ${this._renderTranscriptsDialog()}
       ${(() => {
         // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
         // carrier banner while the signal carrier is down. Copy + elapsed
@@ -5169,33 +5054,10 @@ export class RoomView extends LitElement {
         scroll-behavior: smooth;
       }
 
-      /* Flex layout so inter-element whitespace in the template
-         never renders as a leading space before the timestamp. */
-      .transcription-line {
-        display: flex;
-        align-items: baseline;
-        gap: 6px;
-        margin: 0 0 4px 0;
-        padding: 0;
-        line-height: 1.35;
-      }
-
-      .transcription-ts {
-        flex-shrink: 0;
-        color: #7a88b0;
-        font-variant-numeric: tabular-nums;
-      }
-
-      .transcription-text {
-        flex: 1;
-        color: #d8dce8;
-        min-width: 0;
-      }
-
-      .transcription-empty {
-        color: #7a88b0;
-        font-style: italic;
-        padding: 4px 0;
+      .transcription-pane-body transcript-view {
+        padding: 0 8px;
+        --transcript-text-color: #d8dce8;
+        --transcript-muted-color: #7a88b0;
       }
 
       .custom-log-dialog {

@@ -13,10 +13,10 @@ import {
   renderTranscriptMarkdown,
   speakerCount,
   transcriptFileName,
-  transcriptLines,
   wordCount,
   type LabelFor,
 } from './export';
+import './transcript-view';
 
 function countSpeakers(n: number): string {
   return n === 1 ? msg('1 speaker') : msg(str`${n} speakers`);
@@ -28,7 +28,7 @@ function countWords(n: number): string {
 
 /**
  * Overlay listing this room's stored transcripts with view, download and
- * delete, plus the live visit at the top while a call is in progress.
+ * delete.
  *
  * Events: `transcripts-close`.
  */
@@ -37,8 +37,6 @@ function countWords(n: number): string {
 export class TranscriptsDialog extends LitElement {
   @property({ attribute: false }) store!: TranscriptStore;
   @property({ type: String }) roomKey = '';
-  /** The visit in progress, or null. Rendered first and marked live. */
-  @property({ attribute: false }) live: StoredTranscript | null = null;
   @property({ attribute: false }) labelFor: LabelFor = () => undefined;
   /** Looks up nicknames so that `labelFor` can answer for the given speakers. */
   @property({ attribute: false }) refreshLabels: ((pks: AgentPubKeyB64[]) => Promise<void>) | null = null;
@@ -85,7 +83,7 @@ export class TranscriptsDialog extends LitElement {
   }
 
   private _rows(): StoredTranscript[] {
-    return selectTranscriptRows(this.live, this._entries);
+    return selectTranscriptRows(this._entries);
   }
 
   private _close() {
@@ -114,10 +112,8 @@ export class TranscriptsDialog extends LitElement {
   }
 
   private _duration(t: StoredTranscript): string {
-    const d = describeDuration(t, this.live?.id ?? null);
+    const d = describeDuration(t);
     switch (d.kind) {
-      case 'live':
-        return msg('live');
       case 'ended':
       case 'open':
         return formatOffset(d.ms);
@@ -127,10 +123,9 @@ export class TranscriptsDialog extends LitElement {
   }
 
   private _renderRow(t: StoredTranscript) {
-    const isLive = this.live?.id === t.id;
     const confirming = this._confirmDelete === t.id;
     return html`
-      <div class="row entry ${isLive ? 'live' : ''}">
+      <div class="row entry">
         <div class="column meta">
           <div class="when">${new Date(t.startedAt).toLocaleString()}</div>
           <div class="facts">
@@ -151,11 +146,9 @@ export class TranscriptsDialog extends LitElement {
                 <button class="icon" title=${msg('Download')} @click=${() => this._download(t)}>
                   <sl-icon .src=${wrapPathInSvg(mdiDownloadOutline)}></sl-icon>
                 </button>
-                ${isLive
-                  ? nothing
-                  : html`<button class="icon" title=${msg('Delete')} @click=${() => (this._confirmDelete = t.id)}>
-                      <sl-icon .src=${wrapPathInSvg(mdiDeleteOutline)}></sl-icon>
-                    </button>`}
+                <button class="icon" title=${msg('Delete')} @click=${() => (this._confirmDelete = t.id)}>
+                  <sl-icon .src=${wrapPathInSvg(mdiDeleteOutline)}></sl-icon>
+                </button>
               `}
         </div>
       </div>
@@ -167,7 +160,7 @@ export class TranscriptsDialog extends LitElement {
     return html`
       <div class="headline">${msg('Transcripts')}</div>
       ${this.store.degraded
-        ? html`<div class="warning">${msg('Transcripts cannot be stored in this browser; only the current call is available.')}</div>`
+        ? html`<div class="warning">${msg('Transcripts cannot be stored in this browser; they are kept only until this page closes.')}</div>`
         : nothing}
       ${this._loading
         ? html`<div class="body">${msg('Loading…')}</div>`
@@ -181,33 +174,23 @@ export class TranscriptsDialog extends LitElement {
   }
 
   private _renderView(t: StoredTranscript) {
-    // The live visit is re-read from `live` so the view grows with the call.
-    const current = this.live?.id === t.id ? this.live : t;
-    const lines = transcriptLines(current, this.labelFor);
-    const t0 = lines.length > 0 ? lines[0].ts : current.startedAt;
     return html`
       <div class="row center-content" style="gap: 8px;">
         <button class="icon" title=${msg('Back')} @click=${() => (this._viewing = null)}>
           <sl-icon .src=${wrapPathInSvg(mdiArrowLeft)}></sl-icon>
         </button>
-        <div class="headline">${new Date(current.startedAt).toLocaleString()} · ${this._duration(current)}</div>
+        <div class="headline">${new Date(t.startedAt).toLocaleString()} · ${this._duration(t)}</div>
         <span style="flex: 1;"></span>
-        <button class="icon" title=${msg('Download')} @click=${() => this._download(current)}>
+        <button class="icon" title=${msg('Download')} @click=${() => this._download(t)}>
           <sl-icon .src=${wrapPathInSvg(mdiDownloadOutline)}></sl-icon>
         </button>
       </div>
-      <div class="transcript">
-        ${lines.length === 0
-          ? html`<div class="body">${msg('No utterances yet.')}</div>`
-          : lines.map(
-              (l) => html`
-                <p>
-                  <span class="offset">[${formatOffset(l.ts - t0)}]</span>
-                  <b>${l.label}:</b> ${l.text}
-                </p>
-              `,
-            )}
-      </div>
+      <!-- A fresh labelFor each render, so labels looked up after opening show. -->
+      <transcript-view
+        class="transcript"
+        .transcript=${t}
+        .labelFor=${(pk: AgentPubKeyB64) => this.labelFor(pk)}
+      ></transcript-view>
     `;
   }
 
@@ -248,9 +231,7 @@ export class TranscriptsDialog extends LitElement {
     .actions { gap: 6px; }
     .actions.end { justify-content: flex-end; margin-top: 6px; }
     .confirm { font-size: 13px; margin-right: 4px; }
-    .transcript { max-height: 60vh; overflow: auto; font-size: 14px; line-height: 1.45; }
-    .transcript p { margin: 0 0 10px; }
-    .offset { color: #888; font-family: monospace; font-size: 12px; margin-right: 6px; }
+    .transcript { max-height: 60vh; overflow: auto; font-size: 14px; }
     button { border: none; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
     button.icon { background: transparent; padding: 4px; font-size: 18px; color: #333; }
     button.icon:hover { background: #eee; }

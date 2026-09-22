@@ -3,6 +3,7 @@ import {
   FallbackTranscriptStore,
   IndexedDbTranscriptStore,
   MemoryTranscriptStore,
+  roomTranscriptKey,
   transcriptId,
   type StoredTranscript,
   type TranscriptStore,
@@ -113,5 +114,21 @@ describe('FallbackTranscriptStore', () => {
 describe('transcriptId', () => {
   it('joins room key and start time', () => {
     expect(transcriptId('uhC#presence', 1700000000000)).toBe('uhC#presence:1700000000000');
+  });
+});
+
+describe('roomTranscriptKey', () => {
+  const cases: Array<{ name: string; dna: string; role: string; want: string }> = [
+    { name: 'main room', dna: 'uhC0kAAA', role: 'presence', want: 'uhC0kAAA#presence' },
+    { name: 'group room clone', dna: 'uhC0kBBB', role: 'presence.3', want: 'uhC0kBBB#presence.3' },
+  ];
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(roomTranscriptKey(c.dna, c.role)).toBe(c.want);
+    });
+  }
+
+  it('keeps cells apart that share a role name', () => {
+    expect(roomTranscriptKey('uhC0kAAA', 'presence.1')).not.toBe(roomTranscriptKey('uhC0kBBB', 'presence.1'));
   });
 });

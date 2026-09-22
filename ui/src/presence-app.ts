@@ -66,6 +66,7 @@ import './lobby/private-room-card';
 import './lobby/shared-room-card';
 import './lobby/list-online-agents';
 import './lobby/room-online-agents';
+import './room/transcripts/transcripts-button';
 import { sharedStyles } from './sharedStyles';
 import { RoomClient } from './room/room-client';
 import { exportLogs, clearAllLogs } from './logging';
@@ -84,6 +85,7 @@ import {
   PassivePresenceTracker,
 } from './passive-presence';
 import { RoomStore } from './room/room-store';
+import { roomTranscriptKey } from './room/transcripts/store';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
 
 declare const __APP_VERSION__: string;
@@ -1611,17 +1613,29 @@ export class PresenceApp extends LitElement {
                     ></room-online-agents>
                   </div>`
                 : ''}
-              <button
-                class="enter-main-room-btn"
-                ?disabled=${!this._currentRoomDnaB64}
-                @click=${async () => {
-                  if (this._currentRoomDnaB64) {
-                    await this._enterRoom(this._currentRoomDnaB64);
-                  }
-                }}
-              >
-                ${msg('Enter')}
-              </button>
+              <div class="row center-content" style="gap: 12px;">
+                <button
+                  class="enter-main-room-btn"
+                  ?disabled=${!this._currentRoomDnaB64}
+                  @click=${async () => {
+                    if (this._currentRoomDnaB64) {
+                      await this._enterRoom(this._currentRoomDnaB64);
+                    }
+                  }}
+                >
+                  ${msg('Enter')}
+                </button>
+                ${this._currentRoomDnaB64 && this._selectedRoleName
+                  ? html`<transcripts-button
+                      class="enter-transcripts-btn"
+                      .roomKey=${roomTranscriptKey(
+                        this._currentRoomDnaB64,
+                        this._selectedRoleName
+                      )}
+                      .roomName=${this._currentRoomName ?? msg('this room')}
+                    ></transcripts-button>`
+                  : ''}
+              </div>
             </div>
           </div>
         `;
@@ -1950,6 +1964,13 @@ export class PresenceApp extends LitElement {
         color: #e1e5fc;
         padding: 20px;
         box-sizing: border-box;
+      }
+
+      .enter-transcripts-btn {
+        font-size: 20px;
+        --bg-color: #2a4a8f;
+        --bg-color-hover: #3558a0;
+        color: #fff0f0;
       }
 
       .room-already-open-card {

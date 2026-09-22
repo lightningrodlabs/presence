@@ -9,7 +9,7 @@ import type { TranscriptFrame } from '../modules/transcription';
 export interface StoredTranscript {
   /** `${roomKey}:${startedAt}` */
   id: string;
-  /** `${dnaHashB64}#${roleName}` */
+  /** See `roomTranscriptKey`. */
   roomKey: string;
   roomName: string;
   startedAt: number;
@@ -27,6 +27,15 @@ export interface TranscriptStore {
   get(id: string): Promise<StoredTranscript | undefined>;
   put(t: StoredTranscript): Promise<void>;
   delete(id: string): Promise<void>;
+}
+
+/**
+ * The key every transcript of one room is filed under: the room cell's
+ * DNA hash plus its role name, so a re-created room with a reused clone
+ * id never inherits another room's history.
+ */
+export function roomTranscriptKey(dnaHashB64: string, roleName: string): string {
+  return `${dnaHashB64}#${roleName}`;
 }
 
 export function transcriptId(roomKey: string, startedAt: number): string {

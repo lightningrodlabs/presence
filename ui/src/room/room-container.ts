@@ -21,6 +21,7 @@ import { getCellTypes } from '../utils';
 import { weaveClientContext } from '../types';
 import { StreamsStore } from '../streams-store';
 import { PresenceLogger } from '../logging';
+import { roomTranscriptKey } from './transcripts/store';
 
 @localized()
 @customElement('room-container')
@@ -82,7 +83,7 @@ export class RoomContainer extends LitElement {
     // Transcripts are filed per cell so a re-created room with a reused
     // clone id never inherits another room's history.
     const cell = myCell ?? cellTypes.provisioned;
-    const roomKey = `${encodeHashToBase64(cell.cell_id[0])}#${this.roleName}`;
+    const roomKey = roomTranscriptKey(encodeHashToBase64(cell.cell_id[0]), this.roleName);
 
     this._presenceLogger = new PresenceLogger();
     this.streamsStore = await StreamsStore.connect(
