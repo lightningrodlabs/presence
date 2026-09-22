@@ -1022,6 +1022,17 @@ export class RoomView extends LitElement {
     `;
   }
 
+  /**
+   * Refreshes the speaker-label cache once, then opens the transcripts
+   * dialog. Kept out of the render path: room-view re-renders on every
+   * live frame and every other subscribed store, and each refresh is
+   * one profile-zome call per speaker.
+   */
+  private _openTranscripts() {
+    void this._refreshSpeakerLabels(Array.from(this._transcriptLog.value?.keys() ?? []));
+    this._transcriptsOpen = true;
+  }
+
   private _renderTranscriptsButton() {
     const transcripts = this.streamsStore.transcripts;
     if (!transcripts) return html``;
@@ -1033,9 +1044,9 @@ export class RoomView extends LitElement {
         <div
           class="toggle-btn"
           tabindex="0"
-          @click=${() => (this._transcriptsOpen = true)}
+          @click=${() => this._openTranscripts()}
           @keypress=${(e: KeyboardEvent) => {
-            if (e.key === 'Enter') this._transcriptsOpen = true;
+            if (e.key === 'Enter') this._openTranscripts();
           }}
         >
           <sl-icon class="toggle-btn-icon" .src=${wrapPathInSvg(mdiTextBoxMultipleOutline)}></sl-icon>
@@ -1047,9 +1058,6 @@ export class RoomView extends LitElement {
   private _renderTranscriptsDialog() {
     const transcripts = this.streamsStore.transcripts;
     if (!this._transcriptsOpen || !transcripts) return html``;
-    // Freeze labels for peers whose profiles are loaded, so the dialog
-    // shows nicknames without waiting on the lazy profiles store.
-    void this._refreshSpeakerLabels(Array.from(this._transcriptLog.value?.keys() ?? []));
     return html`
       <transcripts-dialog
         .store=${transcripts.store}

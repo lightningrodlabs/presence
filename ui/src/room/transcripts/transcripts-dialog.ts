@@ -52,9 +52,13 @@ export class TranscriptsDialog extends LitElement {
     }
   }
 
-  /** Stored entries with the live visit substituted for its own stored copy. */
+  /**
+   * Stored entries with the live visit substituted for its own stored
+   * copy. The live visit is withheld until it has produced a frame, so
+   * joining a call with transcription off does not show an empty row.
+   */
   private _rows(): StoredTranscript[] {
-    const live = this.live;
+    const live = this.live && this.live.frames.length > 0 ? this.live : null;
     const stored = this._entries.filter((t) => !live || t.id !== live.id);
     return live ? [live, ...stored] : stored;
   }
@@ -84,9 +88,18 @@ export class TranscriptsDialog extends LitElement {
     await this._reload();
   }
 
+  /**
+   * "live" is reserved for the visit currently being recorded — a
+   * stored entry with no `endedAt` (a page killed mid-call) instead
+   * shows the span it managed to capture, or a dash if it captured
+   * nothing.
+   */
   private _duration(t: StoredTranscript): string {
-    if (!t.endedAt) return msg('live');
-    return formatOffset(t.endedAt - t.startedAt);
+    if (this.live?.id === t.id) return msg('live');
+    if (t.endedAt) return formatOffset(t.endedAt - t.startedAt);
+    if (t.frames.length === 0) return '—';
+    const lastFrameAt = Math.max(...t.frames.map((f) => f.committedAtMs));
+    return formatOffset(lastFrameAt - t.startedAt);
   }
 
   private _renderRow(t: StoredTranscript) {
@@ -206,7 +219,6 @@ export class TranscriptsDialog extends LitElement {
     .body { font-size: 14px; color: #444; }
     .warning { font-size: 13px; color: #8a5a00; background: #fff4d6; padding: 6px 10px; border-radius: 6px; }
     .entry { justify-content: space-between; padding: 8px 4px; border-bottom: 1px solid #eee; gap: 12px; }
-    .entry.live .when::after { content: ' · live'; color: #09b500; font-weight: 600; }
     .when { font-size: 14px; font-weight: 500; }
     .facts { font-size: 12px; color: #666; }
     .actions { gap: 6px; }
