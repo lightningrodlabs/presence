@@ -26,18 +26,18 @@ the capture so nobody hears themselves back.
 
 ## Platform matrix
 
-Verified by research 2026-09-22 (sources in the brainstorming
-transcript; the backend smoke tests in Section 1 are what actually
-establish these):
+As implemented by flexaudio (Section 1); the Linux row was verified
+live 2026-09-22, the other two are upstream's documented behaviour
+until the smoke test in Section 1 runs there:
 
-| OS | Backend | Per-app | Excludes Moss | Floor |
+| OS | Backend (flexaudio crate) | Per-app | Excludes Moss | Floor |
 |---|---|---|---|---|
-| Linux, PipeWire | libpipewire capture stream linked from the chosen apps' output ports, or from the default sink's monitor for "system" | yes | yes (skip streams whose `application.process.id` is in the exclude set) | PipeWire (default on current Fedora/Ubuntu/Debian) |
-| Linux, PulseAudio-only | sink monitor | no | **no** | any |
-| macOS | CoreAudio process taps (`CATapDescription`, exclude list) | yes | yes | 14.2 |
-| Windows | WASAPI process loopback, exclude-tree mode | yes (include mode) | yes (exclude-tree on Moss's pid) | 10 2004 |
+| Linux, PipeWire | `flexaudio-os-linux`: capture stream fan-in linked from every `Stream/Output/Audio` node whose pid is not excluded | yes | yes, after Fix 1 + Fix 2 | a reachable PipeWire session (default on current Fedora/Ubuntu/Debian) |
+| Linux, PulseAudio-only | none | — | — | unsupported (declared) |
+| macOS | `flexaudio-os-macos`: CoreAudio process taps (`CATapDescription`, exclude list) | yes | yes, after Fix 2 | 14.4 + TCC audio-capture consent |
+| Windows | `flexaudio-os-windows`: WASAPI process loopback, INCLUDE per app / EXCLUDE tree for system | yes | yes (tree) | build 20348 (Windows 11 / Server 2022) |
 
-Anything below the floor reports `supported: false` and the feature is
+Below the floor Moss derives `supported: false` and the feature is
 absent (the Presence menu row does not render).
 
 ## Components
@@ -45,8 +45,8 @@ absent (the Presence menu row does not render).
 Four deliverables in four repos, built in this order because each is
 the next one's dependency:
 
-1. `@lightningrodlabs/audio-capture` — napi-rs addon (new repo,
-   `../audio-capture`).
+1. `@lightningrodlabs/flexaudio` — fork of flexaudio with two fixes
+   (checked out at `../audio-capture`).
 2. Moss — settings section, picker, grant/port plumbing, Weave message.
 3. `@theweave/api` — `captureAudioSources()` and the port→track helper.
 4. Presence — mic-menu row and the `MicSource` mixin.
@@ -55,8 +55,8 @@ the next one's dependency:
 
 ```
 OS audio (chosen apps / system, minus Moss's process tree)
-  → audio-capture addon (Rust, per-OS backend)
-  → ThreadsafeFunction callback in Moss main: Int16Array, 960 samples (20 ms) @ 48 kHz mono
+  → flexaudio addon (Rust, per-OS backend): one `system` stream + one `process` stream per chosen app
+  → onChunk callbacks in Moss main: Float32Array mono 48 kHz 20 ms, summed across streams, quantised to Int16Array (960 samples)
   → MessageChannelMain port → webContents.postMessage → Moss renderer
   → forwarded (transfer) to the applet iframe as the `success` reply of `request-audio-sources`
   → @theweave/api: port → AudioWorklet → MediaStreamAudioDestinationNode → MediaStreamTrack
@@ -67,107 +67,111 @@ OS audio (chosen apps / system, minus Moss's process tree)
 No wire-contract change in Presence: peers receive one audio track /
 one Opus stream exactly as today.
 
-## Section 1 — `@lightningrodlabs/audio-capture`
+## Section 1 — `@lightningrodlabs/flexaudio` (fork of flexaudio)
 
-**Home**: new repo at `../audio-capture` (sibling of `moss`), created
-locally by this work; the room owner pushes it to
-`lightningrodlabs/audio-capture`. Structure and pipeline copied from
-`../we-rust-utils`: napi-rs 3, `napi build --platform --release`, the
-same five targets (`x86_64`/`aarch64` darwin, `x86_64`/`aarch64`
-linux-gnu, `x86_64` windows-msvc), prebuilt `.node` binaries published
-per target under `npm/`, GitHub Actions matrix from `we-rust-utils`'s
-`CI.yml`. Moss consumes it as an ordinary dependency (Moss has
-`npmRebuild: false` and no native toolchain; this is the only existing
-way native code ships into Moss).
+**Decision (2026-09-22, after evaluation)**: do not write the backends.
+[Studio-Sadola/flexaudio](https://github.com/Studio-Sadola/flexaudio)
+(MIT, Rust workspace + napi-rs binding `crates/flexaudio-napi`) already
+implements every backend this design needs — PipeWire fan-in capture
+with include/exclude by pid, CoreAudio process taps with an exclude
+list, WASAPI process loopback in both tree modes — plus
+`processes()` enumeration on all three OSes. The evaluation (built on
+the owner's machine, live PipeWire exclusion matrix; findings in the
+session memory `project_flexaudio_evaluation.md`) found it sound for
+native PipeWire clients and found two defects that block *our* use,
+both small and localised. Writing our own would reproduce ~3k lines of
+backend code to arrive at the same mechanism.
 
-**Why an addon and not a sidecar**: the addon delivers PCM through a
-`ThreadsafeFunction` callback with no child-process lifecycle, no stdout
-framing, and no extra binary in `resources/bins`. The sidecar remains
-the fallback if a backend cannot be linked into the Electron process
-(e.g. a Linux distro whose `libpipewire-0.3` soname is missing — see
-"Linux runtime linking" below).
+**Home**: fork to `lightningrodlabs/flexaudio`, checked out at
+`../audio-capture` with `upstream` = Studio-Sadola. The npm package is
+published under our scope, `@lightningrodlabs/flexaudio` (+ the
+per-platform `optionalDependencies` packages the napi CLI generates),
+because upstream's own npm publication is blocked (their
+`RELEASING.md`: npm 2FA-token bug; crates.io has 0.2.0, 0.3.0 is
+unreleased). Both fixes below go upstream as PRs; if upstream publishes
+and merges them, Moss switches back to the upstream package and the
+fork is archived.
 
-**JS surface** (`index.d.ts`, generated by napi):
+**Fix 1 — pid resolution for pipewire-pulse clients (Linux).**
+`crates/flexaudio-os-linux` resolves a stream's pid from the owning
+Client's `pipewire.sec.pid`. For any libpulse client — Electron/Moss,
+Chrome, Zoom, most desktop apps — that is `pipewire-pulse`'s own pid,
+so `processes()` lists every such app under one pid with executable
+"pipewire", excluding an app's real pid excludes nothing, and excluding
+`pipewire-pulse`'s pid excludes every pulse client at once (all three
+measured). The real pid is on both the Node and the Client as
+`application.process.id` (set by libpulse from the client's
+`PA_PROP_APPLICATION_PROCESS_ID`; self-declared, which is acceptable
+for echo prevention). Change: `NodeEntry.app_pid` and the client table
+read `application.process.id` first and fall back to
+`pipewire.sec.pid`; `processes()` follows. Unit tests in that crate's
+`resolve_node_pid_*` family gain the pulse-client row.
+
+**Fix 2 — pid *set* exclusion on Linux and macOS.** `PidSelect::Exclude(u32)`
+(Linux) and `TapKind::ExcludeProcesses(vec![one])` (macOS) exclude one
+pid; Windows already excludes the target's process tree. Electron
+emits audio from the Chromium audio-service helper, not the main pid,
+so exclusion must take a set. Change: `ProcessMode::Exclude` carries
+`Vec<u32>` through core → the three backends → the napi option
+`excludePids: number[]` (kept alongside `processId` for `include`).
+WASAPI takes exactly one process tree per EXCLUDE client, so the
+Windows backend passes the set's root pid (the one whose descendants
+cover the rest — Moss main) and relies on tree semantics; documented in
+the option's doc comment.
+
+**Consumed API** (upstream's, unchanged apart from Fix 2):
 
 ```ts
-export interface AudioCaptureCapabilities {
-  supported: boolean;        // false → nothing else is meaningful
-  perApp: boolean;           // listSources returns kind:'app' entries
-  canExcludeSelf: boolean;   // excludePids is honoured
-  backend: 'pipewire' | 'pulseaudio' | 'coreaudio-tap' | 'wasapi-process-loopback' | 'none';
-  reason?: string;           // human-readable when supported:false or a degradation
-}
-export interface AudioSource {
-  id: string;                // opaque, backend-specific, stable for the process lifetime
-  kind: 'system' | 'app';
-  name: string;              // "All system output" | application display name
-  pid?: number;              // kind:'app' only
-}
-export function capabilities(): AudioCaptureCapabilities;
-export function listSources(): AudioSource[];      // 'system' entry first, then apps sorted by name
-export interface StartOptions {
-  sourceIds: string[];       // ≥1; a 'system' id may be combined with app ids (union)
-  excludePids: number[];     // honoured iff canExcludeSelf
-}
-export interface CaptureHandle { stop(): void; readonly running: boolean; }
-/** onFrame receives an Int16Array of exactly 960 samples (20 ms @ 48 kHz, mono).
- *  onEnded fires once when the backend stops on its own (device gone, app quit
- *  and no sources remain, session error) and never after stop(). */
-export function startCapture(
-  opts: StartOptions,
-  onFrame: (frame: Int16Array) => void,
-  onEnded: (reason: string) => void,
-): CaptureHandle;
+processes(): Promise<{ pid; name; executable?; bundleId?; isOutputActive? }[]>
+devices(): DeviceInfo[]                       // capability probe: rejects → unsupported
+openStream(
+  { kind: 'system', excludePids, outputRate: 48000, outputChannels: 1, chunkMs: 20 }
+  | { kind: 'process', processId, outputRate: 48000, outputChannels: 1, chunkMs: 20 },
+  onChunk: (chunk: { data: Float32Array; frames; peak; rms; seq; droppedBefore }) => void,
+  onEvent: (ev: { type: 'chunkDropped'|'stalled'|'recovered'|'permissionDenied'|'deviceLost'|'error' }) => void,
+): FlexStream  // .stop(): Promise<void>
 ```
 
-One fixed output format (mono, 48 kHz, s16le, 20 ms frames) so no
-negotiation exists anywhere downstream; each backend resamples/downmixes
-in Rust (`rubato` or the backend's native resampler).
+`kind:'system'` + `excludePids` is the "All system output (except
+Moss)" row; each chosen app is its own `kind:'process'` stream and
+Moss sums the chunks (float add, clamp) before quantising to the
+`Int16Array` frames Section 2 sends over the port. Output is requested
+mono/48 kHz/20 ms so the port format stays the one fixed format.
 
-**Backends** (one module each, `src/backend/{pipewire,pulse,coreaudio,wasapi}.rs`,
-selected at compile time by `cfg(target_os)`, PipeWire-vs-Pulse chosen
-at runtime on Linux by probing for a PipeWire server):
+**Capabilities** are derived in Moss, not in the addon: `require` of
+the addon fails → `supported:false` (the `.node` NEEDs
+`libpipewire-0.3.so.0` and `libasound.so.2` at load time — a host
+without PipeWire cannot load it, so Moss `require`s lazily inside
+try/catch); `processes()` rejects → `perApp:false`; `canExcludeSelf` is
+true on every backend the addon supports (there is no PulseAudio-only
+backend in flexaudio — a PulseAudio-only host is `supported:false`,
+which drops the spec's earlier "sink monitor without exclusion"
+fallback; declared change, no user on the team runs one). The
+`canExcludeSelf` field stays in the Weave API (Section 3) so a future
+backend that cannot exclude can say so without an API change; today
+Moss always sends `true`.
 
-- Linux/PipeWire (`pipewire-rs`): enumerate `Node`s with
-  `media.class = Stream/Output/Audio` for `kind:'app'`
-  (name from `application.name`, pid from `application.process.id`);
-  `kind:'system'` is the default sink's monitor ports. Capture: create a
-  `Stream/Input/Audio` node and link the chosen output ports into it
-  (`pw_link`-equivalent via the registry API); a source that appears
-  after start (a new stream from a chosen app, or any new stream for
-  `system`) is linked when it appears; a stream whose pid is in
-  `excludePids` is never linked. Linking an output port to a second
-  input does not steal it from the speakers.
-  **Linux runtime linking**: dynamically link `libpipewire-0.3`
-  (present wherever PipeWire runs). On a host without it the `dlopen`
-  fails → `capabilities()` reports the PulseAudio backend or
-  `supported:false`; the addon must never fail to *load* because a
-  library is absent (use `libloading`, not a link-time dependency).
-- Linux/PulseAudio-only (`libpulse-binding`): default sink monitor
-  source only; `perApp:false`, `canExcludeSelf:false`, `reason` says
-  so. Also `libloading`.
-- macOS (`objc2-core-audio` / `coreaudio-sys`): `CATapDescription`
-  with `processes` = chosen pids (or all, for `system`) and
-  `isExclusive`/exclude list carrying `excludePids`; aggregate device
-  with the tap; IOProc delivers frames. `supported:false` below 14.2.
-  Requires the audio-recording TCC permission; the first `startCapture`
-  triggers the prompt, and a denied prompt surfaces as `onEnded('permission-denied')`.
-- Windows (`windows` crate): `ActivateAudioInterfaceAsync` with
-  `AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS`; `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`
-  on Moss's root pid for `system`, `INCLUDE_TARGET_PROCESS_TREE` per app
-  for `kind:'app'` (one client per chosen app, mixed in Rust).
+**Smoke test** (the property nothing else proves; kept from the
+original design): in the fork's `__test__/`, start a
+`kind:'system'` capture with `excludePids=[child A]`, where child A
+plays a 1 kHz tone through *libpulse* (`paplay`, the Electron path)
+and child B plays 3 kHz natively (`pw-play`); Goertzel over 3 s must
+find 3 kHz and not 1 kHz (bin index `round(N·f/rate)` — the evaluation
+rig's off-by-one read a pure tone as silence). Linux CI installs
+`pipewire`/`wireplumber`/`pipewire-pulse` headless with a null sink;
+Windows CI plays via two child `powershell` processes; macOS CI cannot
+grant the TCC audio-capture permission, so the macOS run is manual by
+the room owner and recorded in the fork's README with the OS version.
 
-**Smoke test** (per backend, in `__test__/`, runs on the CI OS that has
-the backend; the Linux job installs and starts `pipewire` +
-`wireplumber` headless with a null sink): start a capture of `system`
-with `excludePids=[self]`, play a 1 kHz tone from the test process
-itself and a 3 kHz tone from a spawned child process that is NOT
-excluded, record 2 s, assert (FFT) 3 kHz present and 1 kHz absent.
-This is the self-exclusion proof — the property the whole design rests
-on — and it is the first thing built. macOS CI cannot grant TCC
-non-interactively, so the macOS smoke test is run manually by the room
-owner and its result recorded in the repo README with the OS version;
-CI on macOS builds and runs `capabilities()`/`listSources()` only.
+**Floors** (from upstream's docs, superseding the research table):
+macOS 14.4 (`NSAudioCaptureUsageDescription` in Moss's `Info.plist`,
+TCC prompt on first capture), Windows build 20348 (Windows 11 / Server
+2022) for per-process and exclusion, Linux = a reachable PipeWire
+session. Below the floor the picker is not offered.
+
+**Build/publish**: upstream's `release-npm.yml` matrix (linux x64/arm64,
+win x64/arm64, darwin arm64) retargeted to our scope; darwin x64 added
+because Moss ships `build:mac-x64`. Moss pins an exact version.
 
 ## Section 2 — Moss
 
@@ -193,20 +197,25 @@ is already the file CLAUDE.md rule 8 warns about):
 1. IPC `request-audio-sources` from the Moss renderer (preload
    `admin.ts` + `walwindow.ts`, mirroring `selectScreenOrWindow`).
 2. If the persisted "Audio sources" switch is off → resolve `null`.
-3. `capabilities().supported` false → resolve `null`.
+3. `audioCapture.capabilities()` (`src/main/audioCapture.ts`, the lazy
+   `require` wrapper from Section 1) reports `supported:false` →
+   resolve `null`.
 4. Open the picker window (`selectaudiosources.html`, a Lit element
-   modelled on `selectmediasource.ts`): checkbox list from
-   `listSources()`, "All system output (except Moss)" first, then apps;
-   when `canExcludeSelf` is false the first row reads "All system
-   output" and a one-line note says Moss's own audio will be included.
-   Confirm → the chosen ids; cancel/close → `null`. One picker at a time,
-   like `SELECT_SCREEN_OR_WINDOW_WINDOW`.
-5. `startCapture({ sourceIds, excludePids: mossProcessTree() })`. The
-   exclude set is the whole Electron process tree (main + every helper
-   — the Chromium audio service is the process that emits sound, not
-   `process.pid`), computed from `process.pid` via
-   `app.getAppMetrics()` (which lists every child with its pid).
-6. `new MessageChannelMain()`; each `onFrame` → `port1.postMessage(frame)`
+   modelled on `selectmediasource.ts`): checkbox list — "All system
+   output (except Moss)" first, then `processes()` entries by `name`
+   (pids never leave main; the picker gets `{ id, name, isOutputActive }`);
+   when `perApp` is false only the first row shows. Confirm → the
+   chosen ids; cancel/close → `null`. One picker at a time, like
+   `SELECT_SCREEN_OR_WINDOW_WINDOW`.
+5. Open the streams: `kind:'system'` with `excludePids = mossProcessTree()`
+   if that row was chosen, plus `kind:'process', processId` per chosen
+   app. The exclude set is the whole Electron process tree (main +
+   every helper — the Chromium audio service is the process that emits
+   sound, not `process.pid`), computed from `process.pid` via
+   `app.getAppMetrics()` (which lists every child with its pid). A
+   `mixer` (pure, table-tested: sum, clamp, f32→s16) folds the streams'
+   chunks into one `Int16Array` frame per 20 ms.
+6. `new MessageChannelMain()`; each mixed frame → `port1.postMessage(frame)`
    (`MessagePortMain.postMessage` structured-clones the `Int16Array`;
    its transfer list accepts only ports — 96 KB/s of copying is
    immaterial). `port2` → `webContents.postMessage('audio-source-port', { grantId, label, canExcludeSelf }, [port2])`
@@ -220,7 +229,10 @@ is already the file CLAUDE.md rule 8 warns about):
 **Teardown** — a grant ends on any of: the applet iframe unloading
 (`applet-host` tracks grants per iframe and calls `stop-audio-sources`
 on teardown), the user pressing Stop on the chip or in Settings,
-`onEnded` from the backend, the tool closing the port (detected via a
+a stream `onEvent` of `deviceLost`/`permissionDenied`/`error` (a
+`process` stream ending because its app quit ends only that stream —
+the grant continues on the remaining ones and ends when none remain),
+the tool closing the port (detected via a
 `{type:'close'}` message the api helper sends from `stop()`). Every
 path calls one `endGrant(grantId, reason)` that stops the capture,
 closes `port1`, and notifies the renderer; `endGrant` is idempotent.
@@ -363,25 +375,25 @@ as such.
 - Picker cancelled / switch off / unsupported host → `null` everywhere;
   Presence does nothing (no error event, like the cancelled screen
   picker).
-- Backend `onEnded` (device vanished, permission denied) → grant ends,
+- Backend `deviceLost`/`permissionDenied`/`error` (or the last stream's
+  app quitting) → grant ends,
   Presence intent `system-audio-ended`, row returns to idle; the reason
   is logged to the PresenceLogger pipeline as a new `SystemAudioEnded`
   emitted event (added to `SIMPLE_EVENT_TAXONOMY`).
 - Worklet under/overrun → counters only; no teardown.
 - `getAppMetrics` missing a helper (exclusion imperfect) is not
-  detectable; the smoke test in Section 1 is the guard, and
-  `canExcludeSelf:false` is the honest fallback where the backend
-  cannot exclude at all.
+  detectable at runtime; the smoke test in Section 1 is the guard.
+- Stream `chunkDropped`/`stalled`/`recovered` → counters on the grant,
+  shown in the Settings sub-tab; no teardown.
 
 ## Sequencing
 
-1. `audio-capture`: repo scaffold from `we-rust-utils`, Linux/PipeWire
-   backend + smoke test (owner's machine has PipeWire, no PulseAudio
-   tools), then Windows, then macOS (manual TCC run), then PulseAudio
-   fallback. Publish `0.1.0`. **Gate**: the self-exclusion smoke test
-   passes on Linux and Windows before Section 2 starts. If a backend
-   cannot exclude, that platform ships `canExcludeSelf:false` and the
-   design is unchanged.
+1. Fork flexaudio → `../audio-capture`; Fix 1 and Fix 2 with the
+   smoke test as their acceptance test (Linux on the owner's machine
+   and in CI; Windows in CI; macOS manual); retarget the release
+   workflow to `@lightningrodlabs/flexaudio` and publish. Open the two
+   upstream PRs. **Gate**: the self-exclusion smoke test passes on
+   Linux and Windows before Section 2 starts.
 2. Moss: settings section, picker, plumbing, chip; depends on 1.
 3. `@theweave/api` dev release; depends on 2's message type.
 4. Presence; depends on 3's published version and a Moss build carrying 2.
@@ -392,7 +404,12 @@ Each step is one branch, one intent, adversarially reviewed
 ## Decisions (approved 2026-09-22)
 
 - Picker offers per-app sources plus "all system output (except Moss)".
-- New repo `../audio-capture`, napi-rs, `we-rust-utils` pipeline.
+- Native capture is a fork of flexaudio at `../audio-capture` (revised
+  2026-09-22 after the evaluation; supersedes the original "new napi-rs
+  repo modelled on we-rust-utils" decision), published as
+  `@lightningrodlabs/flexaudio` until upstream publishes.
+- PulseAudio-only Linux hosts are unsupported (declared; consequence of
+  adopting flexaudio, which has no PulseAudio backend).
 - Settings: new "Tool Affordances" tab with sub-tabs; "Audio Sources"
   is the first sub-tab.
 - Grants session-scoped, not persisted.
@@ -410,5 +427,8 @@ Each step is one branch, one intent, adversarially reviewed
   peer's voice (manual, two machines, recorded in the plan's final
   task).
 - `nix develop -c npm run verify` green in Presence; Moss `yarn test`
-  and `yarn typecheck` green; `audio-capture` CI green.
+  and `yarn typecheck` green; the fork's CI (upstream's `ci.yml` plus
+  the smoke test) green.
+- The two upstream PRs are open with links recorded in the fork's
+  README.
 - Presence `CLAUDE.md` "True today" gains one bullet for this round.
