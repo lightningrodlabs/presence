@@ -77,7 +77,6 @@ import {
   FilmstripCaptureSize,
 } from './modules/video-filmstrip';
 import './elements/transcription-request-dialog';
-import './elements/save-transcript-dialog';
 import './transcripts/transcripts-dialog';
 import './logs-graph';
 import {
@@ -107,7 +106,6 @@ import {
   parseTranscriptionPayload,
   transcriptionController,
 } from './modules/transcription';
-import type { SpeakerCompleteness } from './elements/save-transcript-dialog';
 import './modules'; // side-effect: registers all modules
 import {
   bestColumns,
@@ -312,26 +310,6 @@ export class RoomView extends LitElement {
   @state()
   private _transcriptsOpen = false;
 
-  /**
-   * Save-transcript-dialog visibility state. Set by quitRoom when
-   * there's anything worth saving; unset by the save/discard
-   * handlers, which also complete the pending quitRoom.
-   */
-  @state()
-  private _saveTranscriptSpeakers: Map<AgentPubKeyB64, SpeakerCompleteness> | null = null;
-
-  private _saveTranscriptMarkdown: string = '';
-
-  private _resumeQuit: (() => void) | null = null;
-
-  /**
-   * Did the user enable transcription at any point during this
-   * session? Used to decide whether to show the save prompt on exit
-   * even when the local accumulator is empty (so the user gets
-   * feedback that the feature was on but produced nothing).
-   */
-  private _transcriptionWasActive = false;
-
   _audioInputDevices = new StoreSubscriber(
     this,
     () => this.streamsStore.audioInputDevices(),
@@ -528,9 +506,9 @@ export class RoomView extends LitElement {
   }
 
   async quitRoom() {
-    // If we were transcribing, publish a finalSeq-carrying payload so
-    // peers can tell our transcript is complete before our signals
-    // stop arriving.
+    // Announce completion so peers can tell our transcript is whole
+    // before our signals stop; the visit itself is closed by the
+    // controller when the store unbinds.
     const myTx = parseTranscriptionPayload(
       (this._myModuleStates.value || {})['transcription'] ?? null,
     );
@@ -541,18 +519,6 @@ export class RoomView extends LitElement {
         console.error('transcription: stopAndAnnounce on quit failed', e);
       }
     }
-
-    // Prompt for save if transcription was active at any point this
-    // session, OR if we received peer transcripts (even without
-    // enabling our own). Suspends teardown until the user decides.
-    // An empty-log prompt gives the user feedback that the feature
-    // was on but produced nothing — otherwise it's silently confusing.
-    const log = this._transcriptLog.value ?? new Map();
-    const hasAnyContent = Array.from(log.values()).some(v => v.length > 0);
-    if (this._transcriptionWasActive || hasAnyContent) {
-      await this._promptSaveTranscript(log);
-    }
-
     this.streamsStore.disconnect('quitRoom-button');
     this.streamsStore.logger.endSession();
     this.dispatchEvent(
@@ -561,86 +527,9 @@ export class RoomView extends LitElement {
   }
 
   /**
-   * Build per-speaker completeness + markdown, mount the save dialog,
-   * resolve the returned promise when the user picks save or discard.
-   */
-  private async _promptSaveTranscript(
-    log: Map<AgentPubKeyB64, TranscriptEntry[]>,
-  ): Promise<void> {
-    // Resolve nicknames before building the dialog + markdown.
-    // Without this, the lazy profiles store may not have fetched a
-    // peer's profile yet (especially if they just left the room and
-    // their tile's subscription was released), and the export would
-    // show a pubkey prefix instead of the nickname.
-    await this._refreshSpeakerLabels(Array.from(log.keys()));
-
-    const speakers = new Map<AgentPubKeyB64, SpeakerCompleteness>();
-    const peerStates = this._peerModuleStates.value || {};
-    const myB64 = this.streamsStore.myPubKeyB64;
-
-    for (const [speaker, entries] of log.entries()) {
-      if (entries.length === 0) continue;
-      const label = this._speakerLabel(speaker);
-      const maxReceivedSeq = Math.max(...entries.map(e => e.seq));
-
-      let status: SpeakerCompleteness['status'] = 'unknown';
-      let detail: string | undefined;
-
-      if (speaker === myB64) {
-        // Our own transcript — we authored every frame, so no gap
-        // possible. finalSeq may not be set yet (we're in the middle
-        // of quitting), but that's fine.
-        status = 'complete';
-      } else {
-        const env = peerStates[speaker]?.['transcription'] ?? null;
-        const tx = parseTranscriptionPayload(env);
-        const finalSeq = tx?.finalSeq;
-        const maxCommitted = tx?.maxCommittedSeq;
-        if (typeof finalSeq === 'number') {
-          if (maxReceivedSeq >= finalSeq) {
-            status = 'complete';
-          } else {
-            status = 'gap';
-            detail = msg(
-              `missing frames after seq ${maxReceivedSeq} (final was ${finalSeq})`,
-            );
-          }
-        } else if (
-          typeof maxCommitted === 'number' &&
-          maxReceivedSeq >= maxCommitted
-        ) {
-          // We're at least up to their last advertised progress, but
-          // they never announced a final — they may have had more
-          // unflushed work when they left.
-          status = 'unknown';
-          detail = msg('left without announcing completion');
-        } else {
-          status = 'unknown';
-          detail = msg('left without announcing completion');
-        }
-      }
-
-      speakers.set(speaker, {
-        label,
-        status,
-        utteranceCount: entries.length,
-        detail,
-      });
-    }
-
-    this._saveTranscriptMarkdown = this._buildTranscriptMarkdown(log);
-    this._saveTranscriptSpeakers = speakers;
-
-    return new Promise<void>(resolve => {
-      this._resumeQuit = resolve;
-    });
-  }
-
-  /**
-   * Cached pubkey → nickname map. Populated via `_refreshSpeakerLabels`
-   * immediately before building the save dialog / markdown, so we
-   * don't depend on the lazy profiles store being hot at the exact
-   * moment of save.
+   * Cached pubkey → nickname map. Populated via `_refreshSpeakerLabels`,
+   * so the transcripts dialog and the live pane don't depend on the
+   * lazy profiles store being hot at the exact moment they render.
    */
   private _speakerLabels: Map<AgentPubKeyB64, string> = new Map();
 
@@ -669,31 +558,6 @@ export class RoomView extends LitElement {
         }
       }),
     );
-  }
-
-  /**
-   * Human-readable label for a speaker. Reads from the pre-populated
-   * cache set up by `_refreshSpeakerLabels`. Falls back to a truncated
-   * pubkey if the refresh never ran or the profile wasn't on the DHT —
-   * the export's Participants key section carries the full pubkey
-   * either way.
-   */
-  private _speakerLabel(pubKeyB64: AgentPubKeyB64): string {
-    return this._speakerLabels.get(pubKeyB64) ?? pubKeyB64.slice(0, 10) + '…';
-  }
-
-  /**
-   * HH:MM:SS (or MM:SS for short sessions) format for a millisecond
-   * offset from session start. Used for the `[HH:MM:SS]` prefix on
-   * each exported transcript line.
-   */
-  private _formatOffset(ms: number): string {
-    const totalSec = Math.max(0, Math.floor(ms / 1000));
-    const h = Math.floor(totalSec / 3600);
-    const m = Math.floor((totalSec % 3600) / 60);
-    const s = totalSec % 60;
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
   }
 
   /**
@@ -758,124 +622,6 @@ export class RoomView extends LitElement {
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
-  private _buildTranscriptMarkdown(
-    log: Map<AgentPubKeyB64, TranscriptEntry[]>,
-  ): string {
-    // Roll everything into one time-ordered stream across speakers.
-    // Sort by `committedAtMs` (sender wall-clock) — `tStart` is only
-    // valid within a single speaker's session and would interleave
-    // wrong across speakers who started their sessions at different
-    // moments.
-    type Line = { ts: number; speaker: AgentPubKeyB64; label: string; text: string };
-    const lines: Line[] = [];
-    // One-shot diagnostic: per-speaker entry count in the raw store vs
-    // after text-filtering. Lets us tell, after the fact, whether a
-    // missing utterance was dropped upstream (store never saw it) or
-    // filtered here (builder threw it out). Emitted to console so we
-    // can correlate with Moss's `[asr-session] transcribe →` lines.
-    const countRaw: Record<string, number> = {};
-    const countKept: Record<string, number> = {};
-    for (const [speaker, entries] of log.entries()) {
-      const label = this._speakerLabel(speaker);
-      countRaw[label] = entries.length;
-      countKept[label] = 0;
-      for (const e of entries) {
-        const text = e.text.trim();
-        if (!text) continue;
-        // Drop whisper non-speech markers like `[BLANK_AUDIO]`,
-        // `[NOISE]`, `[SILENCE]`, `[MUSIC]`. These are whisper's
-        // annotation of audio it received but couldn't transcribe as
-        // speech — useful as a diagnostic signal but noise in the
-        // human-readable transcript.
-        if (/^\[[^\]]*\]\.?$/.test(text)) continue;
-        lines.push({ ts: e.committedAtMs, speaker, label, text });
-        countKept[label]++;
-      }
-    }
-    console.log(
-      '[transcription] build-markdown:',
-      'raw=', countRaw, 'kept=', countKept,
-    );
-    lines.sort((a, b) => a.ts - b.ts);
-
-    // Stitch all consecutive same-speaker lines into one block.
-    // Moss commits a final every ~500 ms of silence (or sooner when
-    // we force a flush to bound whisper's decode window), so a
-    // single speaking turn arrives as N separate finals. A speaker
-    // change starts a new block regardless of gap.
-    //
-    // Seam treatment: sub-COALESCE_MS gaps are natural phrase
-    // breaks — concat seamlessly. Wider gaps are where whisper is
-    // more likely to have dropped content across the decode seam,
-    // so insert a stitch glyph as a visible "content may be
-    // missing here" marker.
-    const COALESCE_MS = 3000;
-    const STITCH_GLYPH = '⋯';
-    const merged: Line[] = [];
-    for (const l of lines) {
-      const prev = merged[merged.length - 1];
-      if (prev && prev.speaker === l.speaker) {
-        const gap = l.ts - prev.ts;
-        const joiner = gap < COALESCE_MS ? ' ' : ` ${STITCH_GLYPH} `;
-        prev.text = `${prev.text}${joiner}${l.text}`;
-      } else {
-        merged.push({ ...l });
-      }
-    }
-
-    // Session anchor for [HH:MM:SS] offsets — first committed frame's
-    // wall-clock. Absolute ISO still in the header for reference.
-    const t0 = merged.length > 0 ? merged[0].ts : Date.now();
-
-    const header =
-      `# Transcript — ${this.roomName()}\n` +
-      `_Saved ${new Date().toISOString()}_\n\n`;
-
-    const body = merged
-      .map(l => `**[${this._formatOffset(l.ts - t0)}]** **${l.label}:** ${l.text}`)
-      .join('\n\n');
-
-    // Participant key: one line per distinct speaker, label → full
-    // pubkey. Gives the reader a durable reference even if profile
-    // nicknames change later.
-    const speakers = Array.from(new Set(merged.map(l => l.speaker)));
-    const keyLines = speakers
-      .map(pk => `- **${this._speakerLabel(pk)}** — \`${pk}\``)
-      .join('\n');
-    const keySection =
-      speakers.length > 0
-        ? `\n\n---\n\n## Participants\n\n${keyLines}\n`
-        : '';
-
-    return header + body + keySection;
-  }
-
-  private _handleSaveTranscriptConfirm() {
-    const blob = new Blob([this._saveTranscriptMarkdown], {
-      type: 'text/markdown',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    a.href = url;
-    a.download = `transcript-${ts}.md`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    this._closeSaveTranscriptDialog();
-  }
-
-  private _handleSaveTranscriptDiscard() {
-    this._closeSaveTranscriptDialog();
-  }
-
-  private _closeSaveTranscriptDialog() {
-    this._saveTranscriptSpeakers = null;
-    this._saveTranscriptMarkdown = '';
-    const resume = this._resumeQuit;
-    this._resumeQuit = null;
-    resume?.();
-  }
-
   /**
    * Header button click — toggle own call-transcription request.
    *
@@ -902,7 +648,6 @@ export class RoomView extends LitElement {
       enabled: true,
       requested: true,
     };
-    this._transcriptionWasActive = true;
     await this.streamsStore.activateModule(
       'transcription',
       JSON.stringify(payload),
@@ -928,7 +673,6 @@ export class RoomView extends LitElement {
       remember: boolean;
     };
     if (remember) writeLocalStorage(AUTO_ACCEPT_KEY, true);
-    this._transcriptionWasActive = true;
     await transcriptionController.acceptRequest(requester);
   }
 
@@ -1096,17 +840,6 @@ export class RoomView extends LitElement {
         @transcription-accept=${(e: CustomEvent) => this._handleTranscriptionAccept(e)}
         @transcription-decline=${(e: CustomEvent) => this._handleTranscriptionDecline(e)}
       ></transcription-request-dialog>
-    `;
-  }
-
-  private _renderSaveTranscriptDialog() {
-    if (!this._saveTranscriptSpeakers) return html``;
-    return html`
-      <save-transcript-dialog
-        .speakerCompleteness=${this._saveTranscriptSpeakers}
-        @transcription-save-confirm=${() => this._handleSaveTranscriptConfirm()}
-        @transcription-save-discard=${() => this._handleSaveTranscriptDiscard()}
-      ></save-transcript-dialog>
     `;
   }
 
@@ -3710,7 +3443,6 @@ export class RoomView extends LitElement {
       </div>
       ${this._renderTranscriptionRequestPrompt()}
       ${this._renderTranscriptsDialog()}
-      ${this._renderSaveTranscriptDialog()}
       ${(() => {
         // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
         // carrier banner while the signal carrier is down. Copy + elapsed
