@@ -20,7 +20,7 @@ export interface StoredTranscript {
 }
 
 export interface TranscriptStore {
-  /** True once persistence has failed and entries live only in memory. */
+  /** True when entries live only in memory: persistence is unavailable or has failed. */
   readonly degraded: boolean;
   /** Newest `startedAt` first. */
   listForRoom(roomKey: string): Promise<StoredTranscript[]>;
@@ -46,8 +46,9 @@ function newestFirst(list: StoredTranscript[]): StoredTranscript[] {
 }
 
 export class MemoryTranscriptStore implements TranscriptStore {
-  readonly degraded = false;
   private readonly entries = new Map<string, StoredTranscript>();
+
+  constructor(readonly degraded = false) {}
 
   async listForRoom(roomKey: string): Promise<StoredTranscript[]> {
     return newestFirst(
@@ -78,12 +79,15 @@ export class IndexedDbTranscriptStore implements TranscriptStore {
   readonly degraded = false;
   private db: Promise<IDBDatabase> | null = null;
 
-  constructor(private readonly factory: IDBFactory) {}
+  constructor(
+    private readonly factory: IDBFactory,
+    private readonly databaseName: string = DB_NAME,
+  ) {}
 
   private open(): Promise<IDBDatabase> {
     if (!this.db) {
       this.db = new Promise((resolve, reject) => {
-        const req = this.factory.open(DB_NAME, DB_VERSION);
+        const req = this.factory.open(this.databaseName, DB_VERSION);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains(OBJECT_STORE)) {
@@ -183,7 +187,7 @@ export function getTranscriptStore(): TranscriptStore {
     const factory = typeof indexedDB !== 'undefined' ? indexedDB : undefined;
     singleton = factory
       ? new FallbackTranscriptStore(new IndexedDbTranscriptStore(factory), new MemoryTranscriptStore())
-      : new MemoryTranscriptStore();
+      : new MemoryTranscriptStore(true);
   }
   return singleton;
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   FallbackTranscriptStore,
+  IndexedDbTranscriptStore,
   MemoryTranscriptStore,
   transcriptId,
   type StoredTranscript,
@@ -65,6 +66,27 @@ function contract(name: string, make: () => TranscriptStore) {
 }
 
 contract('MemoryTranscriptStore', () => new MemoryTranscriptStore());
+
+describe('MemoryTranscriptStore degraded flag', () => {
+  it('is false by default', () => {
+    expect(new MemoryTranscriptStore().degraded).toBe(false);
+  });
+
+  it('is true when constructed with true', () => {
+    expect(new MemoryTranscriptStore(true).degraded).toBe(true);
+  });
+});
+
+const hasIndexedDb = typeof indexedDB !== 'undefined';
+(hasIndexedDb ? describe : describe.skip)(
+  'IndexedDbTranscriptStore (needs an indexedDB global; skipped in node)',
+  () => {
+    let dbCounter = 0;
+    contract('IndexedDbTranscriptStore', () =>
+      new IndexedDbTranscriptStore(indexedDB, `presence-transcripts-test-${dbCounter++}`),
+    );
+  },
+);
 
 describe('FallbackTranscriptStore', () => {
   class Broken implements TranscriptStore {
