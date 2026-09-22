@@ -46,7 +46,7 @@ Four deliverables in four repos, built in this order because each is
 the next one's dependency:
 
 1. `@lightningrodlabs/flexaudio` — fork of flexaudio with two fixes
-   (checked out at `../audio-capture`).
+   (checked out at `../flexaudio`).
 2. Moss — settings section, picker, grant/port plumbing, Weave message.
 3. `@theweave/api` — `captureAudioSources()` and the port→track helper.
 4. Presence — mic-menu row and the `MicSource` mixin.
@@ -83,7 +83,7 @@ both small and localised. Writing our own would reproduce ~3k lines of
 backend code to arrive at the same mechanism.
 
 **Home**: fork to `lightningrodlabs/flexaudio`, checked out at
-`../audio-capture` with `upstream` = Studio-Sadola. The npm package is
+`../flexaudio` with `upstream` = Studio-Sadola. The npm package is
 published under our scope, `@lightningrodlabs/flexaudio` (+ the
 per-platform `optionalDependencies` packages the napi CLI generates),
 because upstream's own npm publication is blocked (their
@@ -388,7 +388,7 @@ as such.
 
 ## Sequencing
 
-1. Fork flexaudio → `../audio-capture`; Fix 1 and Fix 2 with the
+1. Fork flexaudio → `../flexaudio`; Fix 1 and Fix 2 with the
    smoke test as their acceptance test (Linux on the owner's machine
    and in CI; Windows in CI; macOS manual); retarget the release
    workflow to `@lightningrodlabs/flexaudio` and publish. Open the two
@@ -404,7 +404,7 @@ Each step is one branch, one intent, adversarially reviewed
 ## Decisions (approved 2026-09-22)
 
 - Picker offers per-app sources plus "all system output (except Moss)".
-- Native capture is a fork of flexaudio at `../audio-capture` (revised
+- Native capture is a fork of flexaudio at `../flexaudio` (revised
   2026-09-22 after the evaluation; supersedes the original "new napi-rs
   repo modelled on we-rust-utils" decision), published as
   `@lightningrodlabs/flexaudio` until upstream publishes.
