@@ -67,7 +67,8 @@ Five inputs the spec implies but no task's tests exercise — each got its pin a
 | `src/renderer/src/self/settings/moss-settings.ts` | `TabsState.Capabilities` |
 | `src/renderer/src/persisted-store.ts` | `audioSourcesEnabled` (default on) |
 | `src/renderer/src/electron-api.ts` | interface + wrappers |
-| `src/renderer/src/applets/applet-host.ts` | `request-audio-sources` case, `TransferableReply`, reply transfer, unregister teardown, self-post guard |
+| `src/renderer/src/transferable-reply.ts` (new) | `TransferableReply` marker for a reply that carries a transfer list |
+| `src/renderer/src/applets/applet-host.ts` | `request-audio-sources` case, reply transfer, unregister teardown, self-post guard |
 | `src/renderer/src/walwindow.ts` | local handling in WAL windows (same shape as `user-select-screen`) |
 | `src/renderer/src/app/main-dashboard.ts` | mount `<moss-audio-source-chips>`, init the grants store |
 | `src/renderer/xliff/*.xlf`, `src/renderer/src/locales/generated/*.ts` | translations |
@@ -2251,7 +2252,7 @@ port expectation before invoking main, and releases grants per iframe."
 
 **Interfaces:**
 - Consumes: `AudioSourceGrantsClient`, `AudioSourcePortReceiver`, `IframeStore.findIframeIdBySource`, `PersistedStore.audioSourcesEnabled` (Task 5); the preload bridges (Task 4).
-- Produces: the Weave message `{ type: 'request-audio-sources' }` whose success reply is `{ label, canExcludeSelf } | null` with the grant port as `ports[0]` when non-null (spec Section 2 "Reply with a transferable"); `TransferableReply` in `applet-host.ts`; `audioSourceGrantsClient`/`audioSourcePortReceiver` singletons in `src/renderer/src/audio-sources/singletons.ts` — Plan 3's `@theweave/api` helper consumes exactly this reply shape.
+- Produces: the Weave message `{ type: 'request-audio-sources' }` whose success reply is `{ label, canExcludeSelf } | null` with the grant port as `ports[0]` when non-null (spec Section 2 "Reply with a transferable"); `TransferableReply` in `src/renderer/src/transferable-reply.ts`; `audioSourceGrantsClient`/`audioSourcePortReceiver` singletons in `src/renderer/src/audio-sources/singletons.ts` — Plan 3's `@theweave/api` helper consumes exactly this reply shape.
 
 - [ ] **Step 1: Add the message variant and watch the exhaustiveness guard go red**
 
@@ -2383,7 +2384,7 @@ In `src/renderer/src/applets/applet-host.ts`:
 import { audioSourceGrantsClient } from '../audio-sources/singletons.js';
 ```
 
-(b) Above `appletMessageHandler`, the reply wrapper:
+(b) Create `src/renderer/src/transferable-reply.ts` (shared by the main window's applet-host and the WAL window, which must not import applet-host):
 ```ts
 /**
  * A handler result that must be posted with a transfer list. Only
@@ -2396,6 +2397,7 @@ export class TransferableReply<T = unknown> {
   ) {}
 }
 ```
+and import it in `applet-host.ts`: `import { TransferableReply } from '../transferable-reply.js';`
 
 (c) In `appletMessageHandler`'s returned function, first statement inside the `try`:
 ```ts
@@ -2448,7 +2450,10 @@ In `src/renderer/src/walwindow.ts`:
               const toolName = iframeKind.type === 'applet' ? this.appletName ?? encodeHashToBase64(iframeKind.appletHash) : iframeKind.toolCompatibilityId;
               const grant = await audioSourceGrantsClient.request({ iframeKey, toolName });
               if (!grant) return null;
-              return { __transfer: [grant.port], result: { label: grant.result.label, canExcludeSelf: grant.result.canExcludeSelf } };
+              return new TransferableReply(
+                { label: grant.result.label, canExcludeSelf: grant.result.canExcludeSelf },
+                [grant.port],
+              );
             }
 ```
   Look at how the WAL window stores the applet name after its `get-applet-info` call (`grep -n "appletInfo\b\|appletName\|custom_name" src/renderer/src/walwindow.ts`): use the field that holds it, or add `@state() appletName: string | undefined` set from `appletInfo.appletName` in that `try` block.
@@ -2456,14 +2461,13 @@ In `src/renderer/src/walwindow.ts`:
 - at the reply site, replace the success post with:
 ```ts
         const result = await handleRequest(request);
-        if (result && typeof result === 'object' && '__transfer' in result) {
-          const r = result as { __transfer: Transferable[]; result: unknown };
-          message.ports[0].postMessage({ type: 'success', result: r.result }, r.__transfer);
+        if (result instanceof TransferableReply) {
+          message.ports[0].postMessage({ type: 'success', result: result.result }, result.transfer);
         } else {
           message.ports[0].postMessage({ type: 'success', result });
         }
 ```
-  (The WAL window does not import `applet-host.ts`; a local marker keeps it that way.)
+  (import `{ TransferableReply } from './transferable-reply.js'` — the WAL window does not import `applet-host.ts`.)
 - the WAL window's message listener already survives self-posted messages (`getIframeKind` throws → caught → warn → return). Silence that specific warn: at the top of the listener, before `if (this.isAppletDev === undefined) return;`, add `if (message.source === window) return;` with the same intent comment as in applet-host.
 
 - [ ] **Step 8: Typecheck, full suite, then a live round-trip from the example applet**
@@ -2495,7 +2499,7 @@ Expected: the picker opens; after Share, `reply {label, canExcludeSelf: true} po
 
 ```bash
 cd /home/eric/code/metacurrency/holochain/moss
-git add libs/api/src/types.ts src/renderer/src/validationSchemas.ts src/renderer/src/validationSchemas.test.ts src/renderer/src/electron-api.ts src/renderer/src/audio-sources/singletons.ts src/renderer/src/applets/applet-host.ts src/renderer/src/walwindow.ts
+git add libs/api/src/types.ts src/renderer/src/validationSchemas.ts src/renderer/src/validationSchemas.test.ts src/renderer/src/electron-api.ts src/renderer/src/audio-sources/singletons.ts src/renderer/src/transferable-reply.ts src/renderer/src/applets/applet-host.ts src/renderer/src/walwindow.ts
 git commit -m "feat(api,renderer): request-audio-sources Weave message with a transferred grant port
 
 Tools ask with { type: 'request-audio-sources' }; the host resolves the tool
