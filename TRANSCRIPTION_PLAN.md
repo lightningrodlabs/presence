@@ -375,6 +375,8 @@ The only visible controls:
 
 ### Exit-time persistence
 
+Status: SUPERSEDED (see `docs/superpowers/specs/2026-09-22-room-transcripts-design.md`): transcripts are stored per call visit in IndexedDB and browsed from a dialog in the room; there is no exit-time prompt.
+
 No zome entries for live transcripts. When a participant leaves the
 room:
 

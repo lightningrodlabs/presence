@@ -1,6 +1,6 @@
 # Room transcripts: stored per call visit, browsed from the room
 
-Status: APPROVED 2026-09-22 (design agreed in conversation; implementation plan follows)
+Status: IMPLEMENTED 2026-09-22 (see docs/superpowers/plans/2026-09-22-room-transcripts.md)
 
 ## Problem
 
@@ -97,7 +97,7 @@ interface TranscriptStore {
     coalescing as the export (consecutive same-speaker lines within 3 s join),
     a back button, and the Download action. For the live visit the view
     re-renders as frames arrive by subscribing to `_transcriptLog`.
-  - Download: builds Markdown with `transcript-export.ts` and triggers a
+  - Download: builds Markdown with `ui/src/room/transcripts/export.ts` and triggers a
     browser download named `transcript-<roomName>-<startedAt ISO>.md`.
 - Labels: stored `labels` when present, else the profiles store, else a
   10-character pubkey prefix.
@@ -108,10 +108,8 @@ interface TranscriptStore {
   `_saveTranscriptSpeakers`, `_saveTranscriptMarkdown`, and
   `_handleSaveTranscript*` leave `room-view.ts`. `quitRoom` no longer awaits a
   prompt.
-- `_buildTranscriptMarkdown`, `_formatOffset`, and the completeness
-  computation move into `room/transcript-export.ts` as pure functions taking a
-  `StoredTranscript` (plus peer module states for completeness) and returning
-  Markdown or a `SpeakerCompleteness` map.
+- `_buildTranscriptMarkdown` and `_formatOffset` move into `ui/src/room/transcripts/export.ts` as pure functions taking a
+  `StoredTranscript` and returning Markdown. Per-speaker completeness is not carried over; its only consumer was the removed dialog, and computing it for a stored transcript would need peer `finalSeq` values frozen at leave. It can be added without changing the stored shape.
 - The live diagnostic pane behind "connection details" stays.
 
 ## Testing
@@ -121,7 +119,7 @@ interface TranscriptStore {
   `indexedDB` global exists (jsdom does not ship one; the suite skips with a
   message otherwise, and the app run is the check for that implementation).
 - `transcript-export.test.ts`: ordering, coalescing with the stitch glyph,
-  label fallback, participants section, completeness verdicts.
+  label fallback, participants section.
 - `transcription-visit.test.ts`: bind opens a visit; frames from two speakers
   land in it; writes are coalesced; unbind sets `endedAt` and labels; an empty
   visit is deleted. Runs against the in-memory store with a manual clock.
