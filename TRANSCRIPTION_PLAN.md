@@ -252,6 +252,8 @@ ephemeral signals, same shape as voice frames.
 
 ### Persistence — exit-time save only (v1)
 
+Status: SUPERSEDED (see `docs/superpowers/specs/2026-09-22-room-transcripts-design.md`): transcripts are stored per call visit in IndexedDB and browsed from a dialog in the room; there is no exit-time prompt.
+
 No zome entries, no DHT writes, no source-chain commits for conversation
 logs. The in-memory merged view at session end is offered to the user
 as a file download when they leave the room. Mechanics described in
@@ -474,7 +476,7 @@ path before then; the upstream dependency is real and we accept it.
 - Room-menu "Transcribe call" entry; incoming-request
   notification; auto-accept setting.
 - No caption overlays, no per-pane indicators, no transcript panel.
-- Exit-time "Save transcript?" prompt with gap warning.
+- Exit-time "Save transcript?" prompt with gap warning (superseded: transcripts are browsed from the room dialog; see the spec above).
 
 Feature-flag OFF by default. Opt-in at settings level before the
 room-menu option appears.

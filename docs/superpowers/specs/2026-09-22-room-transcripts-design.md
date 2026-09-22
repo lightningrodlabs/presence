@@ -70,19 +70,23 @@ interface TranscriptStore {
 
 ## Accumulation
 
-- `TranscriptionController.bind()` also opens the visit: it reads `store.transcripts`
-  (the store and room key from the dep), creates the `StoredTranscript` with
-  `startedAt`, and writes it.
+- `TranscriptionController.bind(store)` also opens the visit: it reads `store.transcripts`
+  (the store and room key from the dep) and creates the `StoredTranscript` with
+  `startedAt`. The visit is first written when it receives a frame, then
+  coalesced as below; the store only holds visits with content.
 - `ingestFrame` keeps appending to the in-memory `_transcriptLog` (the live
   view) and additionally appends the frame to the visit transcript. Writes to
   the store are coalesced: at most one `put` every 2 s, plus an immediate `put`
   when the visit ends.
-- `unbind()` sets `endedAt`, freezes `labels` from the profiles store for every
-  speaker present, and writes once more. Because the closing commit is
+- `unbind()` sets `endedAt`, freezes `labels` for every speaker present, and
+  writes once more. `room-view` looks nicknames up from the profiles store as
+  speakers appear during the call and once more at leave; the controller
+  freezes them into the record at the visit's end, using the resolver that was
+  set when `unbind()` was called. Because the closing commit is
   delivered before `stopCapture()` resolves (Moss contract), the leave path
   awaits capture teardown before the final write, as `stopAndAnnounce` does now.
-- A visit with zero frames is deleted at `unbind()` rather than kept, so the
-  list only shows visits with content.
+- A visit with zero frames is never written, and is deleted at `unbind()` in
+  case a record of it exists, so the list only shows visits with content.
 
 ## UI
 
@@ -91,9 +95,11 @@ interface TranscriptStore {
   wherever `room-view` renders, which covers the app view and the asset view.
 - **`transcripts-dialog`** (new element under `room/transcripts/`), an overlay in
   the style of `transcription-request-dialog`:
-  - List mode: rows newest first. Each row: date and time of `startedAt`,
-    duration (`endedAt - startedAt`, or "live" for the current visit), speaker
-    count, word count, and three actions: View, Download, Delete. Delete asks
+  - List mode: rows newest first; a visit is listed only once it holds a frame.
+    Each row: date and time of `startedAt`, duration ("live" for the current
+    visit; `endedAt - startedAt` for a closed one; for a record left open by a
+    killed page, the last frame's offset from `startedAt`), speaker count, word
+    count, and three actions: View, Download, Delete. Delete asks
     once inline ("Delete this transcript?" Yes / No).
   - View mode: the transcript rendered as speaker-labelled paragraphs, same
     coalescing as the export (consecutive same-speaker lines within 3 s join),
@@ -102,8 +108,9 @@ interface TranscriptStore {
     as its `live` property from `room-view`, so the view re-renders as frames arrive.
   - Download: builds Markdown with `ui/src/room/transcripts/export.ts` and triggers a
     browser download named `transcript-<roomName>-<startedAt ISO>.md`.
-- Labels: stored `labels` when present, else the profiles store, else a
-  10-character pubkey prefix.
+- Labels: stored `labels` when present, else a nickname the dialog looks up
+  from the profiles store for any listed speaker that has no stored label, else
+  a 10-character pubkey prefix.
 
 ## Removals
 
@@ -124,8 +131,11 @@ interface TranscriptStore {
 - `ui/src/room/transcripts/__tests__/export.test.ts`: ordering, coalescing with the stitch glyph,
   label fallback, participants section.
 - `ui/src/room/transcripts/__tests__/visit.test.ts`: bind opens a visit; frames from two speakers
-  land in it; writes are coalesced; unbind sets `endedAt` and labels; an empty
-  visit is deleted. Runs against the in-memory store with a manual clock.
+  land in it; nothing is stored before the first frame; writes are coalesced;
+  unbind sets `endedAt` and labels through the resolver set at unbind time; an
+  empty visit is never stored. Runs against the in-memory store with a manual clock.
+- `ui/src/room/transcripts/__tests__/dialog-policy.test.ts`: which rows are listed
+  (`selectTranscriptRows`) and each duration case (`describeDuration`).
 - The dialog and button are verified in the running app.
 
 ## Out of scope

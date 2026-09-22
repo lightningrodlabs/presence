@@ -1016,14 +1016,14 @@ class TranscriptionController {
       console.error('transcription: broadcast failed', e),
     );
 
-    // Also land it in our own accumulator so exit-time save sees our
-    // own transcript. Route through the same ingestion path so the
-    // merge rules apply uniformly.
+    // Also land it in our own accumulator, which feeds the live pane and
+    // the visit. Route through the same ingestion path so the merge rules
+    // apply uniformly.
     this.ingestFrame(frame);
 
-    // Periodically refresh our module payload so peers can detect
-    // gaps at exit time. Don't bother updating if this is the first
-    // frame and there's nothing to compare against.
+    // Periodically publish our progress (`maxCommittedSeq`) in the module
+    // payload, as `finalSeq` is published at stop, so a receiver can check
+    // the completeness of what it holds from us.
     this.framesSinceCommit++;
     if (this.framesSinceCommit >= TranscriptionController.COMMIT_EVERY_N) {
       this.framesSinceCommit = 0;
