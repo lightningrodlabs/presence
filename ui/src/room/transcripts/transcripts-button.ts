@@ -53,9 +53,14 @@ export class TranscriptsButton extends LitElement {
         .roomKey=${this.roomKey}
         .labelFor=${(pk: AgentPubKeyB64) => this._speakerLabels()?.get(pk)}
         .refreshLabels=${async (pks: AgentPubKeyB64[]) => {
-          await this._speakerLabels()?.refresh(pks);
+          await this._speakerLabels()?.refresh(pks, { retryFailed: true });
         }}
-        @transcripts-close=${() => (this._open = false)}
+        @transcripts-close=${() => {
+          this._open = false;
+          // The store opens lazily and may have failed while the dialog was
+          // open; re-render so the tooltip re-reads `degraded`.
+          this.requestUpdate();
+        }}
       ></transcripts-dialog>
     `;
   }

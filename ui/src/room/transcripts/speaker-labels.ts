@@ -4,16 +4,25 @@ import type { ProfilesStore } from '@holochain-open-dev/profiles';
 /** Looks up one agent's display name; undefined when it has none. */
 export type SpeakerLabelFetcher = (pk: AgentPubKeyB64) => Promise<string | undefined>;
 
+export interface RefreshOptions {
+  /** Also re-ask keys whose earlier lookup threw. */
+  retryFailed?: boolean;
+}
+
 /**
- * Cached pubkey to nickname map for transcript speakers. Each key is
- * looked up at most once while a lookup is in flight or after it has
- * answered; a lookup that throws leaves the key eligible for a later
- * `refresh`, so a transient failure does not pin the pubkey fallback.
+ * Cached pubkey to nickname map for transcript speakers. A key is looked
+ * up once: while its lookup is in flight or after it has answered (with
+ * or without a nickname) it is skipped. A lookup that throws marks the key
+ * failed; a plain `refresh` skips failed keys too, so a caller that
+ * refreshes on every render never hammers a degraded conductor, and only
+ * `refresh(pks, { retryFailed: true })` asks for them again.
  */
 export class SpeakerLabels {
   private readonly labels = new Map<AgentPubKeyB64, string>();
   /** Keys in flight or already answered (with or without a nickname). */
   private readonly requested = new Set<AgentPubKeyB64>();
+  /** Keys whose last lookup threw. */
+  private readonly failed = new Set<AgentPubKeyB64>();
 
   constructor(private readonly fetch: SpeakerLabelFetcher) {}
 
@@ -25,10 +34,14 @@ export class SpeakerLabels {
     return this.labels.has(pk);
   }
 
-  async refresh(pks: AgentPubKeyB64[]): Promise<void> {
+  async refresh(pks: AgentPubKeyB64[], opts: RefreshOptions = {}): Promise<void> {
     const fresh: AgentPubKeyB64[] = [];
     for (const pk of pks) {
       if (this.labels.has(pk) || this.requested.has(pk)) continue;
+      if (this.failed.has(pk)) {
+        if (!opts.retryFailed) continue;
+        this.failed.delete(pk);
+      }
       this.requested.add(pk);
       fresh.push(pk);
     }
@@ -39,6 +52,7 @@ export class SpeakerLabels {
           if (nickname) this.labels.set(pk, nickname);
         } catch {
           this.requested.delete(pk);
+          this.failed.add(pk);
         }
       }),
     );

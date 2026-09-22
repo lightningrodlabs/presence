@@ -85,8 +85,10 @@ interface TranscriptStore {
   when the visit ends.
 - `unbind()` sets `endedAt`, freezes `labels` for every speaker present, and
   writes once more. `room-view` looks nicknames up from the profiles store as
-  speakers appear during the call and once more at leave, through one
-  `SpeakerLabels` cache (`ui/src/room/transcripts/speaker-labels.ts`); the controller
+  speakers appear during the call, through one `SpeakerLabels` cache
+  (`ui/src/room/transcripts/speaker-labels.ts`); a lookup that throws is not
+  repeated during the call, and leave re-asks every speaker whose lookup
+  failed (`refresh(pks, { retryFailed: true })`); the controller
   freezes them into the record at the visit's end, using the resolver that was
   set when `unbind()` was called. Because the closing commit is
   delivered before `stopCapture()` resolves (Moss contract), the leave path
@@ -100,9 +102,12 @@ interface TranscriptStore {
   an icon button (mdi `text-box-multiple-outline`) with tooltip "Transcripts",
   styled as the twin of `wal-to-pocket-btn`. It takes `roomKey` and `roomName`,
   mounts the dialog, and keeps its own `SpeakerLabels` over the profiles store
-  from context. It appears in two places, each only once the room's cell exists:
+  from context; the dialog's label lookups re-ask failed keys. It appears in
+  three places, each only once the room's cell exists:
   - the lobby room card (`ui/src/lobby/shared-room-card.ts`), right before the
     Enter button; the "add to pocket" button moves to sit beside the room name;
+  - the private room card (`ui/src/lobby/private-room-card.ts`), right before
+    its Enter button;
   - the enter pane (`PageView.EnterRoom` in `ui/src/presence-app.ts`), beside
     Enter. That pane is what an asset view shows before entering, and what a
     room already open in another pane shows.
@@ -114,7 +119,9 @@ interface TranscriptStore {
     a closed visit; for a record left open by a killed page or still being
     recorded, the last frame's offset from `startedAt`), speaker count, word
     count, and three actions: View, Download, Delete. Delete asks once inline
-    ("Delete this transcript?" Yes / No).
+    ("Delete this transcript?" Yes / No). A visit still being recorded in
+    another pane is already stored, so it appears here as an open entry with
+    Delete; the recording pane's next write restores it.
   - View mode: a back button, the Download action, and the transcript body.
   - Download: builds Markdown with `ui/src/room/transcripts/export.ts` and triggers a
     browser download named `transcript-<roomName>-<startedAt ISO>.md`.
@@ -158,8 +165,9 @@ interface TranscriptStore {
 - `ui/src/room/transcripts/__tests__/dialog-policy.test.ts`: which rows are listed
   (`selectTranscriptRows`) and each duration case (`describeDuration`).
 - `ui/src/room/transcripts/__tests__/speaker-labels.test.ts`: `SpeakerLabels` over an
-  in-memory fetcher: in-flight keys are not refetched, a failure leaves the
-  cache untouched, a failed key is retried on a later refresh.
+  in-memory fetcher: in-flight and answered keys are not refetched, a failure
+  leaves the cache untouched, a failed key is skipped on a plain refresh and
+  re-asked only with `retryFailed`.
 - The dialog, `transcript-view`, the button on the room card and enter pane,
   and the connection-details pane are verified in the running app.
 

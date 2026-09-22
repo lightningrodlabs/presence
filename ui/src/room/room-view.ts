@@ -516,11 +516,14 @@ export class RoomView extends LitElement {
         console.error('transcription: stopAndAnnounce on quit failed', e);
       }
     }
-    // One more lookup for every speaker of this visit still unlabelled, so
-    // the labels the controller freezes into the record at the visit's end
-    // are as complete as they can be.
+    // One more lookup for every speaker of this visit still unlabelled,
+    // re-asking those whose lookup failed, so the labels the controller
+    // freezes into the record at the visit's end are as complete as they
+    // can be.
     try {
-      await this._speakerLabels.refresh(Array.from(this._transcriptLog.value?.keys() ?? []));
+      await this._speakerLabels.refresh(Array.from(this._transcriptLog.value?.keys() ?? []), {
+        retryFailed: true,
+      });
     } catch (e) {
       console.error('transcription: speaker label lookup on quit failed', e);
     }
@@ -545,6 +548,7 @@ export class RoomView extends LitElement {
   /**
    * Looks up the nickname of each speaker the transcript log has gained
    * since the last render, so labels are known before the visit ends.
+   * Runs on every render, so failed lookups are left for `quitRoom`.
    */
   private _requestNewSpeakerLabels(): void {
     const log = this._transcriptLog.value;

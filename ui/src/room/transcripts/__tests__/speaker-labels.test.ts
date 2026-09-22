@@ -97,15 +97,39 @@ describe('SpeakerLabels', () => {
     expect(s.has('b')).toBe(false);
   });
 
-  it('a failed key may be requested again on a later refresh', async () => {
-    const answers: Record<AgentPubKeyB64, Answer> = { a: new Error('down') };
-    const f = fetcher(answers);
+  const failedCases: Array<{ name: string; retryFailed: boolean | undefined; calls: AgentPubKeyB64[]; label: string | undefined }> = [
+    { name: 'failed key skipped on a plain refresh', retryFailed: undefined, calls: ['a'], label: undefined },
+    { name: 'failed key skipped with retryFailed false', retryFailed: false, calls: ['a'], label: undefined },
+    { name: 'failed key retried with retryFailed', retryFailed: true, calls: ['a', 'a'], label: 'Ann' },
+  ];
+  for (const c of failedCases) {
+    it(c.name, async () => {
+      const answers: Record<AgentPubKeyB64, Answer> = { a: new Error('down') };
+      const f = fetcher(answers);
+      const s = new SpeakerLabels(f.fetch);
+      await s.refresh(['a']);
+      answers.a = 'Ann';
+      await s.refresh(['a'], c.retryFailed === undefined ? undefined : { retryFailed: c.retryFailed });
+      expect(f.calls).toEqual(c.calls);
+      expect(s.get('a')).toBe(c.label);
+    });
+  }
+
+  it('retryFailed does not refetch answered keys', async () => {
+    const f = fetcher({ a: 'Ann', b: undefined });
+    const s = new SpeakerLabels(f.fetch);
+    await s.refresh(['a', 'b']);
+    await s.refresh(['a', 'b'], { retryFailed: true });
+    expect(f.calls).toEqual(['a', 'b']);
+  });
+
+  it('a key that fails again after a retry stays failed', async () => {
+    const f = fetcher({ a: new Error('down') });
     const s = new SpeakerLabels(f.fetch);
     await s.refresh(['a']);
-    answers.a = 'Ann';
+    await s.refresh(['a'], { retryFailed: true });
     await s.refresh(['a']);
     expect(f.calls).toEqual(['a', 'a']);
-    expect(s.get('a')).toBe('Ann');
   });
 
   it('fetches distinct keys in parallel', async () => {
