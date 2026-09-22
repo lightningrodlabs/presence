@@ -47,6 +47,7 @@ ordering for display is by `committedAtMs`, as the current export does.
 
 ```ts
 interface TranscriptStore {
+  readonly degraded: boolean; // true when nothing is persisted (no IndexedDB, or it failed)
   listForRoom(roomKey: string): Promise<StoredTranscript[]>; // newest first
   get(id: string): Promise<StoredTranscript | undefined>;
   put(t: StoredTranscript): Promise<void>;
@@ -62,14 +63,15 @@ interface TranscriptStore {
 - `MemoryTranscriptStore`: a `Map`, same contract, used by tests and as the
   fallback when IndexedDB is unavailable so the live view still works for the
   duration of the visit.
-- The store is a module singleton created by `presence-app` and reached by the
-  controller and the dialog through the store-deps pattern already used for
-  `localModels`: `StreamsStoreDeps.transcripts?: TranscriptStore`.
+- The page-wide store is the `getTranscriptStore()` singleton in `ui/src/room/transcripts/store.ts`;
+  `StreamsStore.connect` (in `ui/src/streams-store.ts`) builds the dep as `StreamsStoreDeps.transcripts?: { store: TranscriptStore; roomKey: string }`
+  (declared in `ui/src/store-deps.ts`) from the `roomKey` that `ui/src/room/room-container.ts` computes from the cell
+  (`${dnaHashB64}#${roleName}`); the controller and the dialog reach the store through `StreamsStore.transcripts`.
 
 ## Accumulation
 
-- `TranscriptionController.bind(store)` also opens the visit: it computes
-  `roomKey` from the room's cell, creates the `StoredTranscript` with
+- `TranscriptionController.bind()` also opens the visit: it reads `store.transcripts`
+  (the store and room key from the dep), creates the `StoredTranscript` with
   `startedAt`, and writes it.
 - `ingestFrame` keeps appending to the in-memory `_transcriptLog` (the live
   view) and additionally appends the frame to the visit transcript. Writes to
@@ -87,7 +89,7 @@ interface TranscriptStore {
 - **Button.** In the room header, next to the transcribe button, an icon
   button (mdi `text-box-multiple-outline`) with tooltip "Transcripts". Present
   wherever `room-view` renders, which covers the app view and the asset view.
-- **`transcripts-dialog`** (new element under `room/elements/`), an overlay in
+- **`transcripts-dialog`** (new element under `room/transcripts/`), an overlay in
   the style of `transcription-request-dialog`:
   - List mode: rows newest first. Each row: date and time of `startedAt`,
     duration (`endedAt - startedAt`, or "live" for the current visit), speaker
@@ -95,8 +97,9 @@ interface TranscriptStore {
     once inline ("Delete this transcript?" Yes / No).
   - View mode: the transcript rendered as speaker-labelled paragraphs, same
     coalescing as the export (consecutive same-speaker lines within 3 s join),
-    a back button, and the Download action. For the live visit the view
-    re-renders as frames arrive by subscribing to `_transcriptLog`.
+    a back button, and the Download action. For the live visit the dialog receives
+    `transcriptionController.liveVisit` (a `Writable<StoredTranscript | null>`, republished on every frame)
+    as its `live` property from `room-view`, so the view re-renders as frames arrive.
   - Download: builds Markdown with `ui/src/room/transcripts/export.ts` and triggers a
     browser download named `transcript-<roomName>-<startedAt ISO>.md`.
 - Labels: stored `labels` when present, else the profiles store, else a
@@ -114,13 +117,13 @@ interface TranscriptStore {
 
 ## Testing
 
-- `transcript-store.test.ts`: the contract as a table run against
+- `ui/src/room/transcripts/__tests__/store.test.ts`: the contract as a table run against
   `MemoryTranscriptStore`, and against `IndexedDbTranscriptStore` when an
   `indexedDB` global exists (jsdom does not ship one; the suite skips with a
   message otherwise, and the app run is the check for that implementation).
-- `transcript-export.test.ts`: ordering, coalescing with the stitch glyph,
+- `ui/src/room/transcripts/__tests__/export.test.ts`: ordering, coalescing with the stitch glyph,
   label fallback, participants section.
-- `transcription-visit.test.ts`: bind opens a visit; frames from two speakers
+- `ui/src/room/transcripts/__tests__/visit.test.ts`: bind opens a visit; frames from two speakers
   land in it; writes are coalesced; unbind sets `endedAt` and labels; an empty
   visit is deleted. Runs against the in-memory store with a manual clock.
 - The dialog and button are verified in the running app.
