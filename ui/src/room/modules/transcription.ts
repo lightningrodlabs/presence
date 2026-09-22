@@ -259,12 +259,25 @@ class TranscriptionController {
   }
 
   unbind() {
-    // The closing commit's final is delivered during stopCapture, so the
-    // visit ends only after capture has fully stopped.
+    // Moss delivers the closing commit's final while `stopCapture`'s
+    // session.close() is in flight (see stopCapture's comment), and
+    // handleFinal/ingestFrame both bail when `this.store` is null — so
+    // the store has to stay reachable until capture has fully stopped,
+    // not be cleared synchronously here. Any sendModuleData attempted
+    // on a disconnecting store during that window already has its
+    // rejection caught (see handleFinal), so this is harmless.
+    const store = this.store;
+    // Captured so the deferred close below only ever closes the visit
+    // that was open when unbind() was called — a bind() for a new room
+    // during this pending teardown opens its own visit and must not
+    // have it swept by this one.
+    const v = this.visit;
     const stopped = this.stopCapture().catch(() => {});
     this.pendingRequests.set(new Set());
-    this.store = null;
-    void stopped.then(() => this.endVisit());
+    void stopped.then(() => {
+      if (this.store === store) this.store = null;
+      if (this.visit === v) void this.endVisit();
+    });
   }
 
   /** Display name for the visit, learned by room-view once room info loads. */
@@ -281,6 +294,13 @@ class TranscriptionController {
   }
 
   private openVisit(store: StreamsStore): void {
+    // A rebind before an earlier unbind's deferred close has run must
+    // not orphan that visit without an `endedAt` and must not leave it
+    // to be closed later by that deferred call finding a *different*
+    // `this.visit` (this one). End it now instead; endVisit detaches
+    // `this.visit`/`this.visitStore` synchronously before its first
+    // await, so this is safe to leave unawaited.
+    if (this.visit) void this.endVisit();
     const t = store.transcripts;
     if (!t) return;
     const startedAt = Date.now();
