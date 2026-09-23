@@ -364,6 +364,49 @@ Tests: the ring-buffer/framing logic is a pure module
 (`pcm-ring.ts`) table-tested in node; the worklet glue is covered by
 Presence's harness (Section 4).
 
+**Landed (2026-09-22; plan `docs/superpowers/plans/2026-09-22-weave-api-audio-source-capture.md`).**
+Moss branch `feat/api-audio-source-capture` off `main-0.7` @ `8a25037e`
+(commits `c350686a`..`cbfc4cb7`; merge recorded in the plan header).
+`@theweave/api` is at `0.7.0-dev.4` in the tree; the npm publish is the
+owner's step (`cd libs/api && npm publish --tag latest` — `latest` is the
+tag `0.7.0-dev.3` carries; verify with `npm view @theweave/api dist-tags`).
+Deviations from the text above: the request is sent by the applet iframe
+(Moss-injected), not by the package — `libs/api` cannot post to the host,
+so the iframe's `postMessageWithPorts` reads the transferred port off the
+reply and hands `{ label, canExcludeSelf, port }` to
+`createAudioSourceCapture`; the ring lives in the worklet and is ONE
+implementation — `PcmRing`'s compiled source is spliced into the inline
+worklet module via `PcmRing.toString()` (a test pins that the class stays
+self-contained); a caller's `audioContext` is used only when it runs at
+48 kHz, otherwise a private 48 kHz context is created (Presence's shared
+context is 48 kHz); port close is not observable as an event on Electron
+32's Chromium, so the host's `{type:'ended'}` is the end signal and a 5 s
+frame-gap watchdog (`FRAME_GAP_TIMEOUT_MS`) ends the capture as
+`'host-silent'`; the capture also carries `endedReason`, and a grant that
+ends while the worklet module is still loading resolves already-ended and
+fires `onended` once, asynchronously. `captureAudioSources` is absent from
+`WeaveClient` when the host lacks it (feature detection at `connect()`).
+Two host-side fixes landed on this branch after live measurement (Moss
+rule 7): the Moss pump had emitted ~5% more frames than wall time (a
+silence frame on every empty tick plus catch-up), overflowing the Tool's
+ring; emission is now gated by elapsed wall time (`due = floor(elapsed /
+20 ms) − emitted`, at most `PUMP_MAX_FRAMES_PER_TICK` per tick) with
+catch-up debt capped at `MAX_CATCHUP_FRAMES` (5) after a stall — measured
+afterwards at 50.1 frames/s and zero ring overflow over 20 s in both
+consumer conditions; the earlier "zero-gain keepalive to the destination"
+hypothesis was measured and falsified (the worklet already ran at real
+time). Live round trip from the example applet: `client.captureAudioSources`
+is a function, track live, analyser peak 0.80 with a tone, host Stop →
+`onended` + `endedReason 'user-stopped'`, `stop()` → no `onended`, cancel
+→ `null`. Field limits carried to Plan 4: `canExcludeSelf` is always `true`
+on supported backends but the exclude set is a request-time snapshot and
+macOS resolves pids once at start — do not present "excludes Moss" as a
+guarantee; a Tool consuming the track in a context that is not pulled
+still gets real-time frames (measured), so no keepalive is needed on the
+consumer side; and `track.stop()` fires no `ended` event on the local
+track object, so Presence's tear-mix arm must be driven from
+`capture.onended`, never from `track.onended`.
+
 ## Section 4 — Presence
 
 Branch `feat/include-system-audio` off `main-0.7`.
