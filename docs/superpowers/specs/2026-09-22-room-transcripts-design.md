@@ -137,6 +137,15 @@ interface TranscriptStore {
   counts the lines.
 - Labels: stored `labels` when present, else a nickname looked up from the
   profiles store through `SpeakerLabels`, else a 10-character pubkey prefix.
+- **Who is transcribing.** With connection details on, the transcription
+  pane's title line lists who currently has transcription `enabled` (self
+  first, as "you", then peers by name or pubkey prefix), or "nobody
+  transcribing"; each tile's connection-details block (self tile and peer
+  tiles alike) shows a subtitles icon when that agent's transcription is
+  enabled. Both read the transcription module state through the one
+  pair of predicates in `ui/src/room/transcripts/transcribing-policy.ts`
+  — `transcribingAgents` and `isTranscribing` — over `_myModuleStates`/
+  `_peerModuleStates`, not a re-parse of their own.
 
 ## Removals
 
@@ -168,8 +177,13 @@ interface TranscriptStore {
   in-memory fetcher: in-flight and answered keys are not refetched, a failure
   leaves the cache untouched, a failed key is skipped on a plain refresh and
   re-asked only with `retryFailed`.
+- `ui/src/room/transcripts/__tests__/transcribing-policy.test.ts`: table tests
+  for `isTranscribing` and `transcribingAgents` — self on, peer on, both,
+  module inactive, requested but not enabled, malformed payload JSON,
+  undefined maps.
 - The dialog, `transcript-view`, the button on the room card and enter pane,
-  and the connection-details pane are verified in the running app.
+  the transcription pane's transcribing-name list, the per-tile transcribing
+  icon, and the connection-details pane are verified in the running app.
 
 ## Out of scope
 

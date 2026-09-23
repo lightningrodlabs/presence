@@ -79,6 +79,7 @@ import './elements/transcription-request-dialog';
 import './transcripts/transcript-view';
 import { transcriptLines } from './transcripts/export';
 import { SpeakerLabels, profileNicknameFetcher } from './transcripts/speaker-labels';
+import { isTranscribing, transcribingAgents } from './transcripts/transcribing-policy';
 import './logs-graph';
 import {
   downloadJson,
@@ -548,12 +549,24 @@ export class RoomView extends LitElement {
   /**
    * Looks up the nickname of each speaker the transcript log has gained
    * since the last render, so labels are known before the visit ends.
+   * Also covers agents currently transcribing but not yet in the log
+   * (their first frame hasn't landed), so the pane title's name list
+   * doesn't fall back to a truncated pubkey while a lookup is pending.
    * Runs on every render, so failed lookups are left for `quitRoom`.
    */
   private _requestNewSpeakerLabels(): void {
     const log = this._transcriptLog.value;
     if (!log || !this._profilesStore) return;
-    void this._speakerLabels.refresh(Array.from(log.keys()));
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const pks = new Set(log.keys());
+    for (const pk of transcribingAgents(
+      myPubKeyB64,
+      this._myModuleStates.value,
+      this._peerModuleStates.value,
+    )) {
+      if (pk !== myPubKeyB64) pks.add(pk);
+    }
+    void this._speakerLabels.refresh(Array.from(pks));
   }
 
   /**
@@ -567,11 +580,24 @@ export class RoomView extends LitElement {
     const visit = this._liveVisit.value ?? null;
     const labelFor = (pk: AgentPubKeyB64) => this._speakerLabels.get(pk);
     const count = visit ? transcriptLines(visit, labelFor).length : 0;
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const transcribing = transcribingAgents(
+      myPubKeyB64,
+      this._myModuleStates.value,
+      this._peerModuleStates.value,
+    );
+    const nameFor = (pk: AgentPubKeyB64) =>
+      pk === myPubKeyB64 ? msg('you') : this._speakerLabels.get(pk) ?? pk.slice(0, 10) + '…';
     return html`
       <div class="transcription-pane">
         <div class="transcription-pane-title">
           <sl-icon .src=${wrapPathInSvg(mdiSubtitlesOutline)}></sl-icon>
           <span>Transcription (${count})</span>
+          <span class="transcription-pane-subtitle">
+            ${transcribing.length > 0
+              ? `· ${msg('transcribing')}: ${transcribing.map(nameFor).join(', ')}`
+              : `· ${msg('nobody transcribing')}`}
+          </span>
         </div>
         <div class="transcription-pane-body">
           <transcript-view
@@ -2944,6 +2970,24 @@ export class RoomView extends LitElement {
   }
 
   /**
+   * Subtitles icon shown next to a tile's other connection-detail status
+   * icons when that agent (self or peer, same module-state shape either
+   * way) has transcription `enabled`. One rendering for both the self
+   * tile and peer tiles — `isTranscribing` is the one predicate.
+   */
+  private _renderTranscribingIcon(states: Record<string, ModuleStateEnvelope> | undefined) {
+    if (!isTranscribing(states)) return html``;
+    return html`
+      <sl-tooltip hoist content="${msg('Transcribing')}">
+        <sl-icon
+          class="transcribing-icon"
+          .src=${wrapPathInSvg(mdiSubtitlesOutline)}
+        ></sl-icon>
+      </sl-tooltip>
+    `;
+  }
+
+  /**
    * Render a placeholder tile per agent in `phantomAgents()` — agents
    * other peers report as in-room with a working audio link, but who we
    * cannot see directly. Suppresses the normal tile chrome (no video
@@ -3447,9 +3491,10 @@ export class RoomView extends LitElement {
           <!-- Connection states indicators -->
           ${this._showConnectionDetails
             ? html`<div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
+                style="display: flex; flex-direction: row; align-items: center; gap: 6px; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
               >
                 ${this.renderAgentConnectionStatuses('my-video')}
+                ${this._renderTranscribingIcon(this._myModuleStates.value)}
               </div>`
             : html``}
 
@@ -3669,6 +3714,7 @@ export class RoomView extends LitElement {
                     <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
                       ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
                       ${this._renderCarrierToggle(pubkeyB64)}
+                      ${this._renderTranscribingIcon(this._peerModuleStates.value?.[pubkeyB64])}
                     </div>
                     <peer-stats-panel
                       .streamsStore=${this.streamsStore}
@@ -5049,6 +5095,20 @@ export class RoomView extends LitElement {
 
       .transcription-pane-title sl-icon {
         font-size: 16px;
+      }
+
+      .transcription-pane-subtitle {
+        color: #9aa5c9;
+        font-weight: 400;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .transcribing-icon {
+        color: #5ee69c;
+        height: 24px;
+        width: 24px;
       }
 
       .transcription-pane-body {
