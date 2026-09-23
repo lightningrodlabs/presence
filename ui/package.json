@@ -33,7 +33,7 @@
     "@mdi/js": "^7.2.96",
     "@msgpack/msgpack": "^2.8.0",
     "@shoelace-style/shoelace": "^2.3.0",
-    "@theweave/api": "0.7.0-dev.1",
+    "@theweave/api": "0.7.0-dev.4",
     "lit": "^3.1.0",
     "lodash-es": "^4.17.21",
     "nanoid": "5.0.4",

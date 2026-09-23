@@ -1198,7 +1198,10 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
   function armVoice(started: Started) {
     const { store, clock } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
-    store._localIntent.update(i => ({ ...i, mic: { wanted: true, muted: false } }));
+    store._localIntent.update(i => ({
+      ...i,
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+    }));
   }
 
   /** One presence tick with the target peer kept ping-fresh. */
@@ -1471,7 +1474,7 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
     // acquire fails and no live track ever exists — the dead-device case.
     started.store._localIntent.update(i => ({
       ...i,
-      mic: { wanted: true, muted: false },
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
     }));
 
     await presenceTick(started);

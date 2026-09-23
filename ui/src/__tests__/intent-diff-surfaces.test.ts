@@ -51,7 +51,10 @@ function makeRoomView(overrides?: {
   return el;
 }
 
-const INTENT = (mic: { wanted: boolean; muted: boolean }, cameraWanted: boolean) => ({
+const INTENT = (
+  mic: { wanted: boolean; muted: boolean; includeSystemAudio: boolean },
+  cameraWanted: boolean
+) => ({
   mic,
   camera: { wanted: cameraWanted },
   screenShare: { wanted: false },
@@ -60,11 +63,15 @@ const INTENT = (mic: { wanted: boolean; muted: boolean }, cameraWanted: boolean)
 
 describe('toggle buttons render intent (surface 1)', () => {
   it('mic on = wanted && !muted; camera on = wanted', () => {
-    const on = makeRoomView({ intent: INTENT({ wanted: true, muted: false }, true) });
+    const on = makeRoomView({
+      intent: INTENT({ wanted: true, muted: false, includeSystemAudio: false }, true),
+    });
     expect(on._micOn).toBe(true);
     expect(on._cameraOn).toBe(true);
 
-    const muted = makeRoomView({ intent: INTENT({ wanted: true, muted: true }, false) });
+    const muted = makeRoomView({
+      intent: INTENT({ wanted: true, muted: true, includeSystemAudio: false }, false),
+    });
     expect(muted._micOn).toBe(false);
     expect(muted._cameraOn).toBe(false);
   });
