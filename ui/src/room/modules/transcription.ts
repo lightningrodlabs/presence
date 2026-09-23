@@ -258,7 +258,7 @@ class TranscriptionController {
   bind(store: StreamsStore) {
     this.store = store;
     // Start the model now so a later openSession() returns at once.
-    // Older hosts have no warmUp, and a host with Local AI off rejects;
+    // Older hosts have no warmUp, and a host with Transcription off rejects;
     // neither is an error here.
     const asr = store.localModels?.asr;
     if (typeof asr?.warmUp === 'function') {
@@ -560,7 +560,7 @@ class TranscriptionController {
     if (!localModels) {
       console.warn('transcription: weaveClient.localModels not available');
       this.lastError.set(
-        'Local transcription is not enabled in Moss. Open Moss settings → Local AI to enable it.',
+        'Transcription is not enabled in Moss. Open Moss settings → Services → Transcription to enable it.',
       );
       return false;
     }
@@ -578,7 +578,7 @@ class TranscriptionController {
     if (!available) {
       console.warn('transcription: host reports asr.available=false');
       this.lastError.set(
-        'Moss reports no transcription model is configured. Open Moss settings → Local AI to pick a model.',
+        'Moss reports no transcription model is configured. Open Moss settings → Services → Transcription.',
       );
       return false;
     }
@@ -616,7 +616,7 @@ class TranscriptionController {
     } catch (e) {
       console.error('transcription: openSession failed', e);
       this.lastError.set(
-        'Moss refused to open a transcription session. Local AI may be disabled for this tool.',
+        'Moss refused to open a transcription session. Transcription may be disabled in Moss settings or denied for this tool.',
       );
       return false;
     } finally {

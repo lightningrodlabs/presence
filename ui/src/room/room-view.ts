@@ -772,7 +772,7 @@ export class RoomView extends LitElement {
     if (!this._asrAvailable) {
       this.notifyError(
         msg(
-          'You need to enable local transcription in Moss settings (Local AI).',
+          'You need to enable Transcription in Moss settings (Services → Transcription).',
         ),
       );
       return;
