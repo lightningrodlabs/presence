@@ -2686,9 +2686,11 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
       logger.asPresenceLogger(),
       async opts => { calls.push(opts); return (await capture()) as unknown as AudioSourceCapture | null; },
     );
+    const events: StoreEventPayload[] = [];
     store.start();
     live.push(store);
-    return { ...fakes, clock, store, logger, calls };
+    store.onEvent(ev => events.push(ev));
+    return { ...fakes, clock, store, logger, calls, events };
   }
 
   beforeEach(() => {
@@ -2812,14 +2814,82 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(started.calls).toHaveLength(0);
   });
 
-  it('a second systemAudioOn while one is active opens no second picker (Review Focus 4)', async () => {
+  it('an interleaved second systemAudioOn — fired before the first request resolves — opens no second picker (review round 1 finding)', async () => {
+    // The prior pre-await guard (`if (this._systemAudioCapture) return;`)
+    // only covers the state AFTER a picker resolves. A double-click while
+    // the host picker is still open passes that guard on the second call
+    // and would open a second picker — `_systemAudioPending` closes the
+    // in-flight window too, so neither call observes it as clear.
     const device = new FakeTrack('audio', 'device');
     installNavigator(async () => new FakeStream([device]));
-    const started = makeStartedWithCapture(async () => fakeCapture());
+    let resolveSeam!: (c: FakeCapture | null) => void;
+    const started = makeStartedWithCapture(
+      () => new Promise<FakeCapture | null>(r => { resolveSeam = r; })
+    );
     await started.store.audioOn(true);
-    await started.store.systemAudioOn();
-    await started.store.systemAudioOn();
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    const first = started.store.systemAudioOn();
+    const second = started.store.systemAudioOn(); // fired while the first is still in flight
+    resolveSeam(fakeCapture());
+    await first;
+    await second;
+    await flush();
+
     expect(started.calls).toHaveLength(1);
+    expect(
+      started.logger.customMessages.filter(m => m === 'IntentChange: system-audio-on')
+    ).toHaveLength(1);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(started.events.some(e => e.type === 'error')).toBe(false);
+  });
+
+  it('with no Web Audio the mix cannot be built, so the share is refused rather than reported as on (review round 1 minor)', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await flush();
+    // Deleted before the call, not just before setMixin: MicSource caches
+    // its AudioContext on first success, so the seam's own
+    // `ensureAudioContext()` call (before the await) must fail too, or
+    // the cached instance would let the later `setMixin` succeed anyway.
+    delete (globalThis as any).AudioContext;
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('device');
+  });
+
+  it('a throwing seam emits an error event and clears the pending flag for the next request', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let shouldThrow = true;
+    const started = makeStartedWithCapture(async () => {
+      if (shouldThrow) {
+        shouldThrow = false;
+        throw new Error('nope');
+      }
+      return fakeCapture();
+    });
+    await started.store.audioOn(true);
+    await flush();
+
+    await started.store.systemAudioOn();
+    expect(started.events.some(e => e.type === 'error')).toBe(true);
+    expect(started.calls).toHaveLength(1);
+
+    // The pending flag cleared in `finally`: the next request reaches the seam again.
+    await started.store.systemAudioOn();
+    expect(started.calls).toHaveLength(2);
   });
 
   it('a capture that resolves already ended is not installed (Review Focus 2)', async () => {

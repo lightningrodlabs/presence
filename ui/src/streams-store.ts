@@ -428,6 +428,14 @@ export class StreamsStore {
   /** The active host grant, or null when no system audio is included. */
   private _systemAudioCapture: AudioSourceCapture | null = null;
 
+  /** True while a `systemAudioOn` picker request is in flight (from just
+   *  before `await seam(...)` to the method's end). The host allows one
+   *  picker at a time and rejects a second request while one is open —
+   *  the store must not ask, so this closes the pre-resolution window
+   *  `_systemAudioCapture` alone cannot guard (it is only set AFTER the
+   *  picker resolves). */
+  private _systemAudioPending = false;
+
   /** The active system-audio share's label/echo-warning, or null. */
   private _systemAudio: Writable<SystemAudioState | null> = writable(null);
 
@@ -2073,48 +2081,63 @@ export class StreamsStore {
     const seam = this.captureAudioSources;
     if (!seam) return;
     if (!get(this._localIntent).mic.wanted) return;
-    if (this._systemAudioCapture) return;
+    if (this._systemAudioCapture || this._systemAudioPending) return;
     const audioContext = this.micSource.ensureAudioContext() ?? undefined;
-    let capture: AudioSourceCapture | null;
+    this._systemAudioPending = true;
     try {
-      capture = await seam({ audioContext });
-    } catch (e: any) {
-      const error = `Failed to capture audio sources: ${e?.toString?.() ?? e}`;
-      console.error(error);
-      this.eventCallback({ type: 'error', error });
-      return;
+      let capture: AudioSourceCapture | null;
+      try {
+        capture = await seam({ audioContext });
+      } catch (e: any) {
+        const error = `Failed to capture audio sources: ${e?.toString?.() ?? e}`;
+        console.error(error);
+        this.eventCallback({ type: 'error', error });
+        return;
+      }
+      if (!capture) return;
+      if (!isUsableMixin(capture.track)) {
+        // Resolved already ended (spec Section 3): nothing to include.
+        return;
+      }
+      // Defensive belt: unreachable while `_systemAudioPending` closes
+      // the window between the await above and here to a second
+      // gesture — kept so a stop is never skipped if that changes.
+      if (this._systemAudioCapture) {
+        capture.stop();
+        return;
+      }
+      this._systemAudioCapture = capture;
+      // A `const` alias: `capture` is a `let` from the outer scope, so TS
+      // widens it back to `AudioSourceCapture | null` inside this closure
+      // (the guards above narrowed the outer binding, not the closure's
+      // view of it) — this alias keeps the non-null narrowing stable.
+      const endedCapture = capture;
+      capture.onended = () => {
+        if (this._systemAudioCapture !== endedCapture) return;
+        this._applyIntent({ type: 'system-audio-ended' });
+        this._systemAudioCapture = null;
+        this._systemAudio.set(null);
+        this.micSource.setMixin(null);
+        this.logger.logAgentEvent({
+          agent: this.myPubKeyB64,
+          timestamp: this.clock.now(),
+          event: 'SystemAudioEnded',
+          detail: `reason=${endedCapture.endedReason ?? 'unknown'}; label=${endedCapture.label}`,
+        });
+      };
+      if (!this.micSource.setMixin(capture.track)) {
+        // With no Web Audio the mix cannot be built, so the share is
+        // refused rather than reported as on.
+        this._systemAudioCapture = null;
+        capture.onended = undefined;
+        try { capture.stop(); } catch {}
+        return;
+      }
+      this._applyIntent({ type: 'system-audio-on' });
+      this._systemAudio.set({ label: capture.label, canExcludeSelf: capture.canExcludeSelf });
+    } finally {
+      this._systemAudioPending = false;
     }
-    if (!capture) return;
-    if (!isUsableMixin(capture.track)) {
-      // Resolved already ended (spec Section 3): nothing to include.
-      return;
-    }
-    if (this._systemAudioCapture) {
-      capture.stop();
-      return;
-    }
-    this._systemAudioCapture = capture;
-    // A `const` alias: `capture` is a `let` from the outer scope, so TS
-    // widens it back to `AudioSourceCapture | null` inside this closure
-    // (the guards above narrowed the outer binding, not the closure's
-    // view of it) — this alias keeps the non-null narrowing stable.
-    const endedCapture = capture;
-    capture.onended = () => {
-      if (this._systemAudioCapture !== endedCapture) return;
-      this._applyIntent({ type: 'system-audio-ended' });
-      this._systemAudioCapture = null;
-      this._systemAudio.set(null);
-      this.micSource.setMixin(null);
-      this.logger.logAgentEvent({
-        agent: this.myPubKeyB64,
-        timestamp: this.clock.now(),
-        event: 'SystemAudioEnded',
-        detail: `reason=${endedCapture.endedReason ?? 'unknown'}; label=${endedCapture.label}`,
-      });
-    };
-    this._applyIntent({ type: 'system-audio-on' });
-    this.micSource.setMixin(capture.track);
-    this._systemAudio.set({ label: capture.label, canExcludeSelf: capture.canExcludeSelf });
   }
 
   /** The menu row's off gesture: stop the host grant and swap back to the device track. */
