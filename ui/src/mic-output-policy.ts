@@ -36,25 +36,25 @@ export function isUsableMixin(track: MediaStreamTrack | null): track is MediaStr
 
 export function decideMicOutput(input: MicOutputInput): MicOutputDecision {
   const { device, current } = input;
-  const mixinUsable = isUsableMixin(input.mixin);
-  const mixinEnded = !!input.mixin && !mixinUsable;
+  // Read before the guard: a non-null mixin that is not usable is an ended one.
+  const mixinPresent = input.mixin !== null;
 
   if (!device) {
     if (current?.mode === 'mixed') return { kind: 'tear-mix', reason: 'device-closed' };
     return { kind: 'none', reason: 'no-device' };
   }
 
-  if (!mixinUsable) {
+  if (!isUsableMixin(input.mixin)) {
     if (current?.mode === 'mixed') {
-      return { kind: 'tear-mix', reason: mixinEnded ? 'mixin-ended' : 'mixin-removed' };
+      return { kind: 'tear-mix', reason: mixinPresent ? 'mixin-ended' : 'mixin-removed' };
     }
     if (current?.mode === 'device') return { kind: 'none', reason: 'already-device' };
     return { kind: 'use-device', reason: 'device-only' };
   }
 
-  const mixin = input.mixin as MediaStreamTrack;
+  // The predicate narrowed input.mixin to MediaStreamTrack from here on.
   if (current?.mode !== 'mixed') return { kind: 'build-mix', reason: 'mixin-added' };
   if (current.device !== device) return { kind: 'build-mix', reason: 'device-changed' };
-  if (current.mixin !== mixin) return { kind: 'build-mix', reason: 'mixin-changed' };
+  if (current.mixin !== input.mixin) return { kind: 'build-mix', reason: 'mixin-changed' };
   return { kind: 'none', reason: 'already-mixed' };
 }
