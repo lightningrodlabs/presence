@@ -47,6 +47,8 @@ const ALLOWED_CALL_SITES: Array<[name: string, header: RegExp]> = [
   ['audioOff', /^  async audioOff\(\) \{/],
   ['screenShareOn', /^  async screenShareOn\(\) \{/],
   ['screenShareOff', /^  screenShareOff\(\) \{/],
+  ['systemAudioOn', /^  async systemAudioOn\(\): Promise<void> \{/],
+  ['systemAudioOff', /^  systemAudioOff\(\): void \{/],
   ['setCarrierMode', /^  async setCarrierMode\(mode: 'webrtc' \| 'signals'\): Promise<void> \{/],
   ['setPeerCarrier', /^  async setPeerCarrier\(/],
 ];
