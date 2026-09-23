@@ -292,6 +292,40 @@ process-tree computation from a fake `getAppMetrics`),
 `validationSchemas` round-trip for the new message,
 `ipc-contract-drift`.
 
+**Landed (2026-09-22; plan `docs/superpowers/plans/2026-09-22-moss-audio-sources.md`).**
+Moss branch `feat/audio-source-capture` off `main-0.7` @ `1c6db768`, commits
+`f66d4f53`..`09922dea` (16 commits; merge/PR recorded in the plan header).
+Every task was adversarially reviewed and the whole branch reviewed once
+more; the round-trip was observed live (CDP-driven, real 0.7 conductor):
+picker → grant → frames at peak 26215 from a non-Moss `speaker-test` →
+chip Stop → `{type:'ended', reason:'user-stopped'}`; cancel → `null`;
+switch off → `null` without a picker; iframe reload and main-window reload
+both empty the grant list. Not observed: the WAL-window path (the example
+applet's committed `.happ` predates its zome source, so no asset could be
+created — pre-existing, unrelated). Deviations from the text above: the
+enable switch is renderer-owned (`PersistedStore.audioSourcesEnabled`,
+gated in `AudioSourceGrantsClient` before main is invoked — main has no
+preference store); the chip is a fixed overlay at the top centre of the main
+window (there is no global top bar); the picker page is not localised (as
+its sibling); the mixer is clock-driven — a 20 ms interval pops at most one
+chunk per stream, backlog capped at 5 chunks, and catches up by at most one
+extra frame per tick (`PUMP_MAX_FRAMES_PER_TICK`, added after a live run
+showed the timer lagging the backend by ~1 chunk/s); the request message
+carries no payload — the host derives the tool name from the iframe origin;
+a grant also ends on the port's `close` event (a Tool iframe detached from
+the DOM never fires `beforeunload`, so `unregister-iframe` alone was not
+enough), on the owning page navigating/reloading/crashing (`webContents`
+hooks), and the port-delivery deadline (10 s) starts only after main has
+answered, not across the user's picker deliberation. Field limits the code
+does not detect: `canExcludeSelf` is reported `true` on every supported
+backend, but the exclude set is snapshotted at request time and macOS
+resolves pids once at start — Plan 4 must not present "excludes Moss" as a
+guarantee. Reply shape Plan 3 consumes: `{ label, canExcludeSelf }` with the
+grant port in `ports[0]` of the reply, or `null`; main posts
+`{type:'ended', reason}` then closes the port, so the api helper must handle
+both the control message and a bare port close; the applet-iframe
+`postMessage` helper currently drops `m.ports` and needs a port-aware path.
+
 ## Section 3 — `@theweave/api`
 
 In `libs/api` (published as `@theweave/api 0.7.0-dev.4` or later;
