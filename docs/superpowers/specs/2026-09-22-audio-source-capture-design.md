@@ -264,14 +264,14 @@ closes `port1`, and notifies the renderer; `endGrant` is idempotent.
 **Chip**: while ≥1 grant is active the Moss top bar shows
 "<tool name> is using system audio" with a stop button (one chip per grant).
 
-**Settings**: a new top-level tab **Capabilities** (decided 2026-09-22
-over "Tool Affordances"/"Tool Permissions": short, and it stretches to
-non-grant items such as storage access or model downloads; the one cost
-is that "capability" already names Holochain cap-grants and the Weave
-API's applet capability flags for developers, so the element and enum
-names below say what kind) in `moss-settings.ts`
-(`TabsState.Capabilities`), rendering `<moss-capabilities-settings>` which
-owns a sub-tab bar. First sub-tab **Audio Sources**
+**Settings**: a new top-level tab **Services** (renamed from
+"Capabilities" on 2026-09-23, after the tab had shipped under that name
+on the Moss branch — the owner's ruling, on the cost noted below: that
+"capability" already names Holochain cap-grants and the Weave API's
+applet capability flags; "Capabilities" had itself been chosen
+2026-09-22 over "Tool Affordances"/"Tool Permissions") in
+`moss-settings.ts` (`TabsState.Services`), rendering
+`<moss-services-settings>` which owns a sub-tab bar. First sub-tab **Audio Sources**
 (`self/settings/capabilities/audio-sources-settings.ts`):
 
 - persisted enable switch (`persistedStore.audioSourcesEnabled`,
@@ -517,9 +517,9 @@ Each step is one branch, one intent, adversarially reviewed
   `@lightningrodlabs/flexaudio` until upstream publishes.
 - PulseAudio-only Linux hosts are unsupported (declared; consequence of
   adopting flexaudio, which has no PulseAudio backend).
-- Settings: new "Capabilities" tab (decided 2026-09-22; "Tool
-  Affordances" and "Tool Permissions" were considered) with sub-tabs;
-  "Audio Sources" is the first sub-tab.
+- Settings: new "Services" tab (renamed 2026-09-23 from "Capabilities",
+  which had been decided 2026-09-22 over "Tool Affordances" and "Tool
+  Permissions") with sub-tabs; "Audio Sources" is the first sub-tab.
 - Picker shows `isOutputActive` per app and sorts playing apps first
   (decided 2026-09-22).
 - Grants session-scoped, not persisted.
