@@ -278,6 +278,12 @@ export class RoomView extends LitElement {
     () => [this.streamsStore],
   );
 
+  _transcriptionStarting = new StoreSubscriber(
+    this,
+    () => transcriptionController.isStarting,
+    () => [this.streamsStore],
+  );
+
   _transcriptionCapturing = new StoreSubscriber(
     this,
     () => transcriptionController.isCapturing,
@@ -703,6 +709,7 @@ export class RoomView extends LitElement {
     );
     const activated = !!(mine?.enabled || mine?.requested);
     const capturing = this._transcriptionCapturing.value === true;
+    const starting = this._transcriptionStarting.value === true;
     const asrUnavailable = !this._asrAvailable;
 
     // Button-color semantics (activated = module is on; capturing =
@@ -720,11 +727,13 @@ export class RoomView extends LitElement {
 
     const tooltip = asrUnavailable
       ? msg('Local transcription not enabled in Moss — click for details')
-      : capturing
-        ? msg('Transcribing — click to stop')
-        : activated
-          ? msg('Transcription on (paused while mic is muted)')
-          : msg('Transcribe this call');
+      : starting
+        ? msg('Starting transcription…')
+        : capturing
+          ? msg('Transcribing — click to stop')
+          : activated
+            ? msg('Transcription on (paused while mic is muted)')
+            : msg('Transcribe this call');
 
     return html`
       <sl-tooltip content=${tooltip} hoist>
@@ -742,10 +751,16 @@ export class RoomView extends LitElement {
           ></sl-icon>
           ${activated
             ? html`<div
-                class="transcription-status-dot ${capturing ? 'live' : 'paused'}"
-                title=${capturing
-                  ? msg('transcribing')
-                  : msg('paused — unmute mic to resume')}
+                class="transcription-status-dot ${starting
+                  ? 'starting'
+                  : capturing
+                    ? 'live'
+                    : 'paused'}"
+                title=${starting
+                  ? msg('starting the speech model')
+                  : capturing
+                    ? msg('transcribing')
+                    : msg('paused — unmute mic to resume')}
               ></div>`
             : html``}
         </div>
@@ -4801,6 +4816,10 @@ export class RoomView extends LitElement {
 
       .transcription-status-dot.paused {
         background: #e7a008;
+      }
+      .transcription-status-dot.starting {
+        background: #6aa7ff;
+        animation: transcription-dot-pulse 0.8s ease-in-out infinite;
       }
 
       .transcription-status-dot.live {

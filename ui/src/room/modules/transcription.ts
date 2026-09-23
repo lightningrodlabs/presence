@@ -196,6 +196,12 @@ class TranscriptionController {
    * on the toolbar button.
    */
   isCapturing: Writable<boolean> = writable(false);
+  /**
+   * True from the moment a session open is requested until the host
+   * answers. Covers the speech model's cold start, which the UI shows
+   * as its own state rather than as "paused".
+   */
+  isStarting: Writable<boolean> = writable(false);
 
   /**
    * User-facing failure messages from the controller, for room-view
@@ -251,6 +257,13 @@ class TranscriptionController {
 
   bind(store: StreamsStore) {
     this.store = store;
+    // Start the model now so a later openSession() returns at once.
+    // Older hosts have no warmUp, and a host with Local AI off rejects;
+    // neither is an error here.
+    const asr = store.localModels?.asr;
+    if (typeof asr?.warmUp === 'function') {
+      asr.warmUp().catch(() => undefined);
+    }
     // Frame numbering is per speaker per room: receivers drop a repeated
     // (transcriber, seq), so every capture session in this room must
     // continue the count, and only a new room starts over.
@@ -582,6 +595,7 @@ class TranscriptionController {
     // 48000 up front and verify in startPump when the real track
     // becomes available.
     const SAMPLE_RATE_HINT = 48_000;
+    this.isStarting.set(true);
     try {
       this.session = await localModels.asr.openSession({
         language: 'en',
@@ -605,6 +619,8 @@ class TranscriptionController {
         'Moss refused to open a transcription session. Local AI may be disabled for this tool.',
       );
       return false;
+    } finally {
+      this.isStarting.set(false);
     }
 
     this.sessionOffFinal = this.session.onFinal((ev: AsrFinalEvent) => {
