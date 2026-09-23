@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { StoredTranscript } from '../store';
 import {
   formatOffset,
+  pubkeyPrefixLabel,
   renderTranscriptMarkdown,
   speakerCount,
   speakerLabel,
@@ -36,6 +37,12 @@ describe('speakerLabel', () => {
     expect(speakerLabel(base, 'alice', () => 'Live Alice')).toBe('Alice');
     expect(speakerLabel(base, 'bob', () => 'Bob')).toBe('Bob');
     expect(speakerLabel(base, 'uhCAk0123456789abcdef')).toBe('uhCAk01234…');
+  });
+});
+
+describe('pubkeyPrefixLabel', () => {
+  it('takes the first 10 characters and appends an ellipsis', () => {
+    expect(pubkeyPrefixLabel('uhCAk0123456789abcdef')).toBe('uhCAk01234…');
   });
 });
 

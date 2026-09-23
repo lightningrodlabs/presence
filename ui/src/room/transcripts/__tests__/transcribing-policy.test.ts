@@ -39,6 +39,15 @@ describe('transcribingAgents', () => {
     expect(transcribingAgents(ME, myStates, peerStates)).toEqual([ALICE]);
   });
 
+  it('peerStates carrying an entry keyed by myKey is not double-counted', () => {
+    const myStates = { transcription: envelope({ enabled: true, requested: false }) };
+    const peerStates: Record<AgentPubKeyB64, Record<string, ModuleStateEnvelope>> = {
+      [ME]: { transcription: envelope({ enabled: true, requested: false }) },
+      [ALICE]: { transcription: envelope({ enabled: true, requested: false }) },
+    };
+    expect(transcribingAgents(ME, myStates, peerStates)).toEqual([ME, ALICE]);
+  });
+
   it('self and peers both on, self first, peer order preserved', () => {
     const myStates = { transcription: envelope({ enabled: true, requested: false }) };
     const peerStates: Record<AgentPubKeyB64, Record<string, ModuleStateEnvelope>> = {

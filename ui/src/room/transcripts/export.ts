@@ -17,12 +17,17 @@ const STITCH_GLYPH = '⋯';
 /** Whisper's non-speech markers, e.g. [BLANK_AUDIO], [NOISE]. */
 const MARKER = /^\[[^\]]*\]\.?$/;
 
+/** Fallback label for a speaker with no stored or live nickname. */
+export function pubkeyPrefixLabel(pk: AgentPubKeyB64): string {
+  return pk.slice(0, 10) + '…';
+}
+
 export function speakerLabel(
   t: StoredTranscript,
   pk: AgentPubKeyB64,
   live?: LabelFor,
 ): string {
-  return t.labels[pk] ?? live?.(pk) ?? pk.slice(0, 10) + '…';
+  return t.labels[pk] ?? live?.(pk) ?? pubkeyPrefixLabel(pk);
 }
 
 function keptFrames(t: StoredTranscript) {

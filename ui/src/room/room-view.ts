@@ -77,7 +77,7 @@ import {
 } from './modules/video-filmstrip';
 import './elements/transcription-request-dialog';
 import './transcripts/transcript-view';
-import { transcriptLines } from './transcripts/export';
+import { pubkeyPrefixLabel, transcriptLines } from './transcripts/export';
 import { SpeakerLabels, profileNicknameFetcher } from './transcripts/speaker-labels';
 import { isTranscribing, transcribingAgents } from './transcripts/transcribing-policy';
 import './logs-graph';
@@ -587,7 +587,7 @@ export class RoomView extends LitElement {
       this._peerModuleStates.value,
     );
     const nameFor = (pk: AgentPubKeyB64) =>
-      pk === myPubKeyB64 ? msg('you') : this._speakerLabels.get(pk) ?? pk.slice(0, 10) + '…';
+      pk === myPubKeyB64 ? msg('you') : this._speakerLabels.get(pk) ?? pubkeyPrefixLabel(pk);
     return html`
       <div class="transcription-pane">
         <div class="transcription-pane-title">
@@ -2978,7 +2978,7 @@ export class RoomView extends LitElement {
   private _renderTranscribingIcon(states: Record<string, ModuleStateEnvelope> | undefined) {
     if (!isTranscribing(states)) return html``;
     return html`
-      <sl-tooltip hoist content="${msg('Transcribing')}">
+      <sl-tooltip hoist class="tooltip-filled" placement="top" content="${msg('Transcribing')}">
         <sl-icon
           class="transcribing-icon"
           .src=${wrapPathInSvg(mdiSubtitlesOutline)}
