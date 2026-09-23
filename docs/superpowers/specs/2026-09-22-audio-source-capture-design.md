@@ -366,7 +366,7 @@ Presence's harness (Section 4).
 
 **Landed (2026-09-22; plan `docs/superpowers/plans/2026-09-22-weave-api-audio-source-capture.md`).**
 Moss branch `feat/api-audio-source-capture` off `main-0.7` @ `8a25037e`
-(commits `c350686a`..`cbfc4cb7`; merge recorded in the plan header).
+(commits `c350686a`..`cbfc4cb7` plus the PR-review fixes `89819869`..`f8fb8a22`; merged into `main-0.7` as `916ee18b` via lightningrodlabs/moss#248).
 `@theweave/api` is at `0.7.0-dev.4` in the tree; the npm publish is the
 owner's step (`cd libs/api && npm publish --tag latest` — `latest` is the
 tag `0.7.0-dev.3` carries; verify with `npm view @theweave/api dist-tags`).
