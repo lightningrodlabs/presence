@@ -297,6 +297,13 @@ export class RoomView extends LitElement {
     () => [this.streamsStore]
   );
 
+  /** The active system-audio share for the mic menu's "Including: …" row. */
+  _systemAudio = new StoreSubscriber(
+    this,
+    () => this.streamsStore.systemAudio,
+    () => [this.streamsStore]
+  );
+
   // The unfulfilled-intent diffs (Task 6) — the badge on a toggle button
   // and the carrier banner both read this ONE store source, so a surfaced
   // warning always tracks a reconciliation the store is actually running.
@@ -475,6 +482,41 @@ export class RoomView extends LitElement {
     scope: 'mic' | 'camera' | 'carrier'
   ): IntentDiff | undefined {
     return (this._intentDiffs.value ?? []).find(d => d.scope === scope);
+  }
+
+  /**
+   * The "Include audio from…" row (spec Section 4). Rendered only when the
+   * host offers the seam; disabled while the mic is not wanted (v1 rides
+   * the mic track). The active state comes from the store's `systemAudio`
+   * readable, the gestures are the store's `systemAudioOn/Off`.
+   */
+  private _renderSystemAudioRow() {
+    const active = this._systemAudio.value;
+    const micWanted = !!this._localIntent.value?.mic.wanted;
+    const disabled = !active && !micWanted;
+    const label = active
+      ? `✓ ${msg('Including')}: ${active.label}${active.canExcludeSelf ? '' : ` ${msg('(may echo)')}`}`
+      : msg('Include audio from…');
+    const act = async () => {
+      if (disabled) return;
+      this.closeClosables();
+      if (active) this.streamsStore.systemAudioOff();
+      else await this.streamsStore.systemAudioOn();
+    };
+    return html`
+      <div class="system-audio-divider"></div>
+      <div
+        class="audio-source column ${disabled ? 'disabled' : ''}"
+        tabindex="0"
+        title=${disabled ? msg('Turn your microphone on first') : ''}
+        @click=${act}
+        @keypress=${async (e: KeyboardEvent) => {
+          if (e.key === 'Enter') await act();
+        }}
+      >
+        <div class="row">${label}</div>
+      </div>
+    `;
   }
 
   /** Warning-badge class for a capture toggle: '' when met, amber-pulsing
@@ -1761,6 +1803,9 @@ export class RoomView extends LitElement {
                         </div>
                       `;
                     })}
+                    ${this.streamsStore.canCaptureAudioSources
+                      ? this._renderSystemAudioRow()
+                      : html``}
                   </div>
                 `
               : html``}
@@ -4503,6 +4548,16 @@ export class RoomView extends LitElement {
 
       .audio-source:hover {
         background: #263368;
+      }
+
+      .system-audio-divider {
+        height: 1px;
+        margin: 6px 0;
+        background: rgba(255, 255, 255, 0.25);
+      }
+      .audio-source.disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
       }
 
       /*
