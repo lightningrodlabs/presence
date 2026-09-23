@@ -1,3 +1,5 @@
+import { decideMicOutput, isUsableMixin, type MicOutputMode } from './mic-output-policy';
+
 /**
  * MicSource — transport-agnostic owner of the user's microphone.
  *
@@ -31,6 +33,19 @@
  * and future audio consumers should use it rather than creating their own,
  * so we don't end up with clock drift between contexts or multiple
  * autoplay-gesture prompts.
+ *
+ * Mixin (spec Section 4): `setMixin(track)` includes a second audio track
+ * (system audio the host granted) in the ONE output track consumers hold:
+ * device + mixin → two `MediaStreamAudioSourceNode`s → one
+ * `MediaStreamAudioDestinationNode` in the shared 48 kHz context; the
+ * destination's track is the output. `decideMicOutput` (mic-output-policy.ts)
+ * is the only decision; `_installOutputTrack` the only swap; the store's
+ * `onTrackChange` device-change branch carries it to peers. A device change
+ * or reopen while mixed replaces only the device source node — the output
+ * track, and every consumer's view of it, is untouched. Real audio-graph
+ * behaviour (the mixin audible to a peer, no echo) is validated manually —
+ * see the plan's final task; node tests cover the decision and the swap
+ * plumbing with fakes.
  */
 
 /**
@@ -51,7 +66,7 @@ export type CaptureLifecycle =
 
 /** True iff `track` is non-null and not yet ended. The one predicate both
  *  `acquire()` and `_ensureOpen()` use to decide whether a device needs
- *  (re)opening — replaces the old `!this._track` check, which read a
+ *  (re)opening — replaces the old `!this._deviceTrack` check, which read a
  *  stale (externally-ended) track as still usable. */
 export function isLiveTrack(track: MediaStreamTrack | null): track is MediaStreamTrack {
   return !!track && track.readyState === 'live';
@@ -117,7 +132,20 @@ export interface MicSourceBindings {
 export class MicSource {
   private bindings: MicSourceBindings;
 
-  private _track: MediaStreamTrack | null = null;
+  private _deviceTrack: MediaStreamTrack | null = null;
+
+  private _mixin: MediaStreamTrack | null = null;
+
+  /** The output consumers hold: the device track, or the mix destination's track. */
+  private _outputTrack: MediaStreamTrack | null = null;
+
+  private _mix: {
+    device: MediaStreamTrack;
+    mixin: MediaStreamTrack;
+    deviceNode: MediaStreamAudioSourceNode;
+    mixinNode: MediaStreamAudioSourceNode;
+    destination: MediaStreamAudioDestinationNode;
+  } | null = null;
 
   /**
    * The raw MediaStream returned by getUserMedia. Held so we can stop the
@@ -146,7 +174,16 @@ export class MicSource {
   }
 
   get track(): MediaStreamTrack | null {
-    return this._track;
+    return this._outputTrack;
+  }
+
+  /** The raw device track; the reconciler and the lifecycle are about this one. */
+  get deviceTrack(): MediaStreamTrack | null {
+    return this._deviceTrack;
+  }
+
+  get outputMode(): MicOutputMode | null {
+    return this._outputTrack ? (this._mix ? 'mixed' : 'device') : null;
   }
 
   get muted(): boolean {
@@ -175,13 +212,15 @@ export class MicSource {
       return null;
     }
 
-    if (!isLiveTrack(this._track)) {
+    if (!isLiveTrack(this._deviceTrack)) {
       const ok = await this._ensureOpen();
-      if (!ok || !this._track) return null;
+      if (!ok || !this._deviceTrack) return null;
     }
 
+    const track = this._outputTrack;
+    if (!track) return null;
+
     this.consumers.set(options.id, options);
-    const track = this._track;
     return {
       track,
       release: () => this._release(options.id),
@@ -208,8 +247,11 @@ export class MicSource {
   setMuted(muted: boolean): void {
     if (this._muted === muted) return;
     this._muted = muted;
-    if (this._track) {
-      this._track.enabled = !muted;
+    if (this._outputTrack) {
+      this._outputTrack.enabled = !muted;
+    }
+    if (this._deviceTrack && this._deviceTrack !== this._outputTrack) {
+      this._deviceTrack.enabled = !muted;
     }
     try {
       this.bindings.onMutedChange(muted);
@@ -229,7 +271,7 @@ export class MicSource {
   async changeDevice(deviceId: string | undefined): Promise<void> {
     this.bindings.setDeviceId(deviceId);
 
-    if (!this._track) return;
+    if (!this._deviceTrack) return;
 
     // A device switch keeps the old track live if the new one fails to
     // open — `markFailed: false` leaves the lifecycle untouched on error.
@@ -260,7 +302,7 @@ export class MicSource {
     deviceId: string | undefined,
     opts: { markFailed: boolean },
   ): Promise<boolean> {
-    const old = this._track;
+    const old = this._deviceTrack;
     const oldStream = this._rawStream;
 
     let newStream: MediaStream;
@@ -288,24 +330,19 @@ export class MicSource {
     if (this._muted) newTrack.enabled = false;
     newTrack.onended = () => this._onTrackEnded(newTrack);
 
-    this._track = newTrack;
+    this._deviceTrack = newTrack;
     this._rawStream = newStream;
     this._setLifecycle({ state: 'live', track: newTrack });
 
-    // Store-level fanout first (replaceTrack on peers, update mainStream).
-    try {
-      this.bindings.onTrackChange(newTrack, old);
-    } catch (e) {
-      console.warn('MicSource: onTrackChange threw on swap', e);
-    }
-
-    // Then per-consumer callbacks for consumers that bind to track identity.
-    for (const c of this.consumers.values()) {
-      try {
-        c.onTrackChanged?.(newTrack);
-      } catch (e) {
-        console.warn(`MicSource: consumer "${c.id}" onTrackChanged threw`, e);
-      }
+    // While mixed, a device swap only replaces the device source node in
+    // the graph — the destination (output) track and every consumer's view
+    // of it are untouched, so no fanout fires. Otherwise this is the
+    // pre-mixin fanout: store-level replaceTrack first, then per-consumer
+    // rebuilds for consumers bound to track identity.
+    if (this._mix) {
+      this._reconcileOutput();
+    } else {
+      this._installOutputTrack(newTrack, old);
     }
 
     // Stop the old stream last so any mid-flight operations above observed
@@ -354,7 +391,7 @@ export class MicSource {
   }
 
   private async _ensureOpen(): Promise<boolean> {
-    if (isLiveTrack(this._track)) return true;
+    if (isLiveTrack(this._deviceTrack)) return true;
     if (this._openingPromise) return this._openingPromise;
 
     this._openingPromise = (async () => {
@@ -364,14 +401,23 @@ export class MicSource {
         // consumer never released it, the device just died underneath
         // them. Stop its stream before opening a replacement so it
         // doesn't leak.
-        if (this._track) {
+        if (this._deviceTrack) {
           const staleStream = this._rawStream;
           if (staleStream) {
             try { staleStream.getTracks().forEach(t => t.stop()); } catch {}
           } else {
-            try { this._track.stop(); } catch {}
+            try { this._deviceTrack.stop(); } catch {}
           }
-          this._track = null;
+          // Non-mixed, the output mirrors the device 1:1 — clear it with
+          // the device so `_reconcileOutput` below sees `current: null`
+          // rather than a stale `{mode:'device'}` pointing at the corpse
+          // (which would read as "already-device" and skip installing the
+          // track this call is about to open). Mixed, the output is the
+          // destination track, untouched by a dead device source.
+          if (this._outputTrack === this._deviceTrack) {
+            this._outputTrack = null;
+          }
+          this._deviceTrack = null;
           this._rawStream = null;
         }
 
@@ -396,13 +442,12 @@ export class MicSource {
         if (this._muted) track.enabled = false;
         track.onended = () => this._onTrackEnded(track);
         this._rawStream = stream;
-        this._track = track;
+        this._deviceTrack = track;
         this._setLifecycle({ state: 'live', track });
-        try {
-          this.bindings.onTrackChange(track, null);
-        } catch (e) {
-          console.warn('MicSource: onTrackChange threw on open', e);
-        }
+        // Installs the device output via `use-device`, or builds the mix
+        // if a mixin was set before the device opened — fanout
+        // `(output, null)` is the open case the store expects.
+        this._reconcileOutput();
         return true;
       } finally {
         this._openingPromise = null;
@@ -420,7 +465,7 @@ export class MicSource {
    * suspended tab, a browser that doesn't fire `ended` reliably).
    */
   private _onTrackEnded(track: MediaStreamTrack): void {
-    if (this._track !== track) return; // stale event from a superseded track
+    if (this._deviceTrack !== track) return; // stale event from a superseded track
     this._setLifecycle({ state: 'ended', endedAt: this.bindings.now() });
   }
 
@@ -434,9 +479,16 @@ export class MicSource {
   }
 
   private _closeDevice(): void {
-    const old = this._track;
+    // Order: capture the old output, disconnect the mix (if any), then
+    // clear the device — so the fanout below carries whatever consumers
+    // actually held (the mixed track when mixed, the device track when not).
+    const oldOutput = this._outputTrack;
+    this._disconnectMix();
+    this._mixin = null;
+
+    const old = this._deviceTrack;
     const oldStream = this._rawStream;
-    this._track = null;
+    this._deviceTrack = null;
     this._rawStream = null;
     this._setLifecycle({ state: 'idle' });
     if (oldStream) {
@@ -444,13 +496,122 @@ export class MicSource {
     } else if (old) {
       try { old.stop(); } catch {}
     }
-    if (old) {
-      try {
-        this.bindings.onTrackChange(null, old);
-      } catch (e) {
-        console.warn('MicSource: onTrackChange threw on close', e);
+    this._installOutputTrack(null, oldOutput);
+  }
+
+  /** Apply decideMicOutput to the current device/mixin state. Returns true iff the output includes the mixin. */
+  private _reconcileOutput(): boolean {
+    const current = this._mix
+      ? { mode: 'mixed' as const, device: this._mix.device, mixin: this._mix.mixin }
+      : this._outputTrack ? { mode: 'device' as const } : null;
+    const decision = decideMicOutput({ device: this._deviceTrack, mixin: this._mixin, current });
+    switch (decision.kind) {
+      case 'none':
+        return this._mix !== null;
+      case 'use-device':
+        this._installOutputTrack(this._deviceTrack, this._outputTrack);
+        return false;
+      case 'tear-mix': {
+        const old = this._outputTrack;
+        this._disconnectMix();
+        if (decision.reason === 'mixin-ended') this._mixin = null;
+        this._installOutputTrack(this._deviceTrack, old);
+        return false;
+      }
+      case 'build-mix': {
+        if (this._mix && decision.reason === 'device-changed') {
+          // Same destination, same output track: only the device source node changes.
+          this._replaceMixDeviceNode();
+          return true;
+        }
+        const old = this._outputTrack;
+        if (!this._buildMix()) {
+          // No Web Audio: keep the device path and drop the request.
+          this._mixin = null;
+          if (old !== this._deviceTrack) this._installOutputTrack(this._deviceTrack, old);
+          return false;
+        }
+        this._installOutputTrack(this._mix!.destination.stream.getAudioTracks()[0], old);
+        return true;
+      }
+      default: {
+        const exhaustive: never = decision;
+        void exhaustive;
+        return false;
       }
     }
+  }
+
+  private _buildMix(): boolean {
+    const ctx = this.ensureAudioContext();
+    const device = this._deviceTrack;
+    const mixin = this._mixin;
+    if (!ctx || !device || !mixin) return false;
+    this._disconnectMix();
+    try {
+      const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
+      const mixinNode = ctx.createMediaStreamSource(new MediaStream([mixin]));
+      const destination = ctx.createMediaStreamDestination();
+      deviceNode.connect(destination);
+      mixinNode.connect(destination);
+      this._mix = { device, mixin, deviceNode, mixinNode, destination };
+      return true;
+    } catch (e) {
+      console.error('MicSource: building the mix graph failed', e);
+      this._mix = null;
+      return false;
+    }
+  }
+
+  private _replaceMixDeviceNode(): void {
+    const mix = this._mix;
+    const device = this._deviceTrack;
+    if (!mix || !device) return;
+    const ctx = this.ensureAudioContext();
+    if (!ctx) return;
+    try { mix.deviceNode.disconnect(); } catch {}
+    const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
+    deviceNode.connect(mix.destination);
+    this._mix = { ...mix, device, deviceNode };
+  }
+
+  /** Disconnect the graph and end the destination track (nobody holds it after the swap). */
+  private _disconnectMix(): void {
+    const mix = this._mix;
+    if (!mix) return;
+    this._mix = null;
+    try { mix.deviceNode.disconnect(); } catch {}
+    try { mix.mixinNode.disconnect(); } catch {}
+    try { mix.destination.stream.getAudioTracks().forEach(t => t.stop()); } catch {}
+  }
+
+  /**
+   * The ONE output swap: mute state applied, store fanout first
+   * (replaceTrack on peers), then per-consumer rebuilds. `null` new is the
+   * close case (fanout with the old output).
+   */
+  private _installOutputTrack(newTrack: MediaStreamTrack | null, oldTrack: MediaStreamTrack | null): void {
+    if (newTrack === oldTrack) return;
+    if (newTrack) newTrack.enabled = !this._muted;
+    this._outputTrack = newTrack;
+    try {
+      this.bindings.onTrackChange(newTrack, oldTrack);
+    } catch (e) {
+      console.warn('MicSource: onTrackChange threw on output swap', e);
+    }
+    if (newTrack) {
+      for (const c of this.consumers.values()) {
+        try { c.onTrackChanged?.(newTrack); } catch (e) {
+          console.warn(`MicSource: consumer "${c.id}" onTrackChanged threw`, e);
+        }
+      }
+    }
+  }
+
+  /** Include (or remove, with null) a second audio track in the output. Returns true iff the output now includes it. */
+  setMixin(track: MediaStreamTrack | null): boolean {
+    this._mixin = isUsableMixin(track) ? track : null;
+    return this._reconcileOutput();
   }
 
   private _audioConstraints(deviceId: string | undefined): MediaTrackConstraints {
