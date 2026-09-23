@@ -294,7 +294,7 @@ process-tree computation from a fake `getAppMetrics`),
 
 **Landed (2026-09-22; plan `docs/superpowers/plans/2026-09-22-moss-audio-sources.md`).**
 Moss branch `feat/audio-source-capture` off `main-0.7` @ `1c6db768`, commits
-`f66d4f53`..`09922dea` (16 commits; merge/PR recorded in the plan header).
+`f66d4f53`..`09922dea` (16 commits), merged `--no-ff` into `main-0.7` as `8a25037e`.
 Every task was adversarially reviewed and the whole branch reviewed once
 more; the round-trip was observed live (CDP-driven, real 0.7 conductor):
 picker → grant → frames at peak 26215 from a non-Moss `speaker-test` →
