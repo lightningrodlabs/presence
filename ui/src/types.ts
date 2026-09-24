@@ -1,4 +1,4 @@
-import { AgentPubKey, DnaHash, AgentPubKeyB64 } from '@holochain/client';
+import { AgentPubKey, DnaHash, AgentPubKeyB64, Timestamp } from '@holochain/client';
 import { ActionCommittedSignal } from '@holochain-open-dev/utils';
 import { WeaveClient } from '@theweave/api';
 import { createContext } from '@lit/context';
@@ -275,6 +275,18 @@ export type ConnectionStatus =
        */
       type: 'Connected';
     };
+
+/**
+ * One `get_all_agents` row: an agent registered on the room's ALL_AGENTS
+ * anchor and the commit timestamp (µs) of that anchor link — written once
+ * per cell by the zome's `init`, so it is "when this agent first joined
+ * this room, ever". Read from the DHT by every participant; the grid sorts
+ * tiles on it (`orderTiles`, room/tile-order-policy.ts).
+ */
+export type AgentJoin = {
+  agent: AgentPubKey;
+  joined_at: Timestamp;
+};
 
 export type AgentInfo = {
   pubkey: AgentPubKeyB64;

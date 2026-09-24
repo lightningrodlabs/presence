@@ -101,6 +101,7 @@ import {
   GRID_MIN_TILE_WIDTH,
   GRID_TOOLBAR_RESERVE,
 } from './layout';
+import { orderTiles, OrderedTile } from './tile-order-policy';
 import { countAudiblePeers } from '../peer-link-policy';
 import { describeLinkEstablishment } from '../intent-diff-policy';
 import type { IntentDiff } from '../intent-diff-policy';
@@ -145,9 +146,14 @@ export class RoomView extends LitElement {
 
   _customLogTimestamp: number | undefined;
 
-  _allAgentsFromAnchor = new StoreSubscriber(
+  /**
+   * Anchor-link join times — the grid-order key read by _orderedTiles.
+   * Replaces the never-read `_allAgentsFromAnchor` subscriber, whose only
+   * effect was keeping the same anchor poll warm.
+   */
+  _agentJoinedAt = new StoreSubscriber(
     this,
-    () => this.roomStore.allAgents,
+    () => this.roomStore.agentJoinedAt,
     () => [this.roomStore]
   );
 
@@ -861,6 +867,20 @@ export class RoomView extends LitElement {
    */
   private _visiblePeers(): AgentPubKeyB64[] {
     return this._presentPeers.value;
+  }
+
+  /**
+   * The grid's tiles in render order — `orderTiles` (room/tile-order-policy.ts)
+   * over the present set, the phantom set, and the anchor-link join times.
+   * Until the anchor poll completes, every peer sorts by pubkey.
+   */
+  private _orderedTiles(): OrderedTile[] {
+    const joined = this._agentJoinedAt.value;
+    return orderTiles({
+      present: this._visiblePeers(),
+      phantoms: this.streamsStore.phantomAgents(),
+      joinedAt: joined?.status === 'complete' ? joined.value : {},
+    });
   }
 
   /**
@@ -2677,7 +2697,334 @@ export class RoomView extends LitElement {
   }
 
   /**
-   * Render a placeholder tile per agent in `phantomAgents()` — agents
+   * One present peer's tile. Body lifted verbatim from the former inline
+   * repeat() callback in render(); ordering lives in _orderedTiles.
+   */
+  private _renderPeerTile(pubkeyB64: AgentPubKeyB64) {
+    const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
+    const moduleContext: ModuleRenderContext = {
+      isMe: false,
+      connected: true,
+      circleView: this._circleView,
+      streamsStore: this.streamsStore,
+      myPubKeyB64: encodeHashToBase64(this.roomStore.client.client.myPubKey),
+      extra: { conn },
+    };
+    // Determine active replace module for this peer's pane
+    const activeReplaceModule = this._getActiveReplaceModule(pubkeyB64, moduleContext);
+    const videoElId = `video-${pubkeyB64}`;
+
+    // Avatar visibility:
+    //   - conn undefined (signals mode, no WebRTC peer):       show
+    //   - conn defined && !conn.connected (still establishing): hide
+    //                                                          (status text below shows instead)
+    //   - conn defined && conn.connected && !conn.video:       show
+    //   - conn defined && conn.connected && conn.video:        hide (WebRTC video covers it)
+    // Hide the avatar when WebRTC video is live OR when the
+    // filmstrip is currently displaying a clip from this peer.
+    // Hiding while filmstrip is active prevents the avatar
+    // from flashing through any transparent moment in the
+    // bg-image swap.
+    const filmstripActive = this._filmstripActivePeers.has(pubkeyB64);
+    const avatarHidden = filmstripActive
+      ? true
+      : conn
+        ? !conn.connected || !!conn.video
+        : false;
+    return html`
+    <div
+      class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
+      @dblclick=${() => this.toggleMaximized(pubkeyB64)}
+    >
+      <!--
+        Avatar and peer-filmstrip are rendered at FIXED positions in
+        this template (not inside the conditional branches below) so
+        Lit preserves them across renders. When conn flickers between
+        defined and undefined during WebRTC reconnect attempts, the
+        conditional sections rebuild, but these two elements stay
+        mounted — no unmount/remount window during which the avatar
+        or container background would flash through.
+      -->
+      <avatar-with-nickname
+        .hideNickname=${true}
+        .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+        style="width: 35%;${avatarHidden ? ' display: none;' : ''}"
+      ></avatar-with-nickname>
+      <peer-filmstrip
+        .agentPubKeyB64=${pubkeyB64}
+        .onActiveChange=${(active: boolean) => this._onFilmstripActive(pubkeyB64, active)}
+      ></peer-filmstrip>
+
+      <!--
+        Layering over the always-mounted avatar+filmstrip: the
+        avatar is in-flow, so every positioned sibling paints
+        above it; among the positioned siblings document order
+        decides. WebRTC video (.video-el is position: relative —
+        pinned by video-el-paint-order.test.ts) is rendered after
+        the filmstrip host, so an active video covers it;
+        replace-module covers everything via
+        .module-replace-content's z-index.
+      -->
+      ${activeReplaceModule
+        ? html`<div class="module-replace-content">${activeReplaceModule.html}</div>`
+        : html``}
+      ${conn
+        ? html`
+            <video
+              style="${conn.video ? '' : 'display: none;'}"
+              id="${videoElId}"
+              class="video-el"
+            ></video>
+            ${(() => {
+              // Copy lives ONLY in intent-diff-policy.ts
+              // (describeLinkEstablishment) — first-establishment
+              // vs reconnection is decided there, not inline here.
+              const est = this._tileEstablishmentCopy(
+                pubkeyB64,
+                !!conn.connected
+              );
+              return est
+                ? html`<div
+                    style="color: #b9a884; font-size: 0.8em;"
+                  >
+                    ${est}
+                  </div>`
+                : html``;
+            })()}
+            <div
+              style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
+            >
+              connecting media...
+            </div>
+          `
+        : html``}
+
+      <!--
+        Signaling-held indicator. This tile is rendered from the
+        present predicate; if the peer is NOT in _activeAgents,
+        the only reason they are present is media-flowing — on
+        either carrier. Surface a quiet amber marker so the user
+        understands the link is degraded-but-recovering and does
+        NOT manually tear it down. (Was additionally gated on
+        conn?.connected, which covered only the WebRTC half and
+        so missed the signals-only peer whose tile Phase 2
+        deliberately preserves — PR #4 F1.)
+      -->
+      ${!this._activeAgents.value[pubkeyB64]
+        ? html`
+            <sl-tooltip
+              hoist
+              class="tooltip-filled"
+              placement="top"
+              content="Signaling unstable — holding this connection on live media. It should recover on its own."
+            >
+              <div
+                style="position: absolute; top: 10px; right: 10px; width: 10px; height: 10px; border-radius: 50%; background: #e7a008; box-shadow: 0 0 6px #e7a008; opacity: 0.85;"
+              ></div>
+            </sl-tooltip>
+          `
+        : html``}
+
+      <!-- Connection detail statuses (debug) -->
+      ${this._showConnectionDetails
+        ? html`<div
+            style="display: flex; flex-direction: column; align-items: flex-start; gap: 2px; position: absolute; top: 10px; left: 10px; background: none;"
+          >
+            <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
+              ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
+              ${this._renderCarrierToggle(pubkeyB64)}
+            </div>
+            <peer-stats-panel
+              .streamsStore=${this.streamsStore}
+              .agentPubKeyB64=${pubkeyB64}
+            ></peer-stats-panel>
+          </div>`
+        : html``}
+
+      <!-- Module overlays -->
+      ${this.renderModuleOverlays(pubkeyB64, moduleContext)}
+
+      <!-- Pane chrome: icons + avatar + maximize -->
+      ${this._circleView
+        ? html`
+            <div
+              class="tile-meta"
+              style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
+            >
+              <div class="row" style="margin-bottom: 4px;">
+                <sl-icon
+                  title="${this._maximizedVideo === pubkeyB64
+                    ? 'minimize'
+                    : 'maximize'}"
+                  .src=${this._maximizedVideo === pubkeyB64
+                    ? wrapPathInSvg(mdiFullscreenExit)
+                    : wrapPathInSvg(mdiFullscreen)}
+                  tabindex="0"
+                  style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
+                  @click=${() => {
+                    this.toggleMaximized(pubkeyB64);
+                  }}
+                  @keypress=${(e: KeyboardEvent) => {
+                    if (e.key === 'Enter') {
+                      this.toggleMaximized(pubkeyB64);
+                    }
+                  }}
+                ></sl-icon>
+                ${this.renderModuleIconStrip(pubkeyB64, moduleContext)}
+              </div>
+              <div class="row" style="align-items: center;">
+                <avatar-with-nickname
+                  .size=${36}
+                  .hideAvatar=${!conn?.video}
+                  .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                  style="height: 36px;"
+                ></avatar-with-nickname>
+                ${this.renderModuleSwitcher(pubkeyB64)}
+                ${this._renderAudioLevelMeter(pubkeyB64)}
+                ${this._showConnectionDetails
+                  ? html`
+                      <sl-tooltip
+                        content="log stream info"
+                        class="tooltip-filled"
+                      >
+                        <sl-icon-button
+                          src=${wrapPathInSvg(mdiPencilCircleOutline)}
+                          style="margin-bottom: -5px;"
+                          @click=${() => {
+                            const videoEl = this.shadowRoot?.getElementById(
+                              videoElId
+                            ) as HTMLVideoElement;
+                            if (videoEl) {
+                              const stream = videoEl.srcObject;
+                              const tracks = stream
+                                ? (stream as MediaStream).getTracks()
+                                : null;
+                              console.log(
+                                '\nSTREAMINFO:',
+                                stream,
+                                '\nTRACKS: ',
+                                tracks
+                              );
+                              const tracksInfo: any[] = [];
+                              tracks?.forEach(track => {
+                                tracksInfo.push({
+                                  kind: track.kind,
+                                  enabled: track.enabled,
+                                  muted: track.muted,
+                                  readyState: track.readyState,
+                                });
+                              });
+                              const streamInfo = stream
+                                ? {
+                                    active: (stream as MediaStream).active,
+                                  }
+                                : null;
+                              navigator.clipboard.writeText(
+                                JSON.stringify(
+                                  { stream: streamInfo, tracks: tracksInfo },
+                                  undefined,
+                                  2
+                                )
+                              );
+                            }
+                          }}
+                        ></sl-icon-button>
+                      </sl-tooltip>
+                    `
+                  : html``}
+              </div>
+            </div>
+          `
+        : html`
+            <div
+              class="tile-meta"
+              style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
+            >
+              ${this.renderModuleIconStrip(pubkeyB64, moduleContext)}
+              <avatar-with-nickname
+                .size=${36}
+                .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
+                style="height: 36px;"
+              ></avatar-with-nickname>
+              ${this.renderModuleSwitcher(pubkeyB64)}
+              <sl-icon
+                title="${this._maximizedVideo === pubkeyB64
+                  ? 'minimize'
+                  : 'maximize'}"
+                .src=${this._maximizedVideo === pubkeyB64
+                  ? wrapPathInSvg(mdiFullscreenExit)
+                  : wrapPathInSvg(mdiFullscreen)}
+                tabindex="0"
+                style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
+                @click=${() => {
+                  this.toggleMaximized(pubkeyB64);
+                }}
+                @keypress=${(e: KeyboardEvent) => {
+                  if (e.key === 'Enter') {
+                    this.toggleMaximized(pubkeyB64);
+                  }
+                }}
+              ></sl-icon>
+              ${this._renderAudioLevelMeter(pubkeyB64)}
+              ${this._showConnectionDetails
+                ? html`
+                    <sl-tooltip
+                      content="log stream info"
+                      class="tooltip-filled"
+                    >
+                      <sl-icon-button
+                        src=${wrapPathInSvg(mdiPencilCircleOutline)}
+                        style="margin-bottom: -5px;"
+                        @click=${() => {
+                          const videoEl = this.shadowRoot?.getElementById(
+                            videoElId
+                          ) as HTMLVideoElement;
+                          if (videoEl) {
+                            const stream = videoEl.srcObject;
+                            const tracks = stream
+                              ? (stream as MediaStream).getTracks()
+                              : null;
+                            console.log(
+                              '\nSTREAMINFO:',
+                              stream,
+                              '\nTRACKS: ',
+                              tracks
+                            );
+                            const tracksInfo: any[] = [];
+                            tracks?.forEach(track => {
+                              tracksInfo.push({
+                                kind: track.kind,
+                                enabled: track.enabled,
+                                muted: track.muted,
+                                readyState: track.readyState,
+                              });
+                            });
+                            const streamInfo = stream
+                              ? {
+                                  active: (stream as MediaStream).active,
+                                }
+                              : null;
+                            navigator.clipboard.writeText(
+                              JSON.stringify(
+                                { stream: streamInfo, tracks: tracksInfo },
+                                undefined,
+                                2
+                              )
+                            );
+                          }
+                        }}
+                      ></sl-icon-button>
+                    </sl-tooltip>
+                  `
+                : html``}
+            </div>
+          `}
+    </div>
+    `;
+  }
+
+  /**
+   * One phantom tile (an agent in `phantomAgents()`) — agents
    * other peers report as in-room with a working audio link, but who we
    * cannot see directly. Suppresses the normal tile chrome (no video
    * element, no module overlays, no audio meter, no per-tile connection
@@ -2685,68 +3032,60 @@ export class RoomView extends LitElement {
    * Lists the observers who DO see them so the user can tell whether
    * the issue is the peer or our own connectivity.
    */
-  private _renderPhantomTiles() {
-    const phantoms = this.streamsStore.phantomAgents();
-    if (phantoms.length === 0) return html``;
-    return html`${repeat(
-      phantoms,
-      pk => pk,
-      pk => {
-        const seeing = this.streamsStore.observersSeeing(pk);
-        const hearing = this.streamsStore.observersHearing(pk);
-        // Prefer the "heard by" framing when any observer reports live
-        // audio; fall back to "last seen by" when presence is only
-        // ping-level (impolite close in progress, link broken
-        // everywhere). "connected" is reserved for ICE + DTLS up and is
-        // not a claim this tile can make (Phase 4 item 4).
-        const label = hearing.length > 0 ? 'heard by' : 'last seen by';
-        const observers = seeing;
-        return html`
-          <div
-            class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
-            style="opacity: 0.7;"
-            title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not reachable by you"
-          >
-            <avatar-with-nickname
-              .hideNickname=${true}
-              .agentPubKey=${decodeHashFromBase64(pk)}
-              style="width: 35%;"
-            ></avatar-with-nickname>
-            <div
-              class="secondary-font"
-              style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
+  private _renderPhantomTile(pk: AgentPubKeyB64) {
+    const seeing = this.streamsStore.observersSeeing(pk);
+    const hearing = this.streamsStore.observersHearing(pk);
+    // Prefer the "heard by" framing when any observer reports live
+    // audio; fall back to "last seen by" when presence is only
+    // ping-level (impolite close in progress, link broken
+    // everywhere). "connected" is reserved for ICE + DTLS up and is
+    // not a claim this tile can make (Phase 4 item 4).
+    const label = hearing.length > 0 ? 'heard by' : 'last seen by';
+    const observers = seeing;
+    return html`
+      <div
+        class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
+        style="opacity: 0.7;"
+        title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not reachable by you"
+      >
+        <avatar-with-nickname
+          .hideNickname=${true}
+          .agentPubKey=${decodeHashFromBase64(pk)}
+          style="width: 35%;"
+        ></avatar-with-nickname>
+        <div
+          class="secondary-font"
+          style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
+        >
+          reported in room — not reachable by you
+        </div>
+        ${observers.length > 0
+          ? html`<div
+              style="position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px;"
             >
-              reported in room — not reachable by you
-            </div>
-            ${observers.length > 0
-              ? html`<div
-                  style="position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px;"
-                >
-                  <span
-                    class="secondary-font"
-                    style="color: #c3c9eb; font-size: 18px; opacity: 0.85;"
-                    >${label}</span
+              <span
+                class="secondary-font"
+                style="color: #c3c9eb; font-size: 18px; opacity: 0.85;"
+                >${label}</span
+              >
+              <div style="display: flex; flex-direction: row; gap: 4px;">
+                ${repeat(
+                  observers,
+                  obs => obs,
+                  obs => html`<div
+                    style="width: 24px; height: 24px; display: inline-block;"
                   >
-                  <div style="display: flex; flex-direction: row; gap: 4px;">
-                    ${repeat(
-                      observers,
-                      obs => obs,
-                      obs => html`<div
-                        style="width: 24px; height: 24px; display: inline-block;"
-                      >
-                        <avatar-with-nickname
-                          .hideNickname=${true}
-                          .agentPubKey=${decodeHashFromBase64(obs)}
-                        ></avatar-with-nickname>
-                      </div>`,
-                    )}
-                  </div>
-                </div>`
-              : html``}
-          </div>
-        `;
-      },
-    )}`;
+                    <avatar-with-nickname
+                      .hideNickname=${true}
+                      .agentPubKey=${decodeHashFromBase64(obs)}
+                    ></avatar-with-nickname>
+                  </div>`,
+                )}
+              </div>
+            </div>`
+          : html``}
+      </div>
+    `;
   }
 
   renderAgentConnectionStatuses(
@@ -3273,334 +3612,18 @@ export class RoomView extends LitElement {
           `;
         })()}
 
-        <!-- Panes for visible peers: presence-fresh OR media-live (a stale
-             signaling pong must not drop a tile whose media still flows). -->
+        <!-- Peer and phantom tiles: ONE repeat keyed by pubkey in orderTiles
+             order (room/tile-order-policy.ts — anchor-link join time), so a
+             peer keeps its slot across present/phantom and ping-fresh/media-only
+             transitions. Membership is still the present predicate. -->
         ${repeat(
-          this._visiblePeers(),
-          (pubkeyB64) => pubkeyB64,
-          (pubkeyB64) => {
-            const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
-            const moduleContext: ModuleRenderContext = {
-              isMe: false,
-              connected: true,
-              circleView: this._circleView,
-              streamsStore: this.streamsStore,
-              myPubKeyB64: encodeHashToBase64(this.roomStore.client.client.myPubKey),
-              extra: { conn },
-            };
-            // Determine active replace module for this peer's pane
-            const activeReplaceModule = this._getActiveReplaceModule(pubkeyB64, moduleContext);
-            const videoElId = `video-${pubkeyB64}`;
-
-            // Avatar visibility:
-            //   - conn undefined (signals mode, no WebRTC peer):       show
-            //   - conn defined && !conn.connected (still establishing): hide
-            //                                                          (status text below shows instead)
-            //   - conn defined && conn.connected && !conn.video:       show
-            //   - conn defined && conn.connected && conn.video:        hide (WebRTC video covers it)
-            // Hide the avatar when WebRTC video is live OR when the
-            // filmstrip is currently displaying a clip from this peer.
-            // Hiding while filmstrip is active prevents the avatar
-            // from flashing through any transparent moment in the
-            // bg-image swap.
-            const filmstripActive = this._filmstripActivePeers.has(pubkeyB64);
-            const avatarHidden = filmstripActive
-              ? true
-              : conn
-                ? !conn.connected || !!conn.video
-                : false;
-            return html`
-            <div
-              class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
-              @dblclick=${() => this.toggleMaximized(pubkeyB64)}
-            >
-              <!--
-                Avatar and peer-filmstrip are rendered at FIXED positions in
-                this template (not inside the conditional branches below) so
-                Lit preserves them across renders. When conn flickers between
-                defined and undefined during WebRTC reconnect attempts, the
-                conditional sections rebuild, but these two elements stay
-                mounted — no unmount/remount window during which the avatar
-                or container background would flash through.
-              -->
-              <avatar-with-nickname
-                .hideNickname=${true}
-                .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                style="width: 35%;${avatarHidden ? ' display: none;' : ''}"
-              ></avatar-with-nickname>
-              <peer-filmstrip
-                .agentPubKeyB64=${pubkeyB64}
-                .onActiveChange=${(active: boolean) => this._onFilmstripActive(pubkeyB64, active)}
-              ></peer-filmstrip>
-
-              <!--
-                Layering over the always-mounted avatar+filmstrip: the
-                avatar is in-flow, so every positioned sibling paints
-                above it; among the positioned siblings document order
-                decides. WebRTC video (.video-el is position: relative —
-                pinned by video-el-paint-order.test.ts) is rendered after
-                the filmstrip host, so an active video covers it;
-                replace-module covers everything via
-                .module-replace-content's z-index.
-              -->
-              ${activeReplaceModule
-                ? html`<div class="module-replace-content">${activeReplaceModule.html}</div>`
-                : html``}
-              ${conn
-                ? html`
-                    <video
-                      style="${conn.video ? '' : 'display: none;'}"
-                      id="${videoElId}"
-                      class="video-el"
-                    ></video>
-                    ${(() => {
-                      // Copy lives ONLY in intent-diff-policy.ts
-                      // (describeLinkEstablishment) — first-establishment
-                      // vs reconnection is decided there, not inline here.
-                      const est = this._tileEstablishmentCopy(
-                        pubkeyB64,
-                        !!conn.connected
-                      );
-                      return est
-                        ? html`<div
-                            style="color: #b9a884; font-size: 0.8em;"
-                          >
-                            ${est}
-                          </div>`
-                        : html``;
-                    })()}
-                    <div
-                      style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
-                    >
-                      connecting media...
-                    </div>
-                  `
-                : html``}
-
-              <!--
-                Signaling-held indicator. This tile is rendered from the
-                present predicate; if the peer is NOT in _activeAgents,
-                the only reason they are present is media-flowing — on
-                either carrier. Surface a quiet amber marker so the user
-                understands the link is degraded-but-recovering and does
-                NOT manually tear it down. (Was additionally gated on
-                conn?.connected, which covered only the WebRTC half and
-                so missed the signals-only peer whose tile Phase 2
-                deliberately preserves — PR #4 F1.)
-              -->
-              ${!this._activeAgents.value[pubkeyB64]
-                ? html`
-                    <sl-tooltip
-                      hoist
-                      class="tooltip-filled"
-                      placement="top"
-                      content="Signaling unstable — holding this connection on live media. It should recover on its own."
-                    >
-                      <div
-                        style="position: absolute; top: 10px; right: 10px; width: 10px; height: 10px; border-radius: 50%; background: #e7a008; box-shadow: 0 0 6px #e7a008; opacity: 0.85;"
-                      ></div>
-                    </sl-tooltip>
-                  `
-                : html``}
-
-              <!-- Connection detail statuses (debug) -->
-              ${this._showConnectionDetails
-                ? html`<div
-                    style="display: flex; flex-direction: column; align-items: flex-start; gap: 2px; position: absolute; top: 10px; left: 10px; background: none;"
-                  >
-                    <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
-                      ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
-                      ${this._renderCarrierToggle(pubkeyB64)}
-                    </div>
-                    <peer-stats-panel
-                      .streamsStore=${this.streamsStore}
-                      .agentPubKeyB64=${pubkeyB64}
-                    ></peer-stats-panel>
-                  </div>`
-                : html``}
-
-              <!-- Module overlays -->
-              ${this.renderModuleOverlays(pubkeyB64, moduleContext)}
-
-              <!-- Pane chrome: icons + avatar + maximize -->
-              ${this._circleView
-                ? html`
-                    <div
-                      class="tile-meta"
-                      style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
-                    >
-                      <div class="row" style="margin-bottom: 4px;">
-                        <sl-icon
-                          title="${this._maximizedVideo === pubkeyB64
-                            ? 'minimize'
-                            : 'maximize'}"
-                          .src=${this._maximizedVideo === pubkeyB64
-                            ? wrapPathInSvg(mdiFullscreenExit)
-                            : wrapPathInSvg(mdiFullscreen)}
-                          tabindex="0"
-                          style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
-                          @click=${() => {
-                            this.toggleMaximized(pubkeyB64);
-                          }}
-                          @keypress=${(e: KeyboardEvent) => {
-                            if (e.key === 'Enter') {
-                              this.toggleMaximized(pubkeyB64);
-                            }
-                          }}
-                        ></sl-icon>
-                        ${this.renderModuleIconStrip(pubkeyB64, moduleContext)}
-                      </div>
-                      <div class="row" style="align-items: center;">
-                        <avatar-with-nickname
-                          .size=${36}
-                          .hideAvatar=${!conn?.video}
-                          .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                          style="height: 36px;"
-                        ></avatar-with-nickname>
-                        ${this.renderModuleSwitcher(pubkeyB64)}
-                        ${this._renderAudioLevelMeter(pubkeyB64)}
-                        ${this._showConnectionDetails
-                          ? html`
-                              <sl-tooltip
-                                content="log stream info"
-                                class="tooltip-filled"
-                              >
-                                <sl-icon-button
-                                  src=${wrapPathInSvg(mdiPencilCircleOutline)}
-                                  style="margin-bottom: -5px;"
-                                  @click=${() => {
-                                    const videoEl = this.shadowRoot?.getElementById(
-                                      videoElId
-                                    ) as HTMLVideoElement;
-                                    if (videoEl) {
-                                      const stream = videoEl.srcObject;
-                                      const tracks = stream
-                                        ? (stream as MediaStream).getTracks()
-                                        : null;
-                                      console.log(
-                                        '\nSTREAMINFO:',
-                                        stream,
-                                        '\nTRACKS: ',
-                                        tracks
-                                      );
-                                      const tracksInfo: any[] = [];
-                                      tracks?.forEach(track => {
-                                        tracksInfo.push({
-                                          kind: track.kind,
-                                          enabled: track.enabled,
-                                          muted: track.muted,
-                                          readyState: track.readyState,
-                                        });
-                                      });
-                                      const streamInfo = stream
-                                        ? {
-                                            active: (stream as MediaStream).active,
-                                          }
-                                        : null;
-                                      navigator.clipboard.writeText(
-                                        JSON.stringify(
-                                          { stream: streamInfo, tracks: tracksInfo },
-                                          undefined,
-                                          2
-                                        )
-                                      );
-                                    }
-                                  }}
-                                ></sl-icon-button>
-                              </sl-tooltip>
-                            `
-                          : html``}
-                      </div>
-                    </div>
-                  `
-                : html`
-                    <div
-                      class="tile-meta"
-                      style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
-                    >
-                      ${this.renderModuleIconStrip(pubkeyB64, moduleContext)}
-                      <avatar-with-nickname
-                        .size=${36}
-                        .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
-                        style="height: 36px;"
-                      ></avatar-with-nickname>
-                      ${this.renderModuleSwitcher(pubkeyB64)}
-                      <sl-icon
-                        title="${this._maximizedVideo === pubkeyB64
-                          ? 'minimize'
-                          : 'maximize'}"
-                        .src=${this._maximizedVideo === pubkeyB64
-                          ? wrapPathInSvg(mdiFullscreenExit)
-                          : wrapPathInSvg(mdiFullscreen)}
-                        tabindex="0"
-                        style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
-                        @click=${() => {
-                          this.toggleMaximized(pubkeyB64);
-                        }}
-                        @keypress=${(e: KeyboardEvent) => {
-                          if (e.key === 'Enter') {
-                            this.toggleMaximized(pubkeyB64);
-                          }
-                        }}
-                      ></sl-icon>
-                      ${this._renderAudioLevelMeter(pubkeyB64)}
-                      ${this._showConnectionDetails
-                        ? html`
-                            <sl-tooltip
-                              content="log stream info"
-                              class="tooltip-filled"
-                            >
-                              <sl-icon-button
-                                src=${wrapPathInSvg(mdiPencilCircleOutline)}
-                                style="margin-bottom: -5px;"
-                                @click=${() => {
-                                  const videoEl = this.shadowRoot?.getElementById(
-                                    videoElId
-                                  ) as HTMLVideoElement;
-                                  if (videoEl) {
-                                    const stream = videoEl.srcObject;
-                                    const tracks = stream
-                                      ? (stream as MediaStream).getTracks()
-                                      : null;
-                                    console.log(
-                                      '\nSTREAMINFO:',
-                                      stream,
-                                      '\nTRACKS: ',
-                                      tracks
-                                    );
-                                    const tracksInfo: any[] = [];
-                                    tracks?.forEach(track => {
-                                      tracksInfo.push({
-                                        kind: track.kind,
-                                        enabled: track.enabled,
-                                        muted: track.muted,
-                                        readyState: track.readyState,
-                                      });
-                                    });
-                                    const streamInfo = stream
-                                      ? {
-                                          active: (stream as MediaStream).active,
-                                        }
-                                      : null;
-                                    navigator.clipboard.writeText(
-                                      JSON.stringify(
-                                        { stream: streamInfo, tracks: tracksInfo },
-                                        undefined,
-                                        2
-                                      )
-                                    );
-                                  }
-                                }}
-                              ></sl-icon-button>
-                            </sl-tooltip>
-                          `
-                        : html``}
-                    </div>
-                  `}
-            </div>
-          `}
+          this._orderedTiles(),
+          tile => tile.pubkey,
+          tile =>
+            tile.kind === 'present'
+              ? this._renderPeerTile(tile.pubkey)
+              : this._renderPhantomTile(tile.pubkey)
         )}
-        ${this._renderPhantomTiles()}
         </div>
       </div>
       ${this.renderToggles()}
