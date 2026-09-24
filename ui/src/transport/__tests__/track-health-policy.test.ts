@@ -2,6 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   summarizeRtcStats,
   decideTrackRefresh,
+  deadTrackRefreshBudget,
+  DEAD_TRACK_ESCALATION_BACKOFF_CAP,
+  DEAD_TRACK_REFRESH_BUDGET,
   STALE_CYCLES_REFRESH_THRESHOLD,
 } from '../track-health-policy';
 import type {
@@ -33,11 +36,27 @@ const videoInbound = (over: Partial<RtcStatsReportLike> = {}): RtcStatsReportLik
   ...over,
 });
 
+const audioOutbound = (over: Partial<RtcStatsReportLike> = {}): RtcStatsReportLike => ({
+  type: 'outbound-rtp',
+  kind: 'audio',
+  bytesSent: 7000,
+  ...over,
+});
+
+const videoOutbound = (over: Partial<RtcStatsReportLike> = {}): RtcStatsReportLike => ({
+  type: 'outbound-rtp',
+  kind: 'video',
+  bytesSent: 90_000,
+  ...over,
+});
+
 describe('summarizeRtcStats', () => {
   it('returns all-null / zero for an empty report set', () => {
     expect(summarizeRtcStats([])).toEqual({
       audioBytes: 0,
       videoBytes: 0,
+      audioBytesSent: 0,
+      videoBytesSent: 0,
       rttMs: null,
       jitterMs: null,
       lossPercent: null,
@@ -66,6 +85,22 @@ describe('summarizeRtcStats', () => {
   it('accepts mediaType as the kind field (older browsers)', () => {
     const s = summarizeRtcStats([audioInbound({ kind: undefined, mediaType: 'audio' })]);
     expect(s.audioBytes).toBe(1000);
+  });
+
+  it('reads outbound-rtp bytesSent per kind (sender-side forensics)', () => {
+    const s = summarizeRtcStats([audioOutbound(), videoOutbound()]);
+    expect(s.audioBytesSent).toBe(7000);
+    expect(s.videoBytesSent).toBe(90_000);
+    // Outbound reports contribute nothing to the inbound-derived fields.
+    expect(s.audioBytes).toBe(0);
+    expect(s.videoBytes).toBe(0);
+    expect(s.jitterMs).toBeNull();
+    expect(s.lossPercent).toBeNull();
+  });
+
+  it('accepts mediaType in place of kind on outbound-rtp too', () => {
+    const s = summarizeRtcStats([audioOutbound({ kind: undefined, mediaType: 'audio' })]);
+    expect(s.audioBytesSent).toBe(7000);
   });
 
   it('prefers remote-inbound-rtp RTT over the candidate-pair fallback', () => {
@@ -126,14 +161,83 @@ const base: TrackRefreshInputs = {
   lastBytes: { audio: 1000, video: 50_000 },
   staleCycles: { audio: 0, video: 0 },
   staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
+  refreshRequestsSent: 0,
+  refreshBudget: DEAD_TRACK_REFRESH_BUDGET,
+  transportPhase: 'connected',
+  iceDisconnected: false,
 };
 
 describe('decideTrackRefresh', () => {
+  it('holds while the transport is reconnecting: counters held, not advanced', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'reconnecting',
+        audioBytes: 1000,
+        staleCycles: { audio: 1, video: 0 },
+      })
+    ).toEqual({
+      action: 'none',
+      nextStale: { audio: 1, video: 0 },
+      reason: 'transport-recovering',
+      resetRefreshBudget: false,
+    });
+  });
+
+  it('never escalates while the transport is disconnected, even with a spent budget', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'disconnected',
+        audioBytes: 1000,
+        staleCycles: { audio: 2, video: 0 },
+        refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+      }).action
+    ).toBe('none');
+  });
+
+  it('holds while ICE is disconnected inside phase connected: counters held, not advanced', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'connected',
+        iceDisconnected: true,
+        audioBytes: 1000,
+        staleCycles: { audio: 1, video: 0 },
+      })
+    ).toEqual({
+      action: 'none',
+      nextStale: { audio: 1, video: 0 },
+      reason: 'transport-recovering',
+      resetRefreshBudget: false,
+    });
+  });
+
+  it('never escalates while ICE is disconnected, even with a spent budget', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'connected',
+        iceDisconnected: true,
+        audioBytes: 1000,
+        staleCycles: { audio: 2, video: 0 },
+        refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+      }).action
+    ).toBe('none');
+  });
+
+  it('bytes advancing during recovery do not reset the budget', () => {
+    const d = decideTrackRefresh({ ...base, transportPhase: 'reconnecting' });
+    expect(d.action).toBe('none');
+    expect(d.action === 'none' && d.resetRefreshBudget).toBe(false);
+  });
+
   it('bytes advancing resets the counters and requests nothing', () => {
     expect(decideTrackRefresh(base)).toEqual({
       action: 'none',
       nextStale: { audio: 0, video: 0 },
       reason: 'flowing',
+      resetRefreshBudget: true,
     });
   });
 
@@ -146,6 +250,7 @@ describe('decideTrackRefresh', () => {
       action: 'none',
       nextStale: { audio: 1, video: 0 },
       reason: 'flowing',
+      resetRefreshBudget: false,
     });
   });
 
@@ -197,5 +302,92 @@ describe('decideTrackRefresh', () => {
     const staleCycles = { audio: 1, video: 0 };
     decideTrackRefresh({ ...base, audioBytes: 1000, staleCycles });
     expect(staleCycles).toEqual({ audio: 1, video: 0 });
+  });
+
+  it('escalates instead of requesting once the refresh budget is spent', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 1000,
+      staleCycles: { audio: 1, video: 0 },
+      refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+    });
+    expect(d).toEqual({
+      action: 'escalate',
+      nextStale: { audio: 2, video: 0 },
+      reason: 'refresh-budget-exhausted',
+    });
+  });
+
+  it('still requests while the budget has room', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 1000,
+      staleCycles: { audio: 1, video: 0 },
+      refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET - 1,
+    });
+    expect(d.action).toBe('request-refresh');
+  });
+
+  it('a larger budget (prior escalations) delays escalation', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 1000,
+      staleCycles: { audio: 1, video: 0 },
+      refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+      refreshBudget: deadTrackRefreshBudget(1),
+    });
+    expect(d.action).toBe('request-refresh');
+  });
+
+  it('never-started kinds do not move counters or escalate (Review Focus 1)', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 0,
+      videoBytes: 0,
+      lastBytes: { audio: 0, video: 0 },
+      refreshRequestsSent: 99,
+      refreshBudget: 1,
+    });
+    expect(d).toEqual({
+      action: 'none',
+      nextStale: { audio: 0, video: 0 },
+      reason: 'flowing',
+      resetRefreshBudget: true,
+    });
+  });
+
+  it('a partially frozen link does not reset the budget', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      videoBytes: 50_000, // frozen
+      staleCycles: { audio: 0, video: 0 },
+    });
+    expect(d).toEqual({
+      action: 'none',
+      nextStale: { audio: 0, video: 1 },
+      reason: 'flowing',
+      resetRefreshBudget: false,
+    });
+  });
+});
+
+describe('deadTrackRefreshBudget', () => {
+  it.each([
+    [-1, 3],
+    [0, 3],
+    [1, 6],
+    [2, 12],
+    [3, 24],
+    [4, 24],
+    [10, 24],
+  ])('prior escalations %i → budget %i', (prior, budget) => {
+    expect(deadTrackRefreshBudget(prior)).toBe(budget);
+  });
+
+  it('is derived from the two named constants', () => {
+    expect(deadTrackRefreshBudget(0)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(deadTrackRefreshBudget(DEAD_TRACK_ESCALATION_BACKOFF_CAP + 5)).toBe(
+      DEAD_TRACK_REFRESH_BUDGET << DEAD_TRACK_ESCALATION_BACKOFF_CAP
+    );
   });
 });

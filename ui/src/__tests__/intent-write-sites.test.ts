@@ -47,6 +47,14 @@ const ALLOWED_CALL_SITES: Array<[name: string, header: RegExp]> = [
   ['audioOff', /^  async audioOff\(\) \{/],
   ['screenShareOn', /^  async screenShareOn\(\) \{/],
   ['screenShareOff', /^  screenShareOff\(\) \{/],
+  ['systemAudioOn', /^  async systemAudioOn\(\): Promise<void> \{/],
+  ['systemAudioOff', /^  systemAudioOff\(\): void \{/],
+  // The documented gesture-equivalent 'system-audio-ended' (intent.ts
+  // header): the host/platform ending the grant (`capture.onended`) or
+  // MicSource dropping the mixin (`onMixinDropped`) — a share ended from
+  // outside the app, delivered as an event, like `screen-share-track-ended`.
+  // Not a gesture method; listed so the write has exactly one home.
+  ['_systemAudioLost', /^  private _systemAudioLost\(/],
   ['setCarrierMode', /^  async setCarrierMode\(mode: 'webrtc' \| 'signals'\): Promise<void> \{/],
   ['setPeerCarrier', /^  async setPeerCarrier\(/],
 ];

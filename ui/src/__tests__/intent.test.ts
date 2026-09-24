@@ -14,7 +14,7 @@ import {
  */
 
 const INITIAL: LocalIntent = {
-  mic: { wanted: false, muted: true },
+  mic: { wanted: false, muted: true, includeSystemAudio: false },
   camera: { wanted: false },
   screenShare: { wanted: false },
   webrtc: { enabled: true, disabledWith: new Set() },
@@ -22,8 +22,16 @@ const INITIAL: LocalIntent = {
 
 describe('applyIntentGesture: each gesture from the initial state', () => {
   const rows: Array<[string, IntentGesture, Partial<LocalIntent>]> = [
-    ['audio-on', { type: 'audio-on' }, { mic: { wanted: true, muted: false } }],
-    ['audio-mute', { type: 'audio-mute' }, { mic: { wanted: false, muted: true } }],
+    [
+      'audio-on',
+      { type: 'audio-on' },
+      { mic: { wanted: true, muted: false, includeSystemAudio: false } },
+    ],
+    [
+      'audio-mute',
+      { type: 'audio-mute' },
+      { mic: { wanted: false, muted: true, includeSystemAudio: false } },
+    ],
     ['video-on', { type: 'video-on' }, { camera: { wanted: true } }],
     ['video-off', { type: 'video-off' }, { camera: { wanted: false } }],
     ['screen-share-on', { type: 'screen-share-on' }, { screenShare: { wanted: true } }],
@@ -44,10 +52,25 @@ describe('applyIntentGesture: each gesture from the initial state', () => {
       { webrtc: { enabled: false, disabledWith: new Set() } },
     ],
     [
+      'system-audio-on',
+      { type: 'system-audio-on' },
+      { mic: { wanted: false, muted: true, includeSystemAudio: true } },
+    ],
+    [
+      'system-audio-off',
+      { type: 'system-audio-off' },
+      { mic: { wanted: false, muted: true, includeSystemAudio: false } },
+    ],
+    [
+      'system-audio-ended',
+      { type: 'system-audio-ended' },
+      { mic: { wanted: false, muted: true, includeSystemAudio: false } },
+    ],
+    [
       'session-end',
       { type: 'session-end' },
       {
-        mic: { wanted: false, muted: true },
+        mic: { wanted: false, muted: true, includeSystemAudio: false },
         camera: { wanted: false },
         screenShare: { wanted: false },
       },
@@ -63,20 +86,20 @@ describe('applyIntentGesture: each gesture from the initial state', () => {
 describe('applyIntentGesture: audio-mute mic.wanted preservation', () => {
   it('audio-mute on a never-wanted mic keeps wanted: false', () => {
     const next = applyIntentGesture(INITIAL, { type: 'audio-mute' });
-    expect(next.mic).toEqual({ wanted: false, muted: true });
+    expect(next.mic).toEqual({ wanted: false, muted: true, includeSystemAudio: false });
   });
 
   it('audio-mute after audio-on keeps wanted: true', () => {
     const onceOn = applyIntentGesture(INITIAL, { type: 'audio-on' });
     const muted = applyIntentGesture(onceOn, { type: 'audio-mute' });
-    expect(muted.mic).toEqual({ wanted: true, muted: true });
+    expect(muted.mic).toEqual({ wanted: true, muted: true, includeSystemAudio: false });
   });
 });
 
 describe('applyIntentGesture: session-end preserves carrier selection', () => {
   it('drops all wants but leaves webrtc.enabled untouched', () => {
     const busy: LocalIntent = {
-      mic: { wanted: true, muted: false },
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
       camera: { wanted: true },
       screenShare: { wanted: true },
       webrtc: { enabled: false, disabledWith: new Set(['peerA']) },
@@ -131,5 +154,43 @@ describe('initialLocalIntent', () => {
     expect(intent.mic.wanted).toBe(false);
     expect(intent.camera.wanted).toBe(false);
     expect(intent.screenShare.wanted).toBe(false);
+  });
+});
+
+describe('system audio rides the mic: what clears it and what does not', () => {
+  const included: LocalIntent = {
+    ...INITIAL,
+    mic: { wanted: true, muted: false, includeSystemAudio: true },
+  };
+
+  it('audio-mute keeps includeSystemAudio (mute silences the mixed track, it does not end the share)', () => {
+    expect(applyIntentGesture(included, { type: 'audio-mute' }).mic).toEqual({
+      wanted: true,
+      muted: true,
+      includeSystemAudio: true,
+    });
+  });
+
+  it('audio-on keeps includeSystemAudio', () => {
+    expect(applyIntentGesture(included, { type: 'audio-on' }).mic.includeSystemAudio).toBe(true);
+  });
+
+  it('system-audio-off and system-audio-ended both clear it and touch nothing else', () => {
+    for (const type of ['system-audio-off', 'system-audio-ended'] as const) {
+      expect(applyIntentGesture(included, { type }).mic).toEqual({
+        wanted: true,
+        muted: false,
+        includeSystemAudio: false,
+      });
+    }
+  });
+
+  it('session-end clears it along with the other wants', () => {
+    const next = applyIntentGesture(included, { type: 'session-end' });
+    expect(next.mic).toEqual({ wanted: false, muted: false, includeSystemAudio: false });
+  });
+
+  it('initialLocalIntent starts with includeSystemAudio false', () => {
+    expect(initialLocalIntent({ getItem: () => null }).mic.includeSystemAudio).toBe(false);
   });
 });

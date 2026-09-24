@@ -754,12 +754,14 @@ export class MediaLinks {
         const stats = await transport.getStats(pubKeyB64);
         if (!stats) return;
         let isRelayed = false;
+        let sawSucceededPair = false;
         const reportsById: Record<string, any> = {};
         stats.raw.forEach((report: any) => {
           reportsById[report.id] = report;
         });
         Object.values(reportsById).forEach((report: any) => {
           if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+            sawSucceededPair = true;
             const localCandidate = reportsById[report.localCandidateId];
             const remoteCandidate = reportsById[report.remoteCandidateId];
             // A connection is relayed if EITHER endpoint's selected candidate is
@@ -779,6 +781,24 @@ export class MediaLinks {
             );
           }
         });
+        if (!sawSucceededPair) {
+          // Forensics (2026-09-24 incident, spec Part 2): the FSM said
+          // `connected` but no candidate pair had succeeded 2s later on
+          // either side of the dead link, and this sampler said nothing.
+          // Counted over the raw report set, not `reportsById`, so the
+          // histogram does not depend on every report carrying an `id`.
+          const states: Record<string, number> = {};
+          stats.raw.forEach((report: any) => {
+            if (report.type !== 'candidate-pair') return;
+            const state = report.state ?? 'unknown';
+            states[state] = (states[state] ?? 0) + 1;
+          });
+          const histogram =
+            Object.entries(states).map(([k, v]) => `${k}=${v}`).join(',') || 'none';
+          this.bindings.logger.logCustomMessage(
+            `ICE pair [${pubKeyB64.slice(0, 8)}]: no succeeded pair 2s after connected; states=${histogram} ice=${transport.getIceConnectionState(pubKeyB64) ?? 'unknown'}`
+          );
+        }
         this._openConnections.update(current => {
           const conn = current[pubKeyB64];
           if (conn) {
@@ -1053,7 +1073,32 @@ export class MediaLinks {
       this.bindings.setupPeerAudioAnalyser(pubKeyB64, stream);
     }
 
+    // Forensics (2026-09-24 incident, spec Part 2): a remote track's
+    // mute/unmute cycle on a link that stays `connected` was invisible.
+    // onmute was never installed, and onunmute only on tracks that
+    // arrived muted. Both handlers here are log-only. The arrived-muted
+    // branch below keeps its own onunmute, which also calls
+    // _setTrackReady.
+    track.onmute = () => {
+      this.bindings.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: this.bindings.now(),
+        event: 'TrackMuted',
+        connectionId,
+        detail: track.kind,
+      });
+    };
+
     if (!track.muted) {
+      track.onunmute = () => {
+        this.bindings.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: this.bindings.now(),
+          event: 'TrackUnmuted',
+          connectionId,
+          detail: `${track.kind} re-unmute (log-only)`,
+        });
+      };
       this._setTrackReady(pubKeyB64, connectionId, track);
       return;
     }

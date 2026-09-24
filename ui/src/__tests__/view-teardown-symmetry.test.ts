@@ -117,6 +117,24 @@ describe('RoomView intent-diff subscription (Task 6)', () => {
   });
 });
 
+describe('RoomView system-audio subscription (spec Section 4)', () => {
+  it('the systemAudio StoreSubscriber is released on disconnect', () => {
+    const el = makeRoomView();
+    let active = 0;
+    (el.streamsStore as any).systemAudio = {
+      subscribe(cb: (v: unknown) => void) {
+        active += 1;
+        cb(null);
+        return () => { active -= 1; };
+      },
+    };
+    el._systemAudio.hostUpdate();
+    expect(active).toBe(1);
+    el.disconnectedCallback();
+    expect(active).toBe(0);
+  });
+});
+
 describe('PresenceApp.disconnectedCallback (leak 3, second copy)', () => {
   it('reaches super.disconnectedCallback so controllers get hostDisconnected', () => {
     const el = document.createElement('presence-app') as any;

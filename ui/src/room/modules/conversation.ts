@@ -279,7 +279,7 @@ const conversationModule: ModuleDefinition = {
           { icon: mdiPhoneRefresh, tooltip: 'Reconnect', color: '#ffe100' },
         ],
         currentState: Reconnect.Available,
-        onSelect: () => context.streamsStore.disconnectFromPeerVideo(agentPubKeyB64),
+        onSelect: () => context.streamsStore.disconnectFromPeerVideo(agentPubKeyB64, 'reconnect-button'),
       });
     }
 
@@ -317,7 +317,7 @@ const conversationModule: ModuleDefinition = {
       nextPayload.disableWebrtcWith.includes(myPubKey);
 
     if (wasDisabled !== isDisabled && isDisabled) {
-      streamsStore.disconnectFromPeerVideo(agentPubKeyB64);
+      streamsStore.disconnectFromPeerVideo(agentPubKeyB64, 'peer-disabled-webrtc');
       return;
     }
     // The webrtcImpl-flip detection that used to follow died with
