@@ -377,7 +377,10 @@ describe('StreamsStore.connect allAgents subscription (leak 4)', () => {
     const store = await StreamsStore.connect(
       roomStore,
       async () => '',
-      new PresenceLogger()
+      new PresenceLogger(),
+      undefined,
+      undefined,
+      'room-key'
     );
     // One subscription serving both the load gate and ongoing updates —
     // the doubled load-gate subscription is the regression this pins.

@@ -1433,9 +1433,12 @@ export class StreamsStore {
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
     logger: PresenceLogger,
-    captureAudioSources?: CaptureAudioSourcesFn,
-    weaveClient?: Pick<WeaveClient, 'localModels'>,
-    roomKey?: string
+    // The two host seams are `| undefined` (absent on hosts without the
+    // feature) but not optional: every argument is positional and
+    // required, so tsc rejects a call that drops one and shifts the rest.
+    captureAudioSources: CaptureAudioSourcesFn | undefined,
+    weaveClient: Pick<WeaveClient, 'localModels'> | undefined,
+    roomKey: string
   ): Promise<StreamsStore> {
     // The production deps record — the ONE place the ambient world is
     // bound to the store. It reproduces the pre-Phase-6 ambient reads
@@ -1458,7 +1461,7 @@ export class StreamsStore {
       transportFactory: (_purpose, options) => new FsmTransport(options),
       mediaDevices: navigator.mediaDevices,
       localModels: weaveClient?.localModels,
-      transcripts: roomKey ? { store: getTranscriptStore(), roomKey } : undefined,
+      transcripts: { store: getTranscriptStore(), roomKey },
     };
     const streamsStore = new StreamsStore(
       deps,

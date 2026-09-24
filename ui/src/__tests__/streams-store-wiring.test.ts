@@ -3579,10 +3579,26 @@ describe('StreamsStore.connect carries both host seams (release 0.16.0 Review Fo
       fakeWeaveClient,
       'room-key'
     );
-    live.push(store);
 
-    expect(store.canCaptureAudioSources).toBe(true);
-    expect(store.localModels).toBe(fakeLocalModels);
-    expect(store.transcripts?.roomKey).toBe('room-key');
+    try {
+      // Which assertion catches which dropped argument (all three are
+      // required parameters, so tsc rejects each drop first; these are
+      // the runtime backstop, checked by hand as negative controls):
+      //   - captureAudioSources dropped: weaveClient shifts into the
+      //     capture slot, so canCaptureAudioSources STILL reads true —
+      //     the localModels assertion is the one that fails.
+      //   - weaveClient dropped: 'room-key' shifts into its slot —
+      //     localModels fails (and transcripts.roomKey too).
+      //   - roomKey dropped: transcripts.roomKey fails.
+      //   - capture seam passed as undefined: canCaptureAudioSources fails.
+      expect(store.canCaptureAudioSources).toBe(true);
+      expect(store.localModels).toBe(fakeLocalModels);
+      expect(store.transcripts?.roomKey).toBe('room-key');
+    } finally {
+      // Inside the test, while the global stubs are still installed —
+      // not left to the suite's afterEach, whose order against this
+      // describe's unstub hook would otherwise decide what disconnect sees.
+      store.disconnect('wiring-test-connect-seams');
+    }
   });
 });
