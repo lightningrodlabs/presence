@@ -20,9 +20,17 @@ export default defineConfig({
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
-        // Force classic, space-stealing scrollbars (like Linux hc-spin) so the
-        // forceScroll probe can reproduce the width-steal that broke flex-wrap.
-        launchOptions: { args: ['--disable-features=OverlayScrollbar'] },
+        launchOptions: {
+          args: [
+            // Force classic, space-stealing scrollbars (like Linux hc-spin) so the
+            // forceScroll probe can reproduce the width-steal that broke flex-wrap.
+            '--disable-features=OverlayScrollbar',
+            // A fake microphone with no permission prompt, for the harnesses
+            // that run MicSource against real getUserMedia (system-audio-mix).
+            '--use-fake-device-for-media-stream',
+            '--use-fake-ui-for-media-stream',
+          ],
+        },
       },
     },
   ],

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>presence system-audio mix harness</title>
+  </head>
+  <body>
+    <!--
+      Real-Web-Audio tier of the system-audio mixin (spec Section 4).
+      Exposes window.runSystemAudioMix() which drives the PRODUCTION
+      MicSource against Chromium's fake microphone, mixes in an oscillator
+      the way the host seam's capture track is mixed, and reads the OUTPUT
+      track back through a real MediaStreamTrackProcessor and an
+      AudioEncoder configured exactly as the voice module configures its own
+      — the path the node fakes cannot see (the stereo-destination finding).
+    -->
+    <pre id="out">loading…</pre>
+    <script type="module" src="./system-audio-mix-harness.ts"></script>
+  </body>
+</html>

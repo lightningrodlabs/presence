@@ -437,7 +437,6 @@ export class PresenceApp extends LitElement {
     if (isWeaveContext()) {
       const appletServices: AppletServices = {
         creatables: {},
-        blockTypes: {},
         getAssetInfo: async (appletClient, wal, _recordInfo) => {
           // eslint-disable-next-line no-debugger
           // debugger;

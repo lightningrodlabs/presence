@@ -3,8 +3,10 @@
  * surface (store-decomposition round two, Task 4; see
  * docs/superpowers/specs/2026-09-03-owner-extraction-design.md). Owns the
  * periodic bytesReceived-stall poll, the peer-reported stream/track
- * reconciliation driven by pong metadata, and the two-tier (replaceTrack,
- * then full reconnect) recovery ladder both paths fall back to.
+ * reconciliation driven by pong metadata, and the three-rung recovery
+ * ladder: replaceTrack via request-track-refresh, escalation to a close
+ * once the refresh budget is spent (`DEAD_TRACK_REFRESH_BUDGET`), and the
+ * reconcile path's reconnect fallback.
  *
  * `StreamsStore._applyStaleTeardown` does NOT live here: it is the shared
  * teardown bridge into `closeCleanupPlan` used by other supervisor sites
@@ -21,6 +23,7 @@ import type { PresenceLogger } from './logging';
 import {
   summarizeRtcStats,
   decideTrackRefresh,
+  deadTrackRefreshBudget,
   STALE_CYCLES_REFRESH_THRESHOLD,
 } from './transport/track-health-policy';
 import type { RtcStatsReportLike } from './transport/track-health-policy';
@@ -102,14 +105,21 @@ export class TrackHealthMonitor {
           summary.lossPercent,
         );
 
+        const record = this.bindings.peerRecord(pubKeyB64);
+        const priorEscalations = record?.deadTrackEscalations ?? 0;
+        const refreshBudget = deadTrackRefreshBudget(priorEscalations);
         const decision = decideTrackRefresh({
           videoExpected: connInfo.video,
           audioExpected: connInfo.audio,
           audioBytes: summary.audioBytes,
           videoBytes: summary.videoBytes,
-          lastBytes: this.bindings.peerRecord(pubKeyB64)?.lastBytesReceived || { audio: 0, video: 0 },
-          staleCycles: this.bindings.peerRecord(pubKeyB64)?.staleCycles || { audio: 0, video: 0 },
+          lastBytes: record?.lastBytesReceived || { audio: 0, video: 0 },
+          staleCycles: record?.staleCycles || { audio: 0, video: 0 },
           staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
+          refreshRequestsSent: record?.refreshRequestsSent ?? 0,
+          refreshBudget,
+          transportPhase: this.bindings.mediaTransport().getPhase(pubKeyB64),
+          iceDisconnected: record?.iceDisconnectedAt !== undefined,
         });
 
         this.bindings.ensurePeerRecord(pubKeyB64).lastBytesReceived = {
@@ -118,18 +128,67 @@ export class TrackHealthMonitor {
         };
         this.bindings.ensurePeerRecord(pubKeyB64).staleCycles = decision.nextStale;
 
-        if (decision.action === 'request-refresh') {
-          const stale = decision.nextStale;
-          console.warn(
-            `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
-          );
-          this.bindings.logger.logCustomMessage(
-            `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
-          );
-
-          if (this.bindings.sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
-            // Reset stale count to avoid spamming
-            this.bindings.ensurePeerRecord(pubKeyB64).staleCycles = { audio: 0, video: 0 };
+        switch (decision.action) {
+          case 'none':
+            if (decision.resetRefreshBudget) {
+              this.bindings.ensurePeerRecord(pubKeyB64).refreshRequestsSent = 0;
+            }
+            break;
+          case 'request-refresh': {
+            const stale = decision.nextStale;
+            console.warn(
+              `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
+            );
+            this.bindings.logger.logCustomMessage(
+              `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
+            );
+            const r = this.bindings.ensurePeerRecord(pubKeyB64);
+            // The budget counts ATTEMPTS, not deliveries (declared,
+            // 2026-09-24 round): FsmTransport.send swallows every failure
+            // (no FSM, not connected, throw), so delivery is unobservable
+            // here, and a data channel that cannot carry the request is
+            // itself evidence of a dead link. Escalation must not depend
+            // on it. The stale reset keeps its pre-existing sent>0 rule.
+            r.refreshRequestsSent = (r.refreshRequestsSent ?? 0) + 1;
+            if (this.bindings.sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
+              r.staleCycles = { audio: 0, video: 0 };
+            }
+            break;
+          }
+          case 'escalate': {
+            // Spec Part 1 (2026-09-24 incident): replaceTrack cannot
+            // repair a transport-level fault, and the link was left
+            // `connected` for 70s with no exit. Close through the
+            // transport so the peer gets the `leave`; the existing
+            // close-event cleanup row and the pong drive do the rest.
+            const stale = decision.nextStale;
+            const spent = record?.refreshRequestsSent ?? 0;
+            this.bindings.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: this.bindings.now(),
+              event: 'DeadTrackEscalation',
+              connectionId: connInfo.connectionId,
+              detail: `refreshes=${spent} budget=${refreshBudget} prior=${priorEscalations} audioStale=${stale.audio} videoStale=${stale.video}`,
+            });
+            // Bump the survivor BEFORE the close: media-close-full keeps
+            // it, and the next connection reads it for its budget. Zero
+            // the session counters too: when the close clears the slot
+            // this is redundant; it is defense in depth for a close that
+            // does not clear the slot (a throwing or no-op
+            // closeConnection), so escalation cannot re-fire every poll.
+            // The §3.1(c) vanish shape never reaches this arm: the
+            // transport-phase hold in decideTrackRefresh covers it, and
+            // the real transport's getStats returns null with no pc.
+            const r = this.bindings.ensurePeerRecord(pubKeyB64);
+            r.deadTrackEscalations = priorEscalations + 1;
+            r.staleCycles = { audio: 0, video: 0 };
+            r.refreshRequestsSent = 0;
+            this.bindings.mediaTransport().closeConnection(pubKeyB64, 'dead-track-escalation');
+            break;
+          }
+          default: {
+            const exhaustive: never = decision;
+            void exhaustive;
           }
         }
       } catch (e) {
@@ -316,6 +375,11 @@ export class TrackHealthMonitor {
   refreshTracksForPeer(pubKeyB64: AgentPubKeyB64): boolean {
     const mainStream = this.bindings.mainStream();
     const connInfo = this.bindings.openConnections()[pubKeyB64];
+    // Forensics (2026-09-24 incident, spec Part 2): the peer says our
+    // media is dead. Record what our sender thinks it sent, so an export
+    // shows whether the encoder or the path is at fault. Fire-and-forget;
+    // this method stays synchronous for its data-channel caller.
+    if (connInfo) void this._logOutboundForRefresh(pubKeyB64);
     if (!connInfo || !mainStream) {
       console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no connection or stream`);
       return false;
@@ -349,5 +413,20 @@ export class TrackHealthMonitor {
       `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
     );
     return success;
+  }
+
+  private async _logOutboundForRefresh(pubKeyB64: AgentPubKeyB64): Promise<void> {
+    try {
+      const stats = await this.bindings.mediaTransport().getStats(pubKeyB64);
+      if (!stats) return;
+      const reports: RtcStatsReportLike[] = [];
+      stats.raw.forEach((report: RtcStatsReportLike) => reports.push(report));
+      const s = summarizeRtcStats(reports);
+      this.bindings.logger.logCustomMessage(
+        `Track refresh outbound [${pubKeyB64.slice(0, 8)}]: audioSent=${s.audioBytesSent} videoSent=${s.videoBytesSent} rtt=${s.rttMs ?? 'n/a'}ms`
+      );
+    } catch (_e) {
+      // getStats may fail if the connection was already closed
+    }
   }
 }

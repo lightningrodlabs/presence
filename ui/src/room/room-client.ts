@@ -1,6 +1,7 @@
 import { EntryRecord, ZomeClient } from '@holochain-open-dev/utils';
 import { AgentPubKey, AppClient, RoleName, Record, ActionHash } from '@holochain/client';
 import {
+  AgentJoin,
   Attachment,
   DescendentRoom,
   RoomInfo,
@@ -17,7 +18,7 @@ export class RoomClient extends ZomeClient<RoomSignal> {
     super(client, roleName, zomeName);
   }
 
-  async getAllAgents(local: boolean = true): Promise<AgentPubKey[]> {
+  async getAllAgents(local: boolean = true): Promise<AgentJoin[]> {
     return this.callZome('get_all_agents', { input: null, local });
   }
 

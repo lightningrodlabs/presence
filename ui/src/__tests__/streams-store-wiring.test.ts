@@ -24,6 +24,7 @@ import {
 } from '../transport/signals-cadence-policy';
 import { CAP_VOICE_BATCH } from '../transport/wire-contract';
 import { encodeRtcAction } from '../rtc-message-policy';
+import { DEAD_TRACK_REFRESH_BUDGET, deadTrackRefreshBudget } from '../transport/track-health-policy';
 import {
   CAPTURE_REOPEN_MIN_INTERVAL_MS,
   CAPTURE_REOPEN_MAX_ATTEMPTS,
@@ -32,6 +33,7 @@ import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
+import type { AudioSourceCapture } from '@theweave/api';
 
 /**
  * Phase 6 item 2 — the point of the phase: the wiring between the pure
@@ -956,7 +958,7 @@ describe("setCarrierMode teardown — regression pin for the previous/_applyInte
 
     expect(
       media.closeCalls.some(
-        c => c.peer === peerA && c.reason === 'disconnectFromPeerVideo'
+        c => c.peer === peerA && c.reason === 'carrier-mode-signals'
       )
     ).toBe(true);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
@@ -1198,7 +1200,10 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
   function armVoice(started: Started) {
     const { store, clock } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
-    store._localIntent.update(i => ({ ...i, mic: { wanted: true, muted: false } }));
+    store._localIntent.update(i => ({
+      ...i,
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+    }));
   }
 
   /** One presence tick with the target peer kept ping-fresh. */
@@ -1471,7 +1476,7 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
     // acquire fails and no live track ever exists — the dead-device case.
     started.store._localIntent.update(i => ({
       ...i,
-      mic: { wanted: true, muted: false },
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
     }));
 
     await presenceTick(started);
@@ -2439,7 +2444,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     // harness: one queued read, then done. If the mute check regressed
     // and `encode()` ran anyway, the stub throws and fails the test loudly.
     const controller = voiceController as unknown as {
-      micHandle: { track: { enabled: boolean } } | null;
+      encodingTrack: { enabled: boolean } | null;
       pipelineGeneration: number;
       encoder: { state: string; encode: (d: unknown) => void } | null;
       encoderReader: {
@@ -2447,7 +2452,10 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       } | null;
       pumpEncoder(gen: number): Promise<void>;
     };
-    controller.micHandle = { track: { enabled: false } };
+    // The track the reader is pulling from, NOT the acquire-time handle:
+    // during a system-audio share those differ, and the handle's copy is
+    // the microphone, which mute disables while the share plays on.
+    controller.encodingTrack = { enabled: false };
     controller.encoder = {
       state: 'configured',
       encode: () => {
@@ -2539,5 +2547,976 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       mode: 'full',
       reason: 'no-sample',
     });
+  });
+});
+
+describe('system audio (spec Section 4): the capture seam, the mixin swap, and every way it ends', () => {
+  // Local fakes copied from the capture-reconciler block above (block-
+  // scoped there by that block's own convention) plus a FakeAudioContext
+  // identical to mic-source-mixin.test.ts's, since this block drives the
+  // mixin path through the started store rather than MicSource directly.
+  class FakeTrack {
+    readyState: 'live' | 'ended' = 'live';
+
+    enabled = true;
+
+    onended: (() => void) | null = null;
+
+    constructor(public kind: 'audio' | 'video', public label = '') {}
+
+    stop(): void {
+      if (this.readyState === 'ended') return;
+      this.readyState = 'ended';
+      this.onended?.();
+    }
+  }
+
+  class FakeStream {
+    constructor(private tracks: FakeTrack[]) {}
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  /** Minimal MediaStream stand-in — node has none, and the store's mic
+   *  open branch does `new MediaStream()` + add/get/removeTrack. */
+  class FakeMediaStream {
+    private tracks: FakeTrack[] = [];
+
+    addTrack(t: FakeTrack): void {
+      this.tracks.push(t);
+    }
+
+    removeTrack(t: FakeTrack): void {
+      this.tracks = this.tracks.filter(x => x !== t);
+    }
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  /** Counts graph operations; a source node remembers the stream it wraps. */
+  class FakeAudioContext {
+    readonly sampleRate = 48000;
+
+    state = 'running';
+
+    sources: Array<{ stream: FakeStream; connected: boolean }> = [];
+
+    destinations: Array<{ track: FakeTrack }> = [];
+
+    /** Every createMediaStreamSource throws (a context that is gone) —
+     *  the mixin-dropped row needs both MicSource source-node sites to fail. */
+    failAlways = false;
+
+    createMediaStreamSource(stream: FakeStream) {
+      if (this.failAlways) throw new Error('createMediaStreamSource failed');
+      const node = {
+        stream,
+        connected: false,
+        connect: () => { node.connected = true; },
+        disconnect: () => { node.connected = false; },
+      };
+      this.sources.push(node);
+      return node;
+    }
+
+    createMediaStreamDestination() {
+      const track = new FakeTrack('audio', 'mixed');
+      this.destinations.push({ track });
+      return { stream: new FakeStream([track]) };
+    }
+
+    resume = async () => {};
+
+    close = async () => {};
+  }
+
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  /** Record every getUserMedia call and hand back a scripted stream. */
+  function installNavigator(
+    respond: (constraints: unknown) => Promise<FakeStream>
+  ): { calls: unknown[] } {
+    const calls: unknown[] = [];
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async (constraints: unknown) => {
+            calls.push(constraints);
+            return respond(constraints);
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    return { calls };
+  }
+
+  type FakeCapture = {
+    track: FakeTrack; label: string; canExcludeSelf: boolean; endedReason?: string;
+    stop: ReturnType<typeof vi.fn>; onended?: () => void;
+  };
+  function fakeCapture(over: Partial<FakeCapture> = {}): FakeCapture {
+    const c: FakeCapture = {
+      track: new FakeTrack('audio', 'system'), label: 'System audio', canExcludeSelf: true,
+      stop: vi.fn(), ...over,
+    };
+    return c;
+  }
+
+  function makeStartedWithCapture(capture: () => Promise<FakeCapture | null>) {
+    const clock = new ManualClock(1_000_000);
+    const fakes = makeFakeDeps({ clock, myPubKey });
+    const logger = new FakeLogger();
+    const calls: unknown[] = [];
+    const store = new StreamsStore(
+      fakes.deps,
+      async () => '',
+      logger.asPresenceLogger(),
+      async opts => { calls.push(opts); return (await capture()) as unknown as AudioSourceCapture | null; },
+    );
+    const events: StoreEventPayload[] = [];
+    store.start();
+    live.push(store);
+    store.onEvent(ev => events.push(ev));
+    return { ...fakes, clock, store, logger, calls, events };
+  }
+
+  beforeEach(() => {
+    (globalThis as any).MediaStream = FakeMediaStream;
+    (globalThis as any).AudioContext = FakeAudioContext;
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).navigator;
+    delete (globalThis as any).MediaStream;
+    delete (globalThis as any).AudioContext;
+  });
+
+  it('without the seam, canCaptureAudioSources is false and systemAudioOn is a no-op', async () => {
+    const started = makeStarted();
+    expect(started.store.canCaptureAudioSources).toBe(false);
+    await started.store.systemAudioOn();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+  });
+
+  it('systemAudioOn: picker → mixed output reaches every media transport via replaceTrack exactly once; intent and the readable follow', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(1);
+    expect((started.calls[0] as { audioContext?: unknown }).audioContext).toBeDefined();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.systemAudio)).toEqual({ label: 'System audio', canExcludeSelf: true });
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(media.replaceCalls[0].oldTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(media.replaceCalls[0].newTrack).toBe(started.store.micSource.track);
+    expect(typeof capture.onended).toBe('function');
+  });
+
+  it('systemAudioOff: swaps back to the device track once, stops the capture, clears intent and the readable; onended is NOT fired', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    started.store.systemAudioOff();
+    await flush();
+
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(media.replaceCalls[0].newTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('the host ending the grant (capture.onended) → intent system-audio-ended, mix torn, SystemAudioEnded logged with the reason', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture({ endedReason: 'user-stopped' });
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    capture.track.stop();          // what the host's end does to the track (fires no intent by itself)
+    capture.onended!();            // the api's single end notification
+    await flush();
+
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(capture.stop).not.toHaveBeenCalled();
+    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
+    expect(logged?.detail).toBe('reason=user-stopped; via=capture-ended');
+    // The label (a window title, user-chosen free text) is not written into
+    // a log that `DiagnosticResponse` exports to peers.
+    expect(logged?.detail).not.toContain('System audio');
+  });
+
+  it('a stale onended (from a capture that was already replaced or stopped) is ignored', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const first = fakeCapture();
+    const started = makeStartedWithCapture(async () => first);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    started.store.systemAudioOff();
+    await flush();
+    first.onended!();
+    await flush();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('picker cancelled (null) → nothing changes and no intent is written', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => null);
+    await started.store.audioOn(true);
+    const intentBefore = get(started.store.localIntent);
+    await started.store.systemAudioOn();
+    expect(get(started.store.localIntent)).toEqual(intentBefore);
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(get(started.store.systemAudio)).toBeNull();
+  });
+
+  it('with the microphone never turned on, the share still starts and reaches every peer — and no getUserMedia runs', async () => {
+    const { calls: gum } = installNavigator(async () => new FakeStream([new FakeTrack('audio', 'device')]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    const media = started.transports.media!;
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(1); // the picker DID open
+    // Sharing what you are playing neither needs nor opens the mic.
+    expect(gum).toEqual([]);
+    expect(started.store.micSource.deviceTrack).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(get(started.store.localIntent).mic.wanted).toBe(false);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.systemAudio)).toEqual({ label: 'System audio', canExcludeSelf: true });
+    // The one output track reaches peers as an open, not a swap.
+    expect(media.addTrackCalls).toEqual([started.store.micSource.track]);
+  });
+
+  it('the microphone turning on under a running share joins the graph without touching the peers', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    const media = started.transports.media!;
+    await started.store.systemAudioOn();
+    await flush();
+    const shared = started.store.micSource.track;
+    const addsBefore = media.addTrackCalls.length;
+
+    await started.store.audioOn(true);
+    await flush();
+
+    expect(started.store.micSource.deviceTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(started.store.micSource.track).toBe(shared); // same track: in-place
+    expect(media.replaceCalls).toHaveLength(0);
+    expect(media.addTrackCalls).toHaveLength(addsBefore);
+  });
+
+  it('a microphone that will not open does not stop the share: it starts without one', async () => {
+    // Permission denied or the device unplugged while the mic is wanted.
+    // The share used to be refused here, because the mix had to be built
+    // on a device track.
+    installNavigator(async () => { throw new Error('NotAllowedError'); });
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.lifecycle.state).not.toBe('live');
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(1);
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(started.events.filter(e => e.type === 'error')).toEqual([]);
+  });
+
+  it('systemAudioRequest is the one gate: it reports the reason the row disables on, in the store\'s order', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let resolve!: (c: FakeCapture) => void;
+    const started = makeStartedWithCapture(() => new Promise(res => { resolve = res; }));
+    // The microphone is no part of this decision, on or off.
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    const pending = started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'request-pending' });
+    resolve(fakeCapture());
+    await pending;
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'already-active' });
+    started.store.systemAudioOff();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    // Without the seam the reason is the seam, whatever else is true.
+    const bare = makeStarted();
+    expect(bare.store.systemAudioRequest).toEqual({ ok: false, reason: 'no-seam' });
+  });
+
+  it('MicSource dropping the mixin on its own (a failed rebuild after a device change) ends the share: intent, readable, capture, log', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let n = 0;
+    installNavigator(async () => new FakeStream([[device1, device2][n++]!]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    expect(get(started.store.systemAudio)).not.toBeNull();
+    // Every source-node build now throws: the in-place swap and the rebuild.
+    const ctx = started.store.micSource.ensureAudioContext() as unknown as { failAlways: boolean };
+    ctx.failAlways = true;
+    await started.store.changeAudioInput('other');
+    await flush();
+    expect(started.store.micSource.outputMode).toBe('device');
+    // Before the binding existed the readable kept saying "Including" over
+    // a device-only output, and the host grant stayed open.
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
+    expect(logged?.detail).toBe('reason=mix-failed; via=mixin-dropped');
+  });
+
+  it('an interleaved second systemAudioOn — fired before the first request resolves — opens no second picker (review round 1 finding)', async () => {
+    // The prior pre-await guard (`if (this._systemAudioCapture) return;`)
+    // only covers the state AFTER a picker resolves. A double-click while
+    // the host picker is still open passes that guard on the second call
+    // and would open a second picker — `_systemAudioPending` closes the
+    // in-flight window too, so neither call observes it as clear.
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let resolveSeam!: (c: FakeCapture | null) => void;
+    const started = makeStartedWithCapture(
+      () => new Promise<FakeCapture | null>(r => { resolveSeam = r; })
+    );
+    await started.store.audioOn(true);
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    const first = started.store.systemAudioOn();
+    const second = started.store.systemAudioOn(); // fired while the first is still in flight
+    resolveSeam(fakeCapture());
+    await first;
+    await second;
+    await flush();
+
+    expect(started.calls).toHaveLength(1);
+    expect(
+      started.logger.customMessages.filter(m => m === 'IntentChange: system-audio-on')
+    ).toHaveLength(1);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(started.events.some(e => e.type === 'error')).toBe(false);
+  });
+
+  it('with no Web Audio the mix cannot be built, so the share is refused rather than reported as on (review round 1 minor)', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await flush();
+    // Deleted before the call, not just before setMixin: MicSource caches
+    // its AudioContext on first success, so the seam's own
+    // `ensureAudioContext()` call (before the await) must fail too, or
+    // the cached instance would let the later `setMixin` succeed anyway.
+    delete (globalThis as any).AudioContext;
+    const setMixin = vi.spyOn(started.store.micSource, 'setMixin');
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    // The refusal hands the track back before stopping the capture, so
+    // MicSource never keeps a refused track whatever order the host's
+    // `stop()` tears it down in. Spied rather than read off `outputMode`
+    // because MicSource's own build-mix failure arm also drops the mixin
+    // — this pins the store's half of it.
+    expect(setMixin.mock.calls[setMixin.mock.calls.length - 1]?.[0]).toBeNull();
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('device');
+  });
+
+  it('a throwing seam emits an error event and clears the pending flag for the next request', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let shouldThrow = true;
+    const started = makeStartedWithCapture(async () => {
+      if (shouldThrow) {
+        shouldThrow = false;
+        throw new Error('nope');
+      }
+      return fakeCapture();
+    });
+    await started.store.audioOn(true);
+    await flush();
+
+    await started.store.systemAudioOn();
+    expect(started.events.some(e => e.type === 'error')).toBe(true);
+    expect(started.calls).toHaveLength(1);
+
+    // The pending flag cleared in `finally`: the next request reaches the seam again.
+    await started.store.systemAudioOn();
+    expect(started.calls).toHaveLength(2);
+  });
+
+  it('the grant lands while a device reopen is in flight and that reopen fails: the share runs on without a microphone (PR #5 re-review)', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    let rejectOpen!: () => void;
+    let n = 0;
+    installNavigator(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      return new Promise<FakeStream>((_res, rej) => { rejectOpen = () => rej(new Error('NotAllowedError')); });
+    });
+    const capture = fakeCapture();
+    let resolveSeam!: (c: FakeCapture) => void;
+    const started = makeStartedWithCapture(() => new Promise(res => { resolveSeam = res; }));
+    await started.store.audioOn(true);
+    await flush();
+    // The request gate passed while the mic was live; the device dies
+    // while the host picker is up, and a consumer's acquire starts a
+    // replacement that will fail.
+    const pending = started.store.systemAudioOn();
+    device1.stop();
+    const opening = started.store.micSource.acquire({ id: 'voice-2' });
+    resolveSeam(capture);
+    await pending;
+
+    rejectOpen();
+    await opening;
+    await flush();
+
+    // The mixin recorded mid-open is settled by that open either way.
+    // It used to be dropped here, because a mix needed a device; now the
+    // share simply carries on with no microphone in it.
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(started.store.micSource.deviceTrack).toBeNull();
+    expect(get(started.store.systemAudio)).not.toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(capture.stop).not.toHaveBeenCalled();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('a mic-less share starts the signals voice encoder, and turning it off stops it', async () => {
+    const startSpy = vi.spyOn(voiceController, 'startCapture').mockResolvedValue(true);
+    const stopSpy = vi.spyOn(voiceController, 'stopCapture').mockResolvedValue(undefined);
+    installNavigator(async () => new FakeStream([new FakeTrack('audio', 'device')]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    // A signals-carried peer present, and the microphone never turned on.
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    started.clock.advance(PING_INTERVAL);
+    await flush();
+    expect(startSpy).not.toHaveBeenCalled();
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    // Driven by the gesture, not left to the next presence tick: peers
+    // on signals would otherwise hear nothing for up to PING_INTERVAL.
+    expect(get(started.store.localIntent).mic.wanted).toBe(false);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(true);
+
+    started.store.systemAudioOff();
+    await flush();
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(false);
+  });
+
+  it('a capture that resolves already ended is not installed (Review Focus 2)', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture({ endedReason: 'stream-lost' });
+    capture.track.stop();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(get(started.store.systemAudio)).toBeNull();
+  });
+
+  it('muting while included silences the microphone and leaves the share audible to peers', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+
+    await started.store.audioOff();
+
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    // The track peers receive stays enabled — muting yourself must not
+    // take the music down with your voice — while the mic's own branch
+    // goes silent.
+    expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(true);
+    expect(device.enabled).toBe(false);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.localIntent).mic.muted).toBe(true);
+
+    await started.store.audioOn(true);
+    expect(device.enabled).toBe(true);
+    expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(true);
+  });
+
+  it('disconnect stops an active capture without a gesture write beyond session-end', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    started.store.disconnect('test');
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+  });
+});
+
+describe('TrackMuted/TrackUnmuted forensics on remote tracks (2026-09-24 incident)', () => {
+  type FakeRemoteTrack = {
+    kind: 'audio' | 'video';
+    muted: boolean;
+    readyState: 'live' | 'ended';
+    enabled: boolean;
+    onmute: (() => void) | null;
+    onunmute: (() => void) | null;
+  };
+  const remoteTrack = (kind: 'audio' | 'video', muted: boolean): FakeRemoteTrack => ({
+    kind, muted, readyState: 'live', enabled: true, onmute: null, onunmute: null,
+  });
+  const streamOf = (tracks: FakeRemoteTrack[]) => ({
+    id: 'remote-stream',
+    getTracks: () => tracks,
+    getAudioTracks: () => tracks.filter(t => t.kind === 'audio'),
+    getVideoTracks: () => tracks.filter(t => t.kind === 'video'),
+  });
+
+  it('logs TrackMuted from onmute, and a log-only TrackUnmuted for a track that arrived unmuted', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    // Video, not audio: an audio track would route into the analyser
+    // setup, which needs an AudioContext this node environment lacks.
+    const track = remoteTrack('video', false);
+    media.emit({
+      type: 'remote-track',
+      peer: peerA,
+      connectionId: 'conn-1',
+      track: track as unknown as MediaStreamTrack,
+      stream: streamOf([track]) as unknown as MediaStream,
+    });
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+    expect(track.onmute).not.toBeNull();
+    expect(track.onunmute).not.toBeNull();
+
+    track.muted = true;
+    track.onmute!();
+    // Log-only: muting touches no slot state.
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+    expect(get(store._openConnections)[peerA]?.videoMuted).not.toBe(true);
+    const muted = logger.eventsNamed('TrackMuted');
+    expect(muted).toHaveLength(1);
+    expect(muted[0].agent).toBe(peerA);
+    expect(muted[0].connectionId).toBe('conn-1');
+    expect(muted[0].detail).toBe('video');
+
+    track.muted = false;
+    track.onunmute!();
+    const unmuted = logger.eventsNamed('TrackUnmuted');
+    expect(unmuted).toHaveLength(1);
+    expect(unmuted[0].detail).toContain('re-unmute');
+  });
+
+  it('keeps the arrived-muted branch intact: onunmute still marks the track ready (Review Focus 5)', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    const track = remoteTrack('video', true);
+    media.emit({
+      type: 'remote-track',
+      peer: peerA,
+      connectionId: 'conn-1',
+      track: track as unknown as MediaStreamTrack,
+      stream: streamOf([track]) as unknown as MediaStream,
+    });
+    expect(logger.eventsNamed('TrackArrivedMuted')).toHaveLength(1);
+    // The `connected` slot write seeds `video: false`; not yet ready.
+    expect(get(store._openConnections)[peerA]?.video).toBe(false);
+    expect(get(store._openConnections)[peerA]?.videoMuted).toBe(true);
+
+    track.muted = false;
+    track.onunmute!();
+    expect(logger.eventsNamed('TrackUnmuted')).toHaveLength(1);
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+
+    track.muted = true;
+    track.onmute!();
+    expect(logger.eventsNamed('TrackMuted')).toHaveLength(1);
+  });
+});
+
+describe('stats forensics (2026-09-24 incident, spec Part 2)', () => {
+  // refreshTracksForPeer and the request-refresh arm console.warn by
+  // design; keep the suite output pristine.
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+  const statsOf = (reports: Record<string, unknown>[]) => ({
+    raw: new Map(reports.map((r, i) => [`r${i}`, r])) as unknown as RTCStatsReport,
+  });
+
+  it('logs our outbound bytes when a peer asks for a track refresh', async () => {
+    const { transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.getStats = async () =>
+      statsOf([
+        { type: 'outbound-rtp', kind: 'audio', bytesSent: 1000 },
+        { type: 'outbound-rtp', kind: 'video', bytesSent: 50_000 },
+      ]);
+
+    media.emit({
+      type: 'data-channel-message',
+      peer: peerA,
+      connectionId: 'conn-1',
+      data: encodeRtcAction('request-track-refresh'),
+    });
+    await flush();
+
+    expect(
+      logger.customMessages.some(m =>
+        m.startsWith(`Track refresh outbound [${peerA.slice(0, 8)}]: audioSent=1000 videoSent=50000`)
+      )
+    ).toBe(true);
+  });
+
+  it('outbound log survives a rejecting getStats (Review Focus 4)', async () => {
+    const { transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.getStats = async () => {
+      throw new Error('pc closed');
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      media.emit({
+        type: 'data-channel-message',
+        peer: peerA,
+        connectionId: 'conn-1',
+        data: encodeRtcAction('request-track-refresh'),
+      });
+      await flush();
+      await flush();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(unhandled).toHaveLength(0);
+    // The refresh receipt itself is still logged; only the stats line is absent.
+    expect(
+      logger.customMessages.some(m => m.includes('request-track-refresh received from'))
+    ).toBe(true);
+    expect(logger.customMessages.some(m => m.includes('Track refresh outbound'))).toBe(false);
+  });
+
+  it('logs a candidate-pair state histogram when no pair succeeded 2s after connected', async () => {
+    const { transports, logger, clock } = makeStarted();
+    const media = transports.media!;
+    media.setIceConnectionState(peerA, 'connected');
+    media.getStats = async () =>
+      statsOf([
+        { type: 'candidate-pair', state: 'in-progress' },
+        { type: 'candidate-pair', state: 'failed' },
+        { type: 'candidate-pair', state: 'failed' },
+        { type: 'inbound-rtp', kind: 'audio', bytesReceived: 1 },
+      ]);
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+
+    clock.advance(2000);
+    await flush();
+
+    const line = logger.customMessages.find(m =>
+      m.startsWith(`ICE pair [${peerA.slice(0, 8)}]: no succeeded pair`)
+    );
+    expect(line).toBeDefined();
+    expect(line).toContain('states=in-progress=1,failed=2');
+    expect(line).toContain('ice=connected');
+    // Negative control: the succeeded-pair line is NOT logged.
+    expect(logger.customMessages.some(m => /ICE pair \[.*\]: local=/.test(m))).toBe(false);
+  });
+
+  it('stays silent about states when a pair did succeed (existing line only)', async () => {
+    const { transports, logger, clock } = makeStarted();
+    const media = transports.media!;
+    media.getStats = async () =>
+      statsOf([
+        { id: 'p', type: 'candidate-pair', state: 'succeeded', localCandidateId: 'l', remoteCandidateId: 'r' },
+        { id: 'l', type: 'local-candidate', candidateType: 'srflx', address: '1.2.3.4', port: 1, protocol: 'udp' },
+        { id: 'r', type: 'remote-candidate', candidateType: 'relay', address: '5.6.7.8', port: 2 },
+      ]);
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    clock.advance(2000);
+    await flush();
+    expect(logger.customMessages.some(m => m.includes('no succeeded pair'))).toBe(false);
+    expect(logger.customMessages.some(m => m.includes(`ICE pair [${peerA.slice(0, 8)}]: local=srflx`))).toBe(true);
+  });
+});
+
+describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
+  // refreshTracksForPeer and the request-refresh arm console.warn by
+  // design; keep the suite output pristine.
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
+  const inbound = (audioBytes: number) => ({
+    raw: new Map([
+      ['a', { type: 'inbound-rtp', kind: 'audio', bytesReceived: audioBytes, packetsReceived: 1 }],
+    ]) as unknown as RTCStatsReport,
+  });
+
+  /** Open a connected media slot to peerA that expects audio, with
+   *  getStats scripted from a mutable byte counter. The slot's `audio`
+   *  flag is set directly: the remote-stream glue would route an audio
+   *  track into the analyser, which needs an AudioContext node lacks. */
+  function openStalledLink(connectionId = 'conn-1') {
+    const started = makeStarted();
+    const media = started.transports.media!;
+    const counter = { bytes: 1000 };
+    media.getStats = async () => inbound(counter.bytes);
+    media.emitPhase(peerA, connectionId, 'signaling');
+    media.emitPhase(peerA, connectionId, 'connected', 'connecting');
+    get(started.store._openConnections)[peerA].audio = true;
+    return { ...started, media, counter };
+  }
+
+  const refreshFramesTo = (media: FakeTransport, peer: string) =>
+    media.sentData.filter(d => d.peer === peer && d.data === encodeRtcAction('request-track-refresh')).length;
+
+  const poll = async (store: StreamsStore, n: number) => {
+    for (let i = 0; i < n; i += 1) await store.trackHealth.checkTrackHealth();
+  };
+
+  it('(a) requests DEAD_TRACK_REFRESH_BUDGET refreshes, then closes with the named reason', async () => {
+    const { store, media, logger } = openStalledLink();
+    // Bytes frozen at 1000 from the first poll on. Crossings happen on
+    // polls 3, 5, 7 (requests) and 9 (escalation).
+    await poll(store, 8);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
+
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    const ev = logger.eventsNamed('DeadTrackEscalation');
+    expect(ev).toHaveLength(1);
+    expect(ev[0].agent).toBe(peerA);
+    expect(ev[0].connectionId).toBe('conn-1');
+    expect(ev[0].detail).toContain(`refreshes=${DEAD_TRACK_REFRESH_BUDGET} budget=${DEAD_TRACK_REFRESH_BUDGET}`);
+    // The close ran the existing cleanup row: session bookkeeping wiped,
+    // the escalation count survived, lastDisconnectTime stamped.
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBeUndefined();
+    expect(store._peerRecord(peerA)?.staleCycles).toBeUndefined();
+    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(1);
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeDefined();
+    expect(logger.eventsNamed('CarrierSwitch').some(e => e.detail?.includes('webrtc->signals'))).toBe(true);
+  });
+
+  it('(b) the next connection to the same peer gets the doubled budget', async () => {
+    const { store, media } = openStalledLink();
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3); // through the first escalation
+    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(1);
+    media.sentData.length = 0;
+    media.closeCalls.length = 0;
+
+    media.emitPhase(peerA, 'conn-2', 'signaling');
+    media.emitPhase(peerA, 'conn-2', 'connected', 'connecting');
+    get(store._openConnections)[peerA].audio = true;
+    const budget = deadTrackRefreshBudget(1);
+    expect(budget).toBe(2 * DEAD_TRACK_REFRESH_BUDGET);
+    await poll(store, 2 * budget + 2);
+    expect(refreshFramesTo(media, peerA)).toBe(budget);
+    expect(media.closeCalls).toHaveLength(0);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(2);
+  });
+
+  it('(c) bytes resuming resets the refresh budget', async () => {
+    const { store, media, counter } = openStalledLink();
+    await poll(store, 3); // one request
+    expect(refreshFramesTo(media, peerA)).toBe(1);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(1);
+
+    counter.bytes = 2000; // flow resumes
+    await poll(store, 1);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(0);
+
+    // Freeze again: a full budget is available before escalation.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(1 + DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+  });
+
+  it('(d) a failing refresh send still consumes the budget: a dead data channel must not prevent escalation', async () => {
+    const { store, media, logger } = openStalledLink();
+    media.send = () => {
+      throw new Error('data channel closed');
+    };
+    // Crossing on poll 3; the stale counters are not reset because the
+    // send failed, so every later poll crosses again: attempts on polls
+    // 3, 4, 5 and escalation on poll 6.
+    await poll(store, 5);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(1);
+  });
+
+  it('(e) a vanished transport (phase idle, slot still connected) holds: no request, no escalation, no loop (Review Focus 3)', async () => {
+    const { store, media, logger } = openStalledLink();
+    media.vanish(peerA); // the §3.1(c) shape: no closed event will ever come; getPhase reports 'idle'
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+    // The slot outlives the transport (the bounded exception); nothing here
+    // clears it, and nothing here churns on it either.
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    expect(store._peerRecord(peerA)?.deadTrackEscalations ?? 0).toBe(0);
+  });
+
+  it('(f) holds while the transport is recovering, then escalates once it is connected again', async () => {
+    const { store, media, logger } = openStalledLink();
+    // Enter the FSM's own recovery window: the slot keeps connected:true
+    // (transport-owns-recovery route) but the phase is not 'connected'.
+    media.emitPhase(peerA, 'conn-1', 'reconnecting', 'connected');
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+
+    // Reconnection succeeded: same connectionId, phase back to connected.
+    media.emitPhase(peerA, 'conn-1', 'connected', 'reconnecting');
+    // lastBytesReceived is still written under the hold, so the first
+    // post-recovery poll already counts a stale cycle against the last held sample.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+  });
+
+  it('(g) holds through the FSM\'s ICE-disconnected grace inside phase connected, then resumes', async () => {
+    const { store, media, logger } = openStalledLink();
+    // The FSM stays in phase `connected` while ICE is `disconnected`
+    // (its own grace runs there); the record's iceDisconnectedAt is the
+    // store's one authority for that window.
+    media.emit({
+      type: 'ice-diagnostic',
+      peer: peerA,
+      connectionId: 'conn-1',
+      diag: { kind: 'ice-state', state: 'disconnected' },
+    });
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeDefined();
+    expect(media.getPhase(peerA)).toBe('connected');
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+
+    media.emit({
+      type: 'ice-diagnostic',
+      peer: peerA,
+      connectionId: 'conn-1',
+      diag: { kind: 'ice-state', state: 'connected' },
+    });
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeUndefined();
+    // lastBytesReceived was written under the hold, so the first poll
+    // after it already counts a stale cycle against the last held sample.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
   });
 });

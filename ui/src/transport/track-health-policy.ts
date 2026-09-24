@@ -17,6 +17,7 @@
  *
  * Constrains `ui/src/track-health.ts:TrackHealthMonitor.checkTrackHealth`.
  */
+import type { ConnectionPhase } from './types';
 
 /**
  * The subset of an RTCStats report this policy reads. Reports are produced
@@ -29,6 +30,8 @@ export type RtcStatsReportLike = {
   kind?: string;
   mediaType?: string;
   bytesReceived?: number;
+  /** outbound-rtp: our sender's counter. Forensics only (spec Part 2). */
+  bytesSent?: number;
   /** Seconds, per spec. */
   jitter?: number;
   packetsReceived?: number;
@@ -44,6 +47,10 @@ export type RtcStatsSummary = {
   /** inbound-rtp bytesReceived per kind; 0 when the kind is absent. */
   audioBytes: number;
   videoBytes: number;
+  /** outbound-rtp bytesSent per kind; 0 when the kind is absent. Read by
+   *  the request-track-refresh receipt log only, never by a decision. */
+  audioBytesSent: number;
+  videoBytesSent: number;
   /**
    * RTT in whole ms. remote-inbound-rtp (our outgoing direction) is
    * preferred; candidate-pair (ICE-level) is the fallback. Null when
@@ -63,6 +70,8 @@ export type RtcStatsSummary = {
 export function summarizeRtcStats(reports: RtcStatsReportLike[]): RtcStatsSummary {
   let audioBytes = 0;
   let videoBytes = 0;
+  let audioBytesSent = 0;
+  let videoBytesSent = 0;
   let audioJitter: number | null = null;
   let audioPacketsReceived = 0;
   let audioPacketsLost = 0;
@@ -85,6 +94,14 @@ export function summarizeRtcStats(reports: RtcStatsReportLike[]): RtcStatsSummar
         if (typeof report.jitter === 'number') videoJitter = report.jitter;
         videoPacketsReceived = report.packetsReceived || 0;
         videoPacketsLost = report.packetsLost || 0;
+      }
+    }
+    if (report.type === 'outbound-rtp') {
+      const kind = report.kind || report.mediaType;
+      if (kind === 'audio') {
+        audioBytesSent = report.bytesSent || 0;
+      } else if (kind === 'video') {
+        videoBytesSent = report.bytesSent || 0;
       }
     }
     if (
@@ -119,7 +136,7 @@ export function summarizeRtcStats(reports: RtcStatsReportLike[]): RtcStatsSummar
   const lossPercent =
     totalPackets > 0 ? Math.round((pktsLost / totalPackets) * 1000) / 10 : null;
 
-  return { audioBytes, videoBytes, rttMs, jitterMs, lossPercent };
+  return { audioBytes, videoBytes, audioBytesSent, videoBytesSent, rttMs, jitterMs, lossPercent };
 }
 
 export type StaleCycleCounts = { audio: number; video: number };
@@ -131,6 +148,32 @@ export type StaleCycleCounts = { audio: number; video: number };
  * advanced once per `TrackHealthMonitor.checkTrackHealth` poll.
  */
 export const STALE_CYCLES_REFRESH_THRESHOLD = 2;
+
+/**
+ * Refresh requests a connection may spend on a frozen track before the
+ * receiver escalates to a close + re-establish. Serves the media-flowing
+ * predicate on the track-health poll's clock (`PING_INTERVAL`): with
+ * STALE_CYCLES_REFRESH_THRESHOLD = 2 and a 2s poll, requests go out at
+ * t≈4/8/12s and escalation fires at t≈16s. NOT a liveness constant.
+ * 2026-09-24 incident: 18 dead-track cycles over 70s with no exit.
+ */
+export const DEAD_TRACK_REFRESH_BUDGET = 3;
+
+/**
+ * Cap on the doubling of the budget across successive escalations to
+ * the same peer (3, 6, 12, 24, 24, …). Bounds a pathological loop where
+ * the fresh connection is also dead, without ever giving up.
+ * Serves the media-flowing predicate on the track-health poll's clock
+ * (`PING_INTERVAL`); NOT a liveness constant.
+ */
+export const DEAD_TRACK_ESCALATION_BACKOFF_CAP = 3;
+
+/** The refresh budget for a connection, given how many times this peer
+ *  has already been escalated since it last left. */
+export function deadTrackRefreshBudget(priorEscalations: number): number {
+  const exp = Math.max(0, Math.min(priorEscalations, DEAD_TRACK_ESCALATION_BACKOFF_CAP));
+  return DEAD_TRACK_REFRESH_BUDGET << exp;
+}
 
 export type TrackRefreshInputs = {
   /** Whether the slot expects this kind to be flowing (`conn.video` / `conn.audio`). */
@@ -144,6 +187,30 @@ export type TrackRefreshInputs = {
   /** Consecutive-frozen counts carried over from last cycle. */
   staleCycles: StaleCycleCounts;
   staleThresholdCycles: number;
+  /** Refresh requests already sent on this connection without bytes
+   *  resuming (the peer record's `refreshRequestsSent`). */
+  refreshRequestsSent: number;
+  /** Requests allowed before escalation: `deadTrackRefreshBudget(...)`. */
+  refreshBudget: number;
+  /**
+   * The media transport's phase for this peer (`PeerTransport.getPhase`).
+   * A slot stays `connected: true` through `reconnecting`/`disconnected`
+   * (the transport-owns-recovery route in media-event-policy.ts) and the
+   * FSM owns that recovery, so this decision HOLDS — no request, no
+   * escalation, counters and budget frozen — until the phase is
+   * `connected` again. Escalation then resumes on the held counters.
+   */
+  transportPhase: ConnectionPhase;
+  /**
+   * Whether the peer's media ICE state is currently `disconnected`
+   * (`PeerRecord.iceDisconnectedAt !== undefined`, maintained by
+   * `MediaLinks._handleMediaIceDiagnostic`). The FSM's ICE-disconnected
+   * grace runs INSIDE phase `connected` (it logs `connected->connected
+   * trigger="ICE: disconnected"` before any move to `reconnecting`), so
+   * the phase alone does not see it. Held like a non-`connected` phase:
+   * that window is the FSM's recovery, not ours.
+   */
+  iceDisconnected: boolean;
 };
 
 export type TrackRefreshDecision =
@@ -152,7 +219,21 @@ export type TrackRefreshDecision =
       nextStale: StaleCycleCounts;
       reason: 'stale-cycles-exceeded';
     }
-  | { action: 'none'; nextStale: StaleCycleCounts; reason: 'flowing' };
+  | {
+      /** The budget is spent: close the connection and let the pong
+       *  drive re-establish it. */
+      action: 'escalate';
+      nextStale: StaleCycleCounts;
+      reason: 'refresh-budget-exhausted';
+    }
+  | {
+      action: 'none';
+      nextStale: StaleCycleCounts;
+      reason: 'flowing' | 'transport-recovering';
+      /** True when both counters are zero (bytes resumed on every
+       *  expected kind): the caller zeroes `refreshRequestsSent`. */
+      resetRefreshBudget: boolean;
+    };
 
 /**
  * Advance the per-kind frozen-counters and decide whether to request a
@@ -167,8 +248,25 @@ export type TrackRefreshDecision =
  *
  * The caller resets the counters to zero only after the refresh request
  * was actually sent; a send failure keeps them, so the next cycle retries.
+ * The caller increments `refreshRequestsSent` on every attempt, sent or
+ * not (the budget counts attempts, by declaration).
+ * `escalate` replaces `request-refresh` once that count reaches
+ * `refreshBudget`; a `none` with `resetRefreshBudget` zeroes it.
+ *
+ * While `transportPhase` is not `connected`, or `iceDisconnected` is set
+ * (the FSM's ICE-disconnected grace runs inside phase `connected`), the
+ * decision holds (`none`/`transport-recovering`, counters frozen, budget
+ * not reset): the FSM owns that recovery window.
  */
 export function decideTrackRefresh(input: TrackRefreshInputs): TrackRefreshDecision {
+  if (input.transportPhase !== 'connected' || input.iceDisconnected) {
+    return {
+      action: 'none',
+      nextStale: { ...input.staleCycles },
+      reason: 'transport-recovering',
+      resetRefreshBudget: false,
+    };
+  }
   const nextStale: StaleCycleCounts = { ...input.staleCycles };
 
   if (input.videoExpected && input.videoBytes > 0) {
@@ -187,11 +285,19 @@ export function decideTrackRefresh(input: TrackRefreshInputs): TrackRefreshDecis
     }
   }
 
-  if (
+  const crossed =
     nextStale.video >= input.staleThresholdCycles ||
-    nextStale.audio >= input.staleThresholdCycles
-  ) {
+    nextStale.audio >= input.staleThresholdCycles;
+  if (crossed) {
+    if (input.refreshRequestsSent >= input.refreshBudget) {
+      return { action: 'escalate', nextStale, reason: 'refresh-budget-exhausted' };
+    }
     return { action: 'request-refresh', nextStale, reason: 'stale-cycles-exceeded' };
   }
-  return { action: 'none', nextStale, reason: 'flowing' };
+  return {
+    action: 'none',
+    nextStale,
+    reason: 'flowing',
+    resetRefreshBudget: nextStale.audio === 0 && nextStale.video === 0,
+  };
 }

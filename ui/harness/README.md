@@ -30,6 +30,22 @@ reproduce. The rigs living here:
   (`decideScreenSignalRoute`, executed not mirrored), and slot + the peer
   record's `screenShareStream` teardown on a silent peer drop through the
   production recovery phases. Also in the nightly gate.
+- **System-audio mix** (`system-audio-mix-harness.*`, `system-audio-mix.spec.ts`)
+  — the real-Web-Audio tier of the system-audio mixin (spec Section 4).
+  Runs the production `MicSource` against Chromium's fake microphone
+  (`--use-fake-device-for-media-stream`, see `playwright.config.ts`), mixes
+  in an oscillator standing in for the host seam's capture track, and reads
+  the OUTPUT track back through a real `MediaStreamTrackProcessor` and an
+  `AudioEncoder` configured as `voice.ts` configures its own. Asserts mono
+  48 kHz, the mixin audible in the output and gone after the tear, Opus out
+  of the voice config with no encoder error — and, as the negative control,
+  that a destination left at Web Audio's stereo default is rejected by that
+  same encoder (the whole-branch review's Critical, reproduced in the
+  engine: "Input audio buffer is incompatible with codec parameters", then
+  a closed codec). The node fakes cannot see any of this. Also in the
+  nightly gate. Not covered here: the store's swap fanout (node,
+  `streams-store-wiring.test.ts`) and a real peer hearing it (the owner-run
+  two-machine checklist in the plan).
 - **Layout** (below) — NOT in any gate yet: its split-mode baseline is red
   by design; it joins the nightly gate when split-mode is unified onto the
   grid model.
