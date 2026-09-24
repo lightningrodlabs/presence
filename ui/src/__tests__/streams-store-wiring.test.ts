@@ -24,6 +24,7 @@ import {
 } from '../transport/signals-cadence-policy';
 import { CAP_VOICE_BATCH } from '../transport/wire-contract';
 import { encodeRtcAction } from '../rtc-message-policy';
+import { DEAD_TRACK_REFRESH_BUDGET, deadTrackRefreshBudget } from '../transport/track-health-policy';
 import {
   CAPTURE_REOPEN_MIN_INTERVAL_MS,
   CAPTURE_REOPEN_MAX_ATTEMPTS,
@@ -957,7 +958,7 @@ describe("setCarrierMode teardown — regression pin for the previous/_applyInte
 
     expect(
       media.closeCalls.some(
-        c => c.peer === peerA && c.reason === 'disconnectFromPeerVideo'
+        c => c.peer === peerA && c.reason === 'carrier-mode-signals'
       )
     ).toBe(true);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
@@ -3128,5 +3129,394 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(capture.stop).toHaveBeenCalledTimes(1);
     expect(get(started.store.systemAudio)).toBeNull();
     expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+  });
+});
+
+describe('TrackMuted/TrackUnmuted forensics on remote tracks (2026-09-24 incident)', () => {
+  type FakeRemoteTrack = {
+    kind: 'audio' | 'video';
+    muted: boolean;
+    readyState: 'live' | 'ended';
+    enabled: boolean;
+    onmute: (() => void) | null;
+    onunmute: (() => void) | null;
+  };
+  const remoteTrack = (kind: 'audio' | 'video', muted: boolean): FakeRemoteTrack => ({
+    kind, muted, readyState: 'live', enabled: true, onmute: null, onunmute: null,
+  });
+  const streamOf = (tracks: FakeRemoteTrack[]) => ({
+    id: 'remote-stream',
+    getTracks: () => tracks,
+    getAudioTracks: () => tracks.filter(t => t.kind === 'audio'),
+    getVideoTracks: () => tracks.filter(t => t.kind === 'video'),
+  });
+
+  it('logs TrackMuted from onmute, and a log-only TrackUnmuted for a track that arrived unmuted', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    // Video, not audio: an audio track would route into the analyser
+    // setup, which needs an AudioContext this node environment lacks.
+    const track = remoteTrack('video', false);
+    media.emit({
+      type: 'remote-track',
+      peer: peerA,
+      connectionId: 'conn-1',
+      track: track as unknown as MediaStreamTrack,
+      stream: streamOf([track]) as unknown as MediaStream,
+    });
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+    expect(track.onmute).not.toBeNull();
+    expect(track.onunmute).not.toBeNull();
+
+    track.muted = true;
+    track.onmute!();
+    // Log-only: muting touches no slot state.
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+    expect(get(store._openConnections)[peerA]?.videoMuted).not.toBe(true);
+    const muted = logger.eventsNamed('TrackMuted');
+    expect(muted).toHaveLength(1);
+    expect(muted[0].agent).toBe(peerA);
+    expect(muted[0].connectionId).toBe('conn-1');
+    expect(muted[0].detail).toBe('video');
+
+    track.muted = false;
+    track.onunmute!();
+    const unmuted = logger.eventsNamed('TrackUnmuted');
+    expect(unmuted).toHaveLength(1);
+    expect(unmuted[0].detail).toContain('re-unmute');
+  });
+
+  it('keeps the arrived-muted branch intact: onunmute still marks the track ready (Review Focus 5)', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    const track = remoteTrack('video', true);
+    media.emit({
+      type: 'remote-track',
+      peer: peerA,
+      connectionId: 'conn-1',
+      track: track as unknown as MediaStreamTrack,
+      stream: streamOf([track]) as unknown as MediaStream,
+    });
+    expect(logger.eventsNamed('TrackArrivedMuted')).toHaveLength(1);
+    // The `connected` slot write seeds `video: false`; not yet ready.
+    expect(get(store._openConnections)[peerA]?.video).toBe(false);
+    expect(get(store._openConnections)[peerA]?.videoMuted).toBe(true);
+
+    track.muted = false;
+    track.onunmute!();
+    expect(logger.eventsNamed('TrackUnmuted')).toHaveLength(1);
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+
+    track.muted = true;
+    track.onmute!();
+    expect(logger.eventsNamed('TrackMuted')).toHaveLength(1);
+  });
+});
+
+describe('stats forensics (2026-09-24 incident, spec Part 2)', () => {
+  // refreshTracksForPeer and the request-refresh arm console.warn by
+  // design; keep the suite output pristine.
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+  const statsOf = (reports: Record<string, unknown>[]) => ({
+    raw: new Map(reports.map((r, i) => [`r${i}`, r])) as unknown as RTCStatsReport,
+  });
+
+  it('logs our outbound bytes when a peer asks for a track refresh', async () => {
+    const { transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.getStats = async () =>
+      statsOf([
+        { type: 'outbound-rtp', kind: 'audio', bytesSent: 1000 },
+        { type: 'outbound-rtp', kind: 'video', bytesSent: 50_000 },
+      ]);
+
+    media.emit({
+      type: 'data-channel-message',
+      peer: peerA,
+      connectionId: 'conn-1',
+      data: encodeRtcAction('request-track-refresh'),
+    });
+    await flush();
+
+    expect(
+      logger.customMessages.some(m =>
+        m.startsWith(`Track refresh outbound [${peerA.slice(0, 8)}]: audioSent=1000 videoSent=50000`)
+      )
+    ).toBe(true);
+  });
+
+  it('outbound log survives a rejecting getStats (Review Focus 4)', async () => {
+    const { transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.getStats = async () => {
+      throw new Error('pc closed');
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      media.emit({
+        type: 'data-channel-message',
+        peer: peerA,
+        connectionId: 'conn-1',
+        data: encodeRtcAction('request-track-refresh'),
+      });
+      await flush();
+      await flush();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(unhandled).toHaveLength(0);
+    // The refresh receipt itself is still logged; only the stats line is absent.
+    expect(
+      logger.customMessages.some(m => m.includes('request-track-refresh received from'))
+    ).toBe(true);
+    expect(logger.customMessages.some(m => m.includes('Track refresh outbound'))).toBe(false);
+  });
+
+  it('logs a candidate-pair state histogram when no pair succeeded 2s after connected', async () => {
+    const { transports, logger, clock } = makeStarted();
+    const media = transports.media!;
+    media.setIceConnectionState(peerA, 'connected');
+    media.getStats = async () =>
+      statsOf([
+        { type: 'candidate-pair', state: 'in-progress' },
+        { type: 'candidate-pair', state: 'failed' },
+        { type: 'candidate-pair', state: 'failed' },
+        { type: 'inbound-rtp', kind: 'audio', bytesReceived: 1 },
+      ]);
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+
+    clock.advance(2000);
+    await flush();
+
+    const line = logger.customMessages.find(m =>
+      m.startsWith(`ICE pair [${peerA.slice(0, 8)}]: no succeeded pair`)
+    );
+    expect(line).toBeDefined();
+    expect(line).toContain('states=in-progress=1,failed=2');
+    expect(line).toContain('ice=connected');
+    // Negative control: the succeeded-pair line is NOT logged.
+    expect(logger.customMessages.some(m => /ICE pair \[.*\]: local=/.test(m))).toBe(false);
+  });
+
+  it('stays silent about states when a pair did succeed (existing line only)', async () => {
+    const { transports, logger, clock } = makeStarted();
+    const media = transports.media!;
+    media.getStats = async () =>
+      statsOf([
+        { id: 'p', type: 'candidate-pair', state: 'succeeded', localCandidateId: 'l', remoteCandidateId: 'r' },
+        { id: 'l', type: 'local-candidate', candidateType: 'srflx', address: '1.2.3.4', port: 1, protocol: 'udp' },
+        { id: 'r', type: 'remote-candidate', candidateType: 'relay', address: '5.6.7.8', port: 2 },
+      ]);
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    clock.advance(2000);
+    await flush();
+    expect(logger.customMessages.some(m => m.includes('no succeeded pair'))).toBe(false);
+    expect(logger.customMessages.some(m => m.includes(`ICE pair [${peerA.slice(0, 8)}]: local=srflx`))).toBe(true);
+  });
+});
+
+describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
+  // refreshTracksForPeer and the request-refresh arm console.warn by
+  // design; keep the suite output pristine.
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
+  const inbound = (audioBytes: number) => ({
+    raw: new Map([
+      ['a', { type: 'inbound-rtp', kind: 'audio', bytesReceived: audioBytes, packetsReceived: 1 }],
+    ]) as unknown as RTCStatsReport,
+  });
+
+  /** Open a connected media slot to peerA that expects audio, with
+   *  getStats scripted from a mutable byte counter. The slot's `audio`
+   *  flag is set directly: the remote-stream glue would route an audio
+   *  track into the analyser, which needs an AudioContext node lacks. */
+  function openStalledLink(connectionId = 'conn-1') {
+    const started = makeStarted();
+    const media = started.transports.media!;
+    const counter = { bytes: 1000 };
+    media.getStats = async () => inbound(counter.bytes);
+    media.emitPhase(peerA, connectionId, 'signaling');
+    media.emitPhase(peerA, connectionId, 'connected', 'connecting');
+    get(started.store._openConnections)[peerA].audio = true;
+    return { ...started, media, counter };
+  }
+
+  const refreshFramesTo = (media: FakeTransport, peer: string) =>
+    media.sentData.filter(d => d.peer === peer && d.data === encodeRtcAction('request-track-refresh')).length;
+
+  const poll = async (store: StreamsStore, n: number) => {
+    for (let i = 0; i < n; i += 1) await store.trackHealth.checkTrackHealth();
+  };
+
+  it('(a) requests DEAD_TRACK_REFRESH_BUDGET refreshes, then closes with the named reason', async () => {
+    const { store, media, logger } = openStalledLink();
+    // Bytes frozen at 1000 from the first poll on. Crossings happen on
+    // polls 3, 5, 7 (requests) and 9 (escalation).
+    await poll(store, 8);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
+
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    const ev = logger.eventsNamed('DeadTrackEscalation');
+    expect(ev).toHaveLength(1);
+    expect(ev[0].agent).toBe(peerA);
+    expect(ev[0].connectionId).toBe('conn-1');
+    expect(ev[0].detail).toContain(`refreshes=${DEAD_TRACK_REFRESH_BUDGET} budget=${DEAD_TRACK_REFRESH_BUDGET}`);
+    // The close ran the existing cleanup row: session bookkeeping wiped,
+    // the escalation count survived, lastDisconnectTime stamped.
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBeUndefined();
+    expect(store._peerRecord(peerA)?.staleCycles).toBeUndefined();
+    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(1);
+    expect(store._peerRecord(peerA)?.lastDisconnectTime).toBeDefined();
+    expect(logger.eventsNamed('CarrierSwitch').some(e => e.detail?.includes('webrtc->signals'))).toBe(true);
+  });
+
+  it('(b) the next connection to the same peer gets the doubled budget', async () => {
+    const { store, media } = openStalledLink();
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3); // through the first escalation
+    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(1);
+    media.sentData.length = 0;
+    media.closeCalls.length = 0;
+
+    media.emitPhase(peerA, 'conn-2', 'signaling');
+    media.emitPhase(peerA, 'conn-2', 'connected', 'connecting');
+    get(store._openConnections)[peerA].audio = true;
+    const budget = deadTrackRefreshBudget(1);
+    expect(budget).toBe(2 * DEAD_TRACK_REFRESH_BUDGET);
+    await poll(store, 2 * budget + 2);
+    expect(refreshFramesTo(media, peerA)).toBe(budget);
+    expect(media.closeCalls).toHaveLength(0);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(2);
+  });
+
+  it('(c) bytes resuming resets the refresh budget', async () => {
+    const { store, media, counter } = openStalledLink();
+    await poll(store, 3); // one request
+    expect(refreshFramesTo(media, peerA)).toBe(1);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(1);
+
+    counter.bytes = 2000; // flow resumes
+    await poll(store, 1);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(0);
+
+    // Freeze again: a full budget is available before escalation.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(1 + DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+  });
+
+  it('(d) a failing refresh send still consumes the budget: a dead data channel must not prevent escalation', async () => {
+    const { store, media, logger } = openStalledLink();
+    media.send = () => {
+      throw new Error('data channel closed');
+    };
+    // Crossing on poll 3; the stale counters are not reset because the
+    // send failed, so every later poll crosses again: attempts on polls
+    // 3, 4, 5 and escalation on poll 6.
+    await poll(store, 5);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(1);
+  });
+
+  it('(e) a vanished transport (phase idle, slot still connected) holds: no request, no escalation, no loop (Review Focus 3)', async () => {
+    const { store, media, logger } = openStalledLink();
+    media.vanish(peerA); // the §3.1(c) shape: no closed event will ever come; getPhase reports 'idle'
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+    // The slot outlives the transport (the bounded exception); nothing here
+    // clears it, and nothing here churns on it either.
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    expect(store._peerRecord(peerA)?.deadTrackEscalations ?? 0).toBe(0);
+  });
+
+  it('(f) holds while the transport is recovering, then escalates once it is connected again', async () => {
+    const { store, media, logger } = openStalledLink();
+    // Enter the FSM's own recovery window: the slot keeps connected:true
+    // (transport-owns-recovery route) but the phase is not 'connected'.
+    media.emitPhase(peerA, 'conn-1', 'reconnecting', 'connected');
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+
+    // Reconnection succeeded: same connectionId, phase back to connected.
+    media.emitPhase(peerA, 'conn-1', 'connected', 'reconnecting');
+    // lastBytesReceived is still written under the hold, so the first
+    // post-recovery poll already counts a stale cycle against the last held sample.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+  });
+
+  it('(g) holds through the FSM\'s ICE-disconnected grace inside phase connected, then resumes', async () => {
+    const { store, media, logger } = openStalledLink();
+    // The FSM stays in phase `connected` while ICE is `disconnected`
+    // (its own grace runs there); the record's iceDisconnectedAt is the
+    // store's one authority for that window.
+    media.emit({
+      type: 'ice-diagnostic',
+      peer: peerA,
+      connectionId: 'conn-1',
+      diag: { kind: 'ice-state', state: 'disconnected' },
+    });
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeDefined();
+    expect(media.getPhase(peerA)).toBe('connected');
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+
+    media.emit({
+      type: 'ice-diagnostic',
+      peer: peerA,
+      connectionId: 'conn-1',
+      diag: { kind: 'ice-state', state: 'connected' },
+    });
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeUndefined();
+    // lastBytesReceived was written under the hold, so the first poll
+    // after it already counts a stale cycle against the last held sample.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
   });
 });

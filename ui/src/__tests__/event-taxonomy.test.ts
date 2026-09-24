@@ -146,6 +146,7 @@ describe('SimpleEvent taxonomy', () => {
         "ChangeMyVideoInput": "emitted",
         "Connected": "emitted",
         "ConnectionAborted": "emitted",
+        "DeadTrackEscalation": "emitted",
         "FsmClose": "emitted",
         "FsmError": "emitted",
         "FsmEstablishmentTimeline": "emitted",
@@ -185,6 +186,7 @@ describe('SimpleEvent taxonomy', () => {
         "SupersededError": "emitted",
         "SystemAudioEnded": "emitted",
         "TrackArrivedMuted": "emitted",
+        "TrackMuted": "emitted",
         "TrackUnmuteTimeout": "emitted",
         "TrackUnmuted": "emitted",
       }
