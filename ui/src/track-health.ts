@@ -21,6 +21,7 @@ import type { PresenceLogger } from './logging';
 import {
   summarizeRtcStats,
   decideTrackRefresh,
+  deadTrackRefreshBudget,
   STALE_CYCLES_REFRESH_THRESHOLD,
 } from './transport/track-health-policy';
 import type { RtcStatsReportLike } from './transport/track-health-policy';
@@ -110,6 +111,8 @@ export class TrackHealthMonitor {
           lastBytes: this.bindings.peerRecord(pubKeyB64)?.lastBytesReceived || { audio: 0, video: 0 },
           staleCycles: this.bindings.peerRecord(pubKeyB64)?.staleCycles || { audio: 0, video: 0 },
           staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
+          refreshRequestsSent: this.bindings.peerRecord(pubKeyB64)?.refreshRequestsSent ?? 0,
+          refreshBudget: deadTrackRefreshBudget(this.bindings.peerRecord(pubKeyB64)?.deadTrackEscalations ?? 0),
         });
 
         this.bindings.ensurePeerRecord(pubKeyB64).lastBytesReceived = {

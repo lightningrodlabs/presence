@@ -148,6 +148,30 @@ export type StaleCycleCounts = { audio: number; video: number };
  */
 export const STALE_CYCLES_REFRESH_THRESHOLD = 2;
 
+/**
+ * Refresh requests a connection may spend on a frozen track before the
+ * receiver escalates to a close + re-establish. Serves the media-flowing
+ * predicate on the track-health poll's clock (`PING_INTERVAL`): with
+ * STALE_CYCLES_REFRESH_THRESHOLD = 2 and a 2s poll, requests go out at
+ * t≈4/8/12s and escalation fires at t≈16s. NOT a liveness constant.
+ * 2026-09-24 incident: 18 dead-track cycles over 70s with no exit.
+ */
+export const DEAD_TRACK_REFRESH_BUDGET = 3;
+
+/**
+ * Cap on the doubling of the budget across successive escalations to
+ * the same peer (3, 6, 12, 24, 24, …). Bounds a pathological loop where
+ * the fresh connection is also dead, without ever giving up.
+ */
+export const DEAD_TRACK_ESCALATION_BACKOFF_CAP = 3;
+
+/** The refresh budget for a connection, given how many times this peer
+ *  has already been escalated since it last left. */
+export function deadTrackRefreshBudget(priorEscalations: number): number {
+  const exp = Math.max(0, Math.min(priorEscalations, DEAD_TRACK_ESCALATION_BACKOFF_CAP));
+  return DEAD_TRACK_REFRESH_BUDGET << exp;
+}
+
 export type TrackRefreshInputs = {
   /** Whether the slot expects this kind to be flowing (`conn.video` / `conn.audio`). */
   videoExpected: boolean;
@@ -160,6 +184,11 @@ export type TrackRefreshInputs = {
   /** Consecutive-frozen counts carried over from last cycle. */
   staleCycles: StaleCycleCounts;
   staleThresholdCycles: number;
+  /** Refresh requests already sent on this connection without bytes
+   *  resuming (the peer record's `refreshRequestsSent`). */
+  refreshRequestsSent: number;
+  /** Requests allowed before escalation: `deadTrackRefreshBudget(...)`. */
+  refreshBudget: number;
 };
 
 export type TrackRefreshDecision =
@@ -168,7 +197,21 @@ export type TrackRefreshDecision =
       nextStale: StaleCycleCounts;
       reason: 'stale-cycles-exceeded';
     }
-  | { action: 'none'; nextStale: StaleCycleCounts; reason: 'flowing' };
+  | {
+      /** The budget is spent: close the connection and let the pong
+       *  drive re-establish it. */
+      action: 'escalate';
+      nextStale: StaleCycleCounts;
+      reason: 'refresh-budget-exhausted';
+    }
+  | {
+      action: 'none';
+      nextStale: StaleCycleCounts;
+      reason: 'flowing';
+      /** True when both counters are zero (bytes resumed on every
+       *  expected kind): the caller zeroes `refreshRequestsSent`. */
+      resetRefreshBudget: boolean;
+    };
 
 /**
  * Advance the per-kind frozen-counters and decide whether to request a
@@ -183,6 +226,9 @@ export type TrackRefreshDecision =
  *
  * The caller resets the counters to zero only after the refresh request
  * was actually sent; a send failure keeps them, so the next cycle retries.
+ * The caller increments `refreshRequestsSent` on the same condition.
+ * `escalate` replaces `request-refresh` once that count reaches
+ * `refreshBudget`; a `none` with `resetRefreshBudget` zeroes it.
  */
 export function decideTrackRefresh(input: TrackRefreshInputs): TrackRefreshDecision {
   const nextStale: StaleCycleCounts = { ...input.staleCycles };
@@ -203,11 +249,19 @@ export function decideTrackRefresh(input: TrackRefreshInputs): TrackRefreshDecis
     }
   }
 
-  if (
+  const crossed =
     nextStale.video >= input.staleThresholdCycles ||
-    nextStale.audio >= input.staleThresholdCycles
-  ) {
+    nextStale.audio >= input.staleThresholdCycles;
+  if (crossed) {
+    if (input.refreshRequestsSent >= input.refreshBudget) {
+      return { action: 'escalate', nextStale, reason: 'refresh-budget-exhausted' };
+    }
     return { action: 'request-refresh', nextStale, reason: 'stale-cycles-exceeded' };
   }
-  return { action: 'none', nextStale, reason: 'flowing' };
+  return {
+    action: 'none',
+    nextStale,
+    reason: 'flowing',
+    resetRefreshBudget: nextStale.audio === 0 && nextStale.video === 0,
+  };
 }

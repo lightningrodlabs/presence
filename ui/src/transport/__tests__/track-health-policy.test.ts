@@ -2,6 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   summarizeRtcStats,
   decideTrackRefresh,
+  deadTrackRefreshBudget,
+  DEAD_TRACK_ESCALATION_BACKOFF_CAP,
+  DEAD_TRACK_REFRESH_BUDGET,
   STALE_CYCLES_REFRESH_THRESHOLD,
 } from '../track-health-policy';
 import type {
@@ -158,6 +161,8 @@ const base: TrackRefreshInputs = {
   lastBytes: { audio: 1000, video: 50_000 },
   staleCycles: { audio: 0, video: 0 },
   staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
+  refreshRequestsSent: 0,
+  refreshBudget: DEAD_TRACK_REFRESH_BUDGET,
 };
 
 describe('decideTrackRefresh', () => {
@@ -166,6 +171,7 @@ describe('decideTrackRefresh', () => {
       action: 'none',
       nextStale: { audio: 0, video: 0 },
       reason: 'flowing',
+      resetRefreshBudget: true,
     });
   });
 
@@ -178,6 +184,7 @@ describe('decideTrackRefresh', () => {
       action: 'none',
       nextStale: { audio: 1, video: 0 },
       reason: 'flowing',
+      resetRefreshBudget: false,
     });
   });
 
@@ -229,5 +236,91 @@ describe('decideTrackRefresh', () => {
     const staleCycles = { audio: 1, video: 0 };
     decideTrackRefresh({ ...base, audioBytes: 1000, staleCycles });
     expect(staleCycles).toEqual({ audio: 1, video: 0 });
+  });
+
+  it('escalates instead of requesting once the refresh budget is spent', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 1000,
+      staleCycles: { audio: 1, video: 0 },
+      refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+    });
+    expect(d).toEqual({
+      action: 'escalate',
+      nextStale: { audio: 2, video: 0 },
+      reason: 'refresh-budget-exhausted',
+    });
+  });
+
+  it('still requests while the budget has room', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 1000,
+      staleCycles: { audio: 1, video: 0 },
+      refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET - 1,
+    });
+    expect(d.action).toBe('request-refresh');
+  });
+
+  it('a larger budget (prior escalations) delays escalation', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 1000,
+      staleCycles: { audio: 1, video: 0 },
+      refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+      refreshBudget: deadTrackRefreshBudget(1),
+    });
+    expect(d.action).toBe('request-refresh');
+  });
+
+  it('never-started kinds do not move counters or escalate (Review Focus 1)', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      audioBytes: 0,
+      videoBytes: 0,
+      lastBytes: { audio: 0, video: 0 },
+      refreshRequestsSent: 99,
+      refreshBudget: 1,
+    });
+    expect(d).toEqual({
+      action: 'none',
+      nextStale: { audio: 0, video: 0 },
+      reason: 'flowing',
+      resetRefreshBudget: true,
+    });
+  });
+
+  it('a partially frozen link does not reset the budget', () => {
+    const d = decideTrackRefresh({
+      ...base,
+      videoBytes: 50_000, // frozen
+      staleCycles: { audio: 0, video: 0 },
+    });
+    expect(d).toEqual({
+      action: 'none',
+      nextStale: { audio: 0, video: 1 },
+      reason: 'flowing',
+      resetRefreshBudget: false,
+    });
+  });
+});
+
+describe('deadTrackRefreshBudget', () => {
+  it.each([
+    [0, 3],
+    [1, 6],
+    [2, 12],
+    [3, 24],
+    [4, 24],
+    [10, 24],
+  ])('prior escalations %i → budget %i', (prior, budget) => {
+    expect(deadTrackRefreshBudget(prior)).toBe(budget);
+  });
+
+  it('is derived from the two named constants', () => {
+    expect(deadTrackRefreshBudget(0)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(deadTrackRefreshBudget(DEAD_TRACK_ESCALATION_BACKOFF_CAP + 5)).toBe(
+      DEAD_TRACK_REFRESH_BUDGET << DEAD_TRACK_ESCALATION_BACKOFF_CAP
+    );
   });
 });

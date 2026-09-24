@@ -32,6 +32,12 @@ export type PeerRecord = {
   /** Consecutive reconciliation attempts, for exponential backoff of the cooldown. */
   reconcileAttemptCount?: number;
   /**
+   * Refresh requests sent on the current connection without inbound
+   * bytes resuming. Input to `decideTrackRefresh`'s escalation arm.
+   * Zeroed when bytes resume; wiped on media close.
+   */
+  refreshRequestsSent?: number;
+  /**
    * Last-emitted quality bucket, e.g. `"webrtc:ok:clean"`. Dedupes so
    * QualityBucketChange events only fire when the bucket actually
    * changes rather than every poll cycle.
@@ -92,6 +98,13 @@ export type PeerRecord = {
    * from jitter on individual ping/pong round trips.
    */
   signalsRttEwma?: number;
+  /**
+   * How many times the dead-track escalation closed this peer's media
+   * link since the peer last left. Doubles the next connection's refresh
+   * budget (`deadTrackRefreshBudget`). A close survivor by necessity:
+   * it must outlive the close it triggers. Reset on peer-leave only.
+   */
+  deadTrackEscalations?: number;
   // — session survivor: never reset
   /**
    * Monotonic per-peer connection generation ("epoch"). Allocated by the
@@ -137,6 +150,7 @@ export function resetPeerRecord(r: PeerRecord, arm: PeerRecordResetArm): PeerRec
         ...r,
         iceDisconnectedAt: undefined, lastBytesReceived: undefined,
         staleCycles: undefined, reconcileAttemptCount: undefined,
+        refreshRequestsSent: undefined,
         qualityBucket: undefined, webrtcExitReason: undefined,
         videoStream: undefined, pendingInits: undefined, analyser: undefined,
       };
@@ -147,6 +161,7 @@ export function resetPeerRecord(r: PeerRecord, arm: PeerRecordResetArm): PeerRec
         ...r, videoStream: undefined, pendingInits: undefined,
         qualityBucket: undefined, lastDisconnectTime: undefined,
         lastReconcileTime: undefined, signalsRttEwma: undefined,
+        deadTrackEscalations: undefined,
       };
     case 'screen-out-close':
       return { ...r, screenShareIceDisconnectedAt: undefined };
