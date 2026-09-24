@@ -90,6 +90,9 @@ export class RoomContainer extends LitElement {
       this.roomStore,
       () => this.weaveClient.userSelectScreen(),
       this._presenceLogger,
+      this.weaveClient.captureAudioSources
+        ? opts => this.weaveClient.captureAudioSources!(opts)
+        : undefined,
       this.weaveClient,
       roomKey
     );

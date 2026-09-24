@@ -179,6 +179,18 @@ class VoiceController {
   private micHandle: MicAcquireResult | null = null;
   private encoder: any = null; // AudioEncoder
   private encoderReader: ReadableStreamDefaultReader<any> | null = null;
+
+  /**
+   * The track the reader above is actually pulling from. NOT
+   * `micHandle.track`, which is frozen at acquire time: MicSource swaps
+   * the output (a device change, or a system-audio share being built or
+   * torn) and tells us through `onTrackChanged`, but the handle keeps its
+   * original value. The mute gate below reads this one, or muting during
+   * a share would silence the share for every signals peer — the shared
+   * output track stays enabled by design and only the microphone's own
+   * track is disabled (`MicSource._applyMute`).
+   */
+  private encodingTrack: MediaStreamTrack | null = null;
   /**
    * Monotonic generation counter for the capture pipeline. Incremented on
    * every (re)build — startCapture, stopCapture, device change. The pump
@@ -339,12 +351,15 @@ class VoiceController {
     // must too.
     this.epoch = nextVoiceEpoch(Date.now(), this.epoch);
 
-    // Acquire the mic from MicSource. If WebRTC is already holding it, the
-    // underlying device is not reopened — both consumers share the same
-    // track. If nothing is holding it yet, MicSource calls getUserMedia on
-    // our behalf.
+    // Take whatever MicSource's output currently carries: the microphone,
+    // an included system-audio share, or the two mixed. Every consumer
+    // shares that one track. This deliberately does NOT ask for the device
+    // (`needsDevice`) — the capture reconciler owns the microphone, on the
+    // user's intent, and encoding a mic-less share must not open one. With
+    // no output yet this returns null and the per-tick reconcile retries.
     const handle = await this.store.micSource.acquire({
       id: 'voice',
+      outputOnly: true,
       onTrackChanged: (newTrack: MediaStreamTrack) => {
         this.onMicTrackChanged(newTrack).catch(e =>
           console.error('voice: onMicTrackChanged failed', e)
@@ -422,6 +437,7 @@ class VoiceController {
     try {
       const processor = new g.MediaStreamTrackProcessor({ track });
       this.encoderReader = processor.readable.getReader();
+      this.encodingTrack = track;
       return true;
     } catch (e) {
       console.error('voice: failed to create MediaStreamTrackProcessor', e);
@@ -456,7 +472,7 @@ class VoiceController {
         // MicSource.setMuted(true) flips this across every consumer at
         // once, so muting via the mic button automatically silences voice
         // without voice having to subscribe to any separate mute event.
-        const track = this.micHandle?.track;
+        const track = this.encodingTrack;
         if (track && track.enabled === false) {
           // Same rationale as the paused-cadence clear in
           // handleEncodedChunk (review I1, final-review wave F4): frames
@@ -583,6 +599,7 @@ class VoiceController {
   async stopCapture(): Promise<void> {
     // Invalidate any in-flight pump loop.
     this.pipelineGeneration += 1;
+    this.encodingTrack = null;
     if (this.encoderReader) {
       try { await this.encoderReader.cancel(); } catch {}
       this.encoderReader = null;

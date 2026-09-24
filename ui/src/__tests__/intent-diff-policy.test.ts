@@ -42,7 +42,7 @@ const failed: CaptureLifecycle = {
 
 function baseIntent(): LocalIntent {
   return {
-    mic: { wanted: false, muted: true },
+    mic: { wanted: false, muted: true, includeSystemAudio: false },
     camera: { wanted: false },
     screenShare: { wanted: false },
     webrtc: { enabled: true, disabledWith: new Set() },
@@ -68,7 +68,11 @@ describe('describeIntentDiffs — satisfied intent', () => {
   });
 
   it('wanted mic + camera both live → []', () => {
-    const intent = { ...baseIntent(), mic: { wanted: true, muted: false }, camera: { wanted: true } };
+    const intent = {
+      ...baseIntent(),
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+      camera: { wanted: true },
+    };
     expect(
       describeIntentDiffs(
         input({ intent, micLifecycle: live, cameraLifecycle: live })
@@ -77,12 +81,18 @@ describe('describeIntentDiffs — satisfied intent', () => {
   });
 
   it('wanted mic idle (not yet started) → [] (no timestamp to report yet)', () => {
-    const intent = { ...baseIntent(), mic: { wanted: true, muted: false } };
+    const intent = {
+      ...baseIntent(),
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+    };
     expect(describeIntentDiffs(input({ intent, micLifecycle: idle }))).toEqual([]);
   });
 
   it('wanted mic acquiring, under grace → []', () => {
-    const intent = { ...baseIntent(), mic: { wanted: true, muted: false } };
+    const intent = {
+      ...baseIntent(),
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+    };
     expect(
       describeIntentDiffs(input({ intent, micLifecycle: acquiringJustUnderGrace }))
     ).toEqual([]);
@@ -90,7 +100,10 @@ describe('describeIntentDiffs — satisfied intent', () => {
 });
 
 describe('describeIntentDiffs — mic arms', () => {
-  const wantMic: LocalIntent = { ...baseIntent(), mic: { wanted: true, muted: false } };
+  const wantMic: LocalIntent = {
+    ...baseIntent(),
+    mic: { wanted: true, muted: false, includeSystemAudio: false },
+  };
 
   it('ended, attempts < max → mic/pending/"Microphone unavailable — retrying…"', () => {
     const diffs = describeIntentDiffs(
@@ -340,7 +353,10 @@ describe('describeIntentDiffs — carrier arm', () => {
 
 describe('describeIntentDiffs — coexisting diffs (Incident B vs C confusability)', () => {
   it('mic AND carrier diffs both appear when both hold', () => {
-    const intent: LocalIntent = { ...baseIntent(), mic: { wanted: true, muted: false } };
+    const intent: LocalIntent = {
+      ...baseIntent(),
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+    };
     const diffs = describeIntentDiffs(
       input({
         intent,
@@ -361,7 +377,7 @@ describe('describeIntentDiffs — coexisting diffs (Incident B vs C confusabilit
   it('mic AND camera AND carrier all coexist', () => {
     const intent: LocalIntent = {
       ...baseIntent(),
-      mic: { wanted: true, muted: false },
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
       camera: { wanted: true },
     };
     const diffs = describeIntentDiffs(

@@ -17,6 +17,17 @@ name: nightly-harness
 #     real RTCPeerConnections — lazy viewer-side establishment on
 #     SdpFsmScreen, dir-routing under mutual share, malformed-dir drop,
 #     and slot/stream teardown on a silent peer drop.
+#   - packages/signals-media testbed.spec.ts — the signals carriers
+#     (Opus voice, JPEG filmstrip) against a real WebCodecs encoder, a
+#     real AudioWorklet and a real Worker, over a real WebSocket relay
+#     between two pages: selftest, both-direction room flow, voice
+#     restart/epoch adoption, target-set switch, cross-backend Opus.
+#     Same reason as the others — the vitest suites drive fakes.
+#   - system-audio-mix.spec.ts — the production MicSource mixing a real
+#     oscillator into Chromium's fake microphone, read back through a real
+#     MediaStreamTrackProcessor and the voice module's AudioEncoder config:
+#     mono, audible, encodable — with the stereo-destination negative
+#     control that reproduces the review's Critical in the engine.
 #
 # Deliberately NOT gated:
 #   - layout.spec.ts — its split-mode baseline is red by design (see
@@ -60,9 +71,31 @@ jobs:
 
       - run: npm run test:harness -w ui
 
+      # The signals-media Chromium testbed. One step, and it skips itself on a
+      # ref that has no `packages/signals-media`: this workflow checks out the
+      # shipped 0.6 line (see the `ref:` above), and the package lands there
+      # only with the adoption round. A shell guard rather than a YAML `if:`
+      # because the condition is repo state, which `if:` cannot see, and a
+      # missing `working-directory:` fails the step before its script runs —
+      # hence no `working-directory:` here either.
+      #
+      # The testbed keeps its own dependency tree (its own Playwright must own
+      # both the runner and the module — see
+      # packages/signals-media/testbed/README.md), so the `npm ci` above does
+      # not cover it.
+      - name: signals-media Chromium testbed
+        run: |
+          if [ ! -d packages/signals-media ]; then echo "signals-media not on this ref — skipping"; exit 0; fi
+          npm run build -w packages/signals-media
+          npm install --no-audit --no-fund --prefix packages/signals-media/testbed
+          npm --prefix packages/signals-media/testbed exec -- playwright install --with-deps chromium
+          npm run test:browser -w packages/signals-media
+
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: harness-results
-          path: ui/harness/__results__/
+          path: |
+            ui/harness/__results__/
+            packages/signals-media/testbed/test-results/
           retention-days: 14

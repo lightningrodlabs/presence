@@ -117,11 +117,22 @@ export type SimpleEventType =
   | 'MyVideoOff'
   | 'ChangeMyAudioInput'
   | 'ChangeMyVideoInput'
+  | 'SystemAudioEnded'      // the host or platform ended an included system-audio grant
   | 'TrackArrivedMuted'
   | 'TrackUnmuted'
+  // Forensics (2026-09-24 incident): a remote track's onmute. Paired
+  // with TrackUnmuted so a mute/unmute cycle on a link that stays
+  // `connected` is visible in the export. Log-only.
+  | 'TrackMuted'
   | 'TrackUnmuteTimeout'
   | 'StreamReceived'
   | 'StaleCleanup'
+  // Receiver-side dead-track escalation: inbound bytes stayed frozen
+  // through the refresh budget, so the media link was closed for the
+  // pong drive to re-establish (track-health-policy.ts,
+  // DEAD_TRACK_REFRESH_BUDGET). detail: refreshes=N budget=B prior=P
+  // audioStale=A videoStale=V.
+  | 'DeadTrackEscalation'
   | 'PeerLeave'
   // Carrier (WebRTC ↔ signals) transition for a given peer's audio.
   | 'CarrierSwitch'
@@ -256,11 +267,14 @@ export const SIMPLE_EVENT_TAXONOMY = {
   MyVideoOff: 'emitted',
   ChangeMyAudioInput: 'emitted',
   ChangeMyVideoInput: 'emitted',
+  SystemAudioEnded: 'emitted',
   TrackArrivedMuted: 'emitted',
   TrackUnmuted: 'emitted',
+  TrackMuted: 'emitted',
   TrackUnmuteTimeout: 'emitted',
   StreamReceived: 'emitted',
   StaleCleanup: 'emitted',
+  DeadTrackEscalation: 'emitted',
   PeerLeave: 'emitted',
   CarrierSwitch: 'emitted',
   QualityBucketChange: 'emitted',

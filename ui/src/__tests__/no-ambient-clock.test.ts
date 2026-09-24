@@ -97,6 +97,9 @@ const PINNED_FILES: Array<{
   // Task 3 (capture reconciler): takes `clock` via bindings and stamps
   // every retry attempt through it — no ambient time.
   { relPath: '../capture-reconciler.ts', patterns: FULL_PATTERNS },
+  // System-audio mixin (spec Section 4): the output-track decision takes
+  // no time at all — identity and readyState only.
+  { relPath: '../mic-output-policy.ts', patterns: FULL_PATTERNS },
   // Store-decomposition round two, Task 1 (PeerAudioLevels): no timing at
   // all in this owner, but pinned per the round's pattern.
   { relPath: '../peer-audio-levels.ts', patterns: FULL_PATTERNS },

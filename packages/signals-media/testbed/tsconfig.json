@@ -1,0 +1,24 @@
+{
+  "//": "Typechecks the spec, the Playwright config AND the page (`checkJs`). Playwright's own transform is esbuild and Vite's is the same, so nothing else here checks a type at all. `ui/testbed.js` is in scope deliberately: its `host` record is the library's entire embedder seam, and a drift in it should be a compile error in `pretest`, not a nightly failure somewhere downstream. Not part of the package's `typecheck` (whose tsconfig includes `src` only): that one runs in the repo-root `verify` gate, where the testbed's dependencies are not installed. This runs as `pretest`, i.e. inside the browser gate.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowJs": true,
+    "checkJs": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "playwright.config.ts",
+    "testbed.spec.ts",
+    "ui/testbed-globals.d.ts",
+    "ui/testbed.js"
+  ]
+}

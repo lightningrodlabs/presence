@@ -100,13 +100,38 @@ describe('room DNA on holochain 0.7', () => {
 
       await dhtSync([alice, bob], roomCell(alice).cell_id[0]);
 
-      const agents = await call<Uint8Array[]>(alice, 'get_all_agents', {
-        input: null,
-        local: true,
-      });
-      const agentSet = new Set(agents.map((a) => encodeHashToBase64(a)));
-      expect(agentSet.has(encodeHashToBase64(alice.agentPubKey))).toBe(true);
-      expect(agentSet.has(encodeHashToBase64(bob.agentPubKey))).toBe(true);
+      // One entry per agent, carrying the anchor link's commit timestamp —
+      // the room-wide "first joined" constant the UI sorts grid tiles on
+      // (ui/src/room/tile-order-policy.ts).
+      const agents = await call<Array<{ agent: Uint8Array; joined_at: number }>>(
+        alice,
+        'get_all_agents',
+        { input: null, local: true }
+      );
+      const byAgent = new Map(agents.map((a) => [encodeHashToBase64(a.agent), a.joined_at]));
+      expect(byAgent.size).toBe(agents.length);
+      expect(byAgent.has(encodeHashToBase64(alice.agentPubKey))).toBe(true);
+      expect(byAgent.has(encodeHashToBase64(bob.agentPubKey))).toBe(true);
+      for (const joinedAt of byAgent.values()) {
+        expect(typeof joinedAt).toBe('number');
+        expect(joinedAt).toBeGreaterThan(0);
+      }
+
+      // A second anchor link for the same agent (a re-created cell whose
+      // older link is still in the DHT) must not move them: one row per
+      // agent, earliest link wins.
+      const aliceB64 = encodeHashToBase64(alice.agentPubKey);
+      const firstJoin = byAgent.get(aliceB64);
+      await new Promise((r) => setTimeout(r, 5));
+      await call(alice, 'add_agent_to_anchor', null);
+      const again = await call<Array<{ agent: Uint8Array; joined_at: number }>>(
+        alice,
+        'get_all_agents',
+        { input: null, local: true }
+      );
+      const aliceRows = again.filter((a) => encodeHashToBase64(a.agent) === aliceB64);
+      expect(aliceRows).toHaveLength(1);
+      expect(aliceRows[0].joined_at).toBe(firstJoin);
     });
   });
 

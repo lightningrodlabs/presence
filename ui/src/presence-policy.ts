@@ -267,9 +267,11 @@ export interface PresentPeersSnapshot {
  * flowing media is present regardless of pong staleness; a signal-relay
  * hiccup must not remove (or re-announce) a peer we can still hear.
  *
- * Ordering: ping-fresh peers first in their given order, then media-only
- * peers sorted lexically, then (during a carrier outage) held-over peers
- * in `heldPresent`'s order, so tile order is stable across evaluations.
+ * The returned array's order is NOT a contract: ping-fresh peers come
+ * first in their given order, then media-only peers, then held-over
+ * peers, and a peer crossing between those segments moves. Grid tile
+ * order is `orderTiles` (room/tile-order-policy.ts), which sorts on the
+ * anchor-link join time precisely so those crossings do not move a tile.
  */
 export function computePresentPeers(s: PresentPeersSnapshot): AgentPubKeyB64[] {
   const out: AgentPubKeyB64[] = [...s.activeAgents];

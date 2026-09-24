@@ -70,6 +70,11 @@ import { RoomStore } from './room/room-store';
 import type { StreamsStoreDeps } from './store-deps';
 import { PresenceLogger } from './logging';
 import { MicSource } from './mic-source';
+import {
+  decideSystemAudioRequest,
+  isLiveTrack,
+  type SystemAudioRequestDecision,
+} from './mic-output-policy';
 import { CameraSource } from './camera-source';
 import { CaptureReconciler } from './capture-reconciler';
 import { PeerAudioLevels } from './peer-audio-levels';
@@ -93,8 +98,15 @@ import { applyIntentGesture, initialLocalIntent } from './intent';
 import type { IntentGesture, LocalIntent } from './intent';
 import { describeIntentDiffs } from './intent-diff-policy';
 import type { IntentDiff } from './intent-diff-policy';
+import type { AudioSourceCapture, CaptureAudioSourcesOptions } from '@theweave/api';
 
 declare const __APP_VERSION__: string;
+
+/** The host seam for system audio (spec Section 4): `WeaveClient.captureAudioSources`, absent on hosts without the feature. */
+export type CaptureAudioSourcesFn = (
+  opts: CaptureAudioSourcesOptions,
+) => Promise<AudioSourceCapture | null>;
+export type SystemAudioState = { label: string; canExcludeSelf: boolean };
 
 /**
  * Timeout in ms for the SDP exchange phase. If a connection does not progress
@@ -295,6 +307,31 @@ export class StreamsStore {
     return this._localIntent;
   }
 
+  /** True iff the host offered `captureAudioSources` — the menu row renders only then. */
+  get canCaptureAudioSources(): boolean {
+    return this.captureAudioSources !== undefined;
+  }
+
+  /**
+   * Whether a system-audio request can start right now, and why not. The
+   * menu row renders from this (disabled + title) and `systemAudioOn`
+   * refuses on it, so they cannot disagree — `decideSystemAudioRequest`
+   * is the one gate. Not a reactive store: the row re-renders on every
+   * presence tick (`intentDiffs`) and on menu open, which is when it reads.
+   */
+  get systemAudioRequest(): SystemAudioRequestDecision {
+    return decideSystemAudioRequest({
+      seamAvailable: this.captureAudioSources !== undefined,
+      active: this._systemAudioCapture !== null,
+      pending: this._systemAudioPending,
+    });
+  }
+
+  /** The active system-audio share (label + echo warning), or null. */
+  get systemAudio(): Readable<SystemAudioState | null> {
+    return this._systemAudio;
+  }
+
   /**
    * The user-facing list of unfulfilled-intent diffs (mic/camera/carrier)
    * — Task 6's ONE source for the toggle-button badges, the tile
@@ -406,6 +443,24 @@ export class StreamsStore {
    * cleanly into a generic open/close handler. Assigned in start().
    */
   cameraSource!: CameraSource;
+
+  /** The host seam for system audio (spec Section 4); undefined on a host
+   *  without `WeaveClient.captureAudioSources`. Set at construction. */
+  private captureAudioSources: CaptureAudioSourcesFn | undefined;
+
+  /** The active host grant, or null when no system audio is included. */
+  private _systemAudioCapture: AudioSourceCapture | null = null;
+
+  /** True while a `systemAudioOn` picker request is in flight (from just
+   *  before `await seam(...)` to the method's end). The host allows one
+   *  picker at a time and rejects a second request while one is open —
+   *  the store must not ask, so this closes the pre-resolution window
+   *  `_systemAudioCapture` alone cannot guard (it is only set AFTER the
+   *  picker resolves). */
+  private _systemAudioPending = false;
+
+  /** The active system-audio share's label/echo-warning, or null. */
+  private _systemAudio: Writable<SystemAudioState | null> = writable(null);
 
   /**
    * Whether the voice encoder is currently running (sending audio to
@@ -544,11 +599,13 @@ export class StreamsStore {
   constructor(
     deps: StreamsStoreDeps,
     screenSourceSelection: () => Promise<string>,
-    logger: PresenceLogger
+    logger: PresenceLogger,
+    captureAudioSources?: CaptureAudioSourcesFn
   ) {
     this.deps = deps;
     this.screenSourceSelection = screenSourceSelection;
     this.logger = logger;
+    this.captureAudioSources = captureAudioSources;
     this.clock = deps.clock;
     this.localModels = deps.localModels;
     this.transcripts = deps.transcripts;
@@ -945,6 +1002,13 @@ export class StreamsStore {
       // `micSource.lifecycle` directly on the presence tick rather than
       // subscribing here. Wire this if a push-driven consumer arrives.
       onLifecycleChange: () => {},
+      // MicSource dropped the mixin on its own (device closed under it, a
+      // rebuild failed, the track ended): end the host capture and the
+      // intent with it, so the row never shows "Including" over nothing.
+      onMixinDropped: reason => {
+        const capture = this._systemAudioCapture;
+        if (capture) this._systemAudioLost(capture, reason, 'mixin-dropped');
+      },
       now: () => this.clock.now(),
     });
 
@@ -1145,9 +1209,14 @@ export class StreamsStore {
   private _reconcileSignalsAudio(): void {
     // Gate on INTENT, not a held-handle observation (Task 3 replacement #3
     // — the conflation this round kills). Mutation-check (i) / test (b').
-    const micWanted = get(this._localIntent).mic.wanted;
+    // Either want puts audio in the mic output: the microphone itself, or
+    // an included system-audio share, which peers receive on the same one
+    // track. Gating on `mic.wanted` alone left a mic-less share silent for
+    // every signals-carried peer.
+    const intent = get(this._localIntent);
+    const wantsOutgoingAudio = intent.mic.wanted || intent.mic.includeSystemAudio;
     const hasTargets = get(this._signalsTargets).size > 0;
-    const shouldRun = micWanted && hasTargets;
+    const shouldRun = wantsOutgoingAudio && hasTargets;
 
     if (shouldRun && !this._voiceEncoderRunning) {
       // Only start the encoder (send side). The controller is already
@@ -1364,6 +1433,7 @@ export class StreamsStore {
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
     logger: PresenceLogger,
+    captureAudioSources?: CaptureAudioSourcesFn,
     weaveClient?: Pick<WeaveClient, 'localModels'>,
     roomKey?: string
   ): Promise<StreamsStore> {
@@ -1393,7 +1463,8 @@ export class StreamsStore {
     const streamsStore = new StreamsStore(
       deps,
       screenSourceSelection,
-      logger
+      logger,
+      captureAudioSources
     );
     streamsStore.start();
 
@@ -1571,6 +1642,10 @@ export class StreamsStore {
       this._signalsTargetsUnsub = null;
     }
     this.presenceLoop.disarmPresenceSounds();
+    // Stop an active system-audio capture before the sources release below
+    // (session-end intent was already applied by disconnect()'s first
+    // statement, so this is cleanup, not a gesture write).
+    this._releaseSystemAudio();
     // Release both WebRTC acquire handles (Task 3: reconciler-owned;
     // releaseAll is disconnect-only cleanup), then force-close the sources.
     this.captureReconciler.releaseAll();
@@ -2059,9 +2134,151 @@ export class StreamsStore {
     await this.deactivateModule('screen-share');
   }
 
-  disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64) {
+  /**
+   * Include audio playing on this machine in the outgoing mic track (spec
+   * Section 4). The host owns the picker; a null capture is a cancel and
+   * writes no intent. Intent is written only after the picker succeeded,
+   * as `screenShareOn` does. Every other end of the share that is not the
+   * user's own `systemAudioOff` goes through `_systemAudioLost`.
+   */
+  async systemAudioOn(): Promise<void> {
+    const seam = this.captureAudioSources;
+    if (!seam) return;
+    // The row disables itself from this same decision, so every remaining
+    // reason here is benign: no host seam, a share already running, or a
+    // second click while the picker is up.
+    if (!this.systemAudioRequest.ok) return;
+    // Under the click: a suspended context would mix silence (Electron
+    // rarely suspends, and this is free).
+    this.micSource.resumeAudioContext();
+    const audioContext = this.micSource.ensureAudioContext() ?? undefined;
+    this._systemAudioPending = true;
+    try {
+      let capture: AudioSourceCapture | null;
+      try {
+        capture = await seam({ audioContext });
+      } catch (e: unknown) {
+        const error = `Failed to capture audio sources: ${e instanceof Error ? e.message : String(e)}`;
+        console.error(error);
+        this.eventCallback({ type: 'error', error });
+        return;
+      }
+      if (!capture) return;
+      if (!isLiveTrack(capture.track)) {
+        // Resolved already ended (spec Section 3): nothing to include.
+        return;
+      }
+      // Defensive belt: unreachable while `_systemAudioPending` closes
+      // the window between the await above and here to a second
+      // gesture — kept so a stop is never skipped if that changes.
+      if (this._systemAudioCapture) {
+        capture.stop();
+        return;
+      }
+      // A `const` alias: `capture` is a `let` from the outer scope, so TS
+      // widens it back to `AudioSourceCapture | null` inside this closure
+      // (the guards above narrowed the outer binding, not the closure's
+      // view of it) — this alias keeps the non-null narrowing stable.
+      const endedCapture = capture;
+      capture.onended = () =>
+        this._systemAudioLost(endedCapture, endedCapture.endedReason ?? 'unknown', 'capture-ended');
+      // The store owns the capture only once the mix exists: a refused
+      // build fires MicSource's `onMixinDropped` synchronously from inside
+      // `setMixin`, and that binding must find nothing to end — the share
+      // never started, so it is refused here, not "lost".
+      if (!this.micSource.setMixin(capture.track)) {
+        capture.onended = undefined;
+        // Hand the refused track back before stopping the capture, so
+        // MicSource never carries it into the next open whatever order the
+        // host's `stop()` tears it down in.
+        this.micSource.setMixin(null);
+        try { capture.stop(); } catch {}
+        return;
+      }
+      this._systemAudioCapture = capture;
+      this._applyIntent({ type: 'system-audio-on' });
+      this._systemAudio.set({ label: capture.label, canExcludeSelf: capture.canExcludeSelf });
+      // The share is a second reason to be sending audio, so the signals
+      // encoder's gate has just changed. Drive it here as the mic
+      // gestures do, rather than leaving a mic-less share silent for
+      // signals peers until the next presence tick.
+      this._reconcileSignalsAudio();
+    } finally {
+      this._systemAudioPending = false;
+    }
+  }
+
+  /**
+   * The share ended without the user's gesture: the host or platform ended
+   * the grant (`capture.onended` — Stop on Moss's chip, iframe unload,
+   * backend stream loss; `stop()` never fires it) or MicSource dropped the
+   * mixin (`onMixinDropped`: device closed under it, rebuild failed, track
+   * ended). This is the documented gesture-equivalent 'system-audio-ended'
+   * (intent.ts header; `intent-write-sites.test.ts` lists this method):
+   * stopping a share from outside the app is a user action the platform
+   * delivers as an event, and a mix that cannot exist is the same to the
+   * user. Idempotent per capture — a stale event for a superseded capture
+   * touches nothing. The label is not logged: the event log travels to
+   * peers in `DiagnosticResponse`, and a source label can be a window title.
+   */
+  private _systemAudioLost(
+    capture: AudioSourceCapture,
+    reason: string,
+    via: 'capture-ended' | 'mixin-dropped',
+  ): void {
+    if (this._systemAudioCapture !== capture) return;
+    this._applyIntent({ type: 'system-audio-ended' });
+    this._systemAudioCapture = null;
+    this._systemAudio.set(null);
+    if (via === 'capture-ended') {
+      this.micSource.setMixin(null);
+    } else {
+      // MicSource already dropped the track; end the host grant without
+      // hearing back about it.
+      capture.onended = undefined;
+      try { capture.stop(); } catch (e) { console.warn('systemAudio: stop threw', e); }
+    }
+    this.logger.logAgentEvent({
+      agent: this.myPubKeyB64,
+      timestamp: this.clock.now(),
+      event: 'SystemAudioEnded',
+      detail: `reason=${reason}; via=${via}`,
+    });
+    this._reconcileSignalsAudio();
+  }
+
+  /** The menu row's off gesture: stop the host grant and swap back to the device track. */
+  systemAudioOff(): void {
+    this._applyIntent({ type: 'system-audio-off' });
+    this._releaseSystemAudio();
+    this._reconcileSignalsAudio();
+  }
+
+  /** Stop and forget the capture (no intent write — callers own that). */
+  private _releaseSystemAudio(): void {
+    const capture = this._systemAudioCapture;
+    this._systemAudioCapture = null;
+    this._systemAudio.set(null);
+    this.micSource.setMixin(null);
+    if (capture) {
+      try { capture.stop(); } catch (e) { console.warn('systemAudio: stop threw', e); }
+    }
+  }
+
+
+  /**
+   * Close the media link to one peer. `reason` is REQUIRED and names the
+   * caller: it reaches `FsmTransition ... trigger=` and `CarrierSwitch
+   * webrtc->signals reason=` through `webrtcExitReason`, so an export
+   * can tell a Reconnect click from a carrier flip (2026-09-24 incident,
+   * spec Part 2). Current reasons: 'reconnect-button',
+   * 'carrier-mode-signals', 'peer-carrier-change',
+   * 'peer-disabled-webrtc', 'block'. Escalation closes through the
+   * transport directly with 'dead-track-escalation'.
+   */
+  disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64, reason: string) {
     if (get(this._openConnections)[pubKeyB64]) {
-      this.mediaTransport.closeConnection(pubKeyB64, 'disconnectFromPeerVideo');
+      this.mediaTransport.closeConnection(pubKeyB64, reason);
     }
   }
 
@@ -2085,7 +2302,7 @@ export class StreamsStore {
         'blockedAgents',
         JSON.stringify([...blockedAgents, pubKey64])
       );
-    this.disconnectFromPeerVideo(pubKey64);
+    this.disconnectFromPeerVideo(pubKey64, 'block');
     this.disconnectFromPeerScreen(pubKey64);
     this.clock.setTimeout(() => {
       this._connectionStatuses.update(currentValue => {
@@ -2851,7 +3068,7 @@ export class StreamsStore {
       // notices _signalsTargets becoming non-empty and starts the
       // filmstrip encoder against the still-acquired camera.
       for (const pubKeyB64 of Object.keys(get(this._openConnections))) {
-        this.disconnectFromPeerVideo(pubKeyB64);
+        this.disconnectFromPeerVideo(pubKeyB64, 'carrier-mode-signals');
       }
       this._clearPendingWebrtcStatus();
       await this._syncConversationPayload({ webrtcDisabled: true });
@@ -2930,7 +3147,7 @@ export class StreamsStore {
 
     await this._syncConversationPayload(payload);
 
-    this.disconnectFromPeerVideo(peerB64);
+    this.disconnectFromPeerVideo(peerB64, 'peer-carrier-change');
     if (carrier === 'signals') {
       this._clearPendingWebrtcStatus(peerB64);
     }
