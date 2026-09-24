@@ -654,23 +654,13 @@ export class RoomView extends LitElement {
       enabled: true,
       requested: true,
     };
+    // `activateModule` fires onActivate, which starts capture. A failed
+    // start reverts the module state inside the controller
+    // (`startCapture`'s failure arm), the same rule acceptRequest gets.
     await this.streamsStore.activateModule(
       'transcription',
       JSON.stringify(payload),
     );
-    // `activateModule` fires onActivate which calls startCapture
-    // fire-and-forget. Also await it explicitly here so we can revert
-    // the module state if capture fails — otherwise peers would see a
-    // transcription-enabled broadcast while we're producing nothing.
-    // The in-flight guard on startCapture makes this safe (both
-    // callers share the same promise).
-    const ok = await transcriptionController.startCapture();
-    if (!ok) {
-      // Controller has already set `lastError` → room-view's
-      // subscription will surface it via notifyError. Revert the
-      // module so peers don't stay stuck thinking we're transcribing.
-      await this.streamsStore.deactivateModule('transcription');
-    }
   }
 
   private async _handleTranscriptionAccept(e: CustomEvent) {

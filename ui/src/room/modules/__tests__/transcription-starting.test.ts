@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get, writable } from '@holochain-open-dev/stores';
 import type { StreamsStore } from '../../../streams-store';
-import { transcriptionController } from '../transcription';
+import { transcriptionController, AUTO_ACCEPT_KEY } from '../transcription';
+import { getModule } from '../registry';
+import type { ModuleStateEnvelope } from '../../../types';
 
 /** Host whose openSession blocks until the test releases it, to observe the starting phase. */
 function gatedHost() {
@@ -76,5 +78,120 @@ describe('transcription start phase', () => {
     transcriptionController.bind(fakeStore(host.localModels));
     expect(await transcriptionController.startCapture()).toBe(false);
     expect(get(transcriptionController.isStarting)).toBe(false);
+  });
+});
+
+/**
+ * A store fake whose activate/deactivate mirror StreamsStore's: they
+ * write `_myModuleStates` and then fire the registered module hooks, so
+ * `acceptRequest` → onActivate → startCapture runs the production chain.
+ */
+function moduleStore(localModels: unknown) {
+  const states = writable<Record<string, ModuleStateEnvelope>>({});
+  const deactivateModule = vi.fn(async (moduleId: string) => {
+    states.update(s => {
+      const next = { ...s };
+      delete next[moduleId];
+      return next;
+    });
+    getModule(moduleId)?.onDeactivate?.();
+  });
+  const store = {
+    myPubKeyB64: 'me',
+    localModels,
+    _myModuleStates: states,
+    _transcriptLog: writable(new Map()),
+    sendModuleData: async () => {},
+    updateModuleState: async () => {},
+    deactivateModule,
+    async activateModule(moduleId: string, payload?: string) {
+      states.update(s => ({
+        ...s,
+        [moduleId]: { moduleId, active: true, payload: payload ?? '{}', updatedAt: 1 },
+      }));
+      getModule(moduleId)?.onActivate?.({ streamsStore: store, myPubKeyB64: 'me' } as any);
+    },
+  };
+  return { store: store as unknown as StreamsStore, states, deactivateModule };
+}
+
+const requestedEnvelope = (): ModuleStateEnvelope => ({
+  moduleId: 'transcription',
+  active: true,
+  payload: JSON.stringify({ enabled: true, requested: true }),
+  updatedAt: 1,
+});
+
+describe('a host without local models (the old-Moss case)', () => {
+  const g = globalThis as any;
+  const savedProcessor = g.MediaStreamTrackProcessor;
+  const savedWindow = g.window;
+  let stored: Record<string, string>;
+
+  beforeEach(() => {
+    g.MediaStreamTrackProcessor = class {};
+    stored = {};
+    g.window = {
+      setInterval: vi.fn(() => 1),
+      clearInterval: vi.fn(),
+      localStorage: {
+        getItem: (k: string) => stored[k] ?? null,
+        setItem: (k: string, v: string) => { stored[k] = v; },
+      },
+    };
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    transcriptionController.unbind();
+    transcriptionController.lastError.set(null);
+    g.MediaStreamTrackProcessor = savedProcessor;
+    g.window = savedWindow;
+    vi.restoreAllMocks();
+  });
+
+  it('a failed start reverts our advertised enabled state (startCapture false, module deactivated)', async () => {
+    const { store, states, deactivateModule } = moduleStore(undefined);
+    transcriptionController.bind(store);
+    states.set({ transcription: requestedEnvelope() });
+    expect(await transcriptionController.startCapture()).toBe(false);
+    expect(deactivateModule).toHaveBeenCalledWith('transcription');
+    expect(get(states)['transcription']).toBeUndefined();
+  });
+
+  it('acceptRequest on a host whose start fails ends deactivated, not advertising enabled', async () => {
+    // localModels present but reporting no ASR: the request prompt is
+    // legitimate, the accept goes through onActivate, and the start fails.
+    const localModels = {
+      capabilities: async () => ({ asr: { available: false } }),
+      asr: { openSession: async () => { throw new Error('unused'); } },
+    };
+    const { store, states, deactivateModule } = moduleStore(localModels);
+    transcriptionController.bind(store);
+    await transcriptionController.acceptRequest('peer');
+    await vi.waitFor(() => expect(deactivateModule).toHaveBeenCalledWith('transcription'));
+    expect(get(states)['transcription']).toBeUndefined();
+  });
+
+  it('a peer request is not queued for a prompt when the store has no localModels', () => {
+    const { store } = moduleStore(undefined);
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    expect(get(transcriptionController.pendingRequests).size).toBe(0);
+  });
+
+  it('auto-accept does not activate the module when the store has no localModels', async () => {
+    stored[AUTO_ACCEPT_KEY] = 'true';
+    const { store, states } = moduleStore(undefined);
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    await Promise.resolve();
+    expect(get(states)['transcription']).toBeUndefined();
+  });
+
+  it('negative control: with localModels present, the same request IS queued', () => {
+    const { store } = moduleStore({ capabilities: async () => ({}), asr: {} });
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    expect(get(transcriptionController.pendingRequests).has('peer')).toBe(true);
   });
 });

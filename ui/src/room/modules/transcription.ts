@@ -432,6 +432,11 @@ class TranscriptionController {
     // isRequested just flipped true. Skip self-originated requests.
     if (peerPubKeyB64 === this.store.myPubKeyB64) return;
 
+    // A host without local models cannot transcribe: there is nothing to
+    // ask the user, and accepting would only advertise `enabled` with no
+    // capture behind it.
+    if (!this.store.localModels) return;
+
     // Already opted in? Nothing to do.
     const myEnvelope = get(this.store._myModuleStates)['transcription'];
     const myState = parseTranscriptionPayload(myEnvelope ?? null);
@@ -531,12 +536,39 @@ class TranscriptionController {
    */
   async startCapture(): Promise<boolean> {
     if (this._startingCapture) return this._startingCapture;
-    const p = this._doStartCapture();
+    // The failure revert rides inside the shared promise, so every
+    // caller (onActivate for the header button AND for acceptRequest /
+    // auto-accept) gets it exactly once.
+    const p = this._doStartCapture().then(async ok => {
+      if (!ok) await this._revertEnabledAfterFailedStart();
+      return ok;
+    });
     this._startingCapture = p;
     try {
       return await p;
     } finally {
       this._startingCapture = null;
+    }
+  }
+
+  /**
+   * The ONE revert for a start that produced nothing: if our own module
+   * state still advertises `enabled`, deactivate it, so peers do not
+   * show us as transcribing (subtitles icon, "transcribing:" list)
+   * while we send no frames. `lastError` has already been set by the
+   * failing arm of `_doStartCapture`.
+   */
+  private async _revertEnabledAfterFailedStart(): Promise<void> {
+    const store = this.store;
+    if (!store) return;
+    const mine = parseTranscriptionPayload(
+      get(store._myModuleStates)['transcription'] ?? null,
+    );
+    if (!mine?.enabled) return;
+    try {
+      await store.deactivateModule('transcription');
+    } catch (e) {
+      console.error('transcription: revert after failed start failed', e);
     }
   }
 
