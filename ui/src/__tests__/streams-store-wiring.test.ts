@@ -3212,3 +3212,111 @@ describe('TrackMuted/TrackUnmuted forensics on remote tracks (2026-09-24 inciden
     expect(logger.eventsNamed('TrackMuted')).toHaveLength(1);
   });
 });
+
+describe('stats forensics (2026-09-24 incident, spec Part 2)', () => {
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+  const statsOf = (reports: Record<string, unknown>[]) => ({
+    raw: new Map(reports.map((r, i) => [`r${i}`, r])) as unknown as RTCStatsReport,
+  });
+
+  it('logs our outbound bytes when a peer asks for a track refresh', async () => {
+    const { transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.getStats = async () =>
+      statsOf([
+        { type: 'outbound-rtp', kind: 'audio', bytesSent: 1000 },
+        { type: 'outbound-rtp', kind: 'video', bytesSent: 50_000 },
+      ]);
+
+    media.emit({
+      type: 'data-channel-message',
+      peer: peerA,
+      connectionId: 'conn-1',
+      data: encodeRtcAction('request-track-refresh'),
+    });
+    await flush();
+
+    expect(
+      logger.customMessages.some(m =>
+        m.startsWith(`Track refresh outbound [${peerA.slice(0, 8)}]: audioSent=1000 videoSent=50000`)
+      )
+    ).toBe(true);
+  });
+
+  it('outbound log survives a rejecting getStats (Review Focus 4)', async () => {
+    const { transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.getStats = async () => {
+      throw new Error('pc closed');
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      media.emit({
+        type: 'data-channel-message',
+        peer: peerA,
+        connectionId: 'conn-1',
+        data: encodeRtcAction('request-track-refresh'),
+      });
+      await flush();
+      await flush();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    expect(unhandled).toHaveLength(0);
+    // The refresh receipt itself is still logged; only the stats line is absent.
+    expect(
+      logger.customMessages.some(m => m.includes('request-track-refresh received from'))
+    ).toBe(true);
+    expect(logger.customMessages.some(m => m.includes('Track refresh outbound'))).toBe(false);
+  });
+
+  it('logs a candidate-pair state histogram when no pair succeeded 2s after connected', async () => {
+    const { transports, logger, clock } = makeStarted();
+    const media = transports.media!;
+    media.setIceConnectionState(peerA, 'connected');
+    media.getStats = async () =>
+      statsOf([
+        { type: 'candidate-pair', state: 'in-progress' },
+        { type: 'candidate-pair', state: 'failed' },
+        { type: 'candidate-pair', state: 'failed' },
+        { type: 'inbound-rtp', kind: 'audio', bytesReceived: 1 },
+      ]);
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+
+    clock.advance(2000);
+    await flush();
+
+    const line = logger.customMessages.find(m =>
+      m.startsWith(`ICE pair [${peerA.slice(0, 8)}]: no succeeded pair`)
+    );
+    expect(line).toBeDefined();
+    expect(line).toContain('states=in-progress=1,failed=2');
+    expect(line).toContain('ice=connected');
+    // Negative control: the succeeded-pair line is NOT logged.
+    expect(logger.customMessages.some(m => /ICE pair \[.*\]: local=/.test(m))).toBe(false);
+  });
+
+  it('stays silent about states when a pair did succeed (existing line only)', async () => {
+    const { transports, logger, clock } = makeStarted();
+    const media = transports.media!;
+    media.getStats = async () =>
+      statsOf([
+        { id: 'p', type: 'candidate-pair', state: 'succeeded', localCandidateId: 'l', remoteCandidateId: 'r' },
+        { id: 'l', type: 'local-candidate', candidateType: 'srflx', address: '1.2.3.4', port: 1, protocol: 'udp' },
+        { id: 'r', type: 'remote-candidate', candidateType: 'relay', address: '5.6.7.8', port: 2 },
+      ]);
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    clock.advance(2000);
+    await flush();
+    expect(logger.customMessages.some(m => m.includes('no succeeded pair'))).toBe(false);
+    expect(logger.customMessages.some(m => m.includes(`ICE pair [${peerA.slice(0, 8)}]: local=srflx`))).toBe(true);
+  });
+});

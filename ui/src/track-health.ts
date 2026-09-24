@@ -316,6 +316,11 @@ export class TrackHealthMonitor {
   refreshTracksForPeer(pubKeyB64: AgentPubKeyB64): boolean {
     const mainStream = this.bindings.mainStream();
     const connInfo = this.bindings.openConnections()[pubKeyB64];
+    // Forensics (2026-09-24 incident, spec Part 2): the peer says our
+    // media is dead. Record what our sender thinks it sent, so an export
+    // shows whether the encoder or the path is at fault. Fire-and-forget;
+    // this method stays synchronous for its data-channel caller.
+    if (connInfo) void this._logOutboundForRefresh(pubKeyB64);
     if (!connInfo || !mainStream) {
       console.warn(`Cannot refresh tracks for ${pubKeyB64.slice(0, 8)}: no connection or stream`);
       return false;
@@ -349,5 +354,20 @@ export class TrackHealthMonitor {
       `Manual track refresh [${pubKeyB64.slice(0, 8)}]: ${success ? 'replaceTrack' : 'clone fallback'}`
     );
     return success;
+  }
+
+  private async _logOutboundForRefresh(pubKeyB64: AgentPubKeyB64): Promise<void> {
+    try {
+      const stats = await this.bindings.mediaTransport().getStats(pubKeyB64);
+      if (!stats) return;
+      const reports: RtcStatsReportLike[] = [];
+      stats.raw.forEach((report: RtcStatsReportLike) => reports.push(report));
+      const s = summarizeRtcStats(reports);
+      this.bindings.logger.logCustomMessage(
+        `Track refresh outbound [${pubKeyB64.slice(0, 8)}]: audioSent=${s.audioBytesSent} videoSent=${s.videoBytesSent} rtt=${s.rttMs ?? 'n/a'}ms`
+      );
+    } catch (_e) {
+      // getStats may fail if the connection was already closed
+    }
   }
 }

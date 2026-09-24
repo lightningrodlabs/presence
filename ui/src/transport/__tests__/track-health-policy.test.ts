@@ -33,11 +33,27 @@ const videoInbound = (over: Partial<RtcStatsReportLike> = {}): RtcStatsReportLik
   ...over,
 });
 
+const audioOutbound = (over: Partial<RtcStatsReportLike> = {}): RtcStatsReportLike => ({
+  type: 'outbound-rtp',
+  kind: 'audio',
+  bytesSent: 7000,
+  ...over,
+});
+
+const videoOutbound = (over: Partial<RtcStatsReportLike> = {}): RtcStatsReportLike => ({
+  type: 'outbound-rtp',
+  kind: 'video',
+  bytesSent: 90_000,
+  ...over,
+});
+
 describe('summarizeRtcStats', () => {
   it('returns all-null / zero for an empty report set', () => {
     expect(summarizeRtcStats([])).toEqual({
       audioBytes: 0,
       videoBytes: 0,
+      audioBytesSent: 0,
+      videoBytesSent: 0,
       rttMs: null,
       jitterMs: null,
       lossPercent: null,
@@ -66,6 +82,22 @@ describe('summarizeRtcStats', () => {
   it('accepts mediaType as the kind field (older browsers)', () => {
     const s = summarizeRtcStats([audioInbound({ kind: undefined, mediaType: 'audio' })]);
     expect(s.audioBytes).toBe(1000);
+  });
+
+  it('reads outbound-rtp bytesSent per kind (sender-side forensics)', () => {
+    const s = summarizeRtcStats([audioOutbound(), videoOutbound()]);
+    expect(s.audioBytesSent).toBe(7000);
+    expect(s.videoBytesSent).toBe(90_000);
+    // Outbound reports contribute nothing to the inbound-derived fields.
+    expect(s.audioBytes).toBe(0);
+    expect(s.videoBytes).toBe(0);
+    expect(s.jitterMs).toBeNull();
+    expect(s.lossPercent).toBeNull();
+  });
+
+  it('accepts mediaType in place of kind on outbound-rtp too', () => {
+    const s = summarizeRtcStats([audioOutbound({ kind: undefined, mediaType: 'audio' })]);
+    expect(s.audioBytesSent).toBe(7000);
   });
 
   it('prefers remote-inbound-rtp RTT over the candidate-pair fallback', () => {

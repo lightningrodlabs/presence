@@ -29,6 +29,8 @@ export type RtcStatsReportLike = {
   kind?: string;
   mediaType?: string;
   bytesReceived?: number;
+  /** outbound-rtp: our sender's counter. Forensics only (spec Part 2). */
+  bytesSent?: number;
   /** Seconds, per spec. */
   jitter?: number;
   packetsReceived?: number;
@@ -44,6 +46,10 @@ export type RtcStatsSummary = {
   /** inbound-rtp bytesReceived per kind; 0 when the kind is absent. */
   audioBytes: number;
   videoBytes: number;
+  /** outbound-rtp bytesSent per kind; 0 when the kind is absent. Read by
+   *  the request-track-refresh receipt log only, never by a decision. */
+  audioBytesSent: number;
+  videoBytesSent: number;
   /**
    * RTT in whole ms. remote-inbound-rtp (our outgoing direction) is
    * preferred; candidate-pair (ICE-level) is the fallback. Null when
@@ -63,6 +69,8 @@ export type RtcStatsSummary = {
 export function summarizeRtcStats(reports: RtcStatsReportLike[]): RtcStatsSummary {
   let audioBytes = 0;
   let videoBytes = 0;
+  let audioBytesSent = 0;
+  let videoBytesSent = 0;
   let audioJitter: number | null = null;
   let audioPacketsReceived = 0;
   let audioPacketsLost = 0;
@@ -85,6 +93,14 @@ export function summarizeRtcStats(reports: RtcStatsReportLike[]): RtcStatsSummar
         if (typeof report.jitter === 'number') videoJitter = report.jitter;
         videoPacketsReceived = report.packetsReceived || 0;
         videoPacketsLost = report.packetsLost || 0;
+      }
+    }
+    if (report.type === 'outbound-rtp') {
+      const kind = report.kind || report.mediaType;
+      if (kind === 'audio') {
+        audioBytesSent = report.bytesSent || 0;
+      } else if (kind === 'video') {
+        videoBytesSent = report.bytesSent || 0;
       }
     }
     if (
@@ -119,7 +135,7 @@ export function summarizeRtcStats(reports: RtcStatsReportLike[]): RtcStatsSummar
   const lossPercent =
     totalPackets > 0 ? Math.round((pktsLost / totalPackets) * 1000) / 10 : null;
 
-  return { audioBytes, videoBytes, rttMs, jitterMs, lossPercent };
+  return { audioBytes, videoBytes, audioBytesSent, videoBytesSent, rttMs, jitterMs, lossPercent };
 }
 
 export type StaleCycleCounts = { audio: number; video: number };
