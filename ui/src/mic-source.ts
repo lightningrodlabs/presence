@@ -82,6 +82,16 @@ export interface MicConsumerOptions {
    * etc.) must rebuild on this callback.
    */
   onTrackChanged?: (newTrack: MediaStreamTrack) => void;
+  /**
+   * Take whatever the output currently carries and never open the
+   * microphone for it. The voice encoder sets this: with an included
+   * system-audio share and the mic off there IS an output to encode, and
+   * acquiring it must not light the user's recording indicator. Default
+   * false — acquiring otherwise means "I want the microphone", which is
+   * what the capture reconciler (the owner of the device's lifetime, on
+   * `localIntent.mic.wanted`) is asking for.
+   */
+  outputOnly?: boolean;
 }
 
 export interface MicAcquireResult {
@@ -123,13 +133,14 @@ export interface MicSourceBindings {
   onLifecycleChange: (lifecycle: CaptureLifecycle) => void;
   /**
    * Fired when MicSource drops a mixin it held for a reason other than a
-   * `setMixin` call — the device closed under it, a rebuild after a device
-   * change failed, or the mixin track itself ended. The store's binding
-   * ends the host capture and the durable intent with it, so "Including"
-   * is never shown while nothing is mixed. Fires after the output swap the
-   * drop caused, never from inside `setMixin`.
+   * `setMixin` call: the graph could not be built ('mix-failed') or the
+   * mixin track ended under us ('mixin-ended'). The store's binding ends
+   * the host capture and the durable intent with it, so "Including" is
+   * never shown while nothing is mixed. Fires after the output swap the
+   * drop caused, never from inside `setMixin`. Closing the microphone is
+   * NOT one of these: the mixin outlives it (`_closeDevice`).
    */
-  onMixinDropped: (reason: 'device-closed' | 'mix-failed' | 'mixin-ended') => void;
+  onMixinDropped: (reason: 'mix-failed' | 'mixin-ended') => void;
   /** Clock read for lifecycle timestamps — routed from `StreamsStore.clock`
    *  so this file carries no ambient time (see `no-ambient-clock.test.ts`). */
   now: () => number;
@@ -145,10 +156,16 @@ export class MicSource {
   /** The output consumers hold: the device track, or the mix destination's track. */
   private _outputTrack: MediaStreamTrack | null = null;
 
+  /**
+   * The audio graph behind a 'mixed' output. The microphone side is
+   * optional: a share with the mic closed is a one-source graph, and the
+   * mic's node is added and removed in place (`_syncMixDeviceNode`)
+   * without ever swapping the destination track.
+   */
   private _mix: {
-    device: MediaStreamTrack;
+    device: MediaStreamTrack | null;
     mixin: MediaStreamTrack;
-    deviceNode: MediaStreamAudioSourceNode;
+    deviceNode: MediaStreamAudioSourceNode | null;
     mixinNode: MediaStreamAudioSourceNode;
     destination: MediaStreamAudioDestinationNode;
   } | null = null;
@@ -218,7 +235,7 @@ export class MicSource {
       return null;
     }
 
-    if (!isLiveTrack(this._deviceTrack)) {
+    if (!options.outputOnly && !isLiveTrack(this._deviceTrack)) {
       const ok = await this._ensureOpen();
       if (!ok || !this._deviceTrack) return null;
     }
@@ -253,16 +270,32 @@ export class MicSource {
   setMuted(muted: boolean): void {
     if (this._muted === muted) return;
     this._muted = muted;
-    if (this._outputTrack) {
-      this._outputTrack.enabled = !muted;
-    }
-    if (this._deviceTrack && this._deviceTrack !== this._outputTrack) {
-      this._deviceTrack.enabled = !muted;
-    }
+    this._applyMute();
     try {
       this.bindings.onMutedChange(muted);
     } catch (e) {
       console.warn('MicSource: onMutedChange handler threw', e);
+    }
+  }
+
+  /**
+   * Put the current mute state on the tracks. Mute means "my microphone
+   * is off", never "nothing leaves this machine": while mixed it silences
+   * the mic's branch and leaves the output enabled, so an included share
+   * keeps flowing to peers. Without a mix the output IS the device, so
+   * the two coincide. Applied on every output swap as well, since a
+   * reopened or rebuilt track comes back enabled.
+   */
+  private _applyMute(): void {
+    const muted = this._muted;
+    if (this._mix) {
+      if (this._outputTrack) this._outputTrack.enabled = true;
+      if (this._deviceTrack) this._deviceTrack.enabled = !muted;
+      return;
+    }
+    if (this._outputTrack) this._outputTrack.enabled = !muted;
+    if (this._deviceTrack && this._deviceTrack !== this._outputTrack) {
+      this._deviceTrack.enabled = !muted;
     }
   }
 
@@ -394,6 +427,10 @@ export class MicSource {
    */
   dispose(): void {
     this.consumers.clear();
+    // The session is over, so nothing survives the device this time. The
+    // store has already released the capture (`disconnect()` runs
+    // `_releaseSystemAudio` before this), so there is nobody to report to.
+    this._mixin = null;
     this._closeDevice();
     const ac = this._audioContext;
     this._audioContext = null;
@@ -464,18 +501,14 @@ export class MicSource {
       } finally {
         this._openingPromise = null;
         // A `setMixin` that arrived while this open was in flight was
-        // deferred onto it (see `setMixin`). The reconcile above honours
-        // it when the device opened; when the open failed there is no
-        // device to mix against and nothing else would ever pick it up —
-        // `_openAndSwap` only reconciles for a live mixin or an existing
-        // mix, and a rebuild is not attempted for a mixin alone. Holding
-        // a mixin we are not mixing is the state `onMixinDropped` exists
-        // to prevent, so drop it and say so.
-        if (this._mixin && !this._mix) {
-          const reason = isLiveTrack(this._deviceTrack) ? 'mixin-ended' : 'device-closed';
-          this._mixin = null;
-          this._notifyMixinDropped(reason);
-        }
+        // deferred onto it (see `setMixin`). The reconcile above settles
+        // it when the device opened; when the open failed the mixin is
+        // still a source on its own, so settle it here instead of
+        // dropping it — a share survives a microphone that will not open.
+        // Either way this leaves a mix or, if the graph itself refused,
+        // a reported drop (`_reconcileOutput`'s build arm), never a
+        // mixin held silently.
+        if (isLiveTrack(this._mixin) && !this._mix) this._reconcileOutput();
       }
     })();
 
@@ -503,21 +536,21 @@ export class MicSource {
     }
   }
 
+  /**
+   * Close the microphone. The mixin OUTLIVES it: a share of what the
+   * machine is playing does not belong to the mic, so the reconcile below
+   * drops the mic's node from the graph and keeps the same output track
+   * (no fanout, no renegotiation) rather than tearing the share down with
+   * the device. With no mixin the reconcile clears the output, which is
+   * the close every consumer and peer sees.
+   */
   private _closeDevice(): void {
-    // Order: capture the old output, disconnect the mix (if any), then
-    // clear the device — so the fanout below carries whatever consumers
-    // actually held (the mixed track when mixed, the device track when not).
-    const oldOutput = this._outputTrack;
-    const staleMix = this._detachMix();
-    const droppedMixin = this._mixin !== null;
-    this._mixin = null;
-
     const old = this._deviceTrack;
     const oldStream = this._rawStream;
     this._deviceTrack = null;
     this._rawStream = null;
     this._setLifecycle({ state: 'idle' });
-    this._installOutputTrack(null, oldOutput);
+    this._reconcileOutput();
     // Stop the old tracks last (the order `_openAndSwap` documents), so the
     // fanout above observed live tracks.
     if (oldStream) {
@@ -525,11 +558,9 @@ export class MicSource {
     } else if (old) {
       try { old.stop(); } catch {}
     }
-    this._stopTracks(staleMix);
-    if (droppedMixin) this._notifyMixinDropped('device-closed');
   }
 
-  private _notifyMixinDropped(reason: 'device-closed' | 'mix-failed' | 'mixin-ended'): void {
+  private _notifyMixinDropped(reason: 'mix-failed' | 'mixin-ended'): void {
     try { this.bindings.onMixinDropped(reason); } catch (e) {
       console.error('MicSource: onMixinDropped binding threw', e);
     }
@@ -544,20 +575,40 @@ export class MicSource {
     switch (decision.kind) {
       case 'none':
         return this._mix !== null;
+      case 'clear-output':
+        this._installOutputTrack(null, this._outputTrack);
+        return false;
       case 'use-device':
         this._installOutputTrack(this._deviceTrack, this._outputTrack);
         return false;
+      case 'sync-mix-device': {
+        // In place: the destination track does not change, so no consumer
+        // rebuilds and no peer renegotiates when the mic goes on or off
+        // during a share. A graph that refuses the node falls through to a
+        // full rebuild, which swaps through `_installOutputTrack`.
+        if (this._syncMixDeviceNode()) return true;
+        const old = this._outputTrack;
+        const staleMix = this._detachMix();
+        if (!this._buildMix()) {
+          this._mixin = null;
+          this._installOutputTrack(this._deviceTrack, old);
+          this._stopTracks(staleMix);
+          this._notifyMixinDropped('mix-failed');
+          return false;
+        }
+        this._installOutputTrack(this._mix!.destination.stream.getAudioTracks()[0], old);
+        this._stopTracks(staleMix);
+        return true;
+      }
       case 'tear-mix': {
         const old = this._outputTrack;
         const staleMix = this._detachMix();
-        // 'mixin-removed' is the caller's own `setMixin(null)`; the other
-        // two are MicSource dropping a mixin it was asked to hold, which
-        // the store must hear about (`onMixinDropped`). A mixin kept across
-        // a device-closed tear would be orphaned: nothing rebuilds it
-        // (`_openAndSwap` reconciles only while `_mix` exists).
-        const dropped = decision.reason === 'mixin-ended' || decision.reason === 'device-closed'
-          ? decision.reason
-          : null;
+        // 'mixin-removed' is the caller's own `setMixin(null)`, which needs
+        // no report; 'mixin-ended' is MicSource dropping a mixin it was
+        // asked to hold, which the store must hear about.
+        // A closed microphone no longer reaches this arm at all — the
+        // graph keeps running on the mixin alone.
+        const dropped = decision.reason === 'mixin-ended' ? decision.reason : null;
         if (dropped) this._mixin = null;
         this._installOutputTrack(this._deviceTrack, old);
         this._stopTracks(staleMix);
@@ -565,13 +616,7 @@ export class MicSource {
         return false;
       }
       case 'build-mix': {
-        if (this._mix && decision.reason === 'device-changed' && this._replaceMixDeviceNode()) {
-          // Same destination, same output track: only the device source node changed.
-          return true;
-        }
-        // In-place replacement refused or failed: fall through to the full
-        // rebuild below, which swaps through `_installOutputTrack`. The
-        // previous graph's destination track is stopped only after the
+        // The previous graph's destination track is stopped only after the
         // swap has fanned out (the order `_openAndSwap` documents).
         const old = this._outputTrack;
         const staleMix = this._detachMix();
@@ -599,20 +644,25 @@ export class MicSource {
 
   private _buildMix(): boolean {
     const ctx = this.ensureAudioContext();
-    const device = this._deviceTrack;
+    // The microphone is optional here: a share with the mic closed is a
+    // one-source graph. The mixin is not — it is what a graph is for.
+    const device = isLiveTrack(this._deviceTrack) ? this._deviceTrack : null;
     const mixin = this._mixin;
-    if (!ctx || !device || !mixin) return false;
+    if (!ctx || !mixin) return false;
     // The caller has already detached any previous graph (`_detachMix`).
     // A suspended context would produce a silent destination track;
     // `ensureAudioContext` resumes only at creation, so resume again here
     // (a no-op while running, never awaited — the graph is built either way).
     if (ctx.state === 'suspended') ctx.resume().catch(() => {});
     try {
-      const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
+      const deviceNode = device
+        ? ctx.createMediaStreamSource(new MediaStream([device]))
+        : null;
       const mixinNode = ctx.createMediaStreamSource(new MediaStream([mixin]));
       const destination = ctx.createMediaStreamDestination();
       // Mono, deliberately: the device track is opened mono by constraint
-      // (`_audioConstraints`, channelCount: 1) and the voice module's
+      // (`_audioConstraints`, channelCount: 1), the host's capture is mono
+      // by request, and the voice module's
       // AudioEncoder is configured `numberOfChannels: 1`
       // (`ui/src/room/modules/voice.ts`). A MediaStreamAudioDestinationNode
       // defaults to 2 channels, and feeding 2-channel AudioData into a
@@ -620,7 +670,7 @@ export class MicSource {
       // for the rest of the session. The node's channelCountMode is
       // 'explicit', so this downmixes the sum to one channel.
       destination.channelCount = 1;
-      deviceNode.connect(destination);
+      deviceNode?.connect(destination);
       mixinNode.connect(destination);
       this._mix = { device, mixin, deviceNode, mixinNode, destination };
       return true;
@@ -632,26 +682,31 @@ export class MicSource {
   }
 
   /**
-   * Swap only the device source node into the existing graph. Returns
-   * false when it could not be done — the old device node is already
-   * disconnected by then, so the destination would keep carrying the
-   * mixin with no microphone and nothing would reconcile it; the caller
-   * rebuilds the whole mix instead.
+   * Bring the microphone's node in the EXISTING graph into line with the
+   * current device: add it, swap it, or drop it. The destination — and so
+   * the output track every consumer and every peer holds — is untouched,
+   * which is what makes turning the mic on or off mid-share free on the
+   * wire. Returns false when the graph would not take the node; the old
+   * node is already disconnected by then, so the caller rebuilds.
    */
-  private _replaceMixDeviceNode(): boolean {
+  private _syncMixDeviceNode(): boolean {
     const mix = this._mix;
-    const device = this._deviceTrack;
-    if (!mix || !device) return false;
+    if (!mix) return false;
+    const device = isLiveTrack(this._deviceTrack) ? this._deviceTrack : null;
+    try { mix.deviceNode?.disconnect(); } catch {}
+    if (!device) {
+      this._mix = { ...mix, device: null, deviceNode: null };
+      return true;
+    }
     const ctx = this.ensureAudioContext();
     if (!ctx) return false;
-    try { mix.deviceNode.disconnect(); } catch {}
     try {
       const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
       deviceNode.connect(mix.destination);
       this._mix = { ...mix, device, deviceNode };
       return true;
     } catch (e) {
-      console.error('MicSource: replacing the mix device node failed', e);
+      console.error('MicSource: syncing the mix device node failed', e);
       return false;
     }
   }
@@ -666,7 +721,7 @@ export class MicSource {
     const mix = this._mix;
     if (!mix) return [];
     this._mix = null;
-    try { mix.deviceNode.disconnect(); } catch {}
+    try { mix.deviceNode?.disconnect(); } catch {}
     try { mix.mixinNode.disconnect(); } catch {}
     try { return mix.destination.stream.getAudioTracks(); } catch { return []; }
   }
@@ -684,8 +739,8 @@ export class MicSource {
    */
   private _installOutputTrack(newTrack: MediaStreamTrack | null, oldTrack: MediaStreamTrack | null): void {
     if (newTrack === oldTrack) return;
-    if (newTrack) newTrack.enabled = !this._muted;
     this._outputTrack = newTrack;
+    this._applyMute();
     try {
       this.bindings.onTrackChange(newTrack, oldTrack);
     } catch (e) {

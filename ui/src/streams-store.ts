@@ -318,8 +318,6 @@ export class StreamsStore {
   get systemAudioRequest(): SystemAudioRequestDecision {
     return decideSystemAudioRequest({
       seamAvailable: this.captureAudioSources !== undefined,
-      micWanted: get(this._localIntent).mic.wanted,
-      micLifecycle: this.micSource.lifecycle.state,
       active: this._systemAudioCapture !== null,
       pending: this._systemAudioPending,
     });
@@ -1181,9 +1179,14 @@ export class StreamsStore {
   private _reconcileSignalsAudio(): void {
     // Gate on INTENT, not a held-handle observation (Task 3 replacement #3
     // — the conflation this round kills). Mutation-check (i) / test (b').
-    const micWanted = get(this._localIntent).mic.wanted;
+    // Either want puts audio in the mic output: the microphone itself, or
+    // an included system-audio share, which peers receive on the same one
+    // track. Gating on `mic.wanted` alone left a mic-less share silent for
+    // every signals-carried peer.
+    const intent = get(this._localIntent);
+    const wantsOutgoingAudio = intent.mic.wanted || intent.mic.includeSystemAudio;
     const hasTargets = get(this._signalsTargets).size > 0;
-    const shouldRun = micWanted && hasTargets;
+    const shouldRun = wantsOutgoingAudio && hasTargets;
 
     if (shouldRun && !this._voiceEncoderRunning) {
       // Only start the encoder (send side). The controller is already
@@ -2106,18 +2109,10 @@ export class StreamsStore {
   async systemAudioOn(): Promise<void> {
     const seam = this.captureAudioSources;
     if (!seam) return;
-    const request = this.systemAudioRequest;
-    if (!request.ok) {
-      // The row disables itself from the same decision, so a refused click
-      // is the render-to-click race (the mic ended between them). Say so
-      // rather than close the menu silently; the other reasons are either
-      // unreachable from an enabled row or benign (a second click while
-      // the picker is up).
-      if (request.reason === 'mic-not-live') {
-        this.eventCallback({ type: 'error', error: 'Waiting for your microphone' });
-      }
-      return;
-    }
+    // The row disables itself from this same decision, so every remaining
+    // reason here is benign: no host seam, a share already running, or a
+    // second click while the picker is up.
+    if (!this.systemAudioRequest.ok) return;
     // Under the click: a suspended context would mix silence (Electron
     // rarely suspends, and this is free).
     this.micSource.resumeAudioContext();

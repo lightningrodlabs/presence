@@ -2816,38 +2816,64 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(get(started.store.systemAudio)).toBeNull();
   });
 
-  it('mic not wanted → the picker is never opened', async () => {
-    const started = makeStartedWithCapture(async () => fakeCapture());
+  it('with the microphone never turned on, the share still starts and reaches every peer — and no getUserMedia runs', async () => {
+    const { calls: gum } = installNavigator(async () => new FakeStream([new FakeTrack('audio', 'device')]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    const media = started.transports.media!;
+
     await started.store.systemAudioOn();
-    expect(started.calls).toHaveLength(0);
+    await flush();
+
+    expect(started.calls).toHaveLength(1); // the picker DID open
+    // Sharing what you are playing neither needs nor opens the mic.
+    expect(gum).toEqual([]);
+    expect(started.store.micSource.deviceTrack).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(get(started.store.localIntent).mic.wanted).toBe(false);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.systemAudio)).toEqual({ label: 'System audio', canExcludeSelf: true });
+    // The one output track reaches peers as an open, not a swap.
+    expect(media.addTrackCalls).toEqual([started.store.micSource.track]);
   });
 
-  it('mic wanted but no live device → the picker is never opened either (the refusal is before the seam)', async () => {
-    // Permission denied / device unplugged: the intent says the mic is
-    // wanted, the capture reconciler could not open one. Without the
-    // lifecycle gate the picker opened, the user chose sources, and
-    // `setMixin` refused them (decideMicOutput → none/no-device) with no
-    // feedback at all.
+  it('the microphone turning on under a running share joins the graph without touching the peers', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    const media = started.transports.media!;
+    await started.store.systemAudioOn();
+    await flush();
+    const shared = started.store.micSource.track;
+    const addsBefore = media.addTrackCalls.length;
+
+    await started.store.audioOn(true);
+    await flush();
+
+    expect(started.store.micSource.deviceTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(started.store.micSource.track).toBe(shared); // same track: in-place
+    expect(media.replaceCalls).toHaveLength(0);
+    expect(media.addTrackCalls).toHaveLength(addsBefore);
+  });
+
+  it('a microphone that will not open does not stop the share: it starts without one', async () => {
+    // Permission denied or the device unplugged while the mic is wanted.
+    // The share used to be refused here, because the mix had to be built
+    // on a device track.
     installNavigator(async () => { throw new Error('NotAllowedError'); });
     const started = makeStartedWithCapture(async () => fakeCapture());
     await started.store.audioOn(true);
     await flush();
-    expect(get(started.store.localIntent).mic.wanted).toBe(true);
     expect(started.store.micSource.lifecycle.state).not.toBe('live');
-
-    // The row disables itself from the same decision the store refuses on.
-    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'mic-not-live' });
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
 
     await started.store.systemAudioOn();
     await flush();
 
-    expect(started.calls).toHaveLength(0);
-    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
-    expect(get(started.store.systemAudio)).toBeNull();
-    // A click that slipped through the render-to-click race is told why,
-    // not dropped silently: the refusal emits an error event.
-    expect(started.events.filter(e => e.type === 'error').map(e => (e as any).error))
-      .toEqual(['Waiting for your microphone']);
+    expect(started.calls).toHaveLength(1);
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(started.events.filter(e => e.type === 'error')).toEqual([]);
   });
 
   it('systemAudioRequest is the one gate: it reports the reason the row disables on, in the store\'s order', async () => {
@@ -2855,7 +2881,8 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     installNavigator(async () => new FakeStream([device]));
     let resolve!: (c: FakeCapture) => void;
     const started = makeStartedWithCapture(() => new Promise(res => { resolve = res; }));
-    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'mic-not-wanted' });
+    // The microphone is no part of this decision, on or off.
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
     await started.store.audioOn(true);
     await flush();
     expect(started.store.systemAudioRequest).toEqual({ ok: true });
@@ -2983,7 +3010,7 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(started.calls).toHaveLength(2);
   });
 
-  it('the grant lands while a device reopen is in flight and that reopen fails: the share ends instead of showing "Including" over nothing (PR #5 re-review)', async () => {
+  it('the grant lands while a device reopen is in flight and that reopen fails: the share runs on without a microphone (PR #5 re-review)', async () => {
     const device1 = new FakeTrack('audio', 'd1');
     let rejectOpen!: () => void;
     let n = 0;
@@ -3010,12 +3037,15 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     await opening;
     await flush();
 
-    expect(started.store.micSource.outputMode).not.toBe('mixed');
-    expect(get(started.store.systemAudio)).toBeNull();
-    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
-    expect(capture.stop).toHaveBeenCalledTimes(1);
-    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
-    expect(logged?.detail).toBe('reason=device-closed; via=mixin-dropped');
+    // The mixin recorded mid-open is settled by that open either way.
+    // It used to be dropped here, because a mix needed a device; now the
+    // share simply carries on with no microphone in it.
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(started.store.micSource.deviceTrack).toBeNull();
+    expect(get(started.store.systemAudio)).not.toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(capture.stop).not.toHaveBeenCalled();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
   });
 
   it('a capture that resolves already ended is not installed (Review Focus 2)', async () => {
@@ -3032,18 +3062,27 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(get(started.store.systemAudio)).toBeNull();
   });
 
-  it('mute while included keeps the mix and silences the output; audioOn(true) un-mutes it (Review Focus 3)', async () => {
+  it('muting while included silences the microphone and leaves the share audible to peers', async () => {
     const device = new FakeTrack('audio', 'device');
     installNavigator(async () => new FakeStream([device]));
     const started = makeStartedWithCapture(async () => fakeCapture());
     await started.store.audioOn(true);
     await started.store.systemAudioOn();
     await flush();
+
     await started.store.audioOff();
+
     expect(started.store.micSource.outputMode).toBe('mixed');
-    expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(false);
+    // The track peers receive stays enabled — muting yourself must not
+    // take the music down with your voice — while the mic's own branch
+    // goes silent.
+    expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(true);
+    expect(device.enabled).toBe(false);
     expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.localIntent).mic.muted).toBe(true);
+
     await started.store.audioOn(true);
+    expect(device.enabled).toBe(true);
     expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(true);
   });
 

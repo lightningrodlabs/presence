@@ -339,12 +339,15 @@ class VoiceController {
     // must too.
     this.epoch = nextVoiceEpoch(Date.now(), this.epoch);
 
-    // Acquire the mic from MicSource. If WebRTC is already holding it, the
-    // underlying device is not reopened — both consumers share the same
-    // track. If nothing is holding it yet, MicSource calls getUserMedia on
-    // our behalf.
+    // Take whatever MicSource's output currently carries: the microphone,
+    // an included system-audio share, or the two mixed. Every consumer
+    // shares that one track. This deliberately does NOT ask for the device
+    // (`needsDevice`) — the capture reconciler owns the microphone, on the
+    // user's intent, and encoding a mic-less share must not open one. With
+    // no output yet this returns null and the per-tick reconcile retries.
     const handle = await this.store.micSource.acquire({
       id: 'voice',
+      outputOnly: true,
       onTrackChanged: (newTrack: MediaStreamTrack) => {
         this.onMicTrackChanged(newTrack).catch(e =>
           console.error('voice: onMicTrackChanged failed', e)

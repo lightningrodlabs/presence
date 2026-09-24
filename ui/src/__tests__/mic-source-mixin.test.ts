@@ -160,20 +160,24 @@ describe('MicSource mixin: build, tear, and what consumers see', () => {
     expect(r.dropped).toEqual([]); // the caller removed it; nothing to report
   });
 
-  it('a device that died without its event, under a mix, tears it on the next reconcile and reports device-closed', async () => {
+  it('a device that died without its event drops out of the graph; the share plays on', async () => {
     const r = rig();
     await r.mic.acquire({ id: 'c' });
     const mixin = new FakeTrack('audio', 'system');
     r.mic.setMixin(mixin as unknown as MediaStreamTrack);
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    const mixed = ctx.destinations[0].track;
     r.fanout.length = 0;
+
     // Ended without `onended` firing (the FakeTrack fires it; bypass it).
     device.readyState = 'ended';
-    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
-    expect(r.mic.outputMode).toBe('device');
-    expect(r.dropped).toEqual(['device-closed']);
-    // The mixin is not kept for a rebuild nobody would perform.
-    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
-    expect(r.dropped).toEqual(['device-closed']); // no second report: it was already gone
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(true);
+
+    expect(r.mic.outputMode).toBe('mixed');
+    expect(r.mic.track).toBe(mixed as unknown as MediaStreamTrack);
+    expect(r.fanout).toEqual([]); // the node left the graph; the track did not change
+    expect(r.dropped).toEqual([]); // the share is not the microphone's to end
+    expect(ctx.sources.filter(s => s.connected).map(s => s.stream.getAudioTracks()[0])).toEqual([mixin]);
   });
 
   it('a mixin track that ends underneath the mix tears it and reports mixin-ended', async () => {
@@ -228,27 +232,74 @@ describe('MicSource mixin: build, tear, and what consumers see', () => {
     expect(r.fanout).toEqual([]);
   });
 
-  it('mute writes enabled on the output AND the device; unmute restores both (Review Focus 3)', async () => {
+  it('mute while mixed silences the microphone only: the output keeps carrying the share', async () => {
     const r = rig();
     await r.mic.acquire({ id: 'c' });
     const mixin = new FakeTrack('audio', 'system');
     r.mic.setMixin(mixin as unknown as MediaStreamTrack);
     const mixed = ((r.mic.ensureAudioContext() as unknown) as FakeAudioContext).destinations[0].track;
+
     r.mic.setMuted(true);
-    expect(mixed.enabled).toBe(false);
+    // Mute means "my microphone is off", not "nothing leaves this
+    // machine": disabling the destination track would take the included
+    // share down with the voice.
     expect(device.enabled).toBe(false);
-    r.mic.setMuted(false);
     expect(mixed.enabled).toBe(true);
+    expect(mixin.enabled).toBe(true);
+
+    r.mic.setMuted(false);
     expect(device.enabled).toBe(true);
+    expect(mixed.enabled).toBe(true);
   });
 
-  it('a mixin installed while muted starts muted', async () => {
+  it('mute with no mix silences the output, which IS the device track', async () => {
     const r = rig();
     await r.mic.acquire({ id: 'c' });
     r.mic.setMuted(true);
-    r.mic.setMixin(new FakeTrack('audio') as unknown as MediaStreamTrack);
+    expect(r.mic.track).toBe(device as unknown as MediaStreamTrack);
+    expect(device.enabled).toBe(false);
+    r.mic.setMuted(false);
+    expect(device.enabled).toBe(true);
+  });
+
+  it('a mixin installed while muted is audible immediately; the microphone stays silenced', async () => {
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    r.mic.setMuted(true);
+    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
     const mixed = ((r.mic.ensureAudioContext() as unknown) as FakeAudioContext).destinations[0].track;
-    expect(mixed.enabled).toBe(false);
+    expect(mixed.enabled).toBe(true);
+    expect(device.enabled).toBe(false);
+  });
+
+  it('tearing the mix while muted hands mute back to the device track', async () => {
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
+    r.mic.setMuted(true);
+    r.mic.setMixin(null);
+    expect(r.mic.track).toBe(device as unknown as MediaStreamTrack);
+    expect(device.enabled).toBe(false);
+  });
+
+  it('a mixin with no microphone at all builds a one-source mix — no getUserMedia', async () => {
+    const { calls } = installGlobals(async () => new FakeStream([device]));
+    const r = rig();
+    const mixin = new FakeTrack('audio', 'system');
+
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(true);
+
+    // The whole point: sharing what the machine is playing must not open
+    // the microphone, or the user gets a recording indicator they never
+    // asked for.
+    expect(calls).toEqual([]);
+    expect(r.mic.deviceTrack).toBeNull();
+    expect(r.mic.outputMode).toBe('mixed');
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    expect(ctx.sources.map(s => s.stream.getAudioTracks()[0])).toEqual([mixin]);
+    expect(r.mic.track).toBe(ctx.destinations[0].track as unknown as MediaStreamTrack);
+    // The store hears an open, so the track reaches peers.
+    expect(r.fanout).toEqual([{ newTrack: ctx.destinations[0].track, oldTrack: null }]);
   });
 });
 
@@ -387,24 +438,64 @@ describe('MicSource mixin: device swaps and close', () => {
     expect(ctx.sources.every(s => !s.connected)).toBe(true);
   });
 
-  it('closing the device while mixed disconnects the graph and fans out the close with the output track', async () => {
+  it('closing the microphone while mixed keeps the share on the same track — no close, no renegotiation', async () => {
     const device = new FakeTrack('audio', 'd');
     installGlobals(async () => new FakeStream([device]));
     const r = rig();
     const h = await r.mic.acquire({ id: 'c' });
-    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
+    const mixin = new FakeTrack('audio', 'system');
+    r.mic.setMixin(mixin as unknown as MediaStreamTrack);
     const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
     const mixed = ctx.destinations[0].track;
     r.fanout.length = 0; r.oldStateAtFanout.length = 0;
+
+    h!.release(); // the last consumer goes: the device closes
+
+    expect(r.mic.lifecycle).toEqual({ state: 'idle' });
+    expect(device.readyState).toBe('ended');
+    // …and the share survives it, on the very same output track, so no
+    // peer sees a removeTrack and nothing renegotiates.
+    expect(r.mic.outputMode).toBe('mixed');
+    expect(r.mic.track).toBe(mixed as unknown as MediaStreamTrack);
+    expect(mixed.readyState).toBe('live');
+    expect(r.fanout).toEqual([]);
+    expect(r.dropped).toEqual([]);
+    expect(ctx.sources.filter(s => s.connected).map(s => s.stream.getAudioTracks()[0])).toEqual([mixin]);
+  });
+
+  it('closing the microphone with no mixin clears the output, as it always did', async () => {
+    const device = new FakeTrack('audio', 'd');
+    installGlobals(async () => new FakeStream([device]));
+    const r = rig();
+    const h = await r.mic.acquire({ id: 'c' });
+    r.fanout.length = 0; r.oldStateAtFanout.length = 0;
+
     h!.release();
-    expect(r.fanout).toEqual([{ newTrack: null, oldTrack: mixed }]);
+
+    expect(r.fanout).toEqual([{ newTrack: null, oldTrack: device }]);
     expect(r.oldStateAtFanout).toEqual(['live']); // close fans out before the stops
-    expect(ctx.sources.every(s => !s.connected)).toBe(true);
-    expect(mixed.readyState).toBe('ended');
     expect(device.readyState).toBe('ended');
     expect(r.mic.outputMode).toBeNull();
     expect(r.mic.track).toBeNull();
-    expect(r.dropped).toEqual(['device-closed']);
+  });
+
+  it('the microphone opens under a running mic-less share: it joins the graph, the track does not change', async () => {
+    const device = new FakeTrack('audio', 'd');
+    installGlobals(async () => new FakeStream([device]));
+    const r = rig();
+    const mixin = new FakeTrack('audio', 'system');
+    r.mic.setMixin(mixin as unknown as MediaStreamTrack);
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    const mixed = ctx.destinations[0].track;
+    r.fanout.length = 0;
+
+    const h = await r.mic.acquire({ id: 'c' }); // the user turns the mic on
+
+    expect(h!.track).toBe(mixed as unknown as MediaStreamTrack);
+    expect(r.mic.deviceTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(r.mic.track).toBe(mixed as unknown as MediaStreamTrack);
+    expect(r.fanout).toEqual([]); // in place: nothing to tell the peers
+    expect(ctx.sources.filter(s => s.connected).map(s => s.stream.getAudioTracks()[0])).toEqual([mixin, device]);
   });
 
   it('the host ends the grant while a stale-device acquire is opening: the tear waits for the open, and both steps are device changes (no close, no re-add)', async () => {
@@ -438,14 +529,12 @@ describe('MicSource mixin: device swaps and close', () => {
     expect(r.fanout).toEqual([{ newTrack: device2, oldTrack: mixed }]);
   });
 
-  it('a mixin deferred onto an open that then FAILS is dropped and reported, so a later reopen cannot install over it', async () => {
-    // The PR #5 re-review's repro. The picker is open (the request gate
-    // passed while the mic was live); the device dies and a second
-    // consumer's acquire starts a replacement; the grant lands mid-open
-    // and is recorded. If that open fails, nothing would ever build the
-    // recorded mixin — `_openAndSwap` reconciles for a live mixin or an
-    // existing mix, and after a failed open there is neither device nor
-    // mix — so it must not be held silently.
+  it('a mixin deferred onto an open that then FAILS still becomes a one-source mix', async () => {
+    // The PR #5 re-review's repro: the device dies while the host picker
+    // is up, a consumer's acquire starts a replacement, and the grant
+    // lands mid-open. The open then fails — and the share still starts,
+    // because the mixin needs no microphone. Before the mic-less mix it
+    // was held silently and a later reopen installed the device over it.
     const device1 = new FakeTrack('audio', 'd1');
     const device2 = new FakeTrack('audio', 'd2');
     let rejectOpen!: () => void;
@@ -468,14 +557,17 @@ describe('MicSource mixin: device swaps and close', () => {
     await opening;
 
     expect(r.mic.lifecycle.state).toBe('failed');
-    expect(r.dropped).toEqual(['device-closed']);
-    // The reopen that follows is a plain device open — before the fix it
-    // installed the device track over the orphaned mixin and the store
-    // went on showing "Including" with nothing mixed.
+    expect(r.dropped).toEqual([]);
+    expect(r.mic.outputMode).toBe('mixed');
+    const mixed = ((r.mic.ensureAudioContext() as unknown) as FakeAudioContext).destinations[0].track;
+    expect(r.mic.track).toBe(mixed as unknown as MediaStreamTrack);
+
+    // …and the reopen that follows joins the microphone to that same
+    // graph rather than installing over it.
     expect(await r.mic.reopen()).toBe(true);
-    expect(r.mic.outputMode).toBe('device');
-    expect(r.mic.track).toBe(device2 as unknown as MediaStreamTrack);
-    expect(r.dropped).toEqual(['device-closed']);
+    expect(r.mic.deviceTrack).toBe(device2 as unknown as MediaStreamTrack);
+    expect(r.mic.track).toBe(mixed as unknown as MediaStreamTrack);
+    expect(r.dropped).toEqual([]);
   });
 
   it('a mixin deferred onto an open that SUCCEEDS is built onto the new device (the deferral kept)', async () => {
@@ -502,24 +594,36 @@ describe('MicSource mixin: device swaps and close', () => {
     expect(r.dropped).toEqual([]);
   });
 
-  it('reopen honours a recorded live mixin instead of installing the device over it (the _openAndSwap half of the rule)', async () => {
-    // `setMixin` with no device records the mixin and answers false (v1
-    // needs the mic held), so a caller that ignores that answer leaves a
-    // mixin with no mix behind it. Both open paths must then build it
-    // rather than install the bare device: `_ensureOpen` always did;
-    // `_openAndSwap` (reopen, changeDevice) reconciled only while a mix
-    // already existed.
-    const device = new FakeTrack('audio', 'd');
-    installGlobals(async () => new FakeStream([device]));
+  it('an open that lands while a deferred mixin is still unbuilt builds it, rather than installing the device over it', async () => {
+    // A mixin recorded by a deferred `setMixin` has no graph behind it
+    // until the open it was deferred onto settles. `_openAndSwap` (reopen,
+    // changeDevice) reconciles for that recorded mixin as well as for an
+    // existing mix, so an open arriving through the other path in that
+    // window cannot strand it — the shape the PR re-review found.
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let release!: () => void;
+    let n = 0;
+    installGlobals(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      if (n === 2) return new Promise<FakeStream>(res => { release = () => res(new FakeStream([device1])); });
+      return Promise.resolve(new FakeStream([device2]));
+    });
     const r = rig();
+    await r.mic.acquire({ id: 'voice' });
+    device1.stop();
+    const opening = r.mic.acquire({ id: 'filmstrip' }); // _ensureOpen, pending
     const mixin = new FakeTrack('audio', 'system');
-    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(true); // deferred, unbuilt
 
-    expect(await r.mic.reopen()).toBe(true);
+    await r.mic.reopen(); // the other open path, mid-window
 
     expect(r.mic.outputMode).toBe('mixed');
-    expect(r.mic.deviceTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(r.mic.deviceTrack).toBe(device2 as unknown as MediaStreamTrack);
     expect(r.dropped).toEqual([]);
+    release();
+    await opening;
   });
 
   it('acquire after a mixin was set hands out the mixed output', async () => {
