@@ -2814,6 +2814,27 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(started.calls).toHaveLength(0);
   });
 
+  it('mic wanted but no live device → the picker is never opened either (the refusal is before the seam)', async () => {
+    // Permission denied / device unplugged: the intent says the mic is
+    // wanted, the capture reconciler could not open one. Without the
+    // lifecycle gate the picker opened, the user chose sources, and
+    // `setMixin` refused them (decideMicOutput → none/no-device) with no
+    // feedback at all.
+    installNavigator(async () => { throw new Error('NotAllowedError'); });
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    await started.store.audioOn(true);
+    await flush();
+    expect(get(started.store.localIntent).mic.wanted).toBe(true);
+    expect(started.store.micSource.lifecycle.state).not.toBe('live');
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(0);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+  });
+
   it('an interleaved second systemAudioOn — fired before the first request resolves — opens no second picker (review round 1 finding)', async () => {
     // The prior pre-await guard (`if (this._systemAudioCapture) return;`)
     // only covers the state AFTER a picker resolves. A double-click while
@@ -2859,10 +2880,17 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     // `ensureAudioContext()` call (before the await) must fail too, or
     // the cached instance would let the later `setMixin` succeed anyway.
     delete (globalThis as any).AudioContext;
+    const setMixin = vi.spyOn(started.store.micSource, 'setMixin');
 
     await started.store.systemAudioOn();
     await flush();
 
+    // The refusal hands the track back before stopping the capture, so
+    // MicSource never keeps a refused track whatever order the host's
+    // `stop()` tears it down in. Spied rather than read off `outputMode`
+    // because MicSource's own build-mix failure arm also drops the mixin
+    // — this pins the store's half of it.
+    expect(setMixin.mock.calls[setMixin.mock.calls.length - 1]?.[0]).toBeNull();
     expect(capture.stop).toHaveBeenCalledTimes(1);
     expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
     expect(get(started.store.systemAudio)).toBeNull();

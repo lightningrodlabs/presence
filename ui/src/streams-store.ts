@@ -2081,6 +2081,13 @@ export class StreamsStore {
     const seam = this.captureAudioSources;
     if (!seam) return;
     if (!get(this._localIntent).mic.wanted) return;
+    // Wanted is not the same as live: with permission denied or the device
+    // unplugged there is no device track to mix against, so `setMixin`
+    // would refuse whatever the user picked (decideMicOutput → none/
+    // no-device) after the picker had already taken a choice from them.
+    // Refuse before the seam — the mic button's intent-diff badge is what
+    // tells them the mic itself is the problem.
+    if (this.micSource.lifecycle.state !== 'live') return;
     if (this._systemAudioCapture || this._systemAudioPending) return;
     const audioContext = this.micSource.ensureAudioContext() ?? undefined;
     this._systemAudioPending = true;
@@ -2088,8 +2095,8 @@ export class StreamsStore {
       let capture: AudioSourceCapture | null;
       try {
         capture = await seam({ audioContext });
-      } catch (e: any) {
-        const error = `Failed to capture audio sources: ${e?.toString?.() ?? e}`;
+      } catch (e: unknown) {
+        const error = `Failed to capture audio sources: ${e instanceof Error ? e.message : String(e)}`;
         console.error(error);
         this.eventCallback({ type: 'error', error });
         return;
@@ -2130,6 +2137,11 @@ export class StreamsStore {
         // refused rather than reported as on.
         this._systemAudioCapture = null;
         capture.onended = undefined;
+        // Hand the refused track back before stopping the capture: the
+        // api's `stop()` ending the track synchronously is what used to
+        // keep MicSource from carrying it into the next open, and that is
+        // the host's teardown order, not our invariant.
+        this.micSource.setMixin(null);
         try { capture.stop(); } catch {}
         return;
       }

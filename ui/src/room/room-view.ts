@@ -493,7 +493,19 @@ export class RoomView extends LitElement {
   private _renderSystemAudioRow() {
     const active = this._systemAudio.value;
     const micWanted = !!this._localIntent.value?.mic.wanted;
-    const disabled = !active && !micWanted;
+    // A mic-scope diff means the mic is wanted but not live (permission,
+    // device gone) — `intentDiffs` is the one authority for that. The
+    // store refuses the gesture in that state (`systemAudioOn`'s
+    // lifecycle gate), so the row says why instead of opening a picker.
+    const micPending = micWanted && !!this._intentDiff('mic');
+    const disabled = !active && (!micWanted || micPending);
+    const title = active
+      ? ''
+      : micPending
+        ? msg('Waiting for your microphone')
+        : !micWanted
+          ? msg('Turn your microphone on first')
+          : '';
     const label = active
       ? `✓ ${msg('Including')}: ${active.label}${active.canExcludeSelf ? '' : ` ${msg('(may echo)')}`}`
       : msg('Include audio from…');
@@ -508,7 +520,7 @@ export class RoomView extends LitElement {
       <div
         class="audio-source column ${disabled ? 'disabled' : ''}"
         tabindex="0"
-        title=${disabled ? msg('Turn your microphone on first') : ''}
+        title=${title}
         @click=${act}
         @keypress=${async (e: KeyboardEvent) => {
           if (e.key === 'Enter') await act();
