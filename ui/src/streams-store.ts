@@ -70,7 +70,11 @@ import { RoomStore } from './room/room-store';
 import type { StreamsStoreDeps } from './store-deps';
 import { PresenceLogger } from './logging';
 import { MicSource } from './mic-source';
-import { isUsableMixin } from './mic-output-policy';
+import {
+  decideSystemAudioRequest,
+  isLiveTrack,
+  type SystemAudioRequestDecision,
+} from './mic-output-policy';
 import { CameraSource } from './camera-source';
 import { CaptureReconciler } from './capture-reconciler';
 import { PeerAudioLevels } from './peer-audio-levels';
@@ -302,6 +306,23 @@ export class StreamsStore {
   /** True iff the host offered `captureAudioSources` — the menu row renders only then. */
   get canCaptureAudioSources(): boolean {
     return this.captureAudioSources !== undefined;
+  }
+
+  /**
+   * Whether a system-audio request can start right now, and why not. The
+   * menu row renders from this (disabled + title) and `systemAudioOn`
+   * refuses on it, so they cannot disagree — `decideSystemAudioRequest`
+   * is the one gate. Not a reactive store: the row re-renders on every
+   * presence tick (`intentDiffs`) and on menu open, which is when it reads.
+   */
+  get systemAudioRequest(): SystemAudioRequestDecision {
+    return decideSystemAudioRequest({
+      seamAvailable: this.captureAudioSources !== undefined,
+      micWanted: get(this._localIntent).mic.wanted,
+      micLifecycle: this.micSource.lifecycle.state,
+      active: this._systemAudioCapture !== null,
+      pending: this._systemAudioPending,
+    });
   }
 
   /** The active system-audio share (label + echo warning), or null. */
@@ -955,6 +976,13 @@ export class StreamsStore {
       // `micSource.lifecycle` directly on the presence tick rather than
       // subscribing here. Wire this if a push-driven consumer arrives.
       onLifecycleChange: () => {},
+      // MicSource dropped the mixin on its own (device closed under it, a
+      // rebuild failed, the track ended): end the host capture and the
+      // intent with it, so the row never shows "Including" over nothing.
+      onMixinDropped: reason => {
+        const capture = this._systemAudioCapture;
+        if (capture) this._systemAudioLost(capture, reason, 'mixin-dropped');
+      },
       now: () => this.clock.now(),
     });
 
@@ -2072,23 +2100,27 @@ export class StreamsStore {
    * Include audio playing on this machine in the outgoing mic track (spec
    * Section 4). The host owns the picker; a null capture is a cancel and
    * writes no intent. Intent is written only after the picker succeeded,
-   * as `screenShareOn` does. The capture's `onended` — the host (Stop on
-   * Moss's chip, iframe unload) or the platform ending the grant — is the
-   * documented gesture-equivalent 'system-audio-ended' (intent.ts header);
-   * `stop()` never fires it, so `systemAudioOff` is the only other exit.
+   * as `screenShareOn` does. Every other end of the share that is not the
+   * user's own `systemAudioOff` goes through `_systemAudioLost`.
    */
   async systemAudioOn(): Promise<void> {
     const seam = this.captureAudioSources;
     if (!seam) return;
-    if (!get(this._localIntent).mic.wanted) return;
-    // Wanted is not the same as live: with permission denied or the device
-    // unplugged there is no device track to mix against, so `setMixin`
-    // would refuse whatever the user picked (decideMicOutput → none/
-    // no-device) after the picker had already taken a choice from them.
-    // Refuse before the seam — the mic button's intent-diff badge is what
-    // tells them the mic itself is the problem.
-    if (this.micSource.lifecycle.state !== 'live') return;
-    if (this._systemAudioCapture || this._systemAudioPending) return;
+    const request = this.systemAudioRequest;
+    if (!request.ok) {
+      // The row disables itself from the same decision, so a refused click
+      // is the render-to-click race (the mic ended between them). Say so
+      // rather than close the menu silently; the other reasons are either
+      // unreachable from an enabled row or benign (a second click while
+      // the picker is up).
+      if (request.reason === 'mic-not-live') {
+        this.eventCallback({ type: 'error', error: 'Waiting for your microphone' });
+      }
+      return;
+    }
+    // Under the click: a suspended context would mix silence (Electron
+    // rarely suspends, and this is free).
+    this.micSource.resumeAudioContext();
     const audioContext = this.micSource.ensureAudioContext() ?? undefined;
     this._systemAudioPending = true;
     try {
@@ -2102,7 +2134,7 @@ export class StreamsStore {
         return;
       }
       if (!capture) return;
-      if (!isUsableMixin(capture.track)) {
+      if (!isLiveTrack(capture.track)) {
         // Resolved already ended (spec Section 3): nothing to include.
         return;
       }
@@ -2113,43 +2145,70 @@ export class StreamsStore {
         capture.stop();
         return;
       }
-      this._systemAudioCapture = capture;
       // A `const` alias: `capture` is a `let` from the outer scope, so TS
       // widens it back to `AudioSourceCapture | null` inside this closure
       // (the guards above narrowed the outer binding, not the closure's
       // view of it) — this alias keeps the non-null narrowing stable.
       const endedCapture = capture;
-      capture.onended = () => {
-        if (this._systemAudioCapture !== endedCapture) return;
-        this._applyIntent({ type: 'system-audio-ended' });
-        this._systemAudioCapture = null;
-        this._systemAudio.set(null);
-        this.micSource.setMixin(null);
-        this.logger.logAgentEvent({
-          agent: this.myPubKeyB64,
-          timestamp: this.clock.now(),
-          event: 'SystemAudioEnded',
-          detail: `reason=${endedCapture.endedReason ?? 'unknown'}; label=${endedCapture.label}`,
-        });
-      };
+      capture.onended = () =>
+        this._systemAudioLost(endedCapture, endedCapture.endedReason ?? 'unknown', 'capture-ended');
+      // The store owns the capture only once the mix exists: a refused
+      // build fires MicSource's `onMixinDropped` synchronously from inside
+      // `setMixin`, and that binding must find nothing to end — the share
+      // never started, so it is refused here, not "lost".
       if (!this.micSource.setMixin(capture.track)) {
-        // With no Web Audio the mix cannot be built, so the share is
-        // refused rather than reported as on.
-        this._systemAudioCapture = null;
         capture.onended = undefined;
-        // Hand the refused track back before stopping the capture: the
-        // api's `stop()` ending the track synchronously is what used to
-        // keep MicSource from carrying it into the next open, and that is
-        // the host's teardown order, not our invariant.
+        // Hand the refused track back before stopping the capture, so
+        // MicSource never carries it into the next open whatever order the
+        // host's `stop()` tears it down in.
         this.micSource.setMixin(null);
         try { capture.stop(); } catch {}
         return;
       }
+      this._systemAudioCapture = capture;
       this._applyIntent({ type: 'system-audio-on' });
       this._systemAudio.set({ label: capture.label, canExcludeSelf: capture.canExcludeSelf });
     } finally {
       this._systemAudioPending = false;
     }
+  }
+
+  /**
+   * The share ended without the user's gesture: the host or platform ended
+   * the grant (`capture.onended` — Stop on Moss's chip, iframe unload,
+   * backend stream loss; `stop()` never fires it) or MicSource dropped the
+   * mixin (`onMixinDropped`: device closed under it, rebuild failed, track
+   * ended). This is the documented gesture-equivalent 'system-audio-ended'
+   * (intent.ts header; `intent-write-sites.test.ts` lists this method):
+   * stopping a share from outside the app is a user action the platform
+   * delivers as an event, and a mix that cannot exist is the same to the
+   * user. Idempotent per capture — a stale event for a superseded capture
+   * touches nothing. The label is not logged: the event log travels to
+   * peers in `DiagnosticResponse`, and a source label can be a window title.
+   */
+  private _systemAudioLost(
+    capture: AudioSourceCapture,
+    reason: string,
+    via: 'capture-ended' | 'mixin-dropped',
+  ): void {
+    if (this._systemAudioCapture !== capture) return;
+    this._applyIntent({ type: 'system-audio-ended' });
+    this._systemAudioCapture = null;
+    this._systemAudio.set(null);
+    if (via === 'capture-ended') {
+      this.micSource.setMixin(null);
+    } else {
+      // MicSource already dropped the track; end the host grant without
+      // hearing back about it.
+      capture.onended = undefined;
+      try { capture.stop(); } catch (e) { console.warn('systemAudio: stop threw', e); }
+    }
+    this.logger.logAgentEvent({
+      agent: this.myPubKeyB64,
+      timestamp: this.clock.now(),
+      event: 'SystemAudioEnded',
+      detail: `reason=${reason}; via=${via}`,
+    });
   }
 
   /** The menu row's off gesture: stop the host grant and swap back to the device track. */

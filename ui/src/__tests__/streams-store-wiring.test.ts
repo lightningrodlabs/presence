@@ -2619,7 +2619,12 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
 
     destinations: Array<{ track: FakeTrack }> = [];
 
+    /** Every createMediaStreamSource throws (a context that is gone) —
+     *  the mixin-dropped row needs both MicSource source-node sites to fail. */
+    failAlways = false;
+
     createMediaStreamSource(stream: FakeStream) {
+      if (this.failAlways) throw new Error('createMediaStreamSource failed');
       const node = {
         stream,
         connected: false,
@@ -2779,7 +2784,10 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(media.replaceCalls).toHaveLength(1);
     expect(capture.stop).not.toHaveBeenCalled();
     const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
-    expect(logged?.detail).toContain('user-stopped');
+    expect(logged?.detail).toBe('reason=user-stopped; via=capture-ended');
+    // The label (a window title, user-chosen free text) is not written into
+    // a log that `DiagnosticResponse` exports to peers.
+    expect(logged?.detail).not.toContain('System audio');
   });
 
   it('a stale onended (from a capture that was already replaced or stopped) is ignored', async () => {
@@ -2827,12 +2835,67 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(get(started.store.localIntent).mic.wanted).toBe(true);
     expect(started.store.micSource.lifecycle.state).not.toBe('live');
 
+    // The row disables itself from the same decision the store refuses on.
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'mic-not-live' });
+
     await started.store.systemAudioOn();
     await flush();
 
     expect(started.calls).toHaveLength(0);
     expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
     expect(get(started.store.systemAudio)).toBeNull();
+    // A click that slipped through the render-to-click race is told why,
+    // not dropped silently: the refusal emits an error event.
+    expect(started.events.filter(e => e.type === 'error').map(e => (e as any).error))
+      .toEqual(['Waiting for your microphone']);
+  });
+
+  it('systemAudioRequest is the one gate: it reports the reason the row disables on, in the store\'s order', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let resolve!: (c: FakeCapture) => void;
+    const started = makeStartedWithCapture(() => new Promise(res => { resolve = res; }));
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'mic-not-wanted' });
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    const pending = started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'request-pending' });
+    resolve(fakeCapture());
+    await pending;
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'already-active' });
+    started.store.systemAudioOff();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    // Without the seam the reason is the seam, whatever else is true.
+    const bare = makeStarted();
+    expect(bare.store.systemAudioRequest).toEqual({ ok: false, reason: 'no-seam' });
+  });
+
+  it('MicSource dropping the mixin on its own (a failed rebuild after a device change) ends the share: intent, readable, capture, log', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let n = 0;
+    installNavigator(async () => new FakeStream([[device1, device2][n++]!]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    expect(get(started.store.systemAudio)).not.toBeNull();
+    // Every source-node build now throws: the in-place swap and the rebuild.
+    const ctx = started.store.micSource.ensureAudioContext() as unknown as { failAlways: boolean };
+    ctx.failAlways = true;
+    await started.store.changeAudioInput('other');
+    await flush();
+    expect(started.store.micSource.outputMode).toBe('device');
+    // Before the binding existed the readable kept saying "Including" over
+    // a device-only output, and the host grant stayed open.
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
+    expect(logged?.detail).toBe('reason=mix-failed; via=mixin-dropped');
   });
 
   it('an interleaved second systemAudioOn — fired before the first request resolves — opens no second picker (review round 1 finding)', async () => {
