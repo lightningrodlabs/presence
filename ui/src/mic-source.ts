@@ -508,7 +508,7 @@ export class MicSource {
         // Either way this leaves a mix or, if the graph itself refused,
         // a reported drop (`_reconcileOutput`'s build arm), never a
         // mixin held silently.
-        if (isLiveTrack(this._mixin) && !this._mix) this._reconcileOutput();
+        if (isLiveTrack(this._mixin)) this._reconcileOutput();
       }
     })();
 

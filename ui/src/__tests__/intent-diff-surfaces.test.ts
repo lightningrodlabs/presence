@@ -34,6 +34,7 @@ type FakeStore = {
   systemAudioRequest: SystemAudioRequestDecision;
   systemAudioOn: () => Promise<void>;
   systemAudioOff: () => void;
+  micSource: { lifecycle: { state: string } };
 };
 
 function makeRoomView(overrides?: {
@@ -43,6 +44,7 @@ function makeRoomView(overrides?: {
   reconnecting?: (p: string) => boolean;
   systemAudioRequest?: SystemAudioRequestDecision;
   systemAudio?: { label: string; canExcludeSelf: boolean } | null;
+  micLifecycle?: string;
 }): any {
   const el = document.createElement('room-view') as any;
   const store: FakeStore = {
@@ -52,6 +54,7 @@ function makeRoomView(overrides?: {
     systemAudioRequest: overrides?.systemAudioRequest ?? { ok: true },
     systemAudioOn: vi.fn(async () => {}),
     systemAudioOff: vi.fn(),
+    micSource: { lifecycle: { state: overrides?.micLifecycle ?? 'live' } },
   };
   el.streamsStore = store;
   // The StoreSubscriber fields read only `.value`; overwrite them with
@@ -204,6 +207,15 @@ describe('the room-level notice that audio is still going out with the mic off',
     const el = makeRoomView({
       intent: INTENT(MIC(false, true), false),
       systemAudio: { label: 'Spotify', canExcludeSelf: true },
+    });
+    expect(el._systemAudioNoticeText()).toBe('Microphone off — still sending audio from Spotify');
+  });
+
+  it('wanted and unmuted but no live device → the notice still shows: the share is the only audio going out', () => {
+    const el = makeRoomView({
+      intent: INTENT(MIC(true, false), false),
+      systemAudio: { label: 'Spotify', canExcludeSelf: true },
+      micLifecycle: 'failed',
     });
     expect(el._systemAudioNoticeText()).toBe('Microphone off — still sending audio from Spotify');
   });

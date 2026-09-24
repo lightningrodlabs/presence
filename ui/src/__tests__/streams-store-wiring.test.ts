@@ -2443,7 +2443,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     // harness: one queued read, then done. If the mute check regressed
     // and `encode()` ran anyway, the stub throws and fails the test loudly.
     const controller = voiceController as unknown as {
-      micHandle: { track: { enabled: boolean } } | null;
+      encodingTrack: { enabled: boolean } | null;
       pipelineGeneration: number;
       encoder: { state: string; encode: (d: unknown) => void } | null;
       encoderReader: {
@@ -2451,7 +2451,10 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       } | null;
       pumpEncoder(gen: number): Promise<void>;
     };
-    controller.micHandle = { track: { enabled: false } };
+    // The track the reader is pulling from, NOT the acquire-time handle:
+    // during a system-audio share those differ, and the handle's copy is
+    // the microphone, which mute disables while the share plays on.
+    controller.encodingTrack = { enabled: false };
     controller.encoder = {
       state: 'configured',
       encode: () => {
@@ -3046,6 +3049,33 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
     expect(capture.stop).not.toHaveBeenCalled();
     expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('a mic-less share starts the signals voice encoder, and turning it off stops it', async () => {
+    const startSpy = vi.spyOn(voiceController, 'startCapture').mockResolvedValue(true);
+    const stopSpy = vi.spyOn(voiceController, 'stopCapture').mockResolvedValue(undefined);
+    installNavigator(async () => new FakeStream([new FakeTrack('audio', 'device')]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    // A signals-carried peer present, and the microphone never turned on.
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    started.clock.advance(PING_INTERVAL);
+    await flush();
+    expect(startSpy).not.toHaveBeenCalled();
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    // Driven by the gesture, not left to the next presence tick: peers
+    // on signals would otherwise hear nothing for up to PING_INTERVAL.
+    expect(get(started.store.localIntent).mic.wanted).toBe(false);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(true);
+
+    started.store.systemAudioOff();
+    await flush();
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(false);
   });
 
   it('a capture that resolves already ended is not installed (Review Focus 2)', async () => {

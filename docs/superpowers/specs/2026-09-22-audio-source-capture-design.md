@@ -514,8 +514,8 @@ and someone who mutes themselves does not mean "stop the music".
    builds the graph from whichever sources exist, so a mixin alone is a
    one-source mix and no `getUserMedia` runs — a user sharing what they
    are playing gets no recording indicator. `decideSystemAudioRequest`
-   therefore has no microphone condition left; the row is disabled only
-   while the host picker is up. The microphone joins and leaves that
+   therefore has no microphone condition left; what remains is no host
+   seam, a share already running, and the host picker being up. The microphone joins and leaves that
    graph in place (`sync-mix-device`), so turning it on or off during a
    share never swaps the output track and never renegotiates with a peer.
 2. Mute silences the microphone's branch only. `MicSource.setMuted`

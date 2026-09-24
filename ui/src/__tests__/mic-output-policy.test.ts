@@ -62,9 +62,6 @@ describe('decideSystemAudioRequest', () => {
     ['no host seam (older Moss)', { seamAvailable: false }, { ok: false, reason: 'no-seam' }],
     ['a capture is held', { active: true }, { ok: false, reason: 'already-active' }],
     ['the picker is up', { pending: true }, { ok: false, reason: 'request-pending' }],
-    // The microphone is deliberately not a condition: sharing what you
-    // are playing neither needs nor opens it.
-    ['the microphone plays no part in the decision', {}, { ok: true }],
   ];
   it.each(rows)('%s', (_name, patch, expected) => {
     expect(decideSystemAudioRequest({ ...base, ...patch })).toEqual(expected);

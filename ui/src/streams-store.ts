@@ -2163,6 +2163,11 @@ export class StreamsStore {
       this._systemAudioCapture = capture;
       this._applyIntent({ type: 'system-audio-on' });
       this._systemAudio.set({ label: capture.label, canExcludeSelf: capture.canExcludeSelf });
+      // The share is a second reason to be sending audio, so the signals
+      // encoder's gate has just changed. Drive it here as the mic
+      // gestures do, rather than leaving a mic-less share silent for
+      // signals peers until the next presence tick.
+      this._reconcileSignalsAudio();
     } finally {
       this._systemAudioPending = false;
     }
@@ -2204,12 +2209,14 @@ export class StreamsStore {
       event: 'SystemAudioEnded',
       detail: `reason=${reason}; via=${via}`,
     });
+    this._reconcileSignalsAudio();
   }
 
   /** The menu row's off gesture: stop the host grant and swap back to the device track. */
   systemAudioOff(): void {
     this._applyIntent({ type: 'system-audio-off' });
     this._releaseSystemAudio();
+    this._reconcileSignalsAudio();
   }
 
   /** Stop and forget the capture (no intent write — callers own that). */

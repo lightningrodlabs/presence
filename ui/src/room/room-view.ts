@@ -501,7 +501,14 @@ export class RoomView extends LitElement {
     const active = this._systemAudio.value;
     if (!active) return null;
     const intent = this._localIntent.value;
-    const micSending = !!intent && intent.mic.wanted && !intent.mic.muted;
+    // Wanted and unmuted is not the same as sending: a denied permission
+    // or an unplugged device leaves the intent on with no live track, and
+    // the share is then the only audio going out.
+    const micSending =
+      !!intent &&
+      intent.mic.wanted &&
+      !intent.mic.muted &&
+      this.streamsStore.micSource.lifecycle.state === 'live';
     if (micSending) return null;
     return `${msg('Microphone off — still sending audio from')} ${active.label}`;
   }
@@ -4510,11 +4517,6 @@ export class RoomView extends LitElement {
       }
 
       /* Task 6 surface 3: room-level carrier banner (signal carrier down). */
-      .system-audio-banner {
-        background: #123a2a;
-        color: #9be8c4;
-      }
-
       .carrier-banner {
         margin: 4px auto 0;
         padding: 4px 12px;
@@ -4524,6 +4526,13 @@ export class RoomView extends LitElement {
         font-size: 14px;
         text-align: center;
         max-width: 90%;
+      }
+
+      /* After .carrier-banner, whose colours it overrides: the element
+         carries both classes and this is not a carrier warning. */
+      .system-audio-banner {
+        background: #123a2a;
+        color: #9be8c4;
       }
 
       .audio-input-sources {
