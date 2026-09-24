@@ -438,6 +438,90 @@ describe('MicSource mixin: device swaps and close', () => {
     expect(r.fanout).toEqual([{ newTrack: device2, oldTrack: mixed }]);
   });
 
+  it('a mixin deferred onto an open that then FAILS is dropped and reported, so a later reopen cannot install over it', async () => {
+    // The PR #5 re-review's repro. The picker is open (the request gate
+    // passed while the mic was live); the device dies and a second
+    // consumer's acquire starts a replacement; the grant lands mid-open
+    // and is recorded. If that open fails, nothing would ever build the
+    // recorded mixin — `_openAndSwap` reconciles for a live mixin or an
+    // existing mix, and after a failed open there is neither device nor
+    // mix — so it must not be held silently.
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let rejectOpen!: () => void;
+    let n = 0;
+    installGlobals(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      if (n === 2) return new Promise<FakeStream>((_res, rej) => { rejectOpen = () => rej(new Error('NotAllowedError')); });
+      return Promise.resolve(new FakeStream([device2]));
+    });
+    const r = rig();
+    await r.mic.acquire({ id: 'voice' });
+    device1.stop();
+    expect(r.mic.lifecycle.state).toBe('ended');
+    const opening = r.mic.acquire({ id: 'filmstrip' });
+    const mixin = new FakeTrack('audio', 'system');
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(true); // recorded, deferred
+
+    rejectOpen();
+    await opening;
+
+    expect(r.mic.lifecycle.state).toBe('failed');
+    expect(r.dropped).toEqual(['device-closed']);
+    // The reopen that follows is a plain device open — before the fix it
+    // installed the device track over the orphaned mixin and the store
+    // went on showing "Including" with nothing mixed.
+    expect(await r.mic.reopen()).toBe(true);
+    expect(r.mic.outputMode).toBe('device');
+    expect(r.mic.track).toBe(device2 as unknown as MediaStreamTrack);
+    expect(r.dropped).toEqual(['device-closed']);
+  });
+
+  it('a mixin deferred onto an open that SUCCEEDS is built onto the new device (the deferral kept)', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let release!: () => void;
+    let n = 0;
+    installGlobals(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      return new Promise<FakeStream>(res => { release = () => res(new FakeStream([device2])); });
+    });
+    const r = rig();
+    await r.mic.acquire({ id: 'voice' });
+    device1.stop();
+    const opening = r.mic.acquire({ id: 'filmstrip' });
+    expect(r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack)).toBe(true);
+
+    release();
+    await opening;
+
+    expect(r.mic.outputMode).toBe('mixed');
+    expect(r.mic.deviceTrack).toBe(device2 as unknown as MediaStreamTrack);
+    expect(r.dropped).toEqual([]);
+  });
+
+  it('reopen honours a recorded live mixin instead of installing the device over it (the _openAndSwap half of the rule)', async () => {
+    // `setMixin` with no device records the mixin and answers false (v1
+    // needs the mic held), so a caller that ignores that answer leaves a
+    // mixin with no mix behind it. Both open paths must then build it
+    // rather than install the bare device: `_ensureOpen` always did;
+    // `_openAndSwap` (reopen, changeDevice) reconciled only while a mix
+    // already existed.
+    const device = new FakeTrack('audio', 'd');
+    installGlobals(async () => new FakeStream([device]));
+    const r = rig();
+    const mixin = new FakeTrack('audio', 'system');
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
+
+    expect(await r.mic.reopen()).toBe(true);
+
+    expect(r.mic.outputMode).toBe('mixed');
+    expect(r.mic.deviceTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(r.dropped).toEqual([]);
+  });
+
   it('acquire after a mixin was set hands out the mixed output', async () => {
     const device = new FakeTrack('audio', 'd');
     installGlobals(async () => new FakeStream([device]));

@@ -345,7 +345,13 @@ export class MicSource {
     // of it are untouched, so no fanout fires. Otherwise this is the
     // pre-mixin fanout: store-level replaceTrack first, then per-consumer
     // rebuilds for consumers bound to track identity.
-    if (this._mix) {
+    // A live mixin with no mix behind it is one this source was asked to
+    // hold and has not built yet; reconciling here builds it onto the new
+    // device (always `build-mix`, which installs). Without the mixin
+    // clause this branch installed the device track straight over it and
+    // nothing would have rebuilt it. A non-live mixin cannot produce an
+    // installing decision, so it keeps the plain swap.
+    if (this._mix || isLiveTrack(this._mixin)) {
       this._reconcileOutput();
     } else {
       this._installOutputTrack(newTrack, old);
@@ -457,6 +463,19 @@ export class MicSource {
         return true;
       } finally {
         this._openingPromise = null;
+        // A `setMixin` that arrived while this open was in flight was
+        // deferred onto it (see `setMixin`). The reconcile above honours
+        // it when the device opened; when the open failed there is no
+        // device to mix against and nothing else would ever pick it up —
+        // `_openAndSwap` only reconciles for a live mixin or an existing
+        // mix, and a rebuild is not attempted for a mixin alone. Holding
+        // a mixin we are not mixing is the state `onMixinDropped` exists
+        // to prevent, so drop it and say so.
+        if (this._mixin && !this._mix) {
+          const reason = isLiveTrack(this._deviceTrack) ? 'mixin-ended' : 'device-closed';
+          this._mixin = null;
+          this._notifyMixinDropped(reason);
+        }
       }
     })();
 

@@ -13,9 +13,13 @@ import type { AgentPubKeyB64 } from '@holochain/client';
  * as a track event. A second gesture-equivalent exists for the same
  * reason: 'system-audio-ended' — the host (Moss) or the platform ending
  * a system-audio grant is delivered to the store as the capture's
- * onended callback, which is the user's or the OS's action, not ours;
- * the store writes that intent from inside systemAudioOn's method
- * body, where the callback is installed.
+ * onended callback, which is the user's or the OS's action, not ours.
+ * The same gesture-equivalent covers MicSource dropping a mixin it was
+ * asked to hold (its `onMixinDropped` binding: the device closed under
+ * the mix, a rebuild failed, the track ended) — a share that cannot
+ * exist is the same to the user as one the host ended. Both routes write
+ * the intent from one place, `StreamsStore._systemAudioLost`, which
+ * `intent-write-sites.test.ts` lists as a declared non-gesture site.
  *
  * EXTENSION POINT (not built — YAGNI, no automatic writer exists today):
  * if a future feature must override intent automatically (a flap

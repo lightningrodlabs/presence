@@ -2983,6 +2983,41 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(started.calls).toHaveLength(2);
   });
 
+  it('the grant lands while a device reopen is in flight and that reopen fails: the share ends instead of showing "Including" over nothing (PR #5 re-review)', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    let rejectOpen!: () => void;
+    let n = 0;
+    installNavigator(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      return new Promise<FakeStream>((_res, rej) => { rejectOpen = () => rej(new Error('NotAllowedError')); });
+    });
+    const capture = fakeCapture();
+    let resolveSeam!: (c: FakeCapture) => void;
+    const started = makeStartedWithCapture(() => new Promise(res => { resolveSeam = res; }));
+    await started.store.audioOn(true);
+    await flush();
+    // The request gate passed while the mic was live; the device dies
+    // while the host picker is up, and a consumer's acquire starts a
+    // replacement that will fail.
+    const pending = started.store.systemAudioOn();
+    device1.stop();
+    const opening = started.store.micSource.acquire({ id: 'voice-2' });
+    resolveSeam(capture);
+    await pending;
+
+    rejectOpen();
+    await opening;
+    await flush();
+
+    expect(started.store.micSource.outputMode).not.toBe('mixed');
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
+    expect(logged?.detail).toBe('reason=device-closed; via=mixin-dropped');
+  });
+
   it('a capture that resolves already ended is not installed (Review Focus 2)', async () => {
     const device = new FakeTrack('audio', 'device');
     installNavigator(async () => new FakeStream([device]));
