@@ -189,13 +189,24 @@ constants (working agreement 2).
 
 The executor in `checkTrackHealth`:
 
-- `request-refresh`: unchanged, plus `refreshRequestsSent += 1` after a
-  successful send. This is the same "only after the send" rule as the
-  stale reset.
+- `request-refresh`: unchanged, plus `refreshRequestsSent += 1` per
+  attempt. The budget counts attempts, not deliveries: `FsmTransport.send`
+  swallows every failure, so delivery is unobservable, and a data channel
+  that cannot carry the request is itself evidence of a dead link. The
+  stale reset keeps its pre-existing sent>0 rule.
 - `none` with `resetRefreshBudget`: `refreshRequestsSent = 0`.
 - `escalate`: log `DeadTrackEscalation` (new `SimpleEventType`,
   `emitted`), then `deadTrackEscalations += 1`, then
   `mediaTransport().closeConnection(peer, 'dead-track-escalation')`.
+
+The decision holds while the media transport's phase for the peer is
+not `connected` (`transportPhase` input): during
+`reconnecting`/`disconnected` the slot keeps `connected: true` and the
+FSM owns recovery, so no refresh is requested, nothing escalates, and
+the counters and budget are frozen until the phase returns to
+`connected`. On the incident timeline this defers the first escalation
+to about 16 s after `reconnection succeeded` at 10:13:04, which is the
+state the incident was stuck in.
 
 Nothing else is new. `closeConnection` emits `closed` synchronously and
 sends the `leave` signal (`ConnectionManager.closeConnection`).
@@ -249,8 +260,9 @@ Both arms are pinned by the full-object `toEqual` tests in
 ### Declared behavior changes
 
 1. A connected media link whose inbound bytes stay frozen through the
-   refresh budget is closed and re-established (Part 1). Previously it
-   stayed open indefinitely.
+   refresh budget is closed and re-established (Part 1); never while the
+   transport phase is not `connected`. Previously it stayed open
+   indefinitely.
 2. Log-only additions (Part 2). The close-reason strings change. The
    one wiring test that pins `'disconnectFromPeerVideo'` for
    `setCarrierMode('signals')` is updated to `'carrier-mode-signals'`.

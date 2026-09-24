@@ -118,6 +118,7 @@ export class TrackHealthMonitor {
           staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
           refreshRequestsSent: record?.refreshRequestsSent ?? 0,
           refreshBudget,
+          transportPhase: this.bindings.mediaTransport().getPhase(pubKeyB64),
         });
 
         this.bindings.ensurePeerRecord(pubKeyB64).lastBytesReceived = {
@@ -140,12 +141,16 @@ export class TrackHealthMonitor {
             this.bindings.logger.logCustomMessage(
               `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
             );
+            const r = this.bindings.ensurePeerRecord(pubKeyB64);
+            // The budget counts ATTEMPTS, not deliveries (declared,
+            // 2026-09-24 round): FsmTransport.send swallows every failure
+            // (no FSM, not connected, throw), so delivery is unobservable
+            // here, and a data channel that cannot carry the request is
+            // itself evidence of a dead link. Escalation must not depend
+            // on it. The stale reset keeps its pre-existing sent>0 rule.
+            r.refreshRequestsSent = (r.refreshRequestsSent ?? 0) + 1;
             if (this.bindings.sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
-              // Reset stale count to avoid spamming; the budget counts
-              // only requests that actually went out (Review Focus 2).
-              const r = this.bindings.ensurePeerRecord(pubKeyB64);
               r.staleCycles = { audio: 0, video: 0 };
-              r.refreshRequestsSent = (r.refreshRequestsSent ?? 0) + 1;
             }
             break;
           }
@@ -167,9 +172,12 @@ export class TrackHealthMonitor {
             // Bump the survivor BEFORE the close: media-close-full keeps
             // it, and the next connection reads it for its budget. Zero
             // the session counters too: when the close clears the slot
-            // this is redundant, and when it cannot (transport vanished
-            // with no event, the §3.1(c) shape) it stops the escalation
-            // from re-firing every poll (Review Focus 3).
+            // this is redundant; it is defense in depth for a close that
+            // does not clear the slot (a throwing or no-op
+            // closeConnection), so escalation cannot re-fire every poll.
+            // The §3.1(c) vanish shape never reaches this arm: the
+            // transport-phase hold in decideTrackRefresh covers it, and
+            // the real transport's getStats returns null with no pc.
             const r = this.bindings.ensurePeerRecord(pubKeyB64);
             r.deadTrackEscalations = priorEscalations + 1;
             r.staleCycles = { audio: 0, video: 0 };

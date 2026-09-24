@@ -17,6 +17,7 @@
  *
  * Constrains `ui/src/track-health.ts:TrackHealthMonitor.checkTrackHealth`.
  */
+import type { ConnectionPhase } from './types';
 
 /**
  * The subset of an RTCStats report this policy reads. Reports are produced
@@ -191,6 +192,15 @@ export type TrackRefreshInputs = {
   refreshRequestsSent: number;
   /** Requests allowed before escalation: `deadTrackRefreshBudget(...)`. */
   refreshBudget: number;
+  /**
+   * The media transport's phase for this peer (`PeerTransport.getPhase`).
+   * A slot stays `connected: true` through `reconnecting`/`disconnected`
+   * (the transport-owns-recovery route in media-event-policy.ts) and the
+   * FSM owns that recovery, so this decision HOLDS — no request, no
+   * escalation, counters and budget frozen — until the phase is
+   * `connected` again. Escalation then resumes on the held counters.
+   */
+  transportPhase: ConnectionPhase;
 };
 
 export type TrackRefreshDecision =
@@ -209,7 +219,7 @@ export type TrackRefreshDecision =
   | {
       action: 'none';
       nextStale: StaleCycleCounts;
-      reason: 'flowing';
+      reason: 'flowing' | 'transport-recovering';
       /** True when both counters are zero (bytes resumed on every
        *  expected kind): the caller zeroes `refreshRequestsSent`. */
       resetRefreshBudget: boolean;
@@ -228,11 +238,24 @@ export type TrackRefreshDecision =
  *
  * The caller resets the counters to zero only after the refresh request
  * was actually sent; a send failure keeps them, so the next cycle retries.
- * The caller increments `refreshRequestsSent` on the same condition.
+ * The caller increments `refreshRequestsSent` on every attempt, sent or
+ * not (the budget counts attempts, by declaration).
  * `escalate` replaces `request-refresh` once that count reaches
  * `refreshBudget`; a `none` with `resetRefreshBudget` zeroes it.
+ *
+ * While `transportPhase` is not `connected` the decision holds
+ * (`none`/`transport-recovering`, counters frozen, budget not reset): the
+ * FSM owns that recovery window.
  */
 export function decideTrackRefresh(input: TrackRefreshInputs): TrackRefreshDecision {
+  if (input.transportPhase !== 'connected') {
+    return {
+      action: 'none',
+      nextStale: { ...input.staleCycles },
+      reason: 'transport-recovering',
+      resetRefreshBudget: false,
+    };
+  }
   const nextStale: StaleCycleCounts = { ...input.staleCycles };
 
   if (input.videoExpected && input.videoBytes > 0) {

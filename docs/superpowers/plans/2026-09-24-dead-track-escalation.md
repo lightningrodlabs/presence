@@ -27,8 +27,8 @@
 Inputs the spec implies but that no existing test exercises. Each line names the task whose tests pin it.
 
 1. A track that never started (bytes stay 0) must never escalate. It is the establishment path's problem, not a dead track. Task 3, policy test "never-started kinds do not move counters or escalate".
-2. A refresh request whose data-channel send throws must not consume the budget. Task 4, wiring test "(d) a failed refresh send does not consume the budget".
-3. Escalation on a slot whose transport already vanished with no event (the §3.1(c) shape) must not loop every poll. Task 4, wiring test "(e) escalation on a vanished transport resets the counters and does not repeat next poll".
+2. A refresh request whose data-channel send fails must still consume the budget: a dead data channel must not prevent escalation. Task 4, wiring test (d).
+3. Escalation on a slot whose transport already vanished with no event (the §3.1(c) shape, phase `idle`) must not fire or loop: the transport-phase hold covers it. Task 4, wiring test (e).
 4. If `getStats` rejects, the outbound-stats log on `request-track-refresh` receipt must not break the refresh. Task 2, wiring test "outbound log survives a rejecting getStats".
 5. Installing `onmute` and the log-only `onunmute` must not change the arrived-muted branch, whose `onunmute` still calls `_setTrackReady`. Task 1, wiring test "TrackMuted/TrackUnmuted forensics on remote tracks".
 

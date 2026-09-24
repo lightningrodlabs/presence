@@ -163,9 +163,44 @@ const base: TrackRefreshInputs = {
   staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
   refreshRequestsSent: 0,
   refreshBudget: DEAD_TRACK_REFRESH_BUDGET,
+  transportPhase: 'connected',
 };
 
 describe('decideTrackRefresh', () => {
+  it('holds while the transport is reconnecting: counters held, not advanced', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'reconnecting',
+        audioBytes: 1000,
+        staleCycles: { audio: 1, video: 0 },
+      })
+    ).toEqual({
+      action: 'none',
+      nextStale: { audio: 1, video: 0 },
+      reason: 'transport-recovering',
+      resetRefreshBudget: false,
+    });
+  });
+
+  it('never escalates while the transport is disconnected, even with a spent budget', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'disconnected',
+        audioBytes: 1000,
+        staleCycles: { audio: 2, video: 0 },
+        refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+      }).action
+    ).toBe('none');
+  });
+
+  it('bytes advancing during recovery do not reset the budget', () => {
+    const d = decideTrackRefresh({ ...base, transportPhase: 'reconnecting' });
+    expect(d.action).toBe('none');
+    expect(d.action === 'none' && d.resetRefreshBudget).toBe(false);
+  });
+
   it('bytes advancing resets the counters and requests nothing', () => {
     expect(decideTrackRefresh(base)).toEqual({
       action: 'none',

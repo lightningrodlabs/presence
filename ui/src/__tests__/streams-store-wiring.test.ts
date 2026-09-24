@@ -3415,35 +3415,60 @@ describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
     expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
   });
 
-  it('(d) a failed refresh send does not consume the budget (Review Focus 2)', async () => {
-    const { store, media } = openStalledLink();
-    media.send = () => {
-      throw new Error('data channel closed');
-    };
-    await poll(store, 3); // first crossing: send throws, count 0
-    expect(store._peerRecord(peerA)?.refreshRequestsSent ?? 0).toBe(0);
-    // Stale counters were NOT reset (the existing rule), so the next
-    // poll crosses again and retries the send.
-    expect(store._peerRecord(peerA)?.staleCycles?.audio).toBeGreaterThanOrEqual(2);
-    await poll(store, 1);
-    expect(store._peerRecord(peerA)?.refreshRequestsSent ?? 0).toBe(0);
-    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+  it('(d) a failing refresh send still consumes the budget: a dead data channel must not prevent escalation', async () => {
+    const { store, media, logger } = openStalledLink();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      media.send = () => {
+        throw new Error('data channel closed');
+      };
+      // Crossing on poll 3; the stale counters are not reset because the
+      // send failed, so every later poll crosses again: attempts on polls
+      // 3, 4, 5 and escalation on poll 6.
+      await poll(store, 5);
+      expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
+      expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+      await poll(store, 1);
+      expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+      expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
-  it('(e) escalation on a vanished transport resets the counters and does not repeat next poll (Review Focus 3)', async () => {
+  it('(e) a vanished transport (phase idle, slot still connected) holds: no request, no escalation, no loop (Review Focus 3)', async () => {
     const { store, media, logger } = openStalledLink();
-    media.vanish(peerA); // the §3.1(c) shape: no closed event will ever come
+    media.vanish(peerA); // the §3.1(c) shape: no closed event will ever come; getPhase reports 'idle'
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
     await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
-    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
-    // Bounded exception: the slot outlives the transport. The executor
-    // must have zeroed its own counters so the cycle restarts with the
-    // doubled budget instead of escalating every poll.
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+    // The slot outlives the transport (the bounded exception); nothing here
+    // clears it, and nothing here churns on it either.
     expect(get(store._openConnections)[peerA]).toBeDefined();
-    expect(store._peerRecord(peerA)?.staleCycles).toEqual({ audio: 0, video: 0 });
-    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(0);
-    expect(store._peerRecord(peerA)?.deadTrackEscalations).toBe(1);
-    await poll(store, 2);
-    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(1);
-    expect(media.closeCalls.filter(c => c.reason === 'dead-track-escalation')).toHaveLength(1);
+    expect(store._peerRecord(peerA)?.deadTrackEscalations ?? 0).toBe(0);
+  });
+
+  it('(f) holds while the transport is recovering, then escalates once it is connected again', async () => {
+    const { store, media, logger } = openStalledLink();
+    // Enter the FSM's own recovery window: the slot keeps connected:true
+    // (transport-owns-recovery route) but the phase is not 'connected'.
+    media.emitPhase(peerA, 'conn-1', 'reconnecting', 'connected');
+    expect(get(store._openConnections)[peerA]?.connected).toBe(true);
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+
+    // Reconnection succeeded: same connectionId, phase back to connected.
+    media.emitPhase(peerA, 'conn-1', 'connected', 'reconnecting');
+    // lastBytesReceived is still written under the hold, so the first
+    // post-recovery poll already counts a stale cycle against the last held sample.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
   });
 });
