@@ -713,7 +713,9 @@ export class RoomView extends LitElement {
   private _asrAvailable: boolean | undefined = undefined;
 
   private async _probeAsrAvailability() {
-    const localModels = this._weaveClient.localModels;
+    // The store is the one authority on the host's local-model seam
+    // (bound once in StreamsStore.connect).
+    const localModels = this.streamsStore.localModels;
     if (!localModels) {
       this._asrAvailable = false;
       return;
@@ -727,6 +729,10 @@ export class RoomView extends LitElement {
   }
 
   private _renderTranscriptionToolbarButton() {
+    // A host with no local-model seam (a Moss older than the feature)
+    // cannot transcribe, and its settings have no Services →
+    // Transcription page to point at: the entry is absent, not disabled.
+    if (!this.streamsStore.localModels) return html``;
     // Hide until the capability probe completes; avoids flicker where
     // the button first renders disabled and then enables.
     if (this._asrAvailable === undefined) return html``;
