@@ -131,6 +131,15 @@ import {
 
 declare const __APP_VERSION__: string;
 
+/**
+ * The Leave button's budget for transcript finalization (stopAndAnnounce
+ * plus the last speaker-label lookup) before the store disconnects. A
+ * UI teardown budget, declared NOT-liveness: it bounds how long a wedged
+ * ASR sidecar or a degraded conductor can hold the user in the room with
+ * mic and camera live, and says nothing about whether a peer is present.
+ */
+export const QUIT_FINALIZE_MAX_MS = 5000;
+
 @localized()
 @customElement('room-view')
 export class RoomView extends LitElement {
@@ -519,29 +528,47 @@ export class RoomView extends LitElement {
   }
 
   async quitRoom() {
-    // Announce completion so peers can tell our transcript is whole
-    // before our signals stop; the visit itself is closed by the
-    // controller when the store unbinds.
-    const myTx = parseTranscriptionPayload(
-      (this._myModuleStates.value || {})['transcription'] ?? null,
-    );
-    if (myTx?.enabled || myTx?.requested) {
-      try {
-        await transcriptionController.stopAndAnnounce();
-      } catch (e) {
-        console.error('transcription: stopAndAnnounce on quit failed', e);
+    // Transcript finalization before leaving: both steps await host round
+    // trips (Moss ASR, profile zome calls) with no timeout of their own,
+    // so they share one bounded budget, QUIT_FINALIZE_MAX_MS. Past it the
+    // user leaves anyway; a closing ASR commit that lands later still
+    // reaches the visit, because the controller keeps its store until
+    // capture has stopped (see TranscriptionController.unbind).
+    const finalize = (async () => {
+      // Announce completion so peers can tell our transcript is whole
+      // before our signals stop; the visit itself is closed by the
+      // controller when the store unbinds.
+      const myTx = parseTranscriptionPayload(
+        (this._myModuleStates.value || {})['transcription'] ?? null,
+      );
+      if (myTx?.enabled || myTx?.requested) {
+        try {
+          await transcriptionController.stopAndAnnounce();
+        } catch (e) {
+          console.error('transcription: stopAndAnnounce on quit failed', e);
+        }
       }
-    }
-    // One more lookup for every speaker of this visit still unlabelled,
-    // re-asking those whose lookup failed, so the labels the controller
-    // freezes into the record at the visit's end are as complete as they
-    // can be.
-    try {
-      await this._speakerLabels.refresh(Array.from(this._transcriptLog.value?.keys() ?? []), {
-        retryFailed: true,
-      });
-    } catch (e) {
-      console.error('transcription: speaker label lookup on quit failed', e);
+      // One more lookup for every speaker of this visit still unlabelled,
+      // re-asking those whose lookup failed, so the labels the controller
+      // freezes into the record at the visit's end are as complete as they
+      // can be.
+      try {
+        await this._speakerLabels.refresh(Array.from(this._transcriptLog.value?.keys() ?? []), {
+          retryFailed: true,
+        });
+      } catch (e) {
+        console.error('transcription: speaker label lookup on quit failed', e);
+      }
+    })();
+    const clock = this.streamsStore.clock;
+    let timer: number | undefined;
+    const budget = new Promise<'timeout'>(resolve => {
+      timer = clock.setTimeout(() => resolve('timeout'), QUIT_FINALIZE_MAX_MS);
+    });
+    const outcome = await Promise.race([finalize.then(() => 'done' as const), budget]);
+    clock.clearTimeout(timer);
+    if (outcome === 'timeout') {
+      console.warn(`transcription: finalization on quit exceeded ${QUIT_FINALIZE_MAX_MS}ms; leaving anyway`);
     }
     this.streamsStore.disconnect('quitRoom-button');
     this.streamsStore.logger.endSession();
