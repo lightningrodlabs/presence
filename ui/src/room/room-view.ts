@@ -297,15 +297,11 @@ export class RoomView extends LitElement {
   );
 
   /**
-   * Controller-reported transcription errors. Relayed to the standard
-   * error-message overlay the first time a non-null value appears,
-   * then cleared back to null so the overlay can auto-dismiss.
+   * Releases the ONE subscription to the controller's `lastError`, taken
+   * in firstUpdated. The controller is a module singleton that outlives
+   * every room-view, so disconnectedCallback must release it.
    */
-  _transcriptionLastError = new StoreSubscriber(
-    this,
-    () => transcriptionController.lastError,
-    () => [this.streamsStore],
-  );
+  private _transcriptionErrorUnsub: (() => void) | null = null;
 
   _transcriptLog = new StoreSubscriber(
     this,
@@ -1057,7 +1053,8 @@ export class RoomView extends LitElement {
     // reject, mid-session error, capability change). We surface it and
     // immediately clear so subsequent errors of the same string still
     // trigger a fresh notify.
-    transcriptionController.lastError.subscribe(err => {
+    this._transcriptionErrorUnsub?.();
+    this._transcriptionErrorUnsub = transcriptionController.lastError.subscribe(err => {
       if (err) {
         this.notifyError(err);
         transcriptionController.lastError.set(null);
@@ -1421,6 +1418,8 @@ export class RoomView extends LitElement {
     // listeners attached (item 4b(2)).
     this._releaseResizeListeners?.();
     if (this._unsubscribe) this._unsubscribe();
+    this._transcriptionErrorUnsub?.();
+    this._transcriptionErrorUnsub = null;
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect('room-view-disconnectedCallback');
     // The super call is what runs hostDisconnected on the reactive

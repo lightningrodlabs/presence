@@ -155,6 +155,50 @@ describe('RoomView live-visit subscription (room transcripts)', () => {
   });
 });
 
+describe('RoomView transcription lastError subscription (Task 4 review I2)', () => {
+  it('firstUpdated takes exactly one lastError subscription and disconnect releases it', () => {
+    // The controller is a module singleton: a subscription the element
+    // does not release keeps notifying the detached element for the life
+    // of the page. Drives the REAL firstUpdated up to its first await
+    // (getRoomInfo never resolves here) through a counting wrapper.
+    const el = makeRoomView();
+    el.streamsStore.onEvent = vi.fn();
+    el.roomStore = { client: { getRoomInfo: () => new Promise(() => {}) } };
+    el._updateGrid = vi.fn();
+    el._probeAsrAvailability = vi.fn();
+    el.notifyError = vi.fn();
+    let active = 0;
+    let subscribeCalls = 0;
+    const lastError = transcriptionController.lastError as any;
+    const realSubscribe = lastError.subscribe.bind(lastError);
+    const spy = vi.spyOn(lastError, 'subscribe').mockImplementation((cb: any) => {
+      subscribeCalls += 1;
+      active += 1;
+      const unsub = realSubscribe(cb);
+      return () => {
+        active -= 1;
+        unsub();
+      };
+    });
+
+    try {
+      void el.firstUpdated();
+      expect(subscribeCalls).toBe(1);
+      expect(active).toBe(1);
+
+      el.disconnectedCallback();
+      expect(active).toBe(0);
+
+      // The detached element no longer reacts to controller errors.
+      transcriptionController.lastError.set('after-leave');
+      expect(el.notifyError).not.toHaveBeenCalled();
+    } finally {
+      transcriptionController.lastError.set(null);
+      spy.mockRestore();
+    }
+  });
+});
+
 describe('RoomView system-audio subscription (spec Section 4)', () => {
   it('the systemAudio StoreSubscriber is released on disconnect', () => {
     const el = makeRoomView();
