@@ -91,6 +91,7 @@ function makeMic(clock: ManualClock) {
     onTrackChange: () => {},
     onMutedChange: () => {},
     onLifecycleChange: l => lifecycleEvents.push(l),
+    onMixinDropped: () => {},
     now: () => clock.now(),
   };
   return { source: new MicSource(bindings), lifecycleEvents };

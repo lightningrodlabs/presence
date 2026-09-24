@@ -10,7 +10,16 @@ import type { AgentPubKeyB64 } from '@holochain/client';
  * gesture-equivalent exception exists: the `ended` event on a local
  * display-capture track ('screen-share-track-ended'), because stopping a
  * share from outside the app UI is a user action the platform delivers
- * as a track event.
+ * as a track event. A second gesture-equivalent exists for the same
+ * reason: 'system-audio-ended' — the host (Moss) or the platform ending
+ * a system-audio grant is delivered to the store as the capture's
+ * onended callback, which is the user's or the OS's action, not ours.
+ * The same gesture-equivalent covers MicSource dropping a mixin it was
+ * asked to hold (its `onMixinDropped` binding: the device closed under
+ * the mix, a rebuild failed, the track ended) — a share that cannot
+ * exist is the same to the user as one the host ended. Both routes write
+ * the intent from one place, `StreamsStore._systemAudioLost`, which
+ * `intent-write-sites.test.ts` lists as a declared non-gesture site.
  *
  * EXTENSION POINT (not built — YAGNI, no automatic writer exists today):
  * if a future feature must override intent automatically (a flap
@@ -26,8 +35,10 @@ import type { AgentPubKeyB64 } from '@holochain/client';
 export type LocalIntent = {
   /** wanted: the device should be held with a live track (mute keeps the
    *  device — audioOff mutes, it does not release; see streams-store
-   *  audioOff's comment). muted: track.enabled state. */
-  mic: { wanted: boolean; muted: boolean };
+   *  audioOff's comment). muted: track.enabled state. includeSystemAudio:
+   *  the user asked for audio playing on the machine to ride the mic
+   *  track (spec Section 4); mute does not clear it, session-end does. */
+  mic: { wanted: boolean; muted: boolean; includeSystemAudio: boolean };
   camera: { wanted: boolean };
   screenShare: { wanted: boolean };
   webrtc: { enabled: boolean; disabledWith: ReadonlySet<AgentPubKeyB64> };
@@ -41,6 +52,9 @@ export type IntentGesture =
   | { type: 'screen-share-on' }          // fires only after the picker succeeds
   | { type: 'screen-share-off' }         // toolbar button / stop overlay
   | { type: 'screen-share-track-ended' } // gesture-equivalent (see header)
+  | { type: 'system-audio-on' }          // fires only after the host's picker succeeds
+  | { type: 'system-audio-off' }         // menu row
+  | { type: 'system-audio-ended' }       // gesture-equivalent (see header): host/platform ended the grant
   | { type: 'carrier-mode'; mode: 'webrtc' | 'signals' }
   | { type: 'peer-webrtc'; peer: AgentPubKeyB64; disabled: boolean }
   | { type: 'session-end' };             // disconnect(): all wants drop
@@ -51,15 +65,18 @@ export function applyIntentGesture(
 ): LocalIntent {
   switch (gesture.type) {
     case 'audio-on':
-      return { ...intent, mic: { wanted: true, muted: false } };
+      return { ...intent, mic: { ...intent.mic, wanted: true, muted: false } };
     case 'audio-mute':
       // audioOn(false) acquires-then-mutes; audioOff mutes an already
       // wanted mic. Either way the device stays wanted once it has been
       // wanted (fast re-enable, no renegotiation) — matching audioOff's
-      // do-not-release semantics. A never-wanted mic stays unwanted.
+      // do-not-release semantics. A never-wanted mic stays unwanted. And
+      // an included system-audio share stays included AND audible: mute
+      // means "my microphone is off", so `MicSource.setMuted` silences
+      // the mic's branch of the mix and leaves the share flowing.
       return {
         ...intent,
-        mic: { wanted: intent.mic.wanted, muted: true },
+        mic: { ...intent.mic, muted: true },
       };
     case 'video-on':
       return { ...intent, camera: { wanted: true } };
@@ -70,6 +87,11 @@ export function applyIntentGesture(
     case 'screen-share-off':
     case 'screen-share-track-ended':
       return { ...intent, screenShare: { wanted: false } };
+    case 'system-audio-on':
+      return { ...intent, mic: { ...intent.mic, includeSystemAudio: true } };
+    case 'system-audio-off':
+    case 'system-audio-ended':
+      return { ...intent, mic: { ...intent.mic, includeSystemAudio: false } };
     case 'carrier-mode':
       return {
         ...intent,
@@ -84,7 +106,7 @@ export function applyIntentGesture(
     case 'session-end':
       return {
         ...intent,
-        mic: { wanted: false, muted: intent.mic.muted },
+        mic: { wanted: false, muted: intent.mic.muted, includeSystemAudio: false },
         camera: { wanted: false },
         screenShare: { wanted: false },
         // carrier selection survives the session — it is persisted intent
@@ -106,7 +128,7 @@ export function initialLocalIntent(local: {
   getItem(key: string): string | null;
 }): LocalIntent {
   return {
-    mic: { wanted: false, muted: true },
+    mic: { wanted: false, muted: true, includeSystemAudio: false },
     camera: { wanted: false },
     screenShare: { wanted: false },
     webrtc: {

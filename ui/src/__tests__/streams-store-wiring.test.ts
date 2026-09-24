@@ -32,6 +32,7 @@ import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
+import type { AudioSourceCapture } from '@theweave/api';
 
 /**
  * Phase 6 item 2 — the point of the phase: the wiring between the pure
@@ -1198,7 +1199,10 @@ describe('encoder-start retry (the §9 item 2 flag wedge)', () => {
   function armVoice(started: Started) {
     const { store, clock } = started;
     store._knownAgents.set(knownFresh(clock, peerA));
-    store._localIntent.update(i => ({ ...i, mic: { wanted: true, muted: false } }));
+    store._localIntent.update(i => ({
+      ...i,
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
+    }));
   }
 
   /** One presence tick with the target peer kept ping-fresh. */
@@ -1471,7 +1475,7 @@ describe('the capture reconciler (Task 3): intent reconciled against capture lif
     // acquire fails and no live track ever exists — the dead-device case.
     started.store._localIntent.update(i => ({
       ...i,
-      mic: { wanted: true, muted: false },
+      mic: { wanted: true, muted: false, includeSystemAudio: false },
     }));
 
     await presenceTick(started);
@@ -2439,7 +2443,7 @@ describe('signals media cadence gates the senders (Task 7)', () => {
     // harness: one queued read, then done. If the mute check regressed
     // and `encode()` ran anyway, the stub throws and fails the test loudly.
     const controller = voiceController as unknown as {
-      micHandle: { track: { enabled: boolean } } | null;
+      encodingTrack: { enabled: boolean } | null;
       pipelineGeneration: number;
       encoder: { state: string; encode: (d: unknown) => void } | null;
       encoderReader: {
@@ -2447,7 +2451,10 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       } | null;
       pumpEncoder(gen: number): Promise<void>;
     };
-    controller.micHandle = { track: { enabled: false } };
+    // The track the reader is pulling from, NOT the acquire-time handle:
+    // during a system-audio share those differ, and the handle's copy is
+    // the microphone, which mute disables while the share plays on.
+    controller.encodingTrack = { enabled: false };
     controller.encoder = {
       state: 'configured',
       encode: () => {
@@ -2539,5 +2546,587 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       mode: 'full',
       reason: 'no-sample',
     });
+  });
+});
+
+describe('system audio (spec Section 4): the capture seam, the mixin swap, and every way it ends', () => {
+  // Local fakes copied from the capture-reconciler block above (block-
+  // scoped there by that block's own convention) plus a FakeAudioContext
+  // identical to mic-source-mixin.test.ts's, since this block drives the
+  // mixin path through the started store rather than MicSource directly.
+  class FakeTrack {
+    readyState: 'live' | 'ended' = 'live';
+
+    enabled = true;
+
+    onended: (() => void) | null = null;
+
+    constructor(public kind: 'audio' | 'video', public label = '') {}
+
+    stop(): void {
+      if (this.readyState === 'ended') return;
+      this.readyState = 'ended';
+      this.onended?.();
+    }
+  }
+
+  class FakeStream {
+    constructor(private tracks: FakeTrack[]) {}
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  /** Minimal MediaStream stand-in — node has none, and the store's mic
+   *  open branch does `new MediaStream()` + add/get/removeTrack. */
+  class FakeMediaStream {
+    private tracks: FakeTrack[] = [];
+
+    addTrack(t: FakeTrack): void {
+      this.tracks.push(t);
+    }
+
+    removeTrack(t: FakeTrack): void {
+      this.tracks = this.tracks.filter(x => x !== t);
+    }
+
+    getTracks(): FakeTrack[] {
+      return this.tracks;
+    }
+
+    getAudioTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'audio');
+    }
+
+    getVideoTracks(): FakeTrack[] {
+      return this.tracks.filter(t => t.kind === 'video');
+    }
+  }
+
+  /** Counts graph operations; a source node remembers the stream it wraps. */
+  class FakeAudioContext {
+    readonly sampleRate = 48000;
+
+    state = 'running';
+
+    sources: Array<{ stream: FakeStream; connected: boolean }> = [];
+
+    destinations: Array<{ track: FakeTrack }> = [];
+
+    /** Every createMediaStreamSource throws (a context that is gone) —
+     *  the mixin-dropped row needs both MicSource source-node sites to fail. */
+    failAlways = false;
+
+    createMediaStreamSource(stream: FakeStream) {
+      if (this.failAlways) throw new Error('createMediaStreamSource failed');
+      const node = {
+        stream,
+        connected: false,
+        connect: () => { node.connected = true; },
+        disconnect: () => { node.connected = false; },
+      };
+      this.sources.push(node);
+      return node;
+    }
+
+    createMediaStreamDestination() {
+      const track = new FakeTrack('audio', 'mixed');
+      this.destinations.push({ track });
+      return { stream: new FakeStream([track]) };
+    }
+
+    resume = async () => {};
+
+    close = async () => {};
+  }
+
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  /** Record every getUserMedia call and hand back a scripted stream. */
+  function installNavigator(
+    respond: (constraints: unknown) => Promise<FakeStream>
+  ): { calls: unknown[] } {
+    const calls: unknown[] = [];
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async (constraints: unknown) => {
+            calls.push(constraints);
+            return respond(constraints);
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    return { calls };
+  }
+
+  type FakeCapture = {
+    track: FakeTrack; label: string; canExcludeSelf: boolean; endedReason?: string;
+    stop: ReturnType<typeof vi.fn>; onended?: () => void;
+  };
+  function fakeCapture(over: Partial<FakeCapture> = {}): FakeCapture {
+    const c: FakeCapture = {
+      track: new FakeTrack('audio', 'system'), label: 'System audio', canExcludeSelf: true,
+      stop: vi.fn(), ...over,
+    };
+    return c;
+  }
+
+  function makeStartedWithCapture(capture: () => Promise<FakeCapture | null>) {
+    const clock = new ManualClock(1_000_000);
+    const fakes = makeFakeDeps({ clock, myPubKey });
+    const logger = new FakeLogger();
+    const calls: unknown[] = [];
+    const store = new StreamsStore(
+      fakes.deps,
+      async () => '',
+      logger.asPresenceLogger(),
+      async opts => { calls.push(opts); return (await capture()) as unknown as AudioSourceCapture | null; },
+    );
+    const events: StoreEventPayload[] = [];
+    store.start();
+    live.push(store);
+    store.onEvent(ev => events.push(ev));
+    return { ...fakes, clock, store, logger, calls, events };
+  }
+
+  beforeEach(() => {
+    (globalThis as any).MediaStream = FakeMediaStream;
+    (globalThis as any).AudioContext = FakeAudioContext;
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).navigator;
+    delete (globalThis as any).MediaStream;
+    delete (globalThis as any).AudioContext;
+  });
+
+  it('without the seam, canCaptureAudioSources is false and systemAudioOn is a no-op', async () => {
+    const started = makeStarted();
+    expect(started.store.canCaptureAudioSources).toBe(false);
+    await started.store.systemAudioOn();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+  });
+
+  it('systemAudioOn: picker → mixed output reaches every media transport via replaceTrack exactly once; intent and the readable follow', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(1);
+    expect((started.calls[0] as { audioContext?: unknown }).audioContext).toBeDefined();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.systemAudio)).toEqual({ label: 'System audio', canExcludeSelf: true });
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(media.replaceCalls[0].oldTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(media.replaceCalls[0].newTrack).toBe(started.store.micSource.track);
+    expect(typeof capture.onended).toBe('function');
+  });
+
+  it('systemAudioOff: swaps back to the device track once, stops the capture, clears intent and the readable; onended is NOT fired', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    started.store.systemAudioOff();
+    await flush();
+
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(media.replaceCalls[0].newTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('the host ending the grant (capture.onended) → intent system-audio-ended, mix torn, SystemAudioEnded logged with the reason', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture({ endedReason: 'user-stopped' });
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    capture.track.stop();          // what the host's end does to the track (fires no intent by itself)
+    capture.onended!();            // the api's single end notification
+    await flush();
+
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(capture.stop).not.toHaveBeenCalled();
+    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
+    expect(logged?.detail).toBe('reason=user-stopped; via=capture-ended');
+    // The label (a window title, user-chosen free text) is not written into
+    // a log that `DiagnosticResponse` exports to peers.
+    expect(logged?.detail).not.toContain('System audio');
+  });
+
+  it('a stale onended (from a capture that was already replaced or stopped) is ignored', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const first = fakeCapture();
+    const started = makeStartedWithCapture(async () => first);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    started.store.systemAudioOff();
+    await flush();
+    first.onended!();
+    await flush();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('picker cancelled (null) → nothing changes and no intent is written', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => null);
+    await started.store.audioOn(true);
+    const intentBefore = get(started.store.localIntent);
+    await started.store.systemAudioOn();
+    expect(get(started.store.localIntent)).toEqual(intentBefore);
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(get(started.store.systemAudio)).toBeNull();
+  });
+
+  it('with the microphone never turned on, the share still starts and reaches every peer — and no getUserMedia runs', async () => {
+    const { calls: gum } = installNavigator(async () => new FakeStream([new FakeTrack('audio', 'device')]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    const media = started.transports.media!;
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(1); // the picker DID open
+    // Sharing what you are playing neither needs nor opens the mic.
+    expect(gum).toEqual([]);
+    expect(started.store.micSource.deviceTrack).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(get(started.store.localIntent).mic.wanted).toBe(false);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.systemAudio)).toEqual({ label: 'System audio', canExcludeSelf: true });
+    // The one output track reaches peers as an open, not a swap.
+    expect(media.addTrackCalls).toEqual([started.store.micSource.track]);
+  });
+
+  it('the microphone turning on under a running share joins the graph without touching the peers', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    const media = started.transports.media!;
+    await started.store.systemAudioOn();
+    await flush();
+    const shared = started.store.micSource.track;
+    const addsBefore = media.addTrackCalls.length;
+
+    await started.store.audioOn(true);
+    await flush();
+
+    expect(started.store.micSource.deviceTrack).toBe(device as unknown as MediaStreamTrack);
+    expect(started.store.micSource.track).toBe(shared); // same track: in-place
+    expect(media.replaceCalls).toHaveLength(0);
+    expect(media.addTrackCalls).toHaveLength(addsBefore);
+  });
+
+  it('a microphone that will not open does not stop the share: it starts without one', async () => {
+    // Permission denied or the device unplugged while the mic is wanted.
+    // The share used to be refused here, because the mix had to be built
+    // on a device track.
+    installNavigator(async () => { throw new Error('NotAllowedError'); });
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.micSource.lifecycle.state).not.toBe('live');
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.calls).toHaveLength(1);
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(started.events.filter(e => e.type === 'error')).toEqual([]);
+  });
+
+  it('systemAudioRequest is the one gate: it reports the reason the row disables on, in the store\'s order', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let resolve!: (c: FakeCapture) => void;
+    const started = makeStartedWithCapture(() => new Promise(res => { resolve = res; }));
+    // The microphone is no part of this decision, on or off.
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    await started.store.audioOn(true);
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    const pending = started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'request-pending' });
+    resolve(fakeCapture());
+    await pending;
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'already-active' });
+    started.store.systemAudioOff();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    // Without the seam the reason is the seam, whatever else is true.
+    const bare = makeStarted();
+    expect(bare.store.systemAudioRequest).toEqual({ ok: false, reason: 'no-seam' });
+  });
+
+  it('MicSource dropping the mixin on its own (a failed rebuild after a device change) ends the share: intent, readable, capture, log', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let n = 0;
+    installNavigator(async () => new FakeStream([[device1, device2][n++]!]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    expect(get(started.store.systemAudio)).not.toBeNull();
+    // Every source-node build now throws: the in-place swap and the rebuild.
+    const ctx = started.store.micSource.ensureAudioContext() as unknown as { failAlways: boolean };
+    ctx.failAlways = true;
+    await started.store.changeAudioInput('other');
+    await flush();
+    expect(started.store.micSource.outputMode).toBe('device');
+    // Before the binding existed the readable kept saying "Including" over
+    // a device-only output, and the host grant stayed open.
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    const logged = started.logger.agentEvents.find(e => e.event === 'SystemAudioEnded');
+    expect(logged?.detail).toBe('reason=mix-failed; via=mixin-dropped');
+  });
+
+  it('an interleaved second systemAudioOn — fired before the first request resolves — opens no second picker (review round 1 finding)', async () => {
+    // The prior pre-await guard (`if (this._systemAudioCapture) return;`)
+    // only covers the state AFTER a picker resolves. A double-click while
+    // the host picker is still open passes that guard on the second call
+    // and would open a second picker — `_systemAudioPending` closes the
+    // in-flight window too, so neither call observes it as clear.
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let resolveSeam!: (c: FakeCapture | null) => void;
+    const started = makeStartedWithCapture(
+      () => new Promise<FakeCapture | null>(r => { resolveSeam = r; })
+    );
+    await started.store.audioOn(true);
+    await flush();
+    const media = started.transports.media!;
+    media.replaceCalls.length = 0;
+
+    const first = started.store.systemAudioOn();
+    const second = started.store.systemAudioOn(); // fired while the first is still in flight
+    resolveSeam(fakeCapture());
+    await first;
+    await second;
+    await flush();
+
+    expect(started.calls).toHaveLength(1);
+    expect(
+      started.logger.customMessages.filter(m => m === 'IntentChange: system-audio-on')
+    ).toHaveLength(1);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(media.replaceCalls).toHaveLength(1);
+    expect(started.events.some(e => e.type === 'error')).toBe(false);
+  });
+
+  it('with no Web Audio the mix cannot be built, so the share is refused rather than reported as on (review round 1 minor)', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await flush();
+    // Deleted before the call, not just before setMixin: MicSource caches
+    // its AudioContext on first success, so the seam's own
+    // `ensureAudioContext()` call (before the await) must fail too, or
+    // the cached instance would let the later `setMixin` succeed anyway.
+    delete (globalThis as any).AudioContext;
+    const setMixin = vi.spyOn(started.store.micSource, 'setMixin');
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    // The refusal hands the track back before stopping the capture, so
+    // MicSource never keeps a refused track whatever order the host's
+    // `stop()` tears it down in. Spied rather than read off `outputMode`
+    // because MicSource's own build-mix failure arm also drops the mixin
+    // — this pins the store's half of it.
+    expect(setMixin.mock.calls[setMixin.mock.calls.length - 1]?.[0]).toBeNull();
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.store.micSource.outputMode).toBe('device');
+  });
+
+  it('a throwing seam emits an error event and clears the pending flag for the next request', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    let shouldThrow = true;
+    const started = makeStartedWithCapture(async () => {
+      if (shouldThrow) {
+        shouldThrow = false;
+        throw new Error('nope');
+      }
+      return fakeCapture();
+    });
+    await started.store.audioOn(true);
+    await flush();
+
+    await started.store.systemAudioOn();
+    expect(started.events.some(e => e.type === 'error')).toBe(true);
+    expect(started.calls).toHaveLength(1);
+
+    // The pending flag cleared in `finally`: the next request reaches the seam again.
+    await started.store.systemAudioOn();
+    expect(started.calls).toHaveLength(2);
+  });
+
+  it('the grant lands while a device reopen is in flight and that reopen fails: the share runs on without a microphone (PR #5 re-review)', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    let rejectOpen!: () => void;
+    let n = 0;
+    installNavigator(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      return new Promise<FakeStream>((_res, rej) => { rejectOpen = () => rej(new Error('NotAllowedError')); });
+    });
+    const capture = fakeCapture();
+    let resolveSeam!: (c: FakeCapture) => void;
+    const started = makeStartedWithCapture(() => new Promise(res => { resolveSeam = res; }));
+    await started.store.audioOn(true);
+    await flush();
+    // The request gate passed while the mic was live; the device dies
+    // while the host picker is up, and a consumer's acquire starts a
+    // replacement that will fail.
+    const pending = started.store.systemAudioOn();
+    device1.stop();
+    const opening = started.store.micSource.acquire({ id: 'voice-2' });
+    resolveSeam(capture);
+    await pending;
+
+    rejectOpen();
+    await opening;
+    await flush();
+
+    // The mixin recorded mid-open is settled by that open either way.
+    // It used to be dropped here, because a mix needed a device; now the
+    // share simply carries on with no microphone in it.
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    expect(started.store.micSource.deviceTrack).toBeNull();
+    expect(get(started.store.systemAudio)).not.toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(capture.stop).not.toHaveBeenCalled();
+    expect(started.logger.agentEvents.some(e => e.event === 'SystemAudioEnded')).toBe(false);
+  });
+
+  it('a mic-less share starts the signals voice encoder, and turning it off stops it', async () => {
+    const startSpy = vi.spyOn(voiceController, 'startCapture').mockResolvedValue(true);
+    const stopSpy = vi.spyOn(voiceController, 'stopCapture').mockResolvedValue(undefined);
+    installNavigator(async () => new FakeStream([new FakeTrack('audio', 'device')]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    // A signals-carried peer present, and the microphone never turned on.
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    started.clock.advance(PING_INTERVAL);
+    await flush();
+    expect(startSpy).not.toHaveBeenCalled();
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    // Driven by the gesture, not left to the next presence tick: peers
+    // on signals would otherwise hear nothing for up to PING_INTERVAL.
+    expect(get(started.store.localIntent).mic.wanted).toBe(false);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(true);
+
+    started.store.systemAudioOff();
+    await flush();
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(started.store.voiceEncoderRunning).toBe(false);
+  });
+
+  it('a capture that resolves already ended is not installed (Review Focus 2)', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture({ endedReason: 'stream-lost' });
+    capture.track.stop();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(started.store.micSource.outputMode).toBe('device');
+    expect(get(started.store.systemAudio)).toBeNull();
+  });
+
+  it('muting while included silences the microphone and leaves the share audible to peers', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const started = makeStartedWithCapture(async () => fakeCapture());
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+
+    await started.store.audioOff();
+
+    expect(started.store.micSource.outputMode).toBe('mixed');
+    // The track peers receive stays enabled — muting yourself must not
+    // take the music down with your voice — while the mic's own branch
+    // goes silent.
+    expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(true);
+    expect(device.enabled).toBe(false);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    expect(get(started.store.localIntent).mic.muted).toBe(true);
+
+    await started.store.audioOn(true);
+    expect(device.enabled).toBe(true);
+    expect((started.store.micSource.track as unknown as FakeTrack).enabled).toBe(true);
+  });
+
+  it('disconnect stops an active capture without a gesture write beyond session-end', async () => {
+    const device = new FakeTrack('audio', 'device');
+    installNavigator(async () => new FakeStream([device]));
+    const capture = fakeCapture();
+    const started = makeStartedWithCapture(async () => capture);
+    await started.store.audioOn(true);
+    await started.store.systemAudioOn();
+    await flush();
+    started.store.disconnect('test');
+    expect(capture.stop).toHaveBeenCalledTimes(1);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
   });
 });

@@ -117,6 +117,7 @@ export type SimpleEventType =
   | 'MyVideoOff'
   | 'ChangeMyAudioInput'
   | 'ChangeMyVideoInput'
+  | 'SystemAudioEnded'      // the host or platform ended an included system-audio grant
   | 'TrackArrivedMuted'
   | 'TrackUnmuted'
   | 'TrackUnmuteTimeout'
@@ -256,6 +257,7 @@ export const SIMPLE_EVENT_TAXONOMY = {
   MyVideoOff: 'emitted',
   ChangeMyAudioInput: 'emitted',
   ChangeMyVideoInput: 'emitted',
+  SystemAudioEnded: 'emitted',
   TrackArrivedMuted: 'emitted',
   TrackUnmuted: 'emitted',
   TrackUnmuteTimeout: 'emitted',
