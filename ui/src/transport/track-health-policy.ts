@@ -162,6 +162,8 @@ export const DEAD_TRACK_REFRESH_BUDGET = 3;
  * Cap on the doubling of the budget across successive escalations to
  * the same peer (3, 6, 12, 24, 24, …). Bounds a pathological loop where
  * the fresh connection is also dead, without ever giving up.
+ * Serves the media-flowing predicate on the track-health poll's clock
+ * (`PING_INTERVAL`); NOT a liveness constant.
  */
 export const DEAD_TRACK_ESCALATION_BACKOFF_CAP = 3;
 

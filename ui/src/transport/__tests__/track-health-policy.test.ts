@@ -307,6 +307,7 @@ describe('decideTrackRefresh', () => {
 
 describe('deadTrackRefreshBudget', () => {
   it.each([
+    [-1, 3],
     [0, 3],
     [1, 6],
     [2, 12],
