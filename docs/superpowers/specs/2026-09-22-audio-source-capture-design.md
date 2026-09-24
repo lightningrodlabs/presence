@@ -477,6 +477,35 @@ audio-graph behaviour (mixin audible to a peer, exclusion of Moss's own
 playback) is harness/manual territory, recorded in the harness header
 as such.
 
+**Landed (2026-09-23; plan `docs/superpowers/plans/2026-09-23-presence-system-audio.md`).**
+Branch `feat/include-system-audio` off `main-0.7`, commits `4874684`..`ceff1c3` (code Tasks 1-5 `4874684`..`8b27c31`; whole-branch review raised 1 Critical + 2 Important, fixed in one wave `a87e772`..`ceff1c3` and approved on scoped re-review; whether the branch has reached a given line is checked with `git merge-base --is-ancestor ceff1c3 <branch>`, never trusted from this line). Deviations
+from the text above: `decideMicOutput`'s input carries a `current` snapshot
+(`{mode:'device'} | {mode:'mixed', device, mixin} | null`) rather than the
+sketch's `'device'|'mixed'|null` string, so a device change or mixin change
+under a mix is decided by identity; a device change or reopen while mixed
+replaces only the device source node on the same destination (the output
+track and every consumer's view of it are untouched — no rebuild, no fanout);
+the raw device field is `_deviceTrack` and `MicSource.track` is the OUTPUT;
+the mixin's end is driven by the capture's `onended` (never `track.onended`),
+written as `system-audio-ended` from inside `systemAudioOn`; a second
+request while one is in flight is refused by a pending flag (the host allows
+one picker); a share whose mix cannot be built (no Web Audio) stops the
+capture and writes no intent; a capture that resolves already ended is
+ignored; the menu row copy is "Include audio from…" / "✓ Including: <label>"
+with " (may echo)" when `canExcludeSelf` is false, disabled with the title
+"Turn your microphone on first" while the mic is not wanted and "Waiting for your
+microphone" while it is wanted but not live (the store refuses such a request
+before the picker opens — final-review finding); the mix destination is built
+mono, since the voice encoder is configured mono (final-review Critical); a
+failed in-place device-node swap falls back to a full rebuild (final-review
+finding); the
+`SystemAudioEnded` detail is `reason=<endedReason>; label=<label>`; the api
+bump to `0.7.0-dev.4` removed `presence-app.ts`'s empty `blockTypes: {}`
+stub (a surface the api dropped in dev.2). Verified in node: the policy
+table, the mixin swap plumbing with fake Web Audio, and the store wiring
+(one `replaceTrack` per swap on every media transport, every end path).
+Manual (owner-run, two machines): not observed at this landing — the plan's Task 6 checklist is owner-run; until it is run, the audio-graph claims (mixin audible to a peer over WebRTC and over signals, no echo when `canExcludeSelf`) rest on the node fakes and the mono-destination pin only.
+
 ## Error handling
 
 - Picker cancelled / switch off / unsupported host → `null` everywhere;

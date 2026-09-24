@@ -66,7 +66,7 @@ export type CaptureLifecycle =
 
 /** True iff `track` is non-null and not yet ended. The one predicate both
  *  `acquire()` and `_ensureOpen()` use to decide whether a device needs
- *  (re)opening — replaces the old `!this._deviceTrack` check, which read a
+ *  (re)opening — replaces the old `!this._track` check, which read a
  *  stale (externally-ended) track as still usable. */
 export function isLiveTrack(track: MediaStreamTrack | null): track is MediaStreamTrack {
   return !!track && track.readyState === 'live';
