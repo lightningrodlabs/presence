@@ -3,8 +3,10 @@
  * surface (store-decomposition round two, Task 4; see
  * docs/superpowers/specs/2026-09-03-owner-extraction-design.md). Owns the
  * periodic bytesReceived-stall poll, the peer-reported stream/track
- * reconciliation driven by pong metadata, and the two-tier (replaceTrack,
- * then full reconnect) recovery ladder both paths fall back to.
+ * reconciliation driven by pong metadata, and the three-rung recovery
+ * ladder: replaceTrack via request-track-refresh, escalation to a close
+ * once the refresh budget is spent (`DEAD_TRACK_REFRESH_BUDGET`), and the
+ * reconcile path's reconnect fallback.
  *
  * `StreamsStore._applyStaleTeardown` does NOT live here: it is the shared
  * teardown bridge into `closeCleanupPlan` used by other supervisor sites
@@ -103,16 +105,19 @@ export class TrackHealthMonitor {
           summary.lossPercent,
         );
 
+        const record = this.bindings.peerRecord(pubKeyB64);
+        const priorEscalations = record?.deadTrackEscalations ?? 0;
+        const refreshBudget = deadTrackRefreshBudget(priorEscalations);
         const decision = decideTrackRefresh({
           videoExpected: connInfo.video,
           audioExpected: connInfo.audio,
           audioBytes: summary.audioBytes,
           videoBytes: summary.videoBytes,
-          lastBytes: this.bindings.peerRecord(pubKeyB64)?.lastBytesReceived || { audio: 0, video: 0 },
-          staleCycles: this.bindings.peerRecord(pubKeyB64)?.staleCycles || { audio: 0, video: 0 },
+          lastBytes: record?.lastBytesReceived || { audio: 0, video: 0 },
+          staleCycles: record?.staleCycles || { audio: 0, video: 0 },
           staleThresholdCycles: STALE_CYCLES_REFRESH_THRESHOLD,
-          refreshRequestsSent: this.bindings.peerRecord(pubKeyB64)?.refreshRequestsSent ?? 0,
-          refreshBudget: deadTrackRefreshBudget(this.bindings.peerRecord(pubKeyB64)?.deadTrackEscalations ?? 0),
+          refreshRequestsSent: record?.refreshRequestsSent ?? 0,
+          refreshBudget,
         });
 
         this.bindings.ensurePeerRecord(pubKeyB64).lastBytesReceived = {
@@ -121,18 +126,60 @@ export class TrackHealthMonitor {
         };
         this.bindings.ensurePeerRecord(pubKeyB64).staleCycles = decision.nextStale;
 
-        if (decision.action === 'request-refresh') {
-          const stale = decision.nextStale;
-          console.warn(
-            `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
-          );
-          this.bindings.logger.logCustomMessage(
-            `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
-          );
-
-          if (this.bindings.sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
-            // Reset stale count to avoid spamming
-            this.bindings.ensurePeerRecord(pubKeyB64).staleCycles = { audio: 0, video: 0 };
+        switch (decision.action) {
+          case 'none':
+            if (decision.resetRefreshBudget) {
+              this.bindings.ensurePeerRecord(pubKeyB64).refreshRequestsSent = 0;
+            }
+            break;
+          case 'request-refresh': {
+            const stale = decision.nextStale;
+            console.warn(
+              `Dead track detected for ${pubKeyB64.slice(0, 8)}: audio stale=${stale.audio}, video stale=${stale.video}`
+            );
+            this.bindings.logger.logCustomMessage(
+              `Dead track [${pubKeyB64.slice(0, 8)}]: audio=${stale.audio} video=${stale.video} cycles stale`
+            );
+            if (this.bindings.sendRtcAction('request-track-refresh', [pubKeyB64]) > 0) {
+              // Reset stale count to avoid spamming; the budget counts
+              // only requests that actually went out (Review Focus 2).
+              const r = this.bindings.ensurePeerRecord(pubKeyB64);
+              r.staleCycles = { audio: 0, video: 0 };
+              r.refreshRequestsSent = (r.refreshRequestsSent ?? 0) + 1;
+            }
+            break;
+          }
+          case 'escalate': {
+            // Spec Part 1 (2026-09-24 incident): replaceTrack cannot
+            // repair a transport-level fault, and the link was left
+            // `connected` for 70s with no exit. Close through the
+            // transport so the peer gets the `leave`; the existing
+            // close-event cleanup row and the pong drive do the rest.
+            const stale = decision.nextStale;
+            const spent = record?.refreshRequestsSent ?? 0;
+            this.bindings.logger.logAgentEvent({
+              agent: pubKeyB64,
+              timestamp: this.bindings.now(),
+              event: 'DeadTrackEscalation',
+              connectionId: connInfo.connectionId,
+              detail: `refreshes=${spent} budget=${refreshBudget} prior=${priorEscalations} audioStale=${stale.audio} videoStale=${stale.video}`,
+            });
+            // Bump the survivor BEFORE the close: media-close-full keeps
+            // it, and the next connection reads it for its budget. Zero
+            // the session counters too: when the close clears the slot
+            // this is redundant, and when it cannot (transport vanished
+            // with no event, the §3.1(c) shape) it stops the escalation
+            // from re-firing every poll (Review Focus 3).
+            const r = this.bindings.ensurePeerRecord(pubKeyB64);
+            r.deadTrackEscalations = priorEscalations + 1;
+            r.staleCycles = { audio: 0, video: 0 };
+            r.refreshRequestsSent = 0;
+            this.bindings.mediaTransport().closeConnection(pubKeyB64, 'dead-track-escalation');
+            break;
+          }
+          default: {
+            const exhaustive: never = decision;
+            void exhaustive;
           }
         }
       } catch (e) {

@@ -127,6 +127,12 @@ export type SimpleEventType =
   | 'TrackUnmuteTimeout'
   | 'StreamReceived'
   | 'StaleCleanup'
+  // Receiver-side dead-track escalation: inbound bytes stayed frozen
+  // through the refresh budget, so the media link was closed for the
+  // pong drive to re-establish (track-health-policy.ts,
+  // DEAD_TRACK_REFRESH_BUDGET). detail: refreshes=N budget=B prior=P
+  // audioStale=A videoStale=V.
+  | 'DeadTrackEscalation'
   | 'PeerLeave'
   // Carrier (WebRTC ↔ signals) transition for a given peer's audio.
   | 'CarrierSwitch'
@@ -268,6 +274,7 @@ export const SIMPLE_EVENT_TAXONOMY = {
   TrackUnmuteTimeout: 'emitted',
   StreamReceived: 'emitted',
   StaleCleanup: 'emitted',
+  DeadTrackEscalation: 'emitted',
   PeerLeave: 'emitted',
   CarrierSwitch: 'emitted',
   QualityBucketChange: 'emitted',

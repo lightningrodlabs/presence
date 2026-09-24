@@ -146,6 +146,7 @@ describe('SimpleEvent taxonomy', () => {
         "ChangeMyVideoInput": "emitted",
         "Connected": "emitted",
         "ConnectionAborted": "emitted",
+        "DeadTrackEscalation": "emitted",
         "FsmClose": "emitted",
         "FsmError": "emitted",
         "FsmEstablishmentTimeline": "emitted",
