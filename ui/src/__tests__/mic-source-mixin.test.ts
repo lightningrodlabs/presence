@@ -30,7 +30,7 @@ class FakeAudioContext {
   readonly sampleRate = 48000;
   state = 'running';
   sources: Array<{ stream: FakeStream; connected: boolean }> = [];
-  destinations: Array<{ track: FakeTrack }> = [];
+  destinations: Array<{ track: FakeTrack; node: { channelCount: number } }> = [];
   createMediaStreamSource(stream: FakeStream) {
     const node = { stream, connected: false, connect: () => { node.connected = true; }, disconnect: () => { node.connected = false; } };
     this.sources.push(node);
@@ -38,8 +38,12 @@ class FakeAudioContext {
   }
   createMediaStreamDestination() {
     const track = new FakeTrack('audio', 'mixed');
-    this.destinations.push({ track });
-    return { stream: new FakeStream([track]) };
+    // Starts at the Web Audio default (a MediaStreamAudioDestinationNode
+    // is stereo unless the caller narrows it), so MicSource's mono write
+    // is observable rather than assumed.
+    const node = { stream: new FakeStream([track]), channelCount: 2 };
+    this.destinations.push({ track, node });
+    return node;
   }
   resume = async () => {};
   close = async () => {};
@@ -107,6 +111,9 @@ describe('MicSource mixin: build, tear, and what consumers see', () => {
     expect(r.fanout).toEqual([{ newTrack: mixed, oldTrack: device }]);
     expect(consumerSwaps).toEqual([mixed]);
     expect(device.readyState).toBe('live'); // the device keeps feeding the graph
+    // Mono: a stereo destination would feed 2-channel AudioData into the
+    // voice module's 1-channel AudioEncoder, which closes the encoder.
+    expect(ctx.destinations[0].node.channelCount).toBe(1);
   });
 
   it('setMixin(null) tears the mix back to the device track with one swap; the destination track is stopped', async () => {

@@ -552,6 +552,15 @@ export class MicSource {
       const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
       const mixinNode = ctx.createMediaStreamSource(new MediaStream([mixin]));
       const destination = ctx.createMediaStreamDestination();
+      // Mono, deliberately: the device track is opened mono by constraint
+      // (`_audioConstraints`, channelCount: 1) and the voice module's
+      // AudioEncoder is configured `numberOfChannels: 1`
+      // (`ui/src/room/modules/voice.ts`). A MediaStreamAudioDestinationNode
+      // defaults to 2 channels, and feeding 2-channel AudioData into a
+      // 1-channel encoder closes it — voice over signals would go silent
+      // for the rest of the session. The node's channelCountMode is
+      // 'explicit', so this downmixes the sum to one channel.
+      destination.channelCount = 1;
       deviceNode.connect(destination);
       mixinNode.connect(destination);
       this._mix = { device, mixin, deviceNode, mixinNode, destination };
