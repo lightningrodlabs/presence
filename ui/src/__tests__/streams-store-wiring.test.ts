@@ -957,7 +957,7 @@ describe("setCarrierMode teardown — regression pin for the previous/_applyInte
 
     expect(
       media.closeCalls.some(
-        c => c.peer === peerA && c.reason === 'disconnectFromPeerVideo'
+        c => c.peer === peerA && c.reason === 'carrier-mode-signals'
       )
     ).toBe(true);
     expect(get(store._openConnections)[peerA]).toBeUndefined();
@@ -3128,5 +3128,87 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(capture.stop).toHaveBeenCalledTimes(1);
     expect(get(started.store.systemAudio)).toBeNull();
     expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+  });
+});
+
+describe('TrackMuted/TrackUnmuted forensics on remote tracks (2026-09-24 incident)', () => {
+  type FakeRemoteTrack = {
+    kind: 'audio' | 'video';
+    muted: boolean;
+    readyState: 'live' | 'ended';
+    enabled: boolean;
+    onmute: (() => void) | null;
+    onunmute: (() => void) | null;
+  };
+  const remoteTrack = (kind: 'audio' | 'video', muted: boolean): FakeRemoteTrack => ({
+    kind, muted, readyState: 'live', enabled: true, onmute: null, onunmute: null,
+  });
+  const streamOf = (tracks: FakeRemoteTrack[]) => ({
+    id: 'remote-stream',
+    getTracks: () => tracks,
+    getAudioTracks: () => tracks.filter(t => t.kind === 'audio'),
+    getVideoTracks: () => tracks.filter(t => t.kind === 'video'),
+  });
+
+  it('logs TrackMuted from onmute, and a log-only TrackUnmuted for a track that arrived unmuted', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    // Video, not audio: an audio track would route into the analyser
+    // setup, which needs an AudioContext this node environment lacks.
+    const track = remoteTrack('video', false);
+    media.emit({
+      type: 'remote-track',
+      peer: peerA,
+      connectionId: 'conn-1',
+      track: track as unknown as MediaStreamTrack,
+      stream: streamOf([track]) as unknown as MediaStream,
+    });
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+    expect(track.onmute).not.toBeNull();
+    expect(track.onunmute).not.toBeNull();
+
+    track.muted = true;
+    track.onmute!();
+    const muted = logger.eventsNamed('TrackMuted');
+    expect(muted).toHaveLength(1);
+    expect(muted[0].agent).toBe(peerA);
+    expect(muted[0].connectionId).toBe('conn-1');
+    expect(muted[0].detail).toBe('video');
+
+    track.muted = false;
+    track.onunmute!();
+    const unmuted = logger.eventsNamed('TrackUnmuted');
+    expect(unmuted).toHaveLength(1);
+    expect(unmuted[0].detail).toContain('re-unmute');
+  });
+
+  it('keeps the arrived-muted branch intact: onunmute still marks the track ready (Review Focus 5)', () => {
+    const { store, transports, logger } = makeStarted();
+    const media = transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    const track = remoteTrack('video', true);
+    media.emit({
+      type: 'remote-track',
+      peer: peerA,
+      connectionId: 'conn-1',
+      track: track as unknown as MediaStreamTrack,
+      stream: streamOf([track]) as unknown as MediaStream,
+    });
+    expect(logger.eventsNamed('TrackArrivedMuted')).toHaveLength(1);
+    // The `connected` slot write seeds `video: false`; not yet ready.
+    expect(get(store._openConnections)[peerA]?.video).toBe(false);
+    expect(get(store._openConnections)[peerA]?.videoMuted).toBe(true);
+
+    track.muted = false;
+    track.onunmute!();
+    expect(logger.eventsNamed('TrackUnmuted')).toHaveLength(1);
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+
+    track.muted = true;
+    track.onmute!();
+    expect(logger.eventsNamed('TrackMuted')).toHaveLength(1);
   });
 });

@@ -1053,7 +1053,32 @@ export class MediaLinks {
       this.bindings.setupPeerAudioAnalyser(pubKeyB64, stream);
     }
 
+    // Forensics (2026-09-24 incident, spec Part 2): a remote track's
+    // mute/unmute cycle on a link that stays `connected` was invisible.
+    // onmute was never installed, and onunmute only on tracks that
+    // arrived muted. Both handlers here are log-only. The arrived-muted
+    // branch below keeps its own onunmute, which also calls
+    // _setTrackReady.
+    track.onmute = () => {
+      this.bindings.logger.logAgentEvent({
+        agent: pubKeyB64,
+        timestamp: this.bindings.now(),
+        event: 'TrackMuted',
+        connectionId,
+        detail: track.kind,
+      });
+    };
+
     if (!track.muted) {
+      track.onunmute = () => {
+        this.bindings.logger.logAgentEvent({
+          agent: pubKeyB64,
+          timestamp: this.bindings.now(),
+          event: 'TrackUnmuted',
+          connectionId,
+          detail: `${track.kind} re-unmute (log-only)`,
+        });
+      };
       this._setTrackReady(pubKeyB64, connectionId, track);
       return;
     }

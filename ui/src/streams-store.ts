@@ -2230,9 +2230,20 @@ export class StreamsStore {
     }
   }
 
-  disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64) {
+
+  /**
+   * Close the media link to one peer. `reason` is REQUIRED and names the
+   * caller: it reaches `FsmTransition ... trigger=` and `CarrierSwitch
+   * webrtc->signals reason=` through `webrtcExitReason`, so an export
+   * can tell a Reconnect click from a carrier flip (2026-09-24 incident,
+   * spec Part 2). Current reasons: 'reconnect-button',
+   * 'carrier-mode-signals', 'peer-carrier-change',
+   * 'peer-disabled-webrtc', 'block'. Escalation closes through the
+   * transport directly with 'dead-track-escalation'.
+   */
+  disconnectFromPeerVideo(pubKeyB64: AgentPubKeyB64, reason: string) {
     if (get(this._openConnections)[pubKeyB64]) {
-      this.mediaTransport.closeConnection(pubKeyB64, 'disconnectFromPeerVideo');
+      this.mediaTransport.closeConnection(pubKeyB64, reason);
     }
   }
 
@@ -2256,7 +2267,7 @@ export class StreamsStore {
         'blockedAgents',
         JSON.stringify([...blockedAgents, pubKey64])
       );
-    this.disconnectFromPeerVideo(pubKey64);
+    this.disconnectFromPeerVideo(pubKey64, 'block');
     this.disconnectFromPeerScreen(pubKey64);
     this.clock.setTimeout(() => {
       this._connectionStatuses.update(currentValue => {
@@ -3022,7 +3033,7 @@ export class StreamsStore {
       // notices _signalsTargets becoming non-empty and starts the
       // filmstrip encoder against the still-acquired camera.
       for (const pubKeyB64 of Object.keys(get(this._openConnections))) {
-        this.disconnectFromPeerVideo(pubKeyB64);
+        this.disconnectFromPeerVideo(pubKeyB64, 'carrier-mode-signals');
       }
       this._clearPendingWebrtcStatus();
       await this._syncConversationPayload({ webrtcDisabled: true });
@@ -3101,7 +3112,7 @@ export class StreamsStore {
 
     await this._syncConversationPayload(payload);
 
-    this.disconnectFromPeerVideo(peerB64);
+    this.disconnectFromPeerVideo(peerB64, 'peer-carrier-change');
     if (carrier === 'signals') {
       this._clearPendingWebrtcStatus(peerB64);
     }

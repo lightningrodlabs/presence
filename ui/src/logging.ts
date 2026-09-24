@@ -120,6 +120,10 @@ export type SimpleEventType =
   | 'SystemAudioEnded'      // the host or platform ended an included system-audio grant
   | 'TrackArrivedMuted'
   | 'TrackUnmuted'
+  // Forensics (2026-09-24 incident): a remote track's onmute. Paired
+  // with TrackUnmuted so a mute/unmute cycle on a link that stays
+  // `connected` is visible in the export. Log-only.
+  | 'TrackMuted'
   | 'TrackUnmuteTimeout'
   | 'StreamReceived'
   | 'StaleCleanup'
@@ -260,6 +264,7 @@ export const SIMPLE_EVENT_TAXONOMY = {
   SystemAudioEnded: 'emitted',
   TrackArrivedMuted: 'emitted',
   TrackUnmuted: 'emitted',
+  TrackMuted: 'emitted',
   TrackUnmuteTimeout: 'emitted',
   StreamReceived: 'emitted',
   StaleCleanup: 'emitted',

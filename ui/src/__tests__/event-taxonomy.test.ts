@@ -185,6 +185,7 @@ describe('SimpleEvent taxonomy', () => {
         "SupersededError": "emitted",
         "SystemAudioEnded": "emitted",
         "TrackArrivedMuted": "emitted",
+        "TrackMuted": "emitted",
         "TrackUnmuteTimeout": "emitted",
         "TrackUnmuted": "emitted",
       }

@@ -40,8 +40,8 @@ export type PeerRecord = {
   /**
    * Most recent reason this peer left the `connected` webrtc phase,
    * captured from the FSM transition that took it out of `connected`
-   * (e.g. "disconnectFromPeerVideo", "peer left", "transport failure:
-   * dtls-failed"). Read by `_handleMediaClosed` to annotate the
+   * (e.g. "reconnect-button", "carrier-mode-signals", "peer left",
+   * "transport failure: dtls-failed"). Read by `_handleMediaClosed` to annotate the
    * `CarrierSwitch fsm->signals` downgrade with *why* webrtc was
    * abandoned (§6.6).
    */
