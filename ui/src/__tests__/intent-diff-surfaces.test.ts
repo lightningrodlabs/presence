@@ -147,29 +147,21 @@ describe('the "Include audio from…" row renders the store\'s one request gate'
     return { el, row };
   }
 
-  it('mic not wanted → disabled, "Turn your microphone on first"', () => {
-    const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'mic-not-wanted' } });
-    expect(row.classList.contains('disabled')).toBe(true);
-    expect(row.title).toBe('Turn your microphone on first');
-    expect(row.textContent).toContain('Include audio from…');
-  });
-
-  it('mic wanted but not live → disabled, "Waiting for your microphone"', () => {
-    const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'mic-not-live' } });
-    expect(row.classList.contains('disabled')).toBe(true);
-    expect(row.title).toBe('Waiting for your microphone');
-  });
-
-  it('the picker is up → disabled with no title (the store refuses a second request too)', () => {
+  it('the picker is up → disabled, and the row says so in its own text', () => {
     const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'request-pending' } });
     expect(row.classList.contains('disabled')).toBe(true);
-    expect(row.title).toBe('');
+    expect(row.textContent).toContain('Choosing sources…');
   });
 
-  it('request ok → enabled, no title; a click is the on gesture', async () => {
+  it('no host seam → disabled (the row is not rendered at all in that case, but the gate agrees)', () => {
+    const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'no-seam' } });
+    expect(row.classList.contains('disabled')).toBe(true);
+  });
+
+  it('request ok → enabled, offering the picker; a click is the on gesture', async () => {
     const { el, row } = renderRow({ systemAudioRequest: { ok: true } });
     expect(row.classList.contains('disabled')).toBe(false);
-    expect(row.title).toBe('');
+    expect(row.textContent).toContain('Include audio from…');
     row.click();
     await Promise.resolve();
     expect(el.streamsStore.systemAudioOn).toHaveBeenCalledTimes(1);
@@ -177,7 +169,7 @@ describe('the "Include audio from…" row renders the store\'s one request gate'
   });
 
   it('a disabled row swallows the click', async () => {
-    const { el, row } = renderRow({ systemAudioRequest: { ok: false, reason: 'mic-not-live' } });
+    const { el, row } = renderRow({ systemAudioRequest: { ok: false, reason: 'request-pending' } });
     row.click();
     await Promise.resolve();
     expect(el.streamsStore.systemAudioOn).not.toHaveBeenCalled();
@@ -189,12 +181,44 @@ describe('the "Include audio from…" row renders the store\'s one request gate'
       systemAudio: { label: 'Firefox', canExcludeSelf: false },
     });
     expect(row.classList.contains('disabled')).toBe(false);
-    expect(row.title).toBe('');
     expect(row.textContent).toContain('Including: Firefox');
     expect(row.textContent).toContain('(may echo)');
     row.click();
     await Promise.resolve();
     expect(el.streamsStore.systemAudioOff).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the room-level notice that audio is still going out with the mic off', () => {
+  const MIC = (wanted: boolean, muted: boolean) => ({ wanted, muted, includeSystemAudio: true });
+
+  it('muted while including → the notice names the source', () => {
+    const el = makeRoomView({
+      intent: INTENT(MIC(true, true), false),
+      systemAudio: { label: 'Spotify', canExcludeSelf: true },
+    });
+    expect(el._systemAudioNoticeText()).toBe('Microphone off — still sending audio from Spotify');
+  });
+
+  it('never turned the mic on while including → the same notice', () => {
+    const el = makeRoomView({
+      intent: INTENT(MIC(false, true), false),
+      systemAudio: { label: 'Spotify', canExcludeSelf: true },
+    });
+    expect(el._systemAudioNoticeText()).toBe('Microphone off — still sending audio from Spotify');
+  });
+
+  it('microphone sending → no notice, the button already says it', () => {
+    const el = makeRoomView({
+      intent: INTENT(MIC(true, false), false),
+      systemAudio: { label: 'Spotify', canExcludeSelf: true },
+    });
+    expect(el._systemAudioNoticeText()).toBeNull();
+  });
+
+  it('not including → no notice, whatever the microphone is doing', () => {
+    const el = makeRoomView({ intent: INTENT({ wanted: true, muted: true, includeSystemAudio: false }, false) });
+    expect(el._systemAudioNoticeText()).toBeNull();
   });
 });
 

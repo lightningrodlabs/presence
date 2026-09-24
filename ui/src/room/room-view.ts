@@ -490,24 +490,36 @@ export class RoomView extends LitElement {
    * the mic track). The active state comes from the store's `systemAudio`
    * readable, the gestures are the store's `systemAudioOn/Off`.
    */
+  /**
+   * The room-level line for "your microphone is off, but audio from this
+   * machine is still going out". Null whenever the microphone itself is
+   * sending, since the mic button already says that. Reads the same two
+   * authorities the row does: the store's `systemAudio` readable and
+   * `localIntent`.
+   */
+  private _systemAudioNoticeText(): string | null {
+    const active = this._systemAudio.value;
+    if (!active) return null;
+    const intent = this._localIntent.value;
+    const micSending = !!intent && intent.mic.wanted && !intent.mic.muted;
+    if (micSending) return null;
+    return `${msg('Microphone off — still sending audio from')} ${active.label}`;
+  }
+
   private _renderSystemAudioRow() {
     const active = this._systemAudio.value;
     // One gate: the store refuses `systemAudioOn` on the same decision
     // (`decideSystemAudioRequest`), so the row never offers a click the
     // store would drop. Read at render — the menu re-renders on open and
-    // on every presence tick.
+    // on every presence tick. Whatever the row is doing it says in its
+    // own text; nothing important hides in a hover title.
     const request = this.streamsStore.systemAudioRequest;
     const disabled = !active && !request.ok;
-    const title = active || request.ok
-      ? ''
-      : request.reason === 'mic-not-live'
-        ? msg('Waiting for your microphone')
-        : request.reason === 'mic-not-wanted'
-          ? msg('Turn your microphone on first')
-          : '';
     const label = active
       ? `✓ ${msg('Including')}: ${active.label}${active.canExcludeSelf ? '' : ` ${msg('(may echo)')}`}`
-      : msg('Include audio from…');
+      : !request.ok && request.reason === 'request-pending'
+        ? msg('Choosing sources…')
+        : msg('Include audio from…');
     const act = async () => {
       if (disabled) return;
       this.closeClosables();
@@ -519,7 +531,6 @@ export class RoomView extends LitElement {
       <div
         class="audio-source column ${disabled ? 'disabled' : ''}"
         tabindex="0"
-        title=${title}
         @click=${act}
         @keypress=${async (e: KeyboardEvent) => {
           if (e.key === 'Enter') await act();
@@ -3085,6 +3096,17 @@ export class RoomView extends LitElement {
           ? html`<div class="carrier-banner">${banner}</div>`
           : html``;
       })()}
+      ${(() => {
+        // The microphone button reads "off" while an included share is
+        // still going out, because muting silences your voice and not the
+        // share (MicSource.setMuted). Say so where it cannot be missed:
+        // the button alone would tell the user nothing is leaving the
+        // machine, which would be false.
+        const notice = this._systemAudioNoticeText();
+        return notice
+          ? html`<div class="carrier-banner system-audio-banner">${notice}</div>`
+          : html``;
+      })()}
       <div
         class="videos-container${splitMode ? ' split-mode' : ''}${autoGrid
           ? ' auto-grid'
@@ -4488,6 +4510,11 @@ export class RoomView extends LitElement {
       }
 
       /* Task 6 surface 3: room-level carrier banner (signal carrier down). */
+      .system-audio-banner {
+        background: #123a2a;
+        color: #9be8c4;
+      }
+
       .carrier-banner {
         margin: 4px auto 0;
         padding: 4px 12px;

@@ -71,8 +71,9 @@ export function applyIntentGesture(
       // wanted mic. Either way the device stays wanted once it has been
       // wanted (fast re-enable, no renegotiation) — matching audioOff's
       // do-not-release semantics. A never-wanted mic stays unwanted. And
-      // an included system-audio share stays included: mute silences the
-      // mixed track as a whole.
+      // an included system-audio share stays included AND audible: mute
+      // means "my microphone is off", so `MicSource.setMuted` silences
+      // the mic's branch of the mix and leaves the share flowing.
       return {
         ...intent,
         mic: { ...intent.mic, muted: true },

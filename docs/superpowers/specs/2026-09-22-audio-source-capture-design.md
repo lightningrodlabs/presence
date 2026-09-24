@@ -504,6 +504,30 @@ bump to `0.7.0-dev.4` removed `presence-app.ts`'s empty `blockTypes: {}`
 stub (a surface the api dropped in dev.2). Verified in node: the policy
 table, the mixin swap plumbing with fake Web Audio, and the store wiring
 (one `replaceTrack` per swap on every media transport, every end path).
+**Sharing without the microphone (revised 2026-09-24, from the first
+two-machine session).** Two rules changed, because the first cut made the
+feature unusable in the way people actually reach for it — someone who
+wants to play a track to the room does not necessarily want to be heard,
+and someone who mutes themselves does not mean "stop the music".
+
+1. A share no longer requires or opens the microphone. `decideMicOutput`
+   builds the graph from whichever sources exist, so a mixin alone is a
+   one-source mix and no `getUserMedia` runs — a user sharing what they
+   are playing gets no recording indicator. `decideSystemAudioRequest`
+   therefore has no microphone condition left; the row is disabled only
+   while the host picker is up. The microphone joins and leaves that
+   graph in place (`sync-mix-device`), so turning it on or off during a
+   share never swaps the output track and never renegotiates with a peer.
+2. Mute silences the microphone's branch only. `MicSource.setMuted`
+   writes the device track's `enabled` flag and leaves the destination
+   track enabled whenever a mix exists.
+
+Because the mic button then reads "off" while audio is still leaving the
+machine, room-view carries a notice naming the source
+(`_systemAudioNoticeText`), shown whenever a share is running and the
+microphone is not sending. The menu row states what it is doing in its
+own text rather than a hover title.
+
 Manual (owner-run, two machines): not observed at this landing — the plan's Task 6 checklist is owner-run; until it is run, the audio-graph claims (mixin audible to a peer over WebRTC and over signals, no echo when `canExcludeSelf`) rest on the node fakes and the mono-destination pin only.
 
 ## Error handling
@@ -552,8 +576,12 @@ Each step is one branch, one intent, adversarially reviewed
 - Picker shows `isOutputActive` per app and sorts playing apps first
   (decided 2026-09-22).
 - Grants session-scoped, not persisted.
-- v1 requires the mic to be held; system audio rides the mic track.
-- Mute silences the mixed track as a whole (declared here, not asked).
+- System audio rides the mic track — one outgoing audio track either way.
+  v1 additionally required the microphone to be HELD, which two-machine
+  testing on 2026-09-24 rejected: see "Sharing without the microphone"
+  below.
+- Mute silences the microphone's branch of the mix, not the whole track
+  (revised 2026-09-24; it silenced everything as first shipped).
 - Enable switch defaults on (declared here, not asked).
 
 ## Definition of done
