@@ -31,7 +31,16 @@ class FakeAudioContext {
   state = 'running';
   sources: Array<{ stream: FakeStream; connected: boolean }> = [];
   destinations: Array<{ track: FakeTrack; node: { channelCount: number } }> = [];
+  /** One-shot: the next createMediaStreamSource throws, as a real context
+   *  does when the graph cannot take another node. Both places MicSource
+   *  builds source nodes (`_buildMix`, `_replaceMixDeviceNode`) must
+   *  survive it. */
+  failNextSource = false;
   createMediaStreamSource(stream: FakeStream) {
+    if (this.failNextSource) {
+      this.failNextSource = false;
+      throw new Error('createMediaStreamSource failed');
+    }
     const node = { stream, connected: false, connect: () => { node.connected = true; }, disconnect: () => { node.connected = false; } };
     this.sources.push(node);
     return node;
@@ -205,6 +214,51 @@ describe('MicSource mixin: device swaps and close', () => {
     expect(device1.readyState).toBe('ended');
     expect(r.fanout).toEqual([]);
     expect(consumerSwaps).toEqual([]);
+  });
+
+  it('a device change whose source node cannot be built falls back to a full rebuild of the mix', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let n = 0;
+    installGlobals(async () => new FakeStream([[device1, device2][n++]!]));
+    const r = rig();
+    const consumerSwaps: unknown[] = [];
+    await r.mic.acquire({ id: 'c', onTrackChanged: t => void consumerSwaps.push(t) });
+    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    const firstMixed = ctx.destinations[0].track;
+    r.fanout.length = 0; consumerSwaps.length = 0;
+
+    ctx.failNextSource = true; // the in-place device-node replacement throws
+    await r.mic.changeDevice('other');
+
+    // Without the fallback the graph would keep feeding system audio from
+    // a destination whose only microphone node had been disconnected.
+    expect(ctx.destinations).toHaveLength(2);
+    const rebuilt = ctx.destinations[1].track;
+    expect(r.mic.outputMode).toBe('mixed');
+    expect(r.mic.track).toBe(rebuilt as unknown as MediaStreamTrack);
+    expect(firstMixed.readyState).toBe('ended');
+    expect(ctx.sources.filter(s => s.connected).map(s => s.stream.getAudioTracks()[0]!.label))
+      .toEqual(['d2', 'system']);
+    expect(r.fanout).toEqual([{ newTrack: rebuilt, oldTrack: firstMixed }]);
+    expect(consumerSwaps).toEqual([rebuilt]);
+  });
+
+  it('a first build whose source node cannot be built is refused (negative control for _buildMix\'s catch)', async () => {
+    const device = new FakeTrack('audio', 'd');
+    installGlobals(async () => new FakeStream([device]));
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    r.fanout.length = 0;
+
+    ctx.failNextSource = true;
+    expect(r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack)).toBe(false);
+
+    expect(r.mic.outputMode).toBe('device');
+    expect(r.mic.track).toBe(device as unknown as MediaStreamTrack);
+    expect(r.fanout).toEqual([]);
   });
 
   it('a reopen after the device died while mixed also keeps the output (the reconciler path)', async () => {

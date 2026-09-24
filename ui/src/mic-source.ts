@@ -519,11 +519,12 @@ export class MicSource {
         return false;
       }
       case 'build-mix': {
-        if (this._mix && decision.reason === 'device-changed') {
-          // Same destination, same output track: only the device source node changes.
-          this._replaceMixDeviceNode();
+        if (this._mix && decision.reason === 'device-changed' && this._replaceMixDeviceNode()) {
+          // Same destination, same output track: only the device source node changed.
           return true;
         }
+        // In-place replacement refused or failed: fall through to the full
+        // rebuild below, which swaps through `_installOutputTrack`.
         const old = this._outputTrack;
         if (!this._buildMix()) {
           // No Web Audio: keep the device path and drop the request.
@@ -572,16 +573,29 @@ export class MicSource {
     }
   }
 
-  private _replaceMixDeviceNode(): void {
+  /**
+   * Swap only the device source node into the existing graph. Returns
+   * false when it could not be done — the old device node is already
+   * disconnected by then, so the destination would keep carrying the
+   * mixin with no microphone and nothing would reconcile it; the caller
+   * rebuilds the whole mix instead.
+   */
+  private _replaceMixDeviceNode(): boolean {
     const mix = this._mix;
     const device = this._deviceTrack;
-    if (!mix || !device) return;
+    if (!mix || !device) return false;
     const ctx = this.ensureAudioContext();
-    if (!ctx) return;
+    if (!ctx) return false;
     try { mix.deviceNode.disconnect(); } catch {}
-    const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
-    deviceNode.connect(mix.destination);
-    this._mix = { ...mix, device, deviceNode };
+    try {
+      const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
+      deviceNode.connect(mix.destination);
+      this._mix = { ...mix, device, deviceNode };
+      return true;
+    } catch (e) {
+      console.error('MicSource: replacing the mix device node failed', e);
+      return false;
+    }
   }
 
   /** Disconnect the graph and end the destination track (nobody holds it after the swap). */
