@@ -22,13 +22,18 @@ import { join } from 'node:path';
 // view-teardown-symmetry.test.ts for the standing rationale.
 vi.mock('../room/logs-graph', () => ({}));
 
+import { render } from 'lit';
 import '../room/room-view';
 import type { IntentDiff } from '../intent-diff-policy';
+import type { SystemAudioRequestDecision } from '../mic-output-policy';
 
 type FakeStore = {
   clock: { now: () => number };
   peerReconnecting: (p: string) => boolean;
   disconnect: ReturnType<typeof vi.fn>;
+  systemAudioRequest: SystemAudioRequestDecision;
+  systemAudioOn: () => Promise<void>;
+  systemAudioOff: () => void;
 };
 
 function makeRoomView(overrides?: {
@@ -36,18 +41,24 @@ function makeRoomView(overrides?: {
   diffs?: IntentDiff[];
   now?: number;
   reconnecting?: (p: string) => boolean;
+  systemAudioRequest?: SystemAudioRequestDecision;
+  systemAudio?: { label: string; canExcludeSelf: boolean } | null;
 }): any {
   const el = document.createElement('room-view') as any;
   const store: FakeStore = {
     clock: { now: () => overrides?.now ?? 0 },
     peerReconnecting: overrides?.reconnecting ?? (() => false),
     disconnect: vi.fn(),
+    systemAudioRequest: overrides?.systemAudioRequest ?? { ok: true },
+    systemAudioOn: vi.fn(async () => {}),
+    systemAudioOff: vi.fn(),
   };
   el.streamsStore = store;
   // The StoreSubscriber fields read only `.value`; overwrite them with
   // plain value holders (never mounted, so they never subscribed).
   el._localIntent = { value: overrides?.intent };
   el._intentDiffs = { value: overrides?.diffs ?? [] };
+  el._systemAudio = { value: overrides?.systemAudio ?? null };
   return el;
 }
 
@@ -120,6 +131,70 @@ describe('toggle-button badge tracks the matching diff (surface 1)', () => {
   it('a mic diff does not badge the camera button', () => {
     const el = makeRoomView({ diffs: [micPending] });
     expect(el._badgeClassFor('camera')).toBe('');
+  });
+});
+
+describe('the "Include audio from…" row renders the store\'s one request gate', () => {
+  // Rendered into a detached container: the row is a template method, and
+  // its disabled/title states come from `streamsStore.systemAudioRequest`
+  // (`decideSystemAudioRequest`), the same decision `systemAudioOn` refuses
+  // on — so this is what fails if the row stops reading it.
+  function renderRow(overrides: Parameters<typeof makeRoomView>[0]) {
+    const el = makeRoomView(overrides);
+    const host = document.createElement('div');
+    render(el._renderSystemAudioRow(), host);
+    const row = host.querySelector('.audio-source') as HTMLElement;
+    return { el, row };
+  }
+
+  it('mic not wanted → disabled, "Turn your microphone on first"', () => {
+    const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'mic-not-wanted' } });
+    expect(row.classList.contains('disabled')).toBe(true);
+    expect(row.title).toBe('Turn your microphone on first');
+    expect(row.textContent).toContain('Include audio from…');
+  });
+
+  it('mic wanted but not live → disabled, "Waiting for your microphone"', () => {
+    const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'mic-not-live' } });
+    expect(row.classList.contains('disabled')).toBe(true);
+    expect(row.title).toBe('Waiting for your microphone');
+  });
+
+  it('the picker is up → disabled with no title (the store refuses a second request too)', () => {
+    const { row } = renderRow({ systemAudioRequest: { ok: false, reason: 'request-pending' } });
+    expect(row.classList.contains('disabled')).toBe(true);
+    expect(row.title).toBe('');
+  });
+
+  it('request ok → enabled, no title; a click is the on gesture', async () => {
+    const { el, row } = renderRow({ systemAudioRequest: { ok: true } });
+    expect(row.classList.contains('disabled')).toBe(false);
+    expect(row.title).toBe('');
+    row.click();
+    await Promise.resolve();
+    expect(el.streamsStore.systemAudioOn).toHaveBeenCalledTimes(1);
+    expect(el.streamsStore.systemAudioOff).not.toHaveBeenCalled();
+  });
+
+  it('a disabled row swallows the click', async () => {
+    const { el, row } = renderRow({ systemAudioRequest: { ok: false, reason: 'mic-not-live' } });
+    row.click();
+    await Promise.resolve();
+    expect(el.streamsStore.systemAudioOn).not.toHaveBeenCalled();
+  });
+
+  it('active → enabled whatever the gate says (the store reports already-active), label carries the source and the echo note; a click is the off gesture', async () => {
+    const { el, row } = renderRow({
+      systemAudioRequest: { ok: false, reason: 'already-active' },
+      systemAudio: { label: 'Firefox', canExcludeSelf: false },
+    });
+    expect(row.classList.contains('disabled')).toBe(false);
+    expect(row.title).toBe('');
+    expect(row.textContent).toContain('Including: Firefox');
+    expect(row.textContent).toContain('(may echo)');
+    row.click();
+    await Promise.resolve();
+    expect(el.streamsStore.systemAudioOff).toHaveBeenCalledTimes(1);
   });
 });
 

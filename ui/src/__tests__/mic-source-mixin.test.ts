@@ -160,6 +160,22 @@ describe('MicSource mixin: build, tear, and what consumers see', () => {
     expect(r.dropped).toEqual([]); // the caller removed it; nothing to report
   });
 
+  it('a device that died without its event, under a mix, tears it on the next reconcile and reports device-closed', async () => {
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    const mixin = new FakeTrack('audio', 'system');
+    r.mic.setMixin(mixin as unknown as MediaStreamTrack);
+    r.fanout.length = 0;
+    // Ended without `onended` firing (the FakeTrack fires it; bypass it).
+    device.readyState = 'ended';
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
+    expect(r.mic.outputMode).toBe('device');
+    expect(r.dropped).toEqual(['device-closed']);
+    // The mixin is not kept for a rebuild nobody would perform.
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
+    expect(r.dropped).toEqual(['device-closed']); // no second report: it was already gone
+  });
+
   it('a mixin track that ends underneath the mix tears it and reports mixin-ended', async () => {
     const r = rig();
     await r.mic.acquire({ id: 'c' });
@@ -410,7 +426,8 @@ describe('MicSource mixin: device swaps and close', () => {
     // A second consumer acquires (voice starting capture when a peer falls to
     // signals): the stale path clears the dead device and awaits getUserMedia.
     const pending = r.mic.acquire({ id: 'filmstrip' });
-    expect(r.mic.setMixin(null)).toBe(true); // still mixed: the tear is deferred
+    expect(r.mic.setMixin(null)).toBe(false); // recorded; the tear itself waits for the open
+    expect(r.mic.outputMode).toBe('mixed'); // …so the old graph is still what consumers hold
     expect(r.fanout).toEqual([]); // no close fanout on no device
     release();
     await pending;

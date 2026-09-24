@@ -531,11 +531,18 @@ export class MicSource {
       case 'tear-mix': {
         const old = this._outputTrack;
         const staleMix = this._detachMix();
-        const mixinEnded = decision.reason === 'mixin-ended';
-        if (mixinEnded) this._mixin = null;
+        // 'mixin-removed' is the caller's own `setMixin(null)`; the other
+        // two are MicSource dropping a mixin it was asked to hold, which
+        // the store must hear about (`onMixinDropped`). A mixin kept across
+        // a device-closed tear would be orphaned: nothing rebuilds it
+        // (`_openAndSwap` reconciles only while `_mix` exists).
+        const dropped = decision.reason === 'mixin-ended' || decision.reason === 'device-closed'
+          ? decision.reason
+          : null;
+        if (dropped) this._mixin = null;
         this._installOutputTrack(this._deviceTrack, old);
         this._stopTracks(staleMix);
-        if (mixinEnded) this._notifyMixinDropped('mixin-ended');
+        if (dropped) this._notifyMixinDropped(dropped);
         return false;
       }
       case 'build-mix': {
@@ -682,7 +689,9 @@ export class MicSource {
     // lands. Reconciling now would tear the mix onto NO device — a close
     // fanout (removeTrack on every peer) followed by the open's addTrack, a
     // renegotiation per peer — where the deferred tear is one replaceTrack.
-    if (this._openingPromise) return this._mix !== null;
+    // The answer is the recorded intent the open will honour, not the
+    // old graph's existence.
+    if (this._openingPromise) return this._mixin !== null;
     return this._reconcileOutput();
   }
 
