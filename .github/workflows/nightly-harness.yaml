@@ -17,6 +17,11 @@ name: nightly-harness
 #     real RTCPeerConnections — lazy viewer-side establishment on
 #     SdpFsmScreen, dir-routing under mutual share, malformed-dir drop,
 #     and slot/stream teardown on a silent peer drop.
+#   - system-audio-mix.spec.ts — the production MicSource mixing a real
+#     oscillator into Chromium's fake microphone, read back through a real
+#     MediaStreamTrackProcessor and the voice module's AudioEncoder config:
+#     mono, audible, encodable — with the stereo-destination negative
+#     control that reproduces the review's Critical in the engine.
 #
 # Deliberately NOT gated:
 #   - layout.spec.ts — its split-mode baseline is red by design (see
