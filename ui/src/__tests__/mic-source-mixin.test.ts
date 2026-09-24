@@ -36,8 +36,10 @@ class FakeAudioContext {
    *  builds source nodes (`_buildMix`, `_replaceMixDeviceNode`) must
    *  survive it. */
   failNextSource = false;
+  /** Every createMediaStreamSource throws (a context that is gone). */
+  failAlways = false;
   createMediaStreamSource(stream: FakeStream) {
-    if (this.failNextSource) {
+    if (this.failNextSource || this.failAlways) {
       this.failNextSource = false;
       throw new Error('createMediaStreamSource failed');
     }
@@ -54,7 +56,8 @@ class FakeAudioContext {
     this.destinations.push({ track, node });
     return node;
   }
-  resume = async () => {};
+  resumeCalls = 0;
+  resume = async () => { this.resumeCalls += 1; this.state = 'running'; };
   close = async () => {};
 }
 
@@ -73,17 +76,26 @@ function installGlobals(respond: () => Promise<FakeStream>) {
 function rig() {
   const clock = new ManualClock(1_000);
   const fanout: Array<{ newTrack: unknown; oldTrack: unknown }> = [];
+  /** `readyState` of the old track AS SEEN BY the fanout — the stop-the-
+   *  old-last order (`_openAndSwap`) means consumers never see an ended
+   *  track before its replacement. */
+  const oldStateAtFanout: Array<string | null> = [];
+  const dropped: string[] = [];
   let deviceId: string | undefined;
   const bindings: MicSourceBindings = {
     getDeviceId: () => deviceId,
     setDeviceId: id => { deviceId = id; },
-    onTrackChange: (n, o) => void fanout.push({ newTrack: n, oldTrack: o }),
+    onTrackChange: (n, o) => {
+      fanout.push({ newTrack: n, oldTrack: o });
+      oldStateAtFanout.push(o ? (o as unknown as FakeTrack).readyState : null);
+    },
     onMutedChange: () => {},
     onLifecycleChange: () => {},
+    onMixinDropped: reason => void dropped.push(reason),
     now: () => clock.now(),
   };
   const mic = new MicSource(bindings);
-  return { mic, fanout, clock };
+  return { mic, fanout, oldStateAtFanout, dropped, clock };
 }
 
 afterEach(() => {
@@ -133,7 +145,7 @@ describe('MicSource mixin: build, tear, and what consumers see', () => {
     r.mic.setMixin(mixin as unknown as MediaStreamTrack);
     const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
     const mixed = ctx.destinations[0].track;
-    r.fanout.length = 0; consumerSwaps.length = 0;
+    r.fanout.length = 0; consumerSwaps.length = 0; r.oldStateAtFanout.length = 0;
 
     expect(r.mic.setMixin(null)).toBe(false);
     expect(r.mic.track).toBe(device as unknown as MediaStreamTrack);
@@ -142,7 +154,41 @@ describe('MicSource mixin: build, tear, and what consumers see', () => {
     expect(consumerSwaps).toEqual([device]);
     expect(ctx.sources.every(s => !s.connected)).toBe(true);
     expect(mixed.readyState).toBe('ended');
+    // …but only AFTER the swap fanned out: the old track is stopped last.
+    expect(r.oldStateAtFanout).toEqual(['live']);
     expect(mixin.readyState).toBe('live'); // the mixin belongs to the caller (the capture object stops it)
+    expect(r.dropped).toEqual([]); // the caller removed it; nothing to report
+  });
+
+  it('a mixin track that ends underneath the mix tears it and reports mixin-ended', async () => {
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    const mixin = new FakeTrack('audio', 'system');
+    r.mic.setMixin(mixin as unknown as MediaStreamTrack);
+    r.fanout.length = 0;
+    mixin.stop();
+    // MicSource observes the track on its next reconcile, not by event —
+    // the store's `capture.onended` is the push path; this is the pull.
+    expect(r.mic.setMixin(mixin as unknown as MediaStreamTrack)).toBe(false);
+    expect(r.mic.outputMode).toBe('device');
+    expect(r.fanout).toEqual([{ newTrack: device, oldTrack: expect.anything() }]);
+    expect(r.dropped).toEqual([]); // setMixin with an ended track is the caller's own removal
+  });
+
+  it('a suspended context is resumed when the mix is built and under the gesture (resumeAudioContext)', async () => {
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    const atCreation = ctx.resumeCalls; // ensureAudioContext resumes once at creation
+    ctx.state = 'suspended';
+    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
+    expect(ctx.resumeCalls).toBe(atCreation + 1);
+    ctx.state = 'suspended';
+    r.mic.resumeAudioContext();
+    expect(ctx.resumeCalls).toBe(atCreation + 2);
+    ctx.state = 'running';
+    r.mic.resumeAudioContext();
+    expect(ctx.resumeCalls).toBe(atCreation + 2); // running: nothing to resume
   });
 
   it('an ended mixin is refused (negative control for the ended arm)', async () => {
@@ -214,6 +260,29 @@ describe('MicSource mixin: device swaps and close', () => {
     expect(device1.readyState).toBe('ended');
     expect(r.fanout).toEqual([]);
     expect(consumerSwaps).toEqual([]);
+  });
+
+  it('a rebuild that fails after a device change drops the mixin and reports mix-failed (the store ends the share)', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let n = 0;
+    installGlobals(async () => new FakeStream([[device1, device2][n++]!]));
+    const r = rig();
+    await r.mic.acquire({ id: 'c' });
+    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
+    const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
+    const mixed = ctx.destinations[0].track;
+    r.fanout.length = 0; r.oldStateAtFanout.length = 0;
+    // Both source-node sites throw: the in-place swap AND the rebuild.
+    ctx.failNextSource = true;
+    ctx.failAlways = true;
+    await r.mic.changeDevice('other');
+    expect(r.mic.outputMode).toBe('device');
+    expect(r.mic.track).toBe(device2 as unknown as MediaStreamTrack);
+    expect(r.fanout).toEqual([{ newTrack: device2, oldTrack: mixed }]);
+    expect(r.oldStateAtFanout).toEqual(['live']); // stopped after the swap, not before
+    expect(mixed.readyState).toBe('ended');
+    expect(r.dropped).toEqual(['mix-failed']);
   });
 
   it('a device change whose source node cannot be built falls back to a full rebuild of the mix', async () => {
@@ -310,14 +379,46 @@ describe('MicSource mixin: device swaps and close', () => {
     r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
     const ctx = (r.mic.ensureAudioContext() as unknown) as FakeAudioContext;
     const mixed = ctx.destinations[0].track;
-    r.fanout.length = 0;
+    r.fanout.length = 0; r.oldStateAtFanout.length = 0;
     h!.release();
     expect(r.fanout).toEqual([{ newTrack: null, oldTrack: mixed }]);
+    expect(r.oldStateAtFanout).toEqual(['live']); // close fans out before the stops
     expect(ctx.sources.every(s => !s.connected)).toBe(true);
     expect(mixed.readyState).toBe('ended');
     expect(device.readyState).toBe('ended');
     expect(r.mic.outputMode).toBeNull();
     expect(r.mic.track).toBeNull();
+    expect(r.dropped).toEqual(['device-closed']);
+  });
+
+  it('the host ends the grant while a stale-device acquire is opening: the tear waits for the open, and both steps are device changes (no close, no re-add)', async () => {
+    const device1 = new FakeTrack('audio', 'd1');
+    const device2 = new FakeTrack('audio', 'd2');
+    let release!: () => void;
+    let n = 0;
+    installGlobals(() => {
+      n += 1;
+      if (n === 1) return Promise.resolve(new FakeStream([device1]));
+      return new Promise(res => { release = () => res(new FakeStream([device2])); });
+    });
+    const r = rig();
+    await r.mic.acquire({ id: 'voice' });
+    r.mic.setMixin(new FakeTrack('audio', 'system') as unknown as MediaStreamTrack);
+    const mixed = ((r.mic.ensureAudioContext() as unknown) as FakeAudioContext).destinations[0].track;
+    device1.stop(); // the device died under the mix
+    r.fanout.length = 0;
+    // A second consumer acquires (voice starting capture when a peer falls to
+    // signals): the stale path clears the dead device and awaits getUserMedia.
+    const pending = r.mic.acquire({ id: 'filmstrip' });
+    expect(r.mic.setMixin(null)).toBe(true); // still mixed: the tear is deferred
+    expect(r.fanout).toEqual([]); // no close fanout on no device
+    release();
+    await pending;
+    expect(r.mic.outputMode).toBe('device');
+    expect(r.mic.track).toBe(device2 as unknown as MediaStreamTrack);
+    // ONE device-change fanout (replaceTrack on every peer) — never
+    // (null, mixed) then (device2, null), which is removeTrack + addTrack.
+    expect(r.fanout).toEqual([{ newTrack: device2, oldTrack: mixed }]);
   });
 
   it('acquire after a mixin was set hands out the mixed output', async () => {

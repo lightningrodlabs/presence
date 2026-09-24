@@ -1,4 +1,4 @@
-import { decideMicOutput, isUsableMixin, type MicOutputMode } from './mic-output-policy';
+import { decideMicOutput, isLiveTrack, type MicOutputMode } from './mic-output-policy';
 
 /**
  * MicSource — transport-agnostic owner of the user's microphone.
@@ -64,13 +64,10 @@ export type CaptureLifecycle =
   | { state: 'ended'; endedAt: number }
   | { state: 'failed'; error: string; failedAt: number };
 
-/** True iff `track` is non-null and not yet ended. The one predicate both
- *  `acquire()` and `_ensureOpen()` use to decide whether a device needs
- *  (re)opening — replaces the old `!this._track` check, which read a
- *  stale (externally-ended) track as still usable. */
-export function isLiveTrack(track: MediaStreamTrack | null): track is MediaStreamTrack {
-  return !!track && track.readyState === 'live';
-}
+/** The one track-liveness predicate lives beside the output decision that
+ *  reads it (`mic-output-policy.ts`); re-exported here for `CameraSource`
+ *  and the lifecycle tests, which reach it under this name. */
+export { isLiveTrack } from './mic-output-policy';
 
 export type MicConsumerId = string;
 
@@ -124,6 +121,15 @@ export interface MicSourceBindings {
    *  `onMutedChange`). Task 3's reconciler and Task 5's diff policy are
    *  the intended consumers. */
   onLifecycleChange: (lifecycle: CaptureLifecycle) => void;
+  /**
+   * Fired when MicSource drops a mixin it held for a reason other than a
+   * `setMixin` call — the device closed under it, a rebuild after a device
+   * change failed, or the mixin track itself ended. The store's binding
+   * ends the host capture and the durable intent with it, so "Including"
+   * is never shown while nothing is mixed. Fires after the output swap the
+   * drop caused, never from inside `setMixin`.
+   */
+  onMixinDropped: (reason: 'device-closed' | 'mix-failed' | 'mixin-ended') => void;
   /** Clock read for lifecycle timestamps — routed from `StreamsStore.clock`
    *  so this file carries no ambient time (see `no-ambient-clock.test.ts`). */
   now: () => number;
@@ -483,7 +489,8 @@ export class MicSource {
     // clear the device — so the fanout below carries whatever consumers
     // actually held (the mixed track when mixed, the device track when not).
     const oldOutput = this._outputTrack;
-    this._disconnectMix();
+    const staleMix = this._detachMix();
+    const droppedMixin = this._mixin !== null;
     this._mixin = null;
 
     const old = this._deviceTrack;
@@ -491,12 +498,22 @@ export class MicSource {
     this._deviceTrack = null;
     this._rawStream = null;
     this._setLifecycle({ state: 'idle' });
+    this._installOutputTrack(null, oldOutput);
+    // Stop the old tracks last (the order `_openAndSwap` documents), so the
+    // fanout above observed live tracks.
     if (oldStream) {
       try { oldStream.getTracks().forEach(t => t.stop()); } catch {}
     } else if (old) {
       try { old.stop(); } catch {}
     }
-    this._installOutputTrack(null, oldOutput);
+    this._stopTracks(staleMix);
+    if (droppedMixin) this._notifyMixinDropped('device-closed');
+  }
+
+  private _notifyMixinDropped(reason: 'device-closed' | 'mix-failed' | 'mixin-ended'): void {
+    try { this.bindings.onMixinDropped(reason); } catch (e) {
+      console.error('MicSource: onMixinDropped binding threw', e);
+    }
   }
 
   /** Apply decideMicOutput to the current device/mixin state. Returns true iff the output includes the mixin. */
@@ -513,9 +530,12 @@ export class MicSource {
         return false;
       case 'tear-mix': {
         const old = this._outputTrack;
-        this._disconnectMix();
-        if (decision.reason === 'mixin-ended') this._mixin = null;
+        const staleMix = this._detachMix();
+        const mixinEnded = decision.reason === 'mixin-ended';
+        if (mixinEnded) this._mixin = null;
         this._installOutputTrack(this._deviceTrack, old);
+        this._stopTracks(staleMix);
+        if (mixinEnded) this._notifyMixinDropped('mixin-ended');
         return false;
       }
       case 'build-mix': {
@@ -524,15 +544,23 @@ export class MicSource {
           return true;
         }
         // In-place replacement refused or failed: fall through to the full
-        // rebuild below, which swaps through `_installOutputTrack`.
+        // rebuild below, which swaps through `_installOutputTrack`. The
+        // previous graph's destination track is stopped only after the
+        // swap has fanned out (the order `_openAndSwap` documents).
         const old = this._outputTrack;
+        const staleMix = this._detachMix();
         if (!this._buildMix()) {
-          // No Web Audio: keep the device path and drop the request.
+          // No Web Audio, or the graph refused the nodes: keep the device
+          // path and drop the request — and say so, since the store may
+          // still be holding a capture for it.
           this._mixin = null;
           if (old !== this._deviceTrack) this._installOutputTrack(this._deviceTrack, old);
+          this._stopTracks(staleMix);
+          this._notifyMixinDropped('mix-failed');
           return false;
         }
         this._installOutputTrack(this._mix!.destination.stream.getAudioTracks()[0], old);
+        this._stopTracks(staleMix);
         return true;
       }
       default: {
@@ -548,7 +576,11 @@ export class MicSource {
     const device = this._deviceTrack;
     const mixin = this._mixin;
     if (!ctx || !device || !mixin) return false;
-    this._disconnectMix();
+    // The caller has already detached any previous graph (`_detachMix`).
+    // A suspended context would produce a silent destination track;
+    // `ensureAudioContext` resumes only at creation, so resume again here
+    // (a no-op while running, never awaited — the graph is built either way).
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
     try {
       const deviceNode = ctx.createMediaStreamSource(new MediaStream([device]));
       const mixinNode = ctx.createMediaStreamSource(new MediaStream([mixin]));
@@ -598,14 +630,25 @@ export class MicSource {
     }
   }
 
-  /** Disconnect the graph and end the destination track (nobody holds it after the swap). */
-  private _disconnectMix(): void {
+  /**
+   * Disconnect the graph and hand back its destination tracks for the
+   * caller to stop AFTER the output swap has fanned out — the same
+   * stop-the-old-last order `_openAndSwap` keeps, so no consumer sees an
+   * ended track before its replacement.
+   */
+  private _detachMix(): MediaStreamTrack[] {
     const mix = this._mix;
-    if (!mix) return;
+    if (!mix) return [];
     this._mix = null;
     try { mix.deviceNode.disconnect(); } catch {}
     try { mix.mixinNode.disconnect(); } catch {}
-    try { mix.destination.stream.getAudioTracks().forEach(t => t.stop()); } catch {}
+    try { return mix.destination.stream.getAudioTracks(); } catch { return []; }
+  }
+
+  private _stopTracks(tracks: MediaStreamTrack[]): void {
+    for (const t of tracks) {
+      try { t.stop(); } catch {}
+    }
   }
 
   /**
@@ -633,8 +676,21 @@ export class MicSource {
 
   /** Include (or remove, with null) a second audio track in the output. Returns true iff the output now includes it. */
   setMixin(track: MediaStreamTrack | null): boolean {
-    this._mixin = isUsableMixin(track) ? track : null;
+    this._mixin = isLiveTrack(track) ? track : null;
+    // A device open in flight (`_ensureOpen`'s stale path has cleared the
+    // dead device while `getUserMedia` is pending) reconciles when it
+    // lands. Reconciling now would tear the mix onto NO device — a close
+    // fanout (removeTrack on every peer) followed by the open's addTrack, a
+    // renegotiation per peer — where the deferred tear is one replaceTrack.
+    if (this._openingPromise) return this._mix !== null;
     return this._reconcileOutput();
+  }
+
+  /** Resume the shared context under a user gesture (`systemAudioOn`
+   *  runs under the menu click); a no-op without Web Audio or while running. */
+  resumeAudioContext(): void {
+    const ctx = this.ensureAudioContext();
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
   }
 
   private _audioConstraints(deviceId: string | undefined): MediaTrackConstraints {

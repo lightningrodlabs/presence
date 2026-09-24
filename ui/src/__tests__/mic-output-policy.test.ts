@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { decideMicOutput, isUsableMixin, type MicOutputInput } from '../mic-output-policy';
+import {
+  decideMicOutput,
+  decideSystemAudioRequest,
+  isLiveTrack,
+  type MicOutputInput,
+  type SystemAudioRequestInput,
+} from '../mic-output-policy';
 
-/** Identity is all the policy reads; readyState only for the mixin. */
+/** Identity plus readyState: both the device and the mixin are read for liveness. */
 const track = (readyState: 'live' | 'ended' = 'live') =>
   ({ readyState } as unknown as MediaStreamTrack);
 
@@ -25,6 +31,8 @@ describe('decideMicOutput', () => {
     ['mixin removed', { device: dev, mixin: null, current: { mode: 'mixed', device: dev, mixin: mix } }, { kind: 'tear-mix', reason: 'mixin-removed' }],
     ['mixin ended (the host or platform stopped it)', { device: dev, mixin: track('ended'), current: { mode: 'mixed', device: dev, mixin: mix } }, { kind: 'tear-mix', reason: 'mixin-ended' }],
     ['an ended mixin offered to a device-only output is ignored', { device: dev, mixin: track('ended'), current: { mode: 'device' } }, { kind: 'none', reason: 'already-device' }],
+    ['a dead device (ended without its event) is no device: the share is refused', { device: track('ended'), mixin: mix, current: { mode: 'device' } }, { kind: 'none', reason: 'no-device' }],
+    ['a dead device under a mix tears it', { device: track('ended'), mixin: mix, current: { mode: 'mixed', device: dev, mixin: mix } }, { kind: 'tear-mix', reason: 'device-closed' }],
   ];
 
   it.each(rows)('%s', (_name, input, expected) => {
@@ -32,10 +40,30 @@ describe('decideMicOutput', () => {
   });
 });
 
-describe('isUsableMixin', () => {
+describe('isLiveTrack', () => {
   it('null → false, ended → false, live → true', () => {
-    expect(isUsableMixin(null)).toBe(false);
-    expect(isUsableMixin(track('ended'))).toBe(false);
-    expect(isUsableMixin(track('live'))).toBe(true);
+    expect(isLiveTrack(null)).toBe(false);
+    expect(isLiveTrack(track('ended'))).toBe(false);
+    expect(isLiveTrack(track('live'))).toBe(true);
+  });
+});
+
+describe('decideSystemAudioRequest', () => {
+  const base: SystemAudioRequestInput = {
+    seamAvailable: true, micWanted: true, micLifecycle: 'live', active: false, pending: false,
+  };
+  const rows: Array<[string, Partial<SystemAudioRequestInput>, ReturnType<typeof decideSystemAudioRequest>]> = [
+    ['everything in place', {}, { ok: true }],
+    ['no host seam (older Moss)', { seamAvailable: false }, { ok: false, reason: 'no-seam' }],
+    ['mic not wanted', { micWanted: false }, { ok: false, reason: 'mic-not-wanted' }],
+    ['mic wanted, still acquiring', { micLifecycle: 'acquiring' }, { ok: false, reason: 'mic-not-live' }],
+    ['mic wanted, ended', { micLifecycle: 'ended' }, { ok: false, reason: 'mic-not-live' }],
+    ['mic wanted, failed', { micLifecycle: 'failed' }, { ok: false, reason: 'mic-not-live' }],
+    ['a capture is held', { active: true }, { ok: false, reason: 'already-active' }],
+    ['the picker is up', { pending: true }, { ok: false, reason: 'request-pending' }],
+    ['not wanted beats not live (the row says which to fix first)', { micWanted: false, micLifecycle: 'failed' }, { ok: false, reason: 'mic-not-wanted' }],
+  ];
+  it.each(rows)('%s', (_name, patch, expected) => {
+    expect(decideSystemAudioRequest({ ...base, ...patch })).toEqual(expected);
   });
 });
