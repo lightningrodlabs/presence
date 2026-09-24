@@ -119,6 +119,7 @@ export class TrackHealthMonitor {
           refreshRequestsSent: record?.refreshRequestsSent ?? 0,
           refreshBudget,
           transportPhase: this.bindings.mediaTransport().getPhase(pubKeyB64),
+          iceDisconnected: record?.iceDisconnectedAt !== undefined,
         });
 
         this.bindings.ensurePeerRecord(pubKeyB64).lastBytesReceived = {

@@ -164,6 +164,7 @@ const base: TrackRefreshInputs = {
   refreshRequestsSent: 0,
   refreshBudget: DEAD_TRACK_REFRESH_BUDGET,
   transportPhase: 'connected',
+  iceDisconnected: false,
 };
 
 describe('decideTrackRefresh', () => {
@@ -188,6 +189,36 @@ describe('decideTrackRefresh', () => {
       decideTrackRefresh({
         ...base,
         transportPhase: 'disconnected',
+        audioBytes: 1000,
+        staleCycles: { audio: 2, video: 0 },
+        refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,
+      }).action
+    ).toBe('none');
+  });
+
+  it('holds while ICE is disconnected inside phase connected: counters held, not advanced', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'connected',
+        iceDisconnected: true,
+        audioBytes: 1000,
+        staleCycles: { audio: 1, video: 0 },
+      })
+    ).toEqual({
+      action: 'none',
+      nextStale: { audio: 1, video: 0 },
+      reason: 'transport-recovering',
+      resetRefreshBudget: false,
+    });
+  });
+
+  it('never escalates while ICE is disconnected, even with a spent budget', () => {
+    expect(
+      decideTrackRefresh({
+        ...base,
+        transportPhase: 'connected',
+        iceDisconnected: true,
         audioBytes: 1000,
         staleCycles: { audio: 2, video: 0 },
         refreshRequestsSent: DEAD_TRACK_REFRESH_BUDGET,

@@ -3172,6 +3172,9 @@ describe('TrackMuted/TrackUnmuted forensics on remote tracks (2026-09-24 inciden
 
     track.muted = true;
     track.onmute!();
+    // Log-only: muting touches no slot state.
+    expect(get(store._openConnections)[peerA]?.video).toBe(true);
+    expect(get(store._openConnections)[peerA]?.videoMuted).not.toBe(true);
     const muted = logger.eventsNamed('TrackMuted');
     expect(muted).toHaveLength(1);
     expect(muted[0].agent).toBe(peerA);
@@ -3215,6 +3218,14 @@ describe('TrackMuted/TrackUnmuted forensics on remote tracks (2026-09-24 inciden
 });
 
 describe('stats forensics (2026-09-24 incident, spec Part 2)', () => {
+  // refreshTracksForPeer and the request-refresh arm console.warn by
+  // design; keep the suite output pristine.
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
   const flush = () => new Promise<void>(r => setTimeout(r, 0));
   const statsOf = (reports: Record<string, unknown>[]) => ({
     raw: new Map(reports.map((r, i) => [`r${i}`, r])) as unknown as RTCStatsReport,
@@ -3323,6 +3334,14 @@ describe('stats forensics (2026-09-24 incident, spec Part 2)', () => {
 });
 
 describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
+  // refreshTracksForPeer and the request-refresh arm console.warn by
+  // design; keep the suite output pristine.
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
   const inbound = (audioBytes: number) => ({
     raw: new Map([
       ['a', { type: 'inbound-rtp', kind: 'audio', bytesReceived: audioBytes, packetsReceived: 1 }],
@@ -3417,23 +3436,18 @@ describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
 
   it('(d) a failing refresh send still consumes the budget: a dead data channel must not prevent escalation', async () => {
     const { store, media, logger } = openStalledLink();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      media.send = () => {
-        throw new Error('data channel closed');
-      };
-      // Crossing on poll 3; the stale counters are not reset because the
-      // send failed, so every later poll crosses again: attempts on polls
-      // 3, 4, 5 and escalation on poll 6.
-      await poll(store, 5);
-      expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
-      expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
-      await poll(store, 1);
-      expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
-      expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(1);
-    } finally {
-      warn.mockRestore();
-    }
+    media.send = () => {
+      throw new Error('data channel closed');
+    };
+    // Crossing on poll 3; the stale counters are not reset because the
+    // send failed, so every later poll crosses again: attempts on polls
+    // 3, 4, 5 and escalation on poll 6.
+    await poll(store, 5);
+    expect(store._peerRecord(peerA)?.refreshRequestsSent).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(1);
   });
 
   it('(e) a vanished transport (phase idle, slot still connected) holds: no request, no escalation, no loop (Review Focus 3)', async () => {
@@ -3465,6 +3479,40 @@ describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
     media.emitPhase(peerA, 'conn-1', 'connected', 'reconnecting');
     // lastBytesReceived is still written under the hold, so the first
     // post-recovery poll already counts a stale cycle against the last held sample.
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
+    expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    await poll(store, 1);
+    expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+  });
+
+  it('(g) holds through the FSM\'s ICE-disconnected grace inside phase connected, then resumes', async () => {
+    const { store, media, logger } = openStalledLink();
+    // The FSM stays in phase `connected` while ICE is `disconnected`
+    // (its own grace runs there); the record's iceDisconnectedAt is the
+    // store's one authority for that window.
+    media.emit({
+      type: 'ice-diagnostic',
+      peer: peerA,
+      connectionId: 'conn-1',
+      diag: { kind: 'ice-state', state: 'disconnected' },
+    });
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeDefined();
+    expect(media.getPhase(peerA)).toBe('connected');
+    await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 3);
+    expect(refreshFramesTo(media, peerA)).toBe(0);
+    expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
+    expect(logger.eventsNamed('DeadTrackEscalation')).toHaveLength(0);
+
+    media.emit({
+      type: 'ice-diagnostic',
+      peer: peerA,
+      connectionId: 'conn-1',
+      diag: { kind: 'ice-state', state: 'connected' },
+    });
+    expect(store._peerRecord(peerA)?.iceDisconnectedAt).toBeUndefined();
+    // lastBytesReceived was written under the hold, so the first poll
+    // after it already counts a stale cycle against the last held sample.
     await poll(store, 2 * DEAD_TRACK_REFRESH_BUDGET + 1);
     expect(refreshFramesTo(media, peerA)).toBe(DEAD_TRACK_REFRESH_BUDGET);
     expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);

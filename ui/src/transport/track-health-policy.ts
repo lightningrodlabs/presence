@@ -201,6 +201,16 @@ export type TrackRefreshInputs = {
    * `connected` again. Escalation then resumes on the held counters.
    */
   transportPhase: ConnectionPhase;
+  /**
+   * Whether the peer's media ICE state is currently `disconnected`
+   * (`PeerRecord.iceDisconnectedAt !== undefined`, maintained by
+   * `MediaLinks._handleMediaIceDiagnostic`). The FSM's ICE-disconnected
+   * grace runs INSIDE phase `connected` (it logs `connected->connected
+   * trigger="ICE: disconnected"` before any move to `reconnecting`), so
+   * the phase alone does not see it. Held like a non-`connected` phase:
+   * that window is the FSM's recovery, not ours.
+   */
+  iceDisconnected: boolean;
 };
 
 export type TrackRefreshDecision =
@@ -243,12 +253,13 @@ export type TrackRefreshDecision =
  * `escalate` replaces `request-refresh` once that count reaches
  * `refreshBudget`; a `none` with `resetRefreshBudget` zeroes it.
  *
- * While `transportPhase` is not `connected` the decision holds
- * (`none`/`transport-recovering`, counters frozen, budget not reset): the
- * FSM owns that recovery window.
+ * While `transportPhase` is not `connected`, or `iceDisconnected` is set
+ * (the FSM's ICE-disconnected grace runs inside phase `connected`), the
+ * decision holds (`none`/`transport-recovering`, counters frozen, budget
+ * not reset): the FSM owns that recovery window.
  */
 export function decideTrackRefresh(input: TrackRefreshInputs): TrackRefreshDecision {
-  if (input.transportPhase !== 'connected') {
+  if (input.transportPhase !== 'connected' || input.iceDisconnected) {
     return {
       action: 'none',
       nextStale: { ...input.staleCycles },

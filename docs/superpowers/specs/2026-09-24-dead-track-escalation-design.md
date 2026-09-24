@@ -200,13 +200,27 @@ The executor in `checkTrackHealth`:
   `mediaTransport().closeConnection(peer, 'dead-track-escalation')`.
 
 The decision holds while the media transport's phase for the peer is
-not `connected` (`transportPhase` input): during
+not `connected` (`transportPhase` input) OR the peer's ICE state is
+`disconnected` (`iceDisconnected` input, true while
+`PeerRecord.iceDisconnectedAt` is set by
+`MediaLinks._handleMediaIceDiagnostic`). During
 `reconnecting`/`disconnected` the slot keeps `connected: true` and the
-FSM owns recovery, so no refresh is requested, nothing escalates, and
-the counters and budget are frozen until the phase returns to
-`connected`. On the incident timeline this defers the first escalation
-to about 16 s after `reconnection succeeded` at 10:13:04, which is the
-state the incident was stuck in.
+FSM owns recovery. The FSM's ICE-disconnected grace runs inside phase
+`connected` (it logs `connected->connected trigger="ICE: disconnected"`
+before any move to `reconnecting`), so the phase alone misses that
+window; the final whole-branch review found this. In either case no
+refresh is requested, nothing escalates, and the counters and budget
+are frozen until the phase is `connected` and ICE is not
+`disconnected`.
+
+On the incident timeline (the k1VOFk→SPd link): crossing 1 at
+10:12:31.170 spends one request. ICE goes `disconnected` at
+10:12:33.941, so crossings 2 to 4 (10:12:35.149, 39.149, 43.170) are
+held. ICE returns to `connected` and `reconnection succeeded` at
+10:13:04.5. The held counters resume, and the remaining two requests
+and the escalation land at about +4 s, +8 s and +12 s, so the
+escalation fires at about 10:13:16. That is roughly 58 s before the
+manual Reconnect at 10:14:14.586.
 
 Nothing else is new. `closeConnection` emits `closed` synchronously and
 sends the `leave` signal (`ConnectionManager.closeConnection`).
@@ -261,7 +275,7 @@ Both arms are pinned by the full-object `toEqual` tests in
 
 1. A connected media link whose inbound bytes stay frozen through the
    refresh budget is closed and re-established (Part 1); never while the
-   transport phase is not `connected`. Previously it stayed open
+   transport phase is not `connected` (or while ICE is `disconnected`). Previously it stayed open
    indefinitely.
 2. Log-only additions (Part 2). The close-reason strings change. The
    one wiring test that pins `'disconnectFromPeerVideo'` for
@@ -283,6 +297,7 @@ Both arms are pinned by the full-object `toEqual` tests in
   signal-carried leave, and a new wire action. Trigger: field evidence
   that leave delivery, not carrier-down, is what makes escalation slow.
 - **Re-adding transport `restartIce`.** See "why close".
+- **Decay of `deadTrackEscalations` within a session.** The count resets only on peer-leave, so a peer escalated three times early in a call keeps a 24-request budget (about 100 s of dead media before escalation) for the rest of it. Kept by declaration: the manual Reconnect path is unchanged and the doubling exists to stop loops. Trigger: field logs showing a budget of 12 or more slowing recovery on a peer whose links had healed.
 - **Re-sampling the selected pair every poll**, so the relay icon tracks
   pair changes. `checkTrackHealth` already holds the report. It needs a
   `setRelayed` binding into `MediaLinks`' `_openConnections`. Cosmetic.
