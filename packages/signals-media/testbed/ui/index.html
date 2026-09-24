@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>signals-media testbed</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        padding: 10px 12px;
+      }
+      h1 { font-size: 14px; margin: 0 0 6px; font-weight: 600; }
+      #bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+      #start { font: inherit; padding: 4px 14px; }
+      #who { opacity: .75; }
+      #tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
+      .tile { border: 1px solid rgba(128,128,128,.45); padding: 4px; min-width: 200px; }
+      .tile img { display: block; width: 192px; height: 192px; object-fit: cover; background: #222; image-rendering: auto; }
+      .tile .meta { font-size: 11px; white-space: pre; opacity: .85; margin-top: 3px; }
+      .level { height: 6px; background: rgba(128,128,128,.25); margin-top: 3px; }
+      .level > i { display: block; height: 100%; width: 0; background: #3a9; }
+      #log { white-space: pre-wrap; word-break: break-word; max-height: 45vh; overflow: auto;
+             border-top: 1px solid rgba(128,128,128,.35); padding-top: 6px; font-size: 12px; }
+      #stats { white-space: pre-wrap; font-size: 12px; opacity: .9; margin: 6px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>signals-media testbed</h1>
+    <div id="bar">
+      <button id="start">Start</button>
+      <span id="who"></span>
+    </div>
+    <div id="tiles"></div>
+    <div id="stats"></div>
+    <div id="log"></div>
+    <script type="module" src="./testbed.js"></script>
+  </body>
+</html>

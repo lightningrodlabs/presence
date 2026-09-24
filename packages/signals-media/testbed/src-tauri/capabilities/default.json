@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the testbed window. The page's only app command is `report`, which needs no capability entry (custom commands are gated by the invoke handler, not by permissions).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

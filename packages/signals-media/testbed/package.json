@@ -1,0 +1,29 @@
+{
+  "name": "signals-media-testbed",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Testbed for @lightningrodlabs/signals-media: a WebSocket relay, a selftest/room page, a Tauri (WebKitGTK) shell, and a Chromium Playwright gate.",
+  "scripts": {
+    "relay": "node relay.mjs",
+    "predev": "npm --prefix .. run build",
+    "dev": "vite ui",
+    "prebuild": "npm --prefix .. run build",
+    "build": "vite build ui",
+    "pretest": "npm --prefix .. run build && npm run typecheck",
+    "test": "playwright test",
+    "//tauri": "Required by the Android build, not a convenience: gen/android's rust gradle plugin shells out to `npm run tauri android android-studio-script` to build the cdylib, and without this script the Gradle task dies with `npm error Missing script: \"tauri\"`.",
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@lightningrodlabs/signals-media": "file:.."
+  },
+  "devDependencies": {
+    "@playwright/test": "1.59.1",
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/node": "^22.0.0",
+    "vite": "^6.0.0",
+    "ws": "^8.18.0"
+  }
+}
