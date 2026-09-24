@@ -163,7 +163,7 @@ F4. **Forensic gaps**, listed above.
 
 ## Design
 
-### Part 1: escalation, receiver side
+### Part 1: escalation, receiver side (LANDED, Tasks 3 and 4)
 
 `decideTrackRefresh` (`ui/src/transport/track-health-policy.ts`) gains a
 refresh budget and a third arm:
@@ -238,7 +238,7 @@ machinery that is already field-validated.
 Both arms are pinned by the full-object `toEqual` tests in
 `peer-record.test.ts`.
 
-### Part 2: forensics
+### Part 2: forensics (LANDED, Tasks 1 and 2)
 
 - `TrackMuted` (new `SimpleEventType`). `_handleMediaRemoteTrack`
   installs `track.onmute` on every remote track, and `onunmute` on
@@ -305,6 +305,5 @@ Both arms are pinned by the full-object `toEqual` tests in
 
 ## Definition of done
 
-All five plan tasks are landed on branch `dead-track-escalation`. The
-gate is green. The doc-sync task added the CLAUDE.md "True today"
-bullet. This spec's parts are marked landed.
+Met on branch `dead-track-escalation` at `16d67fb` plus the closing
+doc-sync commit; merge into `main-0.7` is a pending human step.
