@@ -28,6 +28,7 @@ import {
   mdiPencilCircleOutline,
   mdiTransitConnectionVariant,
   mdiCloudDownloadOutline,
+  mdiSubtitlesOutline,
   mdiVideo,
   mdiVideoOff,
   mdiSwapHorizontal,
@@ -74,6 +75,11 @@ import {
   FilmstripFps,
   FilmstripCaptureSize,
 } from './modules/video-filmstrip';
+import './elements/transcription-request-dialog';
+import './transcripts/transcript-view';
+import { pubkeyPrefixLabel, transcriptLines } from './transcripts/export';
+import { SpeakerLabels, profileNicknameFetcher } from './transcripts/speaker-labels';
+import { isTranscribing, transcribingAgents } from './transcripts/transcribing-policy';
 import './logs-graph';
 import {
   downloadJson,
@@ -94,6 +100,13 @@ import {
 import { parseConversationPayload } from './modules/conversation';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
+import {
+  AUTO_ACCEPT_KEY,
+  DEFAULT_TRANSCRIPTION_PAYLOAD,
+  TranscriptionPayload,
+  parseTranscriptionPayload,
+  transcriptionController,
+} from './modules/transcription';
 import './modules'; // side-effect: registers all modules
 import {
   bestColumns,
@@ -111,8 +124,21 @@ import {
   LAYOUT_SWITCH_REAPPLY_DELAY_MS,
   STREAM_EVENT_DOM_SETTLE_MS,
 } from './video-bind';
+import {
+  profilesStoreContext,
+  type ProfilesStore,
+} from '@holochain-open-dev/profiles';
 
 declare const __APP_VERSION__: string;
+
+/**
+ * The Leave button's budget for transcript finalization (stopAndAnnounce
+ * plus the last speaker-label lookup) before the store disconnects. A
+ * UI teardown budget, declared NOT-liveness: it bounds how long a wedged
+ * ASR sidecar or a degraded conductor can hold the user in the room with
+ * mic and camera live, and says nothing about whether a peer is present.
+ */
+export const QUIT_FINALIZE_MAX_MS = 5000;
 
 @localized()
 @customElement('room-view')
@@ -128,6 +154,12 @@ export class RoomView extends LitElement {
   @consume({ context: weaveClientContext })
   @state()
   _weaveClient!: WeaveClient;
+
+  /** Profiles store, used to resolve nicknames for the transcript
+   *  export (and anywhere else we want a display name for a pubkey). */
+  @consume({ context: profilesStoreContext, subscribe: true })
+  @state()
+  private _profilesStore: ProfilesStore | undefined;
 
   @property()
   wal!: WAL;
@@ -253,6 +285,44 @@ export class RoomView extends LitElement {
     this,
     () => this.streamsStore._receiverModuleOverrides,
     () => [this.streamsStore]
+  );
+
+  _transcriptionPendingRequests = new StoreSubscriber(
+    this,
+    () => transcriptionController.pendingRequests,
+    () => [this.streamsStore],
+  );
+
+  _transcriptionStarting = new StoreSubscriber(
+    this,
+    () => transcriptionController.isStarting,
+    () => [this.streamsStore],
+  );
+
+  _transcriptionCapturing = new StoreSubscriber(
+    this,
+    () => transcriptionController.isCapturing,
+    () => [this.streamsStore],
+  );
+
+  /**
+   * Releases the ONE subscription to the controller's `lastError`, taken
+   * in firstUpdated. The controller is a module singleton that outlives
+   * every room-view, so disconnectedCallback must release it.
+   */
+  private _transcriptionErrorUnsub: (() => void) | null = null;
+
+  _transcriptLog = new StoreSubscriber(
+    this,
+    () => this.streamsStore._transcriptLog,
+    () => [this.streamsStore],
+  );
+
+  /** The visit being recorded, shown in the connection-details pane. */
+  _liveVisit = new StoreSubscriber(
+    this,
+    () => transcriptionController.liveVisit,
+    () => [this.streamsStore],
   );
 
   _audioInputDevices = new StoreSubscriber(
@@ -457,12 +527,307 @@ export class RoomView extends LitElement {
     }, 4000);
   }
 
-  quitRoom() {
+  async quitRoom() {
+    // Transcript finalization before leaving: both steps await host round
+    // trips (Moss ASR, profile zome calls) with no timeout of their own,
+    // so they share one bounded budget, QUIT_FINALIZE_MAX_MS. Past it the
+    // user leaves anyway; a closing ASR commit that lands later still
+    // reaches the visit, because the controller keeps its store until
+    // capture has stopped (see TranscriptionController.unbind).
+    const finalize = (async () => {
+      // Announce completion so peers can tell our transcript is whole
+      // before our signals stop; the visit itself is closed by the
+      // controller when the store unbinds.
+      const myTx = parseTranscriptionPayload(
+        (this._myModuleStates.value || {})['transcription'] ?? null,
+      );
+      if (myTx?.enabled || myTx?.requested) {
+        try {
+          await transcriptionController.stopAndAnnounce();
+        } catch (e) {
+          console.error('transcription: stopAndAnnounce on quit failed', e);
+        }
+      }
+      // One more lookup for every speaker of this visit still unlabelled,
+      // re-asking those whose lookup failed, so the labels the controller
+      // freezes into the record at the visit's end are as complete as they
+      // can be.
+      try {
+        await this._speakerLabels.refresh(Array.from(this._transcriptLog.value?.keys() ?? []), {
+          retryFailed: true,
+        });
+      } catch (e) {
+        console.error('transcription: speaker label lookup on quit failed', e);
+      }
+    })();
+    const clock = this.streamsStore.clock;
+    let timer: number | undefined;
+    const budget = new Promise<'timeout'>(resolve => {
+      timer = clock.setTimeout(() => resolve('timeout'), QUIT_FINALIZE_MAX_MS);
+    });
+    const outcome = await Promise.race([finalize.then(() => 'done' as const), budget]);
+    clock.clearTimeout(timer);
+    if (outcome === 'timeout') {
+      console.warn(`transcription: finalization on quit exceeded ${QUIT_FINALIZE_MAX_MS}ms; leaving anyway`);
+    }
     this.streamsStore.disconnect('quitRoom-button');
     this.streamsStore.logger.endSession();
     this.dispatchEvent(
       new CustomEvent('quit-room', { bubbles: true, composed: true })
     );
+  }
+
+  /**
+   * Nicknames of this call's speakers, so the connection-details pane
+   * and the labels frozen into the visit record don't depend on the lazy
+   * profiles store being hot at the moment they are read.
+   */
+  private _speakerLabels = new SpeakerLabels(pk => {
+    const store = this._profilesStore;
+    if (!store) return Promise.reject(new Error('profiles store not available'));
+    return profileNicknameFetcher(store)(pk);
+  });
+
+  /**
+   * Looks up the nickname of each speaker the transcript log has gained
+   * since the last render, so labels are known before the visit ends.
+   * Also covers agents currently transcribing but not yet in the log
+   * (their first frame hasn't landed), so the pane title's name list
+   * doesn't fall back to a truncated pubkey while a lookup is pending.
+   * Runs on every render, so failed lookups are left for `quitRoom`.
+   */
+  private _requestNewSpeakerLabels(): void {
+    const log = this._transcriptLog.value;
+    if (!log || !this._profilesStore) return;
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const pks = new Set(log.keys());
+    for (const pk of transcribingAgents(
+      myPubKeyB64,
+      this._myModuleStates.value,
+      this._peerModuleStates.value,
+    )) {
+      if (pk !== myPubKeyB64) pks.add(pk);
+    }
+    void this._speakerLabels.refresh(Array.from(pks));
+  }
+
+  /**
+   * Live transcript of the visit in progress, from every speaker,
+   * rendered by the same `transcript-view` the transcripts dialog uses.
+   * Visible only while "connection details" is toggled on. Auto-scrolls
+   * to bottom on update — see the scroll logic in `updated()`.
+   */
+  private _renderTranscriptionPane() {
+    if (!this._showConnectionDetails) return html``;
+    const visit = this._liveVisit.value ?? null;
+    const labelFor = (pk: AgentPubKeyB64) => this._speakerLabels.get(pk);
+    const count = visit ? transcriptLines(visit, labelFor).length : 0;
+    const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+    const transcribing = transcribingAgents(
+      myPubKeyB64,
+      this._myModuleStates.value,
+      this._peerModuleStates.value,
+    );
+    const nameFor = (pk: AgentPubKeyB64) =>
+      pk === myPubKeyB64 ? msg('you') : this._speakerLabels.get(pk) ?? pubkeyPrefixLabel(pk);
+    return html`
+      <div class="transcription-pane">
+        <div class="transcription-pane-title">
+          <sl-icon .src=${wrapPathInSvg(mdiSubtitlesOutline)}></sl-icon>
+          <span>Transcription (${count})</span>
+          <span class="transcription-pane-subtitle">
+            ${transcribing.length > 0
+              ? `· ${msg('transcribing')}: ${transcribing.map(nameFor).join(', ')}`
+              : `· ${msg('nobody transcribing')}`}
+          </span>
+        </div>
+        <div class="transcription-pane-body">
+          <transcript-view
+            .transcript=${visit}
+            .labelFor=${labelFor}
+          ></transcript-view>
+        </div>
+      </div>
+    `;
+  }
+
+  /**
+   * Header button click — toggle own call-transcription request.
+   *
+   * Clicking activates the transcription module with both `enabled`
+   * and `requested` set; the requester is always also a transcriber.
+   * Clicking again deactivates.
+   *
+   * If the Moss ASR host isn't available the button is rendered
+   * disabled, so this handler only fires when activation is viable.
+   */
+  private async _toggleTranscriptionRequest() {
+    const current = parseTranscriptionPayload(
+      (this._myModuleStates.value || {})['transcription'] ?? null,
+    );
+    if (current?.enabled || current?.requested) {
+      // stopAndAnnounce broadcasts a finalSeq-carrying payload so
+      // peers can distinguish "complete" from "unknown" at save time,
+      // then deactivates — which fires onDeactivate → stopCapture.
+      await transcriptionController.stopAndAnnounce();
+      return;
+    }
+    const payload: TranscriptionPayload = {
+      ...DEFAULT_TRANSCRIPTION_PAYLOAD,
+      enabled: true,
+      requested: true,
+    };
+    // `activateModule` fires onActivate, which starts capture. A failed
+    // start reverts the module state inside the controller
+    // (`startCapture`'s failure arm), the same rule acceptRequest gets.
+    await this.streamsStore.activateModule(
+      'transcription',
+      JSON.stringify(payload),
+    );
+  }
+
+  private async _handleTranscriptionAccept(e: CustomEvent) {
+    const { requester, remember } = e.detail as {
+      requester: AgentPubKeyB64;
+      remember: boolean;
+    };
+    if (remember) writeLocalStorage(AUTO_ACCEPT_KEY, true);
+    await transcriptionController.acceptRequest(requester);
+  }
+
+  private _handleTranscriptionDecline(e: CustomEvent) {
+    const { requester, remember } = e.detail as {
+      requester: AgentPubKeyB64;
+      remember: boolean;
+    };
+    if (remember) writeLocalStorage(AUTO_ACCEPT_KEY, true);
+    transcriptionController.declineRequest(requester);
+  }
+
+  /**
+   * True if the Moss host exposes a functional ASR pipeline. Checked
+   * once on firstUpdated and cached. Controls the header button's
+   * enabled state.
+   */
+  @state()
+  private _asrAvailable: boolean | undefined = undefined;
+
+  private async _probeAsrAvailability() {
+    // The store is the one authority on the host's local-model seam
+    // (bound once in StreamsStore.connect).
+    const localModels = this.streamsStore.localModels;
+    if (!localModels) {
+      this._asrAvailable = false;
+      return;
+    }
+    try {
+      const caps = await localModels.capabilities();
+      this._asrAvailable = !!caps?.asr?.available;
+    } catch {
+      this._asrAvailable = false;
+    }
+  }
+
+  private _renderTranscriptionToolbarButton() {
+    // A host with no local-model seam (a Moss older than the feature)
+    // cannot transcribe, and its settings have no Services →
+    // Transcription page to point at: the entry is absent, not disabled.
+    if (!this.streamsStore.localModels) return html``;
+    // Hide until the capability probe completes; avoids flicker where
+    // the button first renders disabled and then enables.
+    if (this._asrAvailable === undefined) return html``;
+    const mine = parseTranscriptionPayload(
+      (this._myModuleStates.value || {})['transcription'] ?? null,
+    );
+    const activated = !!(mine?.enabled || mine?.requested);
+    const capturing = this._transcriptionCapturing.value === true;
+    const starting = this._transcriptionStarting.value === true;
+    const asrUnavailable = !this._asrAvailable;
+
+    // Button-color semantics (activated = module is on; capturing =
+    // audio is actually flowing to whisper):
+    //   - not activated                    → darkened off-state
+    //   - activated, not capturing (paused — mic muted)
+    //                                      → on-state blue with YELLOW dot
+    //   - activated and capturing          → on-state blue with GREEN  dot
+    // Pausing is tied to the mic button, not the transcribe button, so
+    // the transcribe button must keep signaling "transcription is on"
+    // while the mic is muted — with the dot distinguishing paused vs
+    // actively flowing.
+    const offClass = activated ? '' : 'btn-off';
+    const iconOffClass = activated ? '' : 'btn-icon-off';
+
+    const tooltip = asrUnavailable
+      ? msg('Local transcription not enabled in Moss — click for details')
+      : starting
+        ? msg('Starting transcription…')
+        : capturing
+          ? msg('Transcribing — click to stop')
+          : activated
+            ? msg('Transcription on (paused while mic is muted)')
+            : msg('Transcribe this call');
+
+    return html`
+      <sl-tooltip content=${tooltip} hoist>
+        <div
+          class="toggle-btn ${offClass}"
+          tabindex="0"
+          @click=${() => this._handleTranscriptionButtonClick()}
+          @keypress=${(e: KeyboardEvent) => {
+            if (e.key === 'Enter') this._handleTranscriptionButtonClick();
+          }}
+        >
+          <sl-icon
+            class="toggle-btn-icon ${iconOffClass}"
+            .src=${wrapPathInSvg(mdiSubtitlesOutline)}
+          ></sl-icon>
+          ${activated
+            ? html`<div
+                class="transcription-status-dot ${starting
+                  ? 'starting'
+                  : capturing
+                    ? 'live'
+                    : 'paused'}"
+                title=${starting
+                  ? msg('starting the speech model')
+                  : capturing
+                    ? msg('transcribing')
+                    : msg('paused — unmute mic to resume')}
+              ></div>`
+            : html``}
+        </div>
+      </sl-tooltip>
+    `;
+  }
+
+  private _handleTranscriptionButtonClick() {
+    if (!this._asrAvailable) {
+      this.notifyError(
+        msg(
+          'You need to enable Transcription in Moss settings (Services → Transcription).',
+        ),
+      );
+      return;
+    }
+    this._toggleTranscriptionRequest();
+  }
+
+  private _renderTranscriptionRequestPrompt() {
+    const pending = this._transcriptionPendingRequests.value;
+    if (!pending || pending.size === 0) return html``;
+    // Show one requester at a time. The iterator order on a Set is
+    // insertion order, so "first requester wins" — subsequent
+    // requesters surface after this one is resolved.
+    const requester = pending.values().next().value as AgentPubKeyB64;
+    const offerRemember = readLocalStorage<boolean>(AUTO_ACCEPT_KEY, false) === false;
+    return html`
+      <transcription-request-dialog
+        .requester=${requester}
+        ?offer-remember=${offerRemember}
+        @transcription-accept=${(e: CustomEvent) => this._handleTranscriptionAccept(e)}
+        @transcription-decline=${(e: CustomEvent) => this._handleTranscriptionDecline(e)}
+      ></transcription-request-dialog>
+    `;
   }
 
   // --- Task 6: intent-derived toggle state and the diff surfaces --------
@@ -715,6 +1080,19 @@ export class RoomView extends LitElement {
     window.addEventListener('resize', this._onWindowResize);
     this._updateGrid();
     this.streamsStore.onEvent(event => this._onStoreEvent(event));
+    this._probeAsrAvailability();
+    // Relay controller-level transcription errors to the error overlay.
+    // The controller writes `lastError` on any failure path (session
+    // reject, mid-session error, capability change). We surface it and
+    // immediately clear so subsequent errors of the same string still
+    // trigger a fresh notify.
+    this._transcriptionErrorUnsub?.();
+    this._transcriptionErrorUnsub = transcriptionController.lastError.subscribe(err => {
+      if (err) {
+        this.notifyError(err);
+        transcriptionController.lastError.set(null);
+      }
+    });
     this._leaveAudio.volume = 0.05;
     this._joinAudio.volume = 0.07;
 
@@ -726,6 +1104,9 @@ export class RoomView extends LitElement {
     // while media kept flowing.
 
     this._roomInfo = await this.roomStore.client.getRoomInfo();
+
+    transcriptionController.setVisitRoomName(this.roomName());
+    transcriptionController.setSpeakerLabelResolver(pk => this._speakerLabels.get(pk));
 
     // _unsubscribe is cleared in disconnectedCallback; without retaining
     // it here the callback keeps firing requestUpdate() on the detached
@@ -826,6 +1207,7 @@ export class RoomView extends LitElement {
     }
     this._updateGrid();
     this._ensurePeerVideoStreams();
+    this._requestNewSpeakerLabels();
   }
 
   /**
@@ -848,6 +1230,24 @@ export class RoomView extends LitElement {
         this.streamsStore._peerRecord(pubkeyB64)?.videoStream,
         'ensure'
       );
+    }
+    // Auto-scroll the live transcription pane to bottom on every
+    // update. Cheap: setting scrollTop to scrollHeight is a no-op
+    // when content didn't grow. If the user has manually scrolled
+    // up to read, this will fight them — acceptable for a debug
+    // pane; revisit if it becomes annoying.
+    if (this._showConnectionDetails) {
+      const pane = this.shadowRoot?.querySelector(
+        '.transcription-pane-body',
+      ) as HTMLElement | null;
+      if (pane) {
+        pane.scrollTop = pane.scrollHeight;
+        // transcript-view renders in its own update cycle, after this one.
+        const view = pane.querySelector('transcript-view') as LitElement | null;
+        void view?.updateComplete.then(() => {
+          pane.scrollTop = pane.scrollHeight;
+        });
+      }
     }
   }
 
@@ -1051,6 +1451,8 @@ export class RoomView extends LitElement {
     // listeners attached (item 4b(2)).
     this._releaseResizeListeners?.();
     if (this._unsubscribe) this._unsubscribe();
+    this._transcriptionErrorUnsub?.();
+    this._transcriptionErrorUnsub = null;
     this.removeEventListener('click', this.sideClickListener);
     this.streamsStore.disconnect('room-view-disconnectedCallback');
     // The super call is what runs hostDisconnected on the reactive
@@ -2196,6 +2598,8 @@ export class RoomView extends LitElement {
         </sl-tooltip>
 
 
+        ${this._renderTranscriptionToolbarButton()}
+
         <sl-tooltip content="${msg('Leave Call')}" hoist>
           <div
             class="btn-stop"
@@ -2697,6 +3101,24 @@ export class RoomView extends LitElement {
   }
 
   /**
+   * Subtitles icon shown next to a tile's other connection-detail status
+   * icons when that agent (self or peer, same module-state shape either
+   * way) has transcription `enabled`. One rendering for both the self
+   * tile and peer tiles — `isTranscribing` is the one predicate.
+   */
+  private _renderTranscribingIcon(states: Record<string, ModuleStateEnvelope> | undefined) {
+    if (!isTranscribing(states)) return html``;
+    return html`
+      <sl-tooltip hoist class="tooltip-filled" placement="top" content="${msg('Transcribing')}">
+        <sl-icon
+          class="transcribing-icon"
+          .src=${wrapPathInSvg(mdiSubtitlesOutline)}
+        ></sl-icon>
+      </sl-tooltip>
+    `;
+  }
+
+  /**
    * One present peer's tile. Body lifted verbatim from the former inline
    * repeat() callback in render(); ordering lives in _orderedTiles.
    */
@@ -2833,6 +3255,7 @@ export class RoomView extends LitElement {
             <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
               ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
               ${this._renderCarrierToggle(pubkeyB64)}
+              ${this._renderTranscribingIcon(this._peerModuleStates.value?.[pubkeyB64])}
             </div>
             <peer-stats-panel
               .streamsStore=${this.streamsStore}
@@ -3423,6 +3846,7 @@ export class RoomView extends LitElement {
             </div>
           `
         : html``}
+      ${this._renderTranscriptionPane()}
       <div class="row center-content room-name">
         ${this.private
           ? html`<sl-icon
@@ -3432,6 +3856,7 @@ export class RoomView extends LitElement {
           : html``}
         ${this.roomName()}
       </div>
+      ${this._renderTranscriptionRequestPrompt()}
       ${(() => {
         // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
         // carrier banner while the signal carrier is down. Copy + elapsed
@@ -3528,9 +3953,10 @@ export class RoomView extends LitElement {
           <!-- Connection states indicators -->
           ${this._showConnectionDetails
             ? html`<div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
+                style="display: flex; flex-direction: row; align-items: center; gap: 6px; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
               >
                 ${this.renderAgentConnectionStatuses('my-video')}
+                ${this._renderTranscribingIcon(this._myModuleStates.value)}
               </div>`
             : html``}
 
@@ -3818,6 +4244,7 @@ export class RoomView extends LitElement {
         left: 15px;
         color: #6f7599;
       }
+
 
       .toggle-switch-container {
         position: absolute;
@@ -4500,6 +4927,42 @@ export class RoomView extends LitElement {
         background: #17529f;
       }
 
+      /* Transcription-button status dot. Sits in the top-right of
+         the toolbar circle. Yellow = module activated but mic muted
+         (paused); green = actively transcribing. Only rendered when
+         the transcription module is activated, so the button-color
+         stays blue throughout and the dot tells the user whether
+         audio is really flowing. */
+      .transcription-status-dot {
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid #0e142c;
+        box-sizing: border-box;
+      }
+
+      .transcription-status-dot.paused {
+        background: #e7a008;
+      }
+      .transcription-status-dot.starting {
+        background: #6aa7ff;
+        animation: transcription-dot-pulse 0.8s ease-in-out infinite;
+      }
+
+      .transcription-status-dot.live {
+        background: #7adc7a;
+        /* gentle pulse so the user gets a live indicator */
+        animation: transcription-dot-pulse 1.6s ease-in-out infinite;
+      }
+
+      @keyframes transcription-dot-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(122, 220, 122, 0.5); }
+        50% { box-shadow: 0 0 0 4px rgba(122, 220, 122, 0); }
+      }
+
       .btn-off {
         background: #22365c;
       }
@@ -4764,6 +5227,67 @@ export class RoomView extends LitElement {
 
       .logs-graph-btn:hover {
         background: #bdbbf2;
+      }
+
+      .transcription-pane {
+        position: fixed;
+        top: 90px;
+        left: 10px;
+        z-index: 9;
+        width: 360px;
+        max-height: 260px;
+        display: flex;
+        flex-direction: column;
+        background: rgba(14, 20, 44, 0.92);
+        border: 1px solid #2a3660;
+        border-radius: 6px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+        font-family: sans-serif;
+        font-size: 12px;
+        color: #d8dce8;
+        overflow: hidden;
+        text-align: left;
+      }
+
+      .transcription-pane-title {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 6px;
+        background: rgba(42, 54, 96, 0.6);
+        font-weight: 500;
+        font-size: 13px;
+      }
+
+      .transcription-pane-title sl-icon {
+        font-size: 16px;
+      }
+
+      .transcription-pane-subtitle {
+        color: #9aa5c9;
+        font-weight: 400;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .transcribing-icon {
+        color: #5ee69c;
+        height: 24px;
+        width: 24px;
+      }
+
+      .transcription-pane-body {
+        overflow-y: auto;
+        padding: 6px 0;
+        max-height: 220px;
+        scroll-behavior: smooth;
+      }
+
+      .transcription-pane-body transcript-view {
+        padding: 0 8px;
+        --transcript-text-color: #d8dce8;
+        --transcript-muted-color: #7a88b0;
       }
 
       .custom-log-dialog {

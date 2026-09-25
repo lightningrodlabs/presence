@@ -10,7 +10,7 @@ import {
   SDP_BACKSTOP_RETRY_HEADROOM_MS,
 } from '../streams-store';
 import { ManualClock } from '../clock.testing';
-import { makeFakeDeps, FakeLogger } from '../store-deps.testing';
+import { makeFakeDeps, FakeLogger, FakeKeyValueStore } from '../store-deps.testing';
 import type { FakeDeps, FakeTransport } from '../store-deps.testing';
 import {
   PING_INTERVAL,
@@ -33,7 +33,8 @@ import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
-import type { AudioSourceCapture } from '@theweave/api';
+import type { AudioSourceCapture, LocalModelsApi, WeaveClient } from '@theweave/api';
+import type { RoomStore } from '../room/room-store';
 
 /**
  * Phase 6 item 2 — the point of the phase: the wiring between the pure
@@ -3518,5 +3519,86 @@ describe('dead-track escalation (2026-09-24 incident, spec Part 1)', () => {
     expect(media.closeCalls.some(c => c.peer === peerA)).toBe(false);
     await poll(store, 1);
     expect(media.closeCalls).toContainEqual({ peer: peerA, reason: 'dead-track-escalation' });
+  });
+});
+
+describe('StreamsStore.connect carries both host seams (release 0.16.0 Review Focus 3)', () => {
+  // Drives the PRODUCTION static connect — the one place room-container
+  // binds the host — rather than the constructor, so a connect signature
+  // that drops or reorders a seam fails here. connect's own ambient reads
+  // (window storage + page-lifecycle listeners, document visibility,
+  // navigator.mediaDevices) are stubbed as globals; everything else is
+  // connect's real glue, including systemClock timers that disconnect()
+  // disarms.
+  beforeEach(() => {
+    const noop = () => {};
+    vi.stubGlobal('window', {
+      localStorage: new FakeKeyValueStore(),
+      sessionStorage: new FakeKeyValueStore(),
+      addEventListener: noop,
+      removeEventListener: noop,
+    });
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: noop,
+      removeEventListener: noop,
+    });
+    vi.stubGlobal('navigator', {
+      mediaDevices: { enumerateDevices: async () => [], ondevicechange: null },
+    });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('connect(…, captureAudioSources, weaveClient, roomKey) exposes both seams on the store', async () => {
+    const roomStore = {
+      client: {
+        client: { myPubKey },
+        onSignal: () => () => {},
+        sendMessage: async () => {},
+      },
+      allAgents: {
+        subscribe(cb: (val: unknown) => void) {
+          cb({ status: 'complete', value: [] });
+          return () => {};
+        },
+      },
+    } as unknown as RoomStore;
+    const fakeCaptureAudioSources = async () => null;
+    const fakeLocalModels = {
+      asr: { warmUp: async () => {} },
+    } as unknown as LocalModelsApi;
+    const fakeWeaveClient = { localModels: fakeLocalModels } as Pick<WeaveClient, 'localModels'>;
+
+    const store = await StreamsStore.connect(
+      roomStore,
+      async () => '',
+      new FakeLogger().asPresenceLogger(),
+      fakeCaptureAudioSources,
+      fakeWeaveClient,
+      'room-key'
+    );
+
+    try {
+      // Which assertion catches which dropped argument (all three are
+      // required parameters, so tsc rejects each drop first; these are
+      // the runtime backstop, checked by hand as negative controls):
+      //   - captureAudioSources dropped: weaveClient shifts into the
+      //     capture slot, so canCaptureAudioSources STILL reads true —
+      //     the localModels assertion is the one that fails.
+      //   - weaveClient dropped: 'room-key' shifts into its slot —
+      //     localModels fails (and transcripts.roomKey too).
+      //   - roomKey dropped: transcripts.roomKey fails.
+      //   - capture seam passed as undefined: canCaptureAudioSources fails.
+      expect(store.canCaptureAudioSources).toBe(true);
+      expect(store.localModels).toBe(fakeLocalModels);
+      expect(store.transcripts?.roomKey).toBe('room-key');
+    } finally {
+      // Inside the test, while the global stubs are still installed —
+      // not left to the suite's afterEach, whose order against this
+      // describe's unstub hook would otherwise decide what disconnect sees.
+      store.disconnect('wiring-test-connect-seams');
+    }
   });
 });

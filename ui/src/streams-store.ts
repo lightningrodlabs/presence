@@ -86,6 +86,10 @@ import { MediaLinks } from './media-links';
 import { PresenceLoop } from './presence-loop';
 import { voiceController } from './room/modules/voice';
 import { filmstripController } from './room/modules/video-filmstrip';
+import { transcriptionController } from './room/modules/transcription';
+import type { TranscriptEntry } from './room/modules/transcription';
+import { getTranscriptStore } from './room/transcripts/store';
+import type { LocalModelsApi, WeaveClient } from '@theweave/api';
 import { getStreamInfo } from './utils';
 import { parseSignalPayload } from './signal-payload';
 import { encodeRtcAction } from './rtc-message-policy';
@@ -481,6 +485,21 @@ export class StreamsStore {
    *  retry state (Task 3; see capture-reconciler.ts). Assigned in start(). */
   captureReconciler!: CaptureReconciler;
 
+  /**
+   * Per-speaker transcript accumulator, written by the transcription
+   * module's receive-side handler (and by the local ASR pipeline
+   * routing its own finals through the same path so `myPubKey`
+   * entries land here too). Consumer: room-view, which reads its
+   * speaker keys for nickname lookups during the call and on Leave
+   * (`_requestNewSpeakerLabels`, `quitRoom`). The exit-time save
+   * prompt that once read it was removed by the room-transcripts
+   * work; stored transcripts come from the controller's visit record.
+   *
+   * Keyed by speaker AgentPubKeyB64. Entries within a speaker are
+   * ordered by `tStart`.
+   */
+  _transcriptLog: Writable<Map<AgentPubKeyB64, TranscriptEntry[]>> = writable(new Map());
+
   /** The ONE owner of the per-peer WebRTC AnalyserNode surface (store-
    *  decomposition round two, Task 1; see peer-audio-levels.ts). */
   peerAudioLevels: PeerAudioLevels = new PeerAudioLevels({
@@ -570,6 +589,16 @@ export class StreamsStore {
   screenShareOutTransport!: PeerTransport;
   screenShareInTransport!: PeerTransport;
 
+  /**
+   * The host's on-device model surface, if the Moss this store runs
+   * inside provides one. Read by the transcription controller to open
+   * ASR sessions; undefined on hosts without local models, in which
+   * case transcription reports itself unavailable rather than failing.
+   */
+  readonly localModels: LocalModelsApi | undefined;
+  /** Transcript persistence for this room; undefined when not wired. */
+  readonly transcripts: StreamsStoreDeps['transcripts'];
+
   constructor(
     deps: StreamsStoreDeps,
     screenSourceSelection: () => Promise<string>,
@@ -581,6 +610,8 @@ export class StreamsStore {
     this.logger = logger;
     this.captureAudioSources = captureAudioSources;
     this.clock = deps.clock;
+    this.localModels = deps.localModels;
+    this.transcripts = deps.transcripts;
     this.myPubKeyB64 = encodeHashToBase64(deps.bus.myPubKey);
     this._localIntent = writable(initialLocalIntent(this.deps.storage.local));
     this.mediaSettings = new MediaSettings({
@@ -1008,8 +1039,9 @@ export class StreamsStore {
     });
   }
 
-  /** Bind the voice/filmstrip controllers so their receive side works
-   *  regardless of local mic/camera state. Unbind happens in disconnect(). */
+  /** Bind the voice/filmstrip/transcription controllers so their receive
+   *  side works regardless of local mic/camera state. Unbind happens in
+   *  disconnect(). */
   private _startMediaControllers(): void {
     // Bind controllers permanently so the receive side (decoders /
     // playback) works regardless of whether the local mic / camera is
@@ -1017,6 +1049,7 @@ export class StreamsStore {
     // disconnect().
     voiceController.bind(this);
     filmstripController.bind(this);
+    transcriptionController.bind(this);
   }
 
   /** Subscribe to `_signalsTargets` to drive the per-tick signals-carrier
@@ -1403,7 +1436,12 @@ export class StreamsStore {
     roomStore: RoomStore,
     screenSourceSelection: () => Promise<string>,
     logger: PresenceLogger,
-    captureAudioSources?: CaptureAudioSourcesFn
+    // The two host seams are `| undefined` (absent on hosts without the
+    // feature) but not optional: every argument is positional and
+    // required, so tsc rejects a call that drops one and shifts the rest.
+    captureAudioSources: CaptureAudioSourcesFn | undefined,
+    weaveClient: Pick<WeaveClient, 'localModels'> | undefined,
+    roomKey: string
   ): Promise<StreamsStore> {
     // The production deps record — the ONE place the ambient world is
     // bound to the store. It reproduces the pre-Phase-6 ambient reads
@@ -1425,6 +1463,8 @@ export class StreamsStore {
       },
       transportFactory: (_purpose, options) => new FsmTransport(options),
       mediaDevices: navigator.mediaDevices,
+      localModels: weaveClient?.localModels,
+      transcripts: { store: getTranscriptStore(), roomKey },
     };
     const streamsStore = new StreamsStore(
       deps,
@@ -1591,6 +1631,7 @@ export class StreamsStore {
       this._filmstripEncoderRunning = false;
     }
     filmstripController.unbind();
+    transcriptionController.unbind();
   }
 
   /** Unsubscribe the signals-targets subscription (kept here, not with

@@ -1,3 +1,5 @@
+import type { LocalModelsApi } from '@theweave/api';
+import type { TranscriptStore } from './room/transcripts/store';
 /**
  * StreamsStoreDeps — the ambient world `StreamsStore` runs against, as one
  * injected record (Phase 6 item 1).
@@ -91,4 +93,10 @@ export type StreamsStoreDeps = {
   bus: SignalBus;
   transportFactory: TransportFactory;
   mediaDevices: MediaDevicesDep;
+  /** The host's local-model surface (`WeaveClient.localModels`), when the
+   *  host provides one. Consumed only by the transcription controller. */
+  localModels?: LocalModelsApi;
+  /** Where this room's transcripts are kept and the key they are filed
+   *  under. Absent in tests that do not exercise transcripts. */
+  transcripts?: { store: TranscriptStore; roomKey: string };
 };

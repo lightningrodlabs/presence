@@ -66,6 +66,7 @@ import './lobby/private-room-card';
 import './lobby/shared-room-card';
 import './lobby/list-online-agents';
 import './lobby/room-online-agents';
+import './room/transcripts/transcripts-button';
 import { sharedStyles } from './sharedStyles';
 import { RoomClient } from './room/room-client';
 import { exportLogs, clearAllLogs } from './logging';
@@ -84,6 +85,8 @@ import {
   PassivePresenceTracker,
 } from './passive-presence';
 import { RoomStore } from './room/room-store';
+import { roomTranscriptKey } from './room/transcripts/store';
+import { AUTO_ACCEPT_KEY } from './room/modules/transcription';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
 
 declare const __APP_VERSION__: string;
@@ -196,6 +199,11 @@ export class PresenceApp extends LitElement {
 
   @state()
   _trickleICE = JSON.parse(window.localStorage.getItem('trickleICE') ?? 'true');
+
+  @state()
+  _autoAcceptTranscription = JSON.parse(
+    window.localStorage.getItem(AUTO_ACCEPT_KEY) ?? 'false'
+  );
 
   @state()
   _turnUrl = window.localStorage.getItem('turnUrl') ?? '';
@@ -1231,6 +1239,25 @@ export class PresenceApp extends LitElement {
             >trickle ICE (ON by default)</span
           >
         </div>
+        <div class="row items-center" style="margin-top: 8px;">
+          <toggle-switch
+            class="toggle-switch ${this._autoAcceptTranscription ? 'active' : ''}"
+            .toggleState=${this._autoAcceptTranscription}
+            @toggle-on=${() => {
+              this._autoAcceptTranscription = true;
+              window.localStorage.setItem(AUTO_ACCEPT_KEY, 'true');
+            }}
+            @toggle-off=${() => {
+              this._autoAcceptTranscription = false;
+              window.localStorage.setItem(AUTO_ACCEPT_KEY, 'false');
+            }}
+          ></toggle-switch>
+          <span
+            class="secondary-font"
+            style="color: #c3c9eb; margin-left: 10px; font-size: 18px;"
+            >auto-accept transcription requests</span
+          >
+        </div>
         <div style="margin-top: 16px; width: 100%;">
           <span
             class="secondary-font"
@@ -1587,17 +1614,29 @@ export class PresenceApp extends LitElement {
                     ></room-online-agents>
                   </div>`
                 : ''}
-              <button
-                class="enter-main-room-btn"
-                ?disabled=${!this._currentRoomDnaB64}
-                @click=${async () => {
-                  if (this._currentRoomDnaB64) {
-                    await this._enterRoom(this._currentRoomDnaB64);
-                  }
-                }}
-              >
-                ${msg('Enter')}
-              </button>
+              <div class="row center-content" style="gap: 12px;">
+                <button
+                  class="enter-main-room-btn"
+                  ?disabled=${!this._currentRoomDnaB64}
+                  @click=${async () => {
+                    if (this._currentRoomDnaB64) {
+                      await this._enterRoom(this._currentRoomDnaB64);
+                    }
+                  }}
+                >
+                  ${msg('Enter')}
+                </button>
+                ${this._currentRoomDnaB64 && this._selectedRoleName
+                  ? html`<transcripts-button
+                      class="enter-transcripts-btn"
+                      .roomKey=${roomTranscriptKey(
+                        this._currentRoomDnaB64,
+                        this._selectedRoleName
+                      )}
+                      .roomName=${this._currentRoomName ?? msg('this room')}
+                    ></transcripts-button>`
+                  : ''}
+              </div>
             </div>
           </div>
         `;
@@ -1926,6 +1965,13 @@ export class PresenceApp extends LitElement {
         color: #e1e5fc;
         padding: 20px;
         box-sizing: border-box;
+      }
+
+      .enter-transcripts-btn {
+        font-size: 20px;
+        --bg-color: #2a4a8f;
+        --bg-color-hover: #3558a0;
+        color: #fff0f0;
       }
 
       .room-already-open-card {

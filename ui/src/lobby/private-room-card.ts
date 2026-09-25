@@ -19,11 +19,13 @@ import '@shoelace-style/shoelace/dist/components/icon/icon';
 import '@shoelace-style/shoelace/dist/components/tooltip/tooltip';
 
 import '../room/room-container';
+import '../room/transcripts/transcripts-button';
 import { consume } from '@lit/context';
 import { sharedStyles } from '../sharedStyles';
 import { clientContext } from '../contexts';
 import { RoomClient } from '../room/room-client';
 import { RoomInfo } from '../types';
+import { roomTranscriptKey } from '../room/transcripts/store';
 
 @localized()
 @customElement('private-room-card')
@@ -121,7 +123,17 @@ export class PrivateRoomCard extends LitElement {
         </div>
         <span style="display: flex; flex: 1;"></span>
 
-        <div class="column" style="justify-content: flex-start;">
+        <div class="row" style="align-items: flex-start;">
+          ${this.clonedCell
+            ? html`<transcripts-button
+                class="transcripts-btn"
+                .roomKey=${roomTranscriptKey(
+                  encodeHashToBase64(this.clonedCell.cell_id[0]),
+                  this.clonedCell.clone_id
+                )}
+                .roomName=${this._roomInfo?.name ?? '[unknown]'}
+              ></transcripts-button>`
+            : ''}
           <button
             @click=${() =>
               this.dispatchEvent(
@@ -169,6 +181,13 @@ export class PrivateRoomCard extends LitElement {
         color: #071b31;
         font-size: 20px;
         box-shadow: 1px 1px 8px 2px #020b16b8;
+      }
+
+      .transcripts-btn {
+        margin-right: 10px;
+        --bg-color: #2a4a8f;
+        --bg-color-hover: #3558a0;
+        color: #fff0f0;
       }
 
       .enter-room-btn {

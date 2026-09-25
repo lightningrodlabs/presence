@@ -1,6 +1,6 @@
 import { LitElement, css, html } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { AppClient, RoleName } from '@holochain/client';
+import { AppClient, RoleName, encodeHashToBase64 } from '@holochain/client';
 import { localized } from '@lit/localize';
 import { consume, provide } from '@lit/context';
 import { WAL, WeaveClient } from '@theweave/api';
@@ -21,6 +21,7 @@ import { getCellTypes } from '../utils';
 import { weaveClientContext } from '../types';
 import { StreamsStore } from '../streams-store';
 import { PresenceLogger } from '../logging';
+import { roomTranscriptKey } from './transcripts/store';
 
 @localized()
 @customElement('room-container')
@@ -79,6 +80,11 @@ export class RoomContainer extends LitElement {
       this._private = true;
     }
 
+    // Transcripts are filed per cell so a re-created room with a reused
+    // clone id never inherits another room's history.
+    const cell = myCell ?? cellTypes.provisioned;
+    const roomKey = roomTranscriptKey(encodeHashToBase64(cell.cell_id[0]), this.roleName);
+
     this._presenceLogger = new PresenceLogger();
     this.streamsStore = await StreamsStore.connect(
       this.roomStore,
@@ -87,6 +93,8 @@ export class RoomContainer extends LitElement {
       this.weaveClient.captureAudioSources
         ? opts => this.weaveClient.captureAudioSources!(opts)
         : undefined,
+      this.weaveClient,
+      roomKey
     );
 
     // Disconnected while connecting streams — disconnectedCallback ran before

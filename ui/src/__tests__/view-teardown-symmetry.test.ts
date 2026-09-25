@@ -36,6 +36,7 @@ import '../presence-app';
 import '../room/elements/audio-level-meter';
 import '../room/elements/peer-stats-panel';
 import { StreamsStore } from '../streams-store';
+import { transcriptionController } from '../room/modules/transcription';
 import { PresenceLogger } from '../logging';
 
 function makeRoomView(): any {
@@ -114,6 +115,87 @@ describe('RoomView intent-diff subscription (Task 6)', () => {
 
     el.disconnectedCallback();
     expect(active).toBe(0);
+  });
+});
+
+describe('RoomView live-visit subscription (room transcripts)', () => {
+  it('the liveVisit StoreSubscriber is released on disconnect', () => {
+    // `_liveVisit` subscribes to the controller singleton's `liveVisit`,
+    // which outlives every room-view; like every other StoreSubscriber it
+    // must ride the super.disconnectedCallback() teardown. This drives a
+    // REAL subscribe (hostUpdate) through a counting wrapper and asserts
+    // the disconnect releases it — not a no-op, so an orphaned
+    // subscription fails here.
+    const el = makeRoomView();
+    let active = 0;
+    let subscribeCalls = 0;
+    const live = transcriptionController.liveVisit as any;
+    const realSubscribe = live.subscribe.bind(live);
+    const spy = vi.spyOn(live, 'subscribe').mockImplementation((cb: any) => {
+      subscribeCalls += 1;
+      active += 1;
+      const unsub = realSubscribe(cb);
+      return () => {
+        active -= 1;
+        unsub();
+      };
+    });
+
+    try {
+      // hostUpdate is what Lit calls to (re)subscribe; drive it directly.
+      el._liveVisit.hostUpdate();
+      expect(subscribeCalls).toBe(1);
+      expect(active).toBe(1);
+
+      el.disconnectedCallback();
+      expect(active).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('RoomView transcription lastError subscription (Task 4 review I2)', () => {
+  it('firstUpdated takes exactly one lastError subscription and disconnect releases it', () => {
+    // The controller is a module singleton: a subscription the element
+    // does not release keeps notifying the detached element for the life
+    // of the page. Drives the REAL firstUpdated up to its first await
+    // (getRoomInfo never resolves here) through a counting wrapper.
+    const el = makeRoomView();
+    el.streamsStore.onEvent = vi.fn();
+    el.roomStore = { client: { getRoomInfo: () => new Promise(() => {}) } };
+    el._updateGrid = vi.fn();
+    el._probeAsrAvailability = vi.fn();
+    el.notifyError = vi.fn();
+    let active = 0;
+    let subscribeCalls = 0;
+    const lastError = transcriptionController.lastError as any;
+    const realSubscribe = lastError.subscribe.bind(lastError);
+    const spy = vi.spyOn(lastError, 'subscribe').mockImplementation((cb: any) => {
+      subscribeCalls += 1;
+      active += 1;
+      const unsub = realSubscribe(cb);
+      return () => {
+        active -= 1;
+        unsub();
+      };
+    });
+
+    try {
+      void el.firstUpdated();
+      expect(subscribeCalls).toBe(1);
+      expect(active).toBe(1);
+
+      el.disconnectedCallback();
+      expect(active).toBe(0);
+
+      // The detached element no longer reacts to controller errors.
+      transcriptionController.lastError.set('after-leave');
+      expect(el.notifyError).not.toHaveBeenCalled();
+    } finally {
+      transcriptionController.lastError.set(null);
+      spy.mockRestore();
+    }
   });
 });
 
@@ -295,7 +377,10 @@ describe('StreamsStore.connect allAgents subscription (leak 4)', () => {
     const store = await StreamsStore.connect(
       roomStore,
       async () => '',
-      new PresenceLogger()
+      new PresenceLogger(),
+      undefined,
+      undefined,
+      'room-key'
     );
     // One subscription serving both the load gate and ongoing updates —
     // the doubled load-gate subscription is the regression this pins.
