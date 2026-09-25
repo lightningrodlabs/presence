@@ -1,6 +1,8 @@
 # Room transcripts: stored per call visit, browsed from the room
 
-Status: IMPLEMENTED 2026-09-22 (see docs/superpowers/plans/2026-09-22-room-transcripts.md)
+Every decision below landed on branch `ai-transcription-0.7` (plan:
+`docs/superpowers/plans/2026-09-22-room-transcripts.md`). This is the active
+design record for room transcripts: correct it in place when the code changes.
 
 ## Problem
 
@@ -169,7 +171,9 @@ interface TranscriptStore {
 - `ui/src/room/transcripts/__tests__/visit.test.ts`: bind opens a visit; frames from two speakers
   land in it; nothing is stored before the first frame; writes are coalesced;
   unbind sets `endedAt` and labels through the resolver set at unbind time; an
-  empty visit is never stored. Runs against the in-memory store with a manual clock.
+  empty visit is never stored. Runs against the in-memory store under vitest fake
+  timers (the controller reads `Date.now()` and `setTimeout` directly; see the
+  timing block in `ui/src/room/modules/transcription.ts`'s header).
 - `ui/src/room/transcripts/__tests__/store.test.ts` also tables `roomTranscriptKey`.
 - `ui/src/room/transcripts/__tests__/dialog-policy.test.ts`: which rows are listed
   (`selectTranscriptRows`) and each duration case (`describeDuration`).

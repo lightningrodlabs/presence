@@ -1,5 +1,13 @@
 # Transcription module — implementation plan
 
+Status: HISTORICAL — 2026-04 working notes, no longer maintained. The branches
+and fields they cite predate the Holochain 0.7 port. What shipped is
+`ui/src/room/modules/transcription.ts` (module header) and, for stored
+transcripts, `docs/superpowers/specs/2026-09-22-room-transcripts-design.md`;
+CLAUDE.md's "Transcription round facts" bullet records what landed. The Phase 0
+spikes this plan cites (`spikes/transcription/`) were deleted in the 0.16.0
+release doc sync; they remain in git history on `ai-transcription-0.7`.
+
 Working notes for adding local-first speech-to-text to Presence as a
 module. Written 2026-04-17, revised same day. Branch:
 `feature/transcription` (cut from `feature/voice-over-signals` because

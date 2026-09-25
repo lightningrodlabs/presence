@@ -489,8 +489,11 @@ export class StreamsStore {
    * Per-speaker transcript accumulator, written by the transcription
    * module's receive-side handler (and by the local ASR pipeline
    * routing its own finals through the same path so `myPubKey`
-   * entries land here too). Consumers: the exit-time "Save
-   * transcript?" dialog and, later, the transcript panel.
+   * entries land here too). Consumer: room-view, which reads its
+   * speaker keys for nickname lookups during the call and on Leave
+   * (`_requestNewSpeakerLabels`, `quitRoom`). The exit-time save
+   * prompt that once read it was removed by the room-transcripts
+   * work; stored transcripts come from the controller's visit record.
    *
    * Keyed by speaker AgentPubKeyB64. Entries within a speaker are
    * ordered by `tStart`.

@@ -63,6 +63,34 @@ function txLog(event: string, fields: Record<string, unknown> = {}): void {
  *     cadence we want.
  *   - Push native sample rate. Moss resamples.
  *   - Errors are terminal — open a new session to recover.
+ *
+ * Timing (working agreement 2). This file reads the ambient clock and
+ * timers directly — it is not in `no-ambient-clock.test.ts`'s
+ * PINNED_FILES — and none of the uses below is a liveness predicate;
+ * none says whether a peer is present, reachable, or has media flowing:
+ *
+ *   - `committedAtMs` (`Date.now()` in handleFinal) is a cross-peer wire
+ *     stamp: the sender's wall clock at commit, the display/sort anchor
+ *     for transcripts. ingestFrame falls back to the receiver's
+ *     `Date.now()` for a frame that lacks one.
+ *   - A visit's `startedAt`/`endedAt` (`Date.now()` in openVisit and
+ *     endVisit) are stored-record stamps; `startedAt` also forms the
+ *     record id.
+ *   - `VISIT_WRITE_INTERVAL_MS` (a bare `setTimeout` in markVisitDirty) is
+ *     IndexedDB write coalescing.
+ *   - `LONG_BUFFER_GUARD_MS`/`LONG_BUFFER_HARD_MS`, measured from
+ *     `lastCommitOrFlushMs` (`Date.now()` in startPump, handleFinal and
+ *     the pump loop), are decode-window pacing: when to force a flush
+ *     before Moss's own buffer cap cuts at an arbitrary sample.
+ *   - The `window.setInterval` stats timer (_doStartCapture) and txLog's
+ *     `new Date()` are console diagnostics only.
+ *   - The debug WAV download (DEBUG_RECORD_KEY) stamps its file name
+ *     with `new Date()` and revokes its object URL on a bare
+ *     `setTimeout`.
+ *
+ * The room's Leave budget for finalizing this module's transcript,
+ * `QUIT_FINALIZE_MAX_MS`, lives in room-view.ts and runs on the store's
+ * clock, not here.
  */
 
 // =========================================================================
