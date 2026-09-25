@@ -4,6 +4,7 @@ import type { StreamsStore } from '../../../streams-store';
 import { transcriptionController, AUTO_ACCEPT_KEY } from '../transcription';
 import { getModule } from '../registry';
 import type { ModuleStateEnvelope } from '../../../types';
+import { ManualClock } from '../../../clock.testing';
 
 /** Host whose openSession blocks until the test releases it, to observe the starting phase. */
 function gatedHost() {
@@ -34,6 +35,7 @@ function gatedHost() {
 function fakeStore(localModels: unknown) {
   return {
     myPubKeyB64: 'me',
+    clock: new ManualClock(1_000),
     localModels,
     _myModuleStates: writable({}),
     _transcriptLog: writable(new Map()),
@@ -98,6 +100,7 @@ function moduleStore(localModels: unknown) {
   });
   const store = {
     myPubKeyB64: 'me',
+    clock: new ManualClock(1_000),
     localModels,
     _myModuleStates: states,
     _transcriptLog: writable(new Map()),
@@ -336,11 +339,11 @@ describe('a running session that fails (Task 4 fix rounds 2 and 3)', () => {
     };
     const host = erroringHost({ errorOnEndOfUtterance: true });
     const m = moduleStore(host.localModels);
+    const deviceTrack = { getSettings: () => ({ sampleRate: 48_000 }), enabled: true, readyState: 'live' };
     (m.store as any).micSource = {
-      acquire: async () => ({
-        track: { getSettings: () => ({ sampleRate: 48_000 }), enabled: true },
-        release: () => {},
-      }),
+      deviceTrack,
+      outputMode: 'device',
+      acquire: async () => ({ track: deviceTrack, release: () => {} }),
     };
     m.states.set({
       transcription: requestedEnvelope(),

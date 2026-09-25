@@ -1,5 +1,5 @@
 /* eslint-disable no-console */
-import { LitElement, css, html } from 'lit';
+import { LitElement, css, html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import {
   encodeHashToBase64,
@@ -527,7 +527,24 @@ export class RoomView extends LitElement {
     }, 4000);
   }
 
+  /**
+   * Set by the first Leave click and never cleared on this mount: a second
+   * click during the finalize wait (up to QUIT_FINALIZE_MAX_MS) used to run
+   * stopAndAnnounce, disconnect and `quit-room` a second time. The Leave
+   * button renders disabled while set; a reconnect (Lit DOM reuse) resets
+   * it in connectedCallback. Pinned by `__tests__/room-view-quit.test.ts`.
+   */
+  @state()
+  _quitting = false;
+
+  connectedCallback(): void {
+    super.connectedCallback();
+    this._quitting = false;
+  }
+
   async quitRoom() {
+    if (this._quitting) return;
+    this._quitting = true;
     // Transcript finalization before leaving: both steps await host round
     // trips (Moss ASR, profile zome calls) with no timeout of their own,
     // so they share one bounded budget, QUIT_FINALIZE_MAX_MS. Past it the
@@ -648,6 +665,31 @@ export class RoomView extends LitElement {
           ></transcript-view>
         </div>
       </div>
+    `;
+  }
+
+  /** The Leave button; disabled while `_quitting` (see quitRoom). */
+  private _renderLeaveButton() {
+    const quitting = this._quitting;
+    return html`
+      <sl-tooltip content="${msg('Leave Call')}" hoist>
+        <div
+          class="btn-stop ${quitting ? 'disabled' : ''}"
+          tabindex="0"
+          aria-disabled=${quitting ? 'true' : nothing}
+          @click=${async () => this.quitRoom()}
+          @keypress=${async (e: KeyboardEvent) => {
+            if (e.key === 'Enter') {
+              this.quitRoom();
+            }
+          }}
+        >
+          <sl-icon
+            class="hangup-icon"
+            .src=${wrapPathInSvg(mdiPhoneHangup)}
+          ></sl-icon>
+        </div>
+      </sl-tooltip>
     `;
   }
 
@@ -2600,23 +2642,7 @@ export class RoomView extends LitElement {
 
         ${this._renderTranscriptionToolbarButton()}
 
-        <sl-tooltip content="${msg('Leave Call')}" hoist>
-          <div
-            class="btn-stop"
-            tabindex="0"
-            @click=${async () => this.quitRoom()}
-            @keypress=${async (e: KeyboardEvent) => {
-              if (e.key === 'Enter') {
-                this.quitRoom();
-              }
-            }}
-          >
-            <sl-icon
-              class="hangup-icon"
-              .src=${wrapPathInSvg(mdiPhoneHangup)}
-            ></sl-icon>
-          </div>
-        </sl-tooltip>
+        ${this._renderLeaveButton()}
       </div>
     `;
   }
@@ -4878,6 +4904,13 @@ export class RoomView extends LitElement {
 
       .btn-stop:hover {
         background: #dc4a4a;
+      }
+
+      .btn-stop.disabled,
+      .btn-stop.disabled:hover {
+        background: #9c0f0f;
+        opacity: 0.5;
+        cursor: not-allowed;
       }
 
       .hangup-icon {

@@ -10,6 +10,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 
 vi.mock('../room/logs-graph', () => ({}));
 
+import { render } from 'lit';
 import { QUIT_FINALIZE_MAX_MS } from '../room/room-view';
 import { transcriptionController } from '../room/modules/transcription';
 import { ManualClock } from '../clock.testing';
@@ -88,5 +89,68 @@ describe('quitRoom finalization budget', () => {
     await el.quitRoom();
     expect(el.streamsStore.disconnect).toHaveBeenCalledWith('quitRoom-button');
     expect(clock.pendingTimerCount).toBe(0);
+  });
+});
+
+/**
+ * Re-entrancy (release-0.16.0 final review, M1): a second Leave click
+ * during the finalize wait used to run stopAndAnnounce, disconnect and
+ * the `quit-room` event twice. `_quitting` guards the method, the Leave
+ * button renders disabled while it is set, and a reconnect (Lit DOM
+ * reuse) resets it.
+ */
+describe('quitRoom re-entrancy guard', () => {
+  it('two Leave clicks during the finalize wait: one stopAndAnnounce, one disconnect, one quit-room event', async () => {
+    const clock = new ManualClock(1_000);
+    const el = makeQuittingRoomView(clock);
+    let release!: () => void;
+    const stop = vi
+      .spyOn(transcriptionController, 'stopAndAnnounce')
+      .mockImplementation(() => new Promise<void>(r => (release = r)));
+    el._speakerLabels.refresh = vi.fn(async () => {});
+    const quitEvents = vi.fn();
+    el.addEventListener('quit-room', quitEvents);
+
+    const first = el.quitRoom();
+    await flush();
+    const second = el.quitRoom(); // the second click, mid-wait
+    await flush();
+    expect(stop).toHaveBeenCalledTimes(1);
+
+    release();
+    await Promise.all([first, second]);
+    expect(el.streamsStore.disconnect).toHaveBeenCalledTimes(1);
+    expect(el.streamsStore.logger.endSession).toHaveBeenCalledTimes(1);
+    expect(quitEvents).toHaveBeenCalledTimes(1);
+    // The guard stays set after the quit: the element is on its way out.
+    expect(el._quitting).toBe(true);
+  });
+
+  it('the Leave button renders disabled while quitting, and not otherwise', () => {
+    const el = makeQuittingRoomView(new ManualClock(1_000));
+    const renderLeave = () => {
+      const host = document.createElement('div');
+      render(el._renderLeaveButton(), host);
+      return host.querySelector('.btn-stop') as HTMLElement;
+    };
+    expect(renderLeave().classList.contains('disabled')).toBe(false);
+    expect(renderLeave().getAttribute('aria-disabled')).toBeNull();
+
+    el._quitting = true;
+    expect(renderLeave().classList.contains('disabled')).toBe(true);
+    expect(renderLeave().getAttribute('aria-disabled')).toBe('true');
+  });
+
+  it('a reconnect resets the guard (Lit DOM reuse)', () => {
+    const el = makeQuittingRoomView(new ManualClock(1_000));
+    el._quitting = true;
+    // connectedCallback enables updating, which would schedule a full
+    // render against this fake store; the guard reset is what is under
+    // test, so the render is stubbed out on this instance only.
+    el.scheduleUpdate = async () => {};
+    el.connectedCallback();
+    expect(el._quitting).toBe(false);
+    // …and it reached the base class (the render root exists).
+    expect(el.renderRoot).toBeTruthy();
   });
 });
