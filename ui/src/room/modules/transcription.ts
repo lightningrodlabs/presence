@@ -63,8 +63,9 @@ function txLog(event: string, fields: Record<string, unknown> = {}): void {
  * their own `enabled: true`) or ignore it. A per-device setting can
  * auto-accept future requests.
  *
- * See the Moss repository, `docs/build/transcription.md`, for the
- * host-side API contract. Key invariants we follow there:
+ * See the Moss repository (`lightningrodlabs/moss`, branch `main-0.7`),
+ * `docs/build/transcription.md`, for the host-side API contract. Key
+ * invariants we follow there:
  *
  *   - No client-side VAD. Moss commits finals after ~500 ms of silence,
  *     which is already the natural "broadcast during speaker pauses"
@@ -95,6 +96,10 @@ function txLog(event: string, fields: Record<string, unknown> = {}): void {
  *   - The debug WAV download (DEBUG_RECORD_KEY) stamps its file name
  *     with `new Date()` and revokes its object URL on a bare
  *     `setTimeout`.
+ *
+ * `seqBase` (bind) is the exception that reads the store's injected
+ * clock rather than the ambient one: an identifier seed for frame
+ * numbering, not timing, so the suites control it.
  *
  * The room's Leave budget for finalizing this module's transcript,
  * `QUIT_FINALIZE_MAX_MS`, lives in room-view.ts and runs on the store's

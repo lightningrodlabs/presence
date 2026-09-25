@@ -5,8 +5,8 @@ and fields they cite predate the Holochain 0.7 port. What shipped is
 `ui/src/room/modules/transcription.ts` (module header) and, for stored
 transcripts, `docs/superpowers/specs/2026-09-22-room-transcripts-design.md`;
 CLAUDE.md's "Transcription round facts" bullet records what landed. The Phase 0
-spikes this plan cites (`spikes/transcription/`) were deleted in the 0.16.0
-release doc sync; they remain in git history (before `1fb6840`).
+spikes this plan cites (`spikes/transcription/`) were deleted in the
+transcription round's doc sync, `1fb6840`; they remain in git history before it.
 
 Working notes for adding local-first speech-to-text to Presence as a
 module. Written 2026-04-17, revised same day. Branch:
