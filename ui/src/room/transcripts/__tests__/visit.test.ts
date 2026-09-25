@@ -3,6 +3,7 @@ import { get, writable } from '@holochain-open-dev/stores';
 import type { StreamsStore } from '../../../streams-store';
 import { transcriptionController, type TranscriptEntry, type TranscriptFrame } from '../../modules/transcription';
 import { MemoryTranscriptStore } from '../store';
+import { ManualClock } from '../../../clock.testing';
 
 function frame(speaker: string, seq: number, text: string, committedAtMs: number): TranscriptFrame {
   return { speaker, transcriber: speaker, seq, tStart: 0, tEnd: 1000, committedAtMs, text };
@@ -11,6 +12,7 @@ function frame(speaker: string, seq: number, text: string, committedAtMs: number
 function fakeStore(store: MemoryTranscriptStore, roomKey: string) {
   return {
     myPubKeyB64: 'me',
+    clock: new ManualClock(1_000_000),
     _myModuleStates: writable({}),
     _transcriptLog: writable(new Map<string, TranscriptEntry[]>()),
     sendModuleData: async () => {},
@@ -95,6 +97,7 @@ function fakeStoreWithHost(
 ) {
   return {
     myPubKeyB64: me,
+    clock: new ManualClock(1_000_000),
     localModels: host.localModels,
     _myModuleStates: writable({}),
     _transcriptLog: writable(new Map<string, TranscriptEntry[]>()),

@@ -288,7 +288,23 @@ class TranscriptionController {
   private sessionOffFinal: (() => void) | null = null;
   private sessionOffError: (() => void) | null = null;
   private sessionOffPartial: (() => void) | null = null;
+  /** Next frame number; `seq++` in handleFinal. Starts at `seqBase`. */
   private seq = 0;
+  /**
+   * The first frame number of this bind's numbering. Receivers dedupe by
+   * `(transcriber, seq)` (`ingestFrame`, `appendToVisit`) and clear
+   * nothing on peer leave, so a visit's numbers must not overlap what a
+   * peer still holds from this speaker's previous visit: numbering that
+   * restarted at 0 on rebind made a rejoin's first frames duplicates of
+   * the old ones in every remaining peer's eyes, dropped up to the old
+   * count. `bind` seeds it from the store's clock — seconds × 1000 — so a
+   * rebind N seconds later starts 1000·N above the previous base, and
+   * frames collide only if the earlier visit produced more than a
+   * thousand finals per second elapsed. An identifier seed on the
+   * injected clock, not a threshold and not liveness. `seq > seqBase`
+   * is "something was sent" (`stopAndAnnounce`'s `finalSeq`).
+   */
+  private seqBase = 0;
 
   /**
    * The call visit being recorded: one StoredTranscript from bind to
@@ -314,10 +330,13 @@ class TranscriptionController {
     if (typeof asr?.warmUp === 'function') {
       asr.warmUp().catch(() => undefined);
     }
-    // Frame numbering is per speaker per room: receivers drop a repeated
-    // (transcriber, seq), so every capture session in this room must
-    // continue the count, and only a new room starts over.
-    this.seq = 0;
+    // Frame numbering is per speaker per bind: receivers drop a repeated
+    // (transcriber, seq) and keep what they hold across our leave, so
+    // every capture session in this bind continues the count, and a new
+    // bind (a rejoin, another room) starts from a base that cannot
+    // repeat a previous bind's numbers — see `seqBase`.
+    this.seqBase = Math.floor(store.clock.now() / 1000) * 1000;
+    this.seq = this.seqBase;
     this.openVisit(store);
   }
 
@@ -1226,7 +1245,7 @@ class TranscriptionController {
       get(this.store._myModuleStates)['transcription'] ?? null,
     );
     if (current) {
-      const finalSeq = this.seq > 0 ? this.seq - 1 : undefined;
+      const finalSeq = this.seq > this.seqBase ? this.seq - 1 : undefined;
       const announcement: TranscriptionPayload = {
         ...current,
         enabled: false,
