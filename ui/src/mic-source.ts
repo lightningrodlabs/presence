@@ -27,6 +27,10 @@ import { decideMicOutput, isLiveTrack, type MicOutputMode } from './mic-output-p
  *   2. Per-consumer `onTrackChanged` callbacks provided at `acquire()` time,
  *      for consumers that hold a specific track instance (e.g. the voice
  *      module's `MediaStreamTrackProcessor`) and must rebuild their pipeline.
+ *      Both of these are about the OUTPUT. A consumer of the raw device
+ *      track (transcription) gets `onDeviceTrackChanged` instead, fanned
+ *      out from `_setLifecycle`'s `live` transition, because a device swap
+ *      while mixed changes no output at all.
  *
  * AudioContext: `ensureAudioContext()` lazily creates a single shared
  * `AudioContext` owned by this instance. The voice module's squelch synth
@@ -82,6 +86,18 @@ export interface MicConsumerOptions {
    * etc.) must rebuild on this callback.
    */
   onTrackChanged?: (newTrack: MediaStreamTrack) => void;
+  /**
+   * Fired when a new DEVICE track goes live (open, device change, reopen)
+   * while this consumer holds a reference — whether or not the output
+   * changed. While mixed, a device swap replaces only the mic's source
+   * node and the output is untouched, so `onTrackChanged` stays silent;
+   * a consumer of the raw microphone (transcription, which must never
+   * read the shared system audio) rebuilds on this one instead. Fanned
+   * out from `_setLifecycle`, the one write of the device lifecycle, on
+   * its `live` transition; the device closing or ending has no callback
+   * here — the track itself ends, and a reader on it sees `done`.
+   */
+  onDeviceTrackChanged?: (track: MediaStreamTrack) => void;
   /**
    * Take whatever the output currently carries and never open the
    * microphone for it. The voice encoder sets this: with an included
@@ -533,6 +549,18 @@ export class MicSource {
       this.bindings.onLifecycleChange(next);
     } catch (e) {
       console.warn('MicSource: onLifecycleChange handler threw', e);
+    }
+    // A new device track is live: tell the consumers bound to the raw
+    // microphone (see `MicConsumerOptions.onDeviceTrackChanged`). This is
+    // the device-side twin of `_installOutputTrack`'s consumer fanout, and
+    // it fires from here because this is the one write of the device
+    // lifecycle — both open paths and `_openAndSwap` land on it.
+    if (next.state === 'live') {
+      for (const c of this.consumers.values()) {
+        try { c.onDeviceTrackChanged?.(next.track); } catch (e) {
+          console.warn(`MicSource: consumer "${c.id}" onDeviceTrackChanged threw`, e);
+        }
+      }
     }
   }
 

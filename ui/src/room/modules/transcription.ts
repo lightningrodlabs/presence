@@ -49,6 +49,14 @@ function txLog(event: string, fields: Record<string, unknown> = {}): void {
  * module-data signal channel. No other peer transcribes them in
  * Phase 1; volunteer fallback is Phase 2.
  *
+ * "Their own microphone" is `MicSource.deviceTrack`, never `MicSource.track`:
+ * the output is a mix destination whenever system audio is shared, and
+ * the pump reads the raw device so shared audio is never transcribed as
+ * the speaker's words (`readingTrack`, `startPump`; pinned in
+ * `__tests__/transcription-device-track.test.ts`). The acquire is
+ * `outputOnly` — the capture reconciler is the one owner of the
+ * microphone's lifetime, and this module never opens a device.
+ *
  * UX is deliberately minimal: one room participant "requests"
  * call-wide transcription (broadcast as `requested: true`); other
  * participants get a yes/no notification and either opt in (setting
@@ -79,7 +87,7 @@ function txLog(event: string, fields: Record<string, unknown> = {}): void {
  *   - `VISIT_WRITE_INTERVAL_MS` (a bare `setTimeout` in markVisitDirty) is
  *     IndexedDB write coalescing.
  *   - `LONG_BUFFER_GUARD_MS`/`LONG_BUFFER_HARD_MS`, measured from
- *     `lastCommitOrFlushMs` (`Date.now()` in startPump, handleFinal and
+ *     `lastCommitOrFlushMs` (`Date.now()` in startReader, handleFinal and
  *     the pump loop), are decode-window pacing: when to force a flush
  *     before Moss's own buffer cap cuts at an arbitrary sample.
  *   - The `window.setInterval` stats timer (_doStartCapture) and txLog's
@@ -244,6 +252,20 @@ class TranscriptionController {
   // Capture-side state
   private micHandle: MicAcquireResult | null = null;
   private reader: ReadableStreamDefaultReader<any> | null = null;
+  /**
+   * The DEVICE track the reader above pulls from — `MicSource.deviceTrack`
+   * at build time, never `micHandle.track`. The handle's track is
+   * MicSource's OUTPUT, which since the system-audio round is the mix
+   * destination whenever a share is on: a pump on it would transcribe the
+   * shared system audio (a video, the peers' voices out of Moss) and
+   * broadcast it as this speaker's words. The module header's intent is
+   * "each speaker transcribes their own microphone", so only the raw
+   * device is read, and the mute gate in `pumpLoop` reads this track's
+   * `enabled` — the one `MicSource._applyMute` writes for the microphone
+   * in both the mixed and the plain case. Null while no live device
+   * exists (a share without the microphone): no reader, no frames.
+   */
+  private readingTrack: MediaStreamTrack | null = null;
   /** Rolling counters for the periodic stats line. Reset on
    *  startCapture. `framesSkippedMuted` is retained as 0 for log
    *  schema stability — every frame is now pushed regardless of
@@ -653,10 +675,12 @@ class TranscriptionController {
       return false;
     }
 
-    // Open the Moss ASR session. We do NOT touch the microphone here.
-    // The mic is owned by the conversation/WebRTC path; transcription
-    // only piggybacks on it once the user has actually unmuted via the
-    // mic button. This makes two user-visible guarantees:
+    // Open the Moss ASR session. We do NOT touch the microphone here, or
+    // anywhere: the capture reconciler is the one owner of the device's
+    // lifetime, and startPump takes MicSource's output-only handle and
+    // reads the device track the reconciler opened. Transcription only
+    // runs once the user has actually unmuted via the mic button. This
+    // makes two user-visible guarantees:
     //   1. Clicking "Transcribe call" never triggers the browser
     //      microphone permission prompt. That prompt is tied to
     //      clicking the mic button.
@@ -761,7 +785,7 @@ class TranscriptionController {
     this.statsInterval = window.setInterval(() => {
       txLog('stats', {
         pushed: this.framesPushed,
-        pumping: !!this.micHandle,
+        pumping: !!this.reader,
         finals: this.finalsReceived,
         micOn: this.lastMicOn,
       });
@@ -785,12 +809,17 @@ class TranscriptionController {
   }
 
   /**
-   * Acquire the mic and start the pump loop. Called when the
-   * conversation module's `micMuted` flips to false — i.e., the user
-   * hit the unmute button. If the device isn't yet open, MicSource's
-   * acquire triggers getUserMedia here, but that's exactly the
-   * permission prompt tied to the mic button's action, not the
-   * transcription button.
+   * Take a MicSource handle and start the pump loop on the DEVICE track.
+   * Called when the conversation module's `micMuted` flips to false —
+   * i.e., the user hit the unmute button. `audioOn` has already run the
+   * capture reconciler's tick before it writes that payload, so the
+   * device the reconciler opened is what `deviceTrack` holds here; this
+   * acquire is `outputOnly` and never opens a device of its own (the
+   * reconciler is the one owner of the microphone's lifetime, on
+   * `localIntent.mic.wanted`). With no live device — a share without the
+   * microphone, or a device the reconciler could not open — the handle is
+   * held with no reader, and `onDeviceTrackChanged` builds one the moment
+   * a device goes live.
    */
   private async startPump(): Promise<void> {
     if (!this.store || !this.session) return;
@@ -798,9 +827,10 @@ class TranscriptionController {
 
     const handle = await this.store.micSource.acquire({
       id: 'transcription',
-      onTrackChanged: (newTrack: MediaStreamTrack) => {
-        this.onMicTrackChanged(newTrack).catch(e =>
-          console.error('transcription: onMicTrackChanged failed', e),
+      outputOnly: true,
+      onDeviceTrackChanged: (track: MediaStreamTrack) => {
+        this.onDeviceTrackChanged(track).catch(e =>
+          console.error('transcription: onDeviceTrackChanged failed', e),
         );
       },
     });
@@ -811,7 +841,25 @@ class TranscriptionController {
     }
     this.micHandle = handle;
 
-    const settings = handle.track.getSettings();
+    const device = this.store.micSource.deviceTrack;
+    if (!device || device.readyState !== 'live') {
+      txLog('pump-waiting-for-device', { outputMode: this.store.micSource.outputMode });
+      return;
+    }
+    this.startReader(device, { anchorDecodeWindow: true });
+  }
+
+  /**
+   * Build the reader on `track` (the device) and run the pump loop on
+   * it. Shared by startPump and the device-change path so the sample-rate
+   * check, the generation bump and the `isCapturing` write are stated
+   * once. Returns whether a reader is now running.
+   */
+  private startReader(
+    track: MediaStreamTrack,
+    opts: { anchorDecodeWindow: boolean },
+  ): boolean {
+    const settings = track.getSettings();
     const trackRate = settings.sampleRate ?? 48_000;
     if (trackRate !== 48_000) {
       // MicSource pins its AudioContext to 48 kHz so this should not
@@ -822,17 +870,14 @@ class TranscriptionController {
       );
     }
 
-    if (!this.buildTrackReader(handle.track)) {
-      try { handle.release(); } catch {}
-      this.micHandle = null;
-      return;
-    }
+    if (!this.buildTrackReader(track)) return false;
 
     this.pipelineGeneration += 1;
     const gen = this.pipelineGeneration;
-    // Anchor the decode-window clock at pump start so the first
-    // frame after unmute isn't counted against time spent muted.
-    this.lastCommitOrFlushMs = Date.now();
+    // Anchor the decode-window clock when audio starts flowing so the
+    // first frame after unmute isn't counted against time spent muted.
+    // A device change mid-utterance keeps the running window.
+    if (opts.anchorDecodeWindow) this.lastCommitOrFlushMs = Date.now();
     this.pumpLoop(gen).catch(e =>
       console.error('transcription: pump loop error', e),
     );
@@ -840,8 +885,9 @@ class TranscriptionController {
     this.isCapturing.set(true);
     txLog('pump-started', {
       trackRate,
-      trackEnabled: handle.track.enabled,
+      trackEnabled: track.enabled,
     });
+    return true;
   }
 
   /**
@@ -873,6 +919,7 @@ class TranscriptionController {
       try { await this.reader.cancel(); } catch {}
       this.reader = null;
     }
+    this.readingTrack = null;
 
     try { this.micHandle.release(); } catch {}
     this.micHandle = null;
@@ -915,31 +962,36 @@ class TranscriptionController {
   }
 
   /**
-   * Called by MicSource when the shared track is replaced (device
-   * change). Rebuild the MediaStreamTrackProcessor; the ASR session
-   * stays open so seq numbering continues uninterrupted.
+   * Called by MicSource when a new DEVICE track goes live while we hold
+   * the handle: a device change, a reopen after the device ended, or
+   * the microphone joining a running share (`_syncMixDeviceNode`, where
+   * the output does not change at all). Rebuild the
+   * MediaStreamTrackProcessor on the new device; the ASR session stays
+   * open so seq numbering continues uninterrupted.
    */
-  private async onMicTrackChanged(newTrack: MediaStreamTrack): Promise<void> {
+  private async onDeviceTrackChanged(track: MediaStreamTrack): Promise<void> {
     if (!this.session) return;
-    // onTrackChanged only fires while we hold an acquire. If we've
+    // The callback only fires while we hold an acquire. If we've
     // released the handle (stopPump), skip — the acquire slot is gone
     // and a new pump will be built on next unmute.
     if (!this.micHandle) return;
+    if (track === this.readingTrack) return;
 
+    // No reader yet (the handle was taken while no device was live) means
+    // audio starts flowing now; a swap mid-utterance keeps its window.
+    const firstAudio = this.readingTrack === null;
     if (this.reader) {
       try { await this.reader.cancel(); } catch {}
       this.reader = null;
     }
-    if (!this.buildTrackReader(newTrack)) {
+    // The cancel above awaited; a stop or a later device may have run
+    // meanwhile, in which case that path owns the reader now.
+    if (!this.micHandle || !this.session) return;
+    if (!this.startReader(track, { anchorDecodeWindow: firstAudio })) {
       console.error('transcription: failed to rebuild reader after device change');
       return;
     }
-    this.pipelineGeneration += 1;
-    const gen = this.pipelineGeneration;
-    this.pumpLoop(gen).catch(e =>
-      console.error('transcription: pump loop error after device change', e),
-    );
-    txLog('track-changed', { trackEnabled: newTrack.enabled });
+    txLog('track-changed', { trackEnabled: track.enabled });
   }
 
   private buildTrackReader(track: MediaStreamTrack): boolean {
@@ -947,6 +999,7 @@ class TranscriptionController {
     try {
       const processor = new g.MediaStreamTrackProcessor({ track });
       this.reader = processor.readable.getReader();
+      this.readingTrack = track;
       return true;
     } catch (e) {
       console.error('transcription: failed to create MediaStreamTrackProcessor', e);
@@ -985,7 +1038,11 @@ class TranscriptionController {
       const audioData = read.value as AnyAudioData;
       if (!audioData) continue;
       try {
-        const track = this.micHandle?.track;
+        // The DEVICE track's flag, not the handle's: while a share is
+        // mixed in, the output stays enabled by design (the share keeps
+        // flowing to peers) and only the microphone's own track is
+        // disabled (`MicSource._applyMute`).
+        const track = this.readingTrack;
         if (!track || track.enabled === false) {
           // Hard refuse. No audio to whisper while the user believes
           // the mic is muted, on any platform, under any condition.

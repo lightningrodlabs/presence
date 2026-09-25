@@ -336,11 +336,11 @@ describe('a running session that fails (Task 4 fix rounds 2 and 3)', () => {
     };
     const host = erroringHost({ errorOnEndOfUtterance: true });
     const m = moduleStore(host.localModels);
+    const deviceTrack = { getSettings: () => ({ sampleRate: 48_000 }), enabled: true, readyState: 'live' };
     (m.store as any).micSource = {
-      acquire: async () => ({
-        track: { getSettings: () => ({ sampleRate: 48_000 }), enabled: true },
-        release: () => {},
-      }),
+      deviceTrack,
+      outputMode: 'device',
+      acquire: async () => ({ track: deviceTrack, release: () => {} }),
     };
     m.states.set({
       transcription: requestedEnvelope(),
