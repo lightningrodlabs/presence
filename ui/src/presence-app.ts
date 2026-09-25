@@ -86,6 +86,7 @@ import {
 } from './passive-presence';
 import { RoomStore } from './room/room-store';
 import { roomTranscriptKey } from './room/transcripts/store';
+import { AUTO_ACCEPT_KEY } from './room/modules/transcription';
 import { CellTypes, getCellTypes, groupRoomNetworkSeed } from './utils';
 
 declare const __APP_VERSION__: string;
@@ -201,7 +202,7 @@ export class PresenceApp extends LitElement {
 
   @state()
   _autoAcceptTranscription = JSON.parse(
-    window.localStorage.getItem('autoAcceptTranscriptionRequests') ?? 'false'
+    window.localStorage.getItem(AUTO_ACCEPT_KEY) ?? 'false'
   );
 
   @state()
@@ -1244,11 +1245,11 @@ export class PresenceApp extends LitElement {
             .toggleState=${this._autoAcceptTranscription}
             @toggle-on=${() => {
               this._autoAcceptTranscription = true;
-              window.localStorage.setItem('autoAcceptTranscriptionRequests', 'true');
+              window.localStorage.setItem(AUTO_ACCEPT_KEY, 'true');
             }}
             @toggle-off=${() => {
               this._autoAcceptTranscription = false;
-              window.localStorage.setItem('autoAcceptTranscriptionRequests', 'false');
+              window.localStorage.setItem(AUTO_ACCEPT_KEY, 'false');
             }}
           ></toggle-switch>
           <span
