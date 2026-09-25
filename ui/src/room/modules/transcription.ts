@@ -55,8 +55,8 @@ function txLog(event: string, fields: Record<string, unknown> = {}): void {
  * their own `enabled: true`) or ignore it. A per-device setting can
  * auto-accept future requests.
  *
- * See moss-ai-transcription/docs/build/transcription.md for the host-
- * side API contract. Key invariants we follow there:
+ * See the Moss repository, `docs/build/transcription.md`, for the
+ * host-side API contract. Key invariants we follow there:
  *
  *   - No client-side VAD. Moss commits finals after ~500 ms of silence,
  *     which is already the natural "broadcast during speaker pauses"
