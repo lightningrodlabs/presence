@@ -64,20 +64,31 @@ release notes.
    The line's records use **raw sha256 of the artifact and of the members
    extracted from it** — verify (and, on a disagreement, derive) that way:
 
+       D=$(mktemp -d)   # fresh each run: unpack refuses an existing -o dir
        sha256sum workdir/presence.webhapp            # webhappSha256
-       hc web-app unpack workdir/presence.webhapp -o /tmp/wh
-       sha256sum /tmp/wh/presence.happ               # happSha256
-       sha256sum /tmp/wh/dist.zip                    # uiSha256
+       hc web-app unpack workdir/presence.webhapp -o $D/wh
+       sha256sum $D/wh/presence.happ                 # happSha256
+       sha256sum $D/wh/dist.zip                      # uiSha256
 
    Consistency of basis WITHIN a line is what preserves in-place updates:
    Moss compares the candidate entry's `happSha256` against the installed
    version's entry, so recording a same-bytes happ under a different
    hashing basis fabricates a mismatch and splits the install exactly as a
    real happ change would.
-7. Push trunk + tag. `gh release create vX.Y.Z workdir/presence.webhapp`
+7. Push trunk + tag.
+   `gh release create vX.Y.Z workdir/presence.webhapp --repo lightningrodlabs/presence`
    with notes (Compatibility section first — DNA/network and interop
-   claims, each backed by a check actually run). Re-download the asset and
-   `sha256sum` it against `webhappSha256`.
+   claims, each backed by a check actually run). Then check what was
+   uploaded, not what is on disk: re-download the asset, unpack it, and
+   hash the webhapp and both members. All three must equal the step 6
+   triple; on any mismatch, fix the asset before step 8 records it.
+
+       D=$(mktemp -d)   # fresh each run: see step 6
+       gh release download vX.Y.Z --repo lightningrodlabs/presence -p presence.webhapp -D $D
+       sha256sum $D/presence.webhapp                 # webhappSha256
+       hc web-app unpack $D/presence.webhapp -o $D/wh
+       sha256sum $D/wh/presence.happ                 # happSha256
+       sha256sum $D/wh/dist.zip                      # uiSha256
 8. Append the release's entry (version, url, hash triple, releasedAt from
    the `npm run hash` output) to `fixtures/releases.json` and commit — this
    is what arms the gate for the next release.

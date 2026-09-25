@@ -42,9 +42,12 @@ jobs:
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: 1
 
-      # Runs the package tests, builds packages/webrtc-peer (load-bearing: the
-      # ui tests and ui typecheck resolve @lightningrodlabs/webrtc-peer through
-      # its dist/), runs the ui tests, then typechecks both workspaces.
+      # Runs the two package test suites (packages/webrtc-peer,
+      # packages/signals-media), builds both packages (load-bearing: the ui
+      # tests and ui typecheck resolve @lightningrodlabs/webrtc-peer through
+      # its dist/), runs the ui tests, typechecks all three workspaces, then
+      # runs the signals-media drift alarm (scripts/check-signals-media-drift.mjs).
+      # The root `verify` script in package.json is the authority for this list.
       - run: npm run verify
 
   # Conductor-level DNA tests (tests/src/room over tryorama). Unlike `verify`,
