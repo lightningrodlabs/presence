@@ -540,7 +540,7 @@ class TranscriptionController {
     // caller (onActivate for the header button AND for acceptRequest /
     // auto-accept) gets it exactly once.
     const p = this._doStartCapture().then(async ok => {
-      if (!ok) await this._revertEnabledAfterFailedStart();
+      if (!ok) await this._revertAdvertisedEnabled();
       return ok;
     });
     this._startingCapture = p;
@@ -552,13 +552,16 @@ class TranscriptionController {
   }
 
   /**
-   * The ONE revert for a start that produced nothing: if our own module
-   * state still advertises `enabled`, deactivate it, so peers do not
-   * show us as transcribing (subtitles icon, "transcribing:" list)
-   * while we send no frames. `lastError` has already been set by the
-   * failing arm of `_doStartCapture`.
+   * The ONE revert for a capture that failed without the user stopping
+   * it: if our own module state still advertises `enabled`, deactivate
+   * it, so peers do not show us as transcribing (subtitles icon,
+   * "transcribing:" list) while we send no frames. Two callers: a start
+   * that failed (startCapture's shared promise) and a running session
+   * that failed (the session's onError handler). The caller has already
+   * set `lastError`. Purposeful stops (the header toggle,
+   * stopAndAnnounce, unbind) deactivate on their own and never reach it.
    */
-  private async _revertEnabledAfterFailedStart(): Promise<void> {
+  private async _revertAdvertisedEnabled(): Promise<void> {
     const store = this.store;
     if (!store) return;
     const mine = parseTranscriptionPayload(
@@ -664,10 +667,18 @@ class TranscriptionController {
       this.lastError.set(
         `Transcription session ended unexpectedly: ${err?.message ?? 'unknown error'}.`,
       );
-      // Session is already closed by Moss when onError fires. Tear
-      // down the local pipeline so the next startCapture opens a
-      // fresh session.
-      this.stopCapture().catch(() => {});
+      // Session is already closed by Moss when onError fires (the API
+      // declares it terminal; host-side closes such as access revoked or
+      // view closed arrive here too). Tear down the local pipeline so the
+      // next startCapture opens a fresh session, then stop advertising
+      // `enabled`. An error raised while a purposeful stop is closing
+      // the session needs no extra rule: stopAndAnnounce has already
+      // published enabled:false and the toggle has deleted the state,
+      // so the revert finds nothing to revert, and unbind clears the
+      // store first. Pinned in transcription-starting.test.ts.
+      void this.stopCapture()
+        .catch(() => {})
+        .then(() => this._revertAdvertisedEnabled());
     });
     // Wire partial subscription even though v1 doesn't emit — makes
     // the upgrade to streaming partials a one-line change later.

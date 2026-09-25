@@ -102,7 +102,15 @@ function moduleStore(localModels: unknown) {
     _myModuleStates: states,
     _transcriptLog: writable(new Map()),
     sendModuleData: async () => {},
-    updateModuleState: async () => {},
+    // Like StreamsStore.updateModuleState: the write lands before the
+    // broadcast await.
+    async updateModuleState(moduleId: string, payload: string) {
+      states.update(s => ({
+        ...s,
+        [moduleId]: { moduleId, active: true, payload, updatedAt: 1 },
+      }));
+      await Promise.resolve();
+    },
     deactivateModule,
     async activateModule(moduleId: string, payload?: string) {
       states.update(s => ({
@@ -193,5 +201,105 @@ describe('a host without local models (the old-Moss case)', () => {
     transcriptionController.bind(store);
     transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
     expect(get(transcriptionController.pendingRequests).has('peer')).toBe(true);
+  });
+});
+
+/** A host whose open session hands the test its onError subscribers. */
+function erroringHost(opts: { errorOnClose?: boolean } = {}) {
+  const errorSubs = new Set<(e: Error) => void>();
+  const fire = (e: Error) => { for (const cb of [...errorSubs]) cb(e); };
+  const localModels = {
+    capabilities: async () => ({ asr: { available: true } }),
+    asr: {
+      openSession: async () => ({
+        sessionId: 's-err',
+        onFinal: () => () => {},
+        onPartial: () => () => {},
+        onError: (cb: (e: Error) => void) => {
+          errorSubs.add(cb);
+          return () => errorSubs.delete(cb);
+        },
+        pushAudio: async () => {},
+        close: async () => {
+          if (opts.errorOnClose) fire(new Error('closed mid-stop'));
+        },
+      }),
+    },
+  };
+  return { localModels, fire };
+}
+
+describe('a running session that fails (Task 4 fix round 2)', () => {
+  const g = globalThis as any;
+  const savedProcessor = g.MediaStreamTrackProcessor;
+  const savedWindow = g.window;
+
+  beforeEach(() => {
+    g.MediaStreamTrackProcessor = class {};
+    g.window = {
+      setInterval: vi.fn(() => 1),
+      clearInterval: vi.fn(),
+      localStorage: { getItem: () => null, setItem: () => {} },
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    transcriptionController.unbind();
+    transcriptionController.lastError.set(null);
+    g.MediaStreamTrackProcessor = savedProcessor;
+    g.window = savedWindow;
+    vi.restoreAllMocks();
+  });
+
+  it('onError mid-call deactivates the module through the one revert and keeps lastError', async () => {
+    const host = erroringHost();
+    const { store, states, deactivateModule } = moduleStore(host.localModels);
+    transcriptionController.bind(store);
+    states.set({ transcription: requestedEnvelope() });
+    expect(await transcriptionController.startCapture()).toBe(true);
+    expect(deactivateModule).not.toHaveBeenCalled();
+
+    host.fire(new Error('sidecar crashed'));
+
+    await vi.waitFor(() => expect(deactivateModule).toHaveBeenCalledWith('transcription'));
+    expect(deactivateModule).toHaveBeenCalledTimes(1);
+    expect(get(states)['transcription']).toBeUndefined();
+    expect(get(transcriptionController.lastError)).toContain('sidecar crashed');
+  });
+
+  it('negative control: stopAndAnnounce deactivates exactly once', async () => {
+    const host = erroringHost();
+    const { store, states, deactivateModule } = moduleStore(host.localModels);
+    transcriptionController.bind(store);
+    states.set({ transcription: requestedEnvelope() });
+    expect(await transcriptionController.startCapture()).toBe(true);
+
+    await transcriptionController.stopAndAnnounce();
+    await new Promise(r => setTimeout(r, 0));
+    expect(deactivateModule).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaving the room (unbind) while the closing session errors does not deactivate', async () => {
+    const host = erroringHost({ errorOnClose: true });
+    const { store, states, deactivateModule } = moduleStore(host.localModels);
+    transcriptionController.bind(store);
+    states.set({ transcription: requestedEnvelope() });
+    expect(await transcriptionController.startCapture()).toBe(true);
+
+    transcriptionController.unbind();
+    await new Promise(r => setTimeout(r, 0));
+    expect(deactivateModule).not.toHaveBeenCalled();
+  });
+
+  it('an error raised while a purposeful stop closes the session does not add a second deactivate', async () => {
+    const host = erroringHost({ errorOnClose: true });
+    const { store, states, deactivateModule } = moduleStore(host.localModels);
+    transcriptionController.bind(store);
+    states.set({ transcription: requestedEnvelope() });
+    expect(await transcriptionController.startCapture()).toBe(true);
+
+    await transcriptionController.stopAndAnnounce();
+    await new Promise(r => setTimeout(r, 0));
+    expect(deactivateModule).toHaveBeenCalledTimes(1);
   });
 });
