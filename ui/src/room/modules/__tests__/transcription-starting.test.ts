@@ -204,32 +204,57 @@ describe('a host without local models (the old-Moss case)', () => {
   });
 });
 
-/** A host whose open session hands the test its onError subscribers. */
-function erroringHost(opts: { errorOnClose?: boolean } = {}) {
-  const errorSubs = new Set<(e: Error) => void>();
-  const fire = (e: Error) => { for (const cb of [...errorSubs]) cb(e); };
+/**
+ * A host whose sessions hand the test their onError subscribers. Every
+ * openSession returns a fresh session; `fire` reaches the most recent
+ * one. `errorOnClose` fires an error from inside close(); `gateClose`
+ * holds every close() until `releaseClose()`.
+ */
+function erroringHost(opts: { errorOnClose?: boolean; gateClose?: boolean; errorOnEndOfUtterance?: boolean } = {}) {
+  let current = new Set<(e: Error) => void>();
+  const fire = (e: Error) => { for (const cb of [...current]) cb(e); };
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>(r => (releaseClose = r));
+  let opened = 0;
   const localModels = {
     capabilities: async () => ({ asr: { available: true } }),
     asr: {
-      openSession: async () => ({
-        sessionId: 's-err',
-        onFinal: () => () => {},
-        onPartial: () => () => {},
-        onError: (cb: (e: Error) => void) => {
-          errorSubs.add(cb);
-          return () => errorSubs.delete(cb);
-        },
-        pushAudio: async () => {},
-        close: async () => {
-          if (opts.errorOnClose) fire(new Error('closed mid-stop'));
-        },
-      }),
+      openSession: async () => {
+        opened += 1;
+        const subs = new Set<(e: Error) => void>();
+        current = subs;
+        return {
+          sessionId: `s-err-${opened}`,
+          onFinal: () => () => {},
+          onPartial: () => () => {},
+          onError: (cb: (e: Error) => void) => {
+            subs.add(cb);
+            return () => subs.delete(cb);
+          },
+          pushAudio: async (_pcm: Int16Array, endOfUtterance?: boolean) => {
+            if (endOfUtterance && opts.errorOnEndOfUtterance) {
+              // Delivered as the host does: from the transport's incoming
+              // message, after the call that caused it, while it is awaited.
+              await Promise.resolve();
+              for (const cb of [...subs]) cb(new Error('push failed mid-stop'));
+            }
+          },
+          close: async () => {
+            if (opts.errorOnClose) for (const cb of [...subs]) cb(new Error('closed mid-stop'));
+            if (opts.gateClose) await closeGate;
+          },
+        };
+      },
     },
   };
-  return { localModels, fire };
+  return { localModels, fire, releaseClose, opened: () => opened };
 }
 
-describe('a running session that fails (Task 4 fix round 2)', () => {
+async function ticks(n: number) {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+}
+
+describe('a running session that fails (Task 4 fix rounds 2 and 3)', () => {
   const g = globalThis as any;
   const savedProcessor = g.MediaStreamTrackProcessor;
   const savedWindow = g.window;
@@ -251,12 +276,17 @@ describe('a running session that fails (Task 4 fix round 2)', () => {
     vi.restoreAllMocks();
   });
 
+  async function started(host: ReturnType<typeof erroringHost>) {
+    const m = moduleStore(host.localModels);
+    transcriptionController.bind(m.store);
+    m.states.set({ transcription: requestedEnvelope() });
+    expect(await transcriptionController.startCapture()).toBe(true);
+    return m;
+  }
+
   it('onError mid-call deactivates the module through the one revert and keeps lastError', async () => {
     const host = erroringHost();
-    const { store, states, deactivateModule } = moduleStore(host.localModels);
-    transcriptionController.bind(store);
-    states.set({ transcription: requestedEnvelope() });
-    expect(await transcriptionController.startCapture()).toBe(true);
+    const { states, deactivateModule } = await started(host);
     expect(deactivateModule).not.toHaveBeenCalled();
 
     host.fire(new Error('sidecar crashed'));
@@ -267,39 +297,109 @@ describe('a running session that fails (Task 4 fix round 2)', () => {
     expect(get(transcriptionController.lastError)).toContain('sidecar crashed');
   });
 
-  it('negative control: stopAndAnnounce deactivates exactly once', async () => {
-    const host = erroringHost();
-    const { store, states, deactivateModule } = moduleStore(host.localModels);
-    transcriptionController.bind(store);
-    states.set({ transcription: requestedEnvelope() });
-    expect(await transcriptionController.startCapture()).toBe(true);
+  it('an error raised while stopAndAnnounce closes the session adds no revert and no error toast', async () => {
+    const host = erroringHost({ errorOnClose: true });
+    const { deactivateModule } = await started(host);
 
     await transcriptionController.stopAndAnnounce();
     await new Promise(r => setTimeout(r, 0));
-    expect(deactivateModule).toHaveBeenCalledTimes(1);
+    expect(deactivateModule).toHaveBeenCalledTimes(1); // stopAndAnnounce's own
+    expect(get(transcriptionController.lastError)).toBeNull();
   });
 
-  it('leaving the room (unbind) while the closing session errors does not deactivate', async () => {
+  it('ordering independence: the same, with the enabled:false write delayed by extra microtasks', async () => {
+    // The reviewer's measured reorder: ticks between stopAndAnnounce's
+    // `await this.stopCapture()` and its updateModuleState write. The
+    // error is told apart when it fires, so the delay changes nothing.
     const host = erroringHost({ errorOnClose: true });
-    const { store, states, deactivateModule } = moduleStore(host.localModels);
-    transcriptionController.bind(store);
-    states.set({ transcription: requestedEnvelope() });
+    const m = await started(host);
+    const realUpdate = (m.store as any).updateModuleState;
+    (m.store as any).updateModuleState = async (id: string, payload: string) => {
+      await ticks(20);
+      return realUpdate(id, payload);
+    };
+
+    await transcriptionController.stopAndAnnounce();
+    await new Promise(r => setTimeout(r, 0));
+    expect(m.deactivateModule).toHaveBeenCalledTimes(1);
+  });
+
+  it('an error raised during the stop\'s end-of-utterance push (before the session is nulled) adds no revert', async () => {
+    // _doStopCapture awaits stopPump — whose end-of-utterance pushAudio
+    // runs while this.session is still set — before it nulls the session
+    // and closes it. The stop is told apart by stopInFlight, which spans
+    // that window too.
+    g.MediaStreamTrackProcessor = class {
+      readable = {
+        getReader: () => ({ read: () => new Promise(() => {}), cancel: async () => {} }),
+      };
+    };
+    const host = erroringHost({ errorOnEndOfUtterance: true });
+    const m = moduleStore(host.localModels);
+    (m.store as any).micSource = {
+      acquire: async () => ({
+        track: { getSettings: () => ({ sampleRate: 48_000 }), enabled: true },
+        release: () => {},
+      }),
+    };
+    m.states.set({
+      transcription: requestedEnvelope(),
+      conversation: {
+        moduleId: 'conversation',
+        active: true,
+        payload: JSON.stringify({ micMuted: false }),
+        updatedAt: 1,
+      },
+    });
+    transcriptionController.bind(m.store);
     expect(await transcriptionController.startCapture()).toBe(true);
+    await vi.waitFor(() => expect(get(transcriptionController.isCapturing)).toBe(true));
+
+    await transcriptionController.stopAndAnnounce();
+    await new Promise(r => setTimeout(r, 0));
+    expect(m.deactivateModule).toHaveBeenCalledTimes(1);
+    expect(get(transcriptionController.lastError)).toBeNull();
+  });
+
+  it('an error raised while unbind (leaving) closes the session does not deactivate', async () => {
+    const host = erroringHost({ errorOnClose: true });
+    const { deactivateModule } = await started(host);
 
     transcriptionController.unbind();
     await new Promise(r => setTimeout(r, 0));
     expect(deactivateModule).not.toHaveBeenCalled();
   });
 
-  it('an error raised while a purposeful stop closes the session does not add a second deactivate', async () => {
-    const host = erroringHost({ errorOnClose: true });
-    const { store, states, deactivateModule } = moduleStore(host.localModels);
-    transcriptionController.bind(store);
-    states.set({ transcription: requestedEnvelope() });
-    expect(await transcriptionController.startCapture()).toBe(true);
+  it('a re-enable between the error and the end of the stop is not reverted', async () => {
+    const host = erroringHost({ gateClose: true });
+    const m = await started(host);
 
-    await transcriptionController.stopAndAnnounce();
+    host.fire(new Error('sidecar crashed')); // stop begins; close() is held
+    await ticks(5);
+    // The user turns transcription back on inside the close() window.
+    await m.store.activateModule(
+      'transcription',
+      JSON.stringify({ enabled: true, requested: true }),
+    );
+    host.releaseClose();
     await new Promise(r => setTimeout(r, 0));
-    expect(deactivateModule).toHaveBeenCalledTimes(1);
+
+    expect(m.deactivateModule).not.toHaveBeenCalled();
+    expect(get(m.states)['transcription']).toBeDefined();
+  });
+
+  it('a bind() to another room before the stop resolves leaves that room alone', async () => {
+    const host = erroringHost({ gateClose: true });
+    await started(host);
+
+    host.fire(new Error('sidecar crashed'));
+    await ticks(5);
+    const roomB = moduleStore(host.localModels);
+    roomB.states.set({ transcription: requestedEnvelope() });
+    transcriptionController.bind(roomB.store);
+    host.releaseClose();
+    await new Promise(r => setTimeout(r, 0));
+
+    expect(roomB.deactivateModule).not.toHaveBeenCalled();
   });
 });

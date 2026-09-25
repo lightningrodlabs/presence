@@ -558,20 +558,27 @@ class TranscriptionController {
    * "transcribing:" list) while we send no frames. Two callers: a start
    * that failed (startCapture's shared promise) and a running session
    * that failed (the session's onError handler). The caller has already
-   * set `lastError`. Purposeful stops (the header toggle,
-   * stopAndAnnounce, unbind) deactivate on their own and never reach it.
+   * set `lastError`.
+   *
+   * `at`, when given, is what the caller saw when the failure happened:
+   * the store and our transcription envelope. The revert runs only if
+   * both are still the same objects, so a re-enable (a fresh envelope
+   * from activateModule) or a bind() to another room between the failure
+   * and this call is left alone.
    */
-  private async _revertAdvertisedEnabled(): Promise<void> {
+  private async _revertAdvertisedEnabled(at?: {
+    store: StreamsStore;
+    envelope: ModuleStateEnvelope | null;
+  }): Promise<void> {
     const store = this.store;
     if (!store) return;
-    const mine = parseTranscriptionPayload(
-      get(store._myModuleStates)['transcription'] ?? null,
-    );
-    if (!mine?.enabled) return;
+    const envelope = get(store._myModuleStates)['transcription'] ?? null;
+    if (at && (at.store !== store || at.envelope !== envelope)) return;
+    if (!parseTranscriptionPayload(envelope)?.enabled) return;
     try {
       await store.deactivateModule('transcription');
     } catch (e) {
-      console.error('transcription: revert after failed start failed', e);
+      console.error('transcription: revert of advertised enabled failed', e);
     }
   }
 
@@ -664,6 +671,13 @@ class TranscriptionController {
     this.sessionOffError = this.session.onError((err: Error) => {
       console.error('transcription: session error', err);
       txLog('session-error', { message: err?.message ?? String(err) });
+      // A stop is told apart from a failure by state read synchronously
+      // when the error fires, never by promise ordering: `stopInFlight`
+      // is set for the whole of any stop (toggle off, stopAndAnnounce,
+      // unbind, or an earlier error's own teardown) — its end-of-
+      // utterance push, while `this.session` is still set, and its
+      // close(). An error inside that window belongs to the stop.
+      if (this.stopInFlight) return;
       this.lastError.set(
         `Transcription session ended unexpectedly: ${err?.message ?? 'unknown error'}.`,
       );
@@ -671,14 +685,15 @@ class TranscriptionController {
       // declares it terminal; host-side closes such as access revoked or
       // view closed arrive here too). Tear down the local pipeline so the
       // next startCapture opens a fresh session, then stop advertising
-      // `enabled`. An error raised while a purposeful stop is closing
-      // the session needs no extra rule: stopAndAnnounce has already
-      // published enabled:false and the toggle has deleted the state,
-      // so the revert finds nothing to revert, and unbind clears the
-      // store first. Pinned in transcription-starting.test.ts.
+      // `enabled` — measured against the store and envelope as they are
+      // NOW, at the failure, not after the stop has finished.
+      const store = this.store;
+      const at = store
+        ? { store, envelope: get(store._myModuleStates)['transcription'] ?? null }
+        : undefined;
       void this.stopCapture()
         .catch(() => {})
-        .then(() => this._revertAdvertisedEnabled());
+        .then(() => (at ? this._revertAdvertisedEnabled(at) : undefined));
     });
     // Wire partial subscription even though v1 doesn't emit — makes
     // the upgrade to streaming partials a one-line change later.
