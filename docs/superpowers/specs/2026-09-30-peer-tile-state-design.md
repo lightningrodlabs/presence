@@ -100,8 +100,12 @@ see them, do I wait or act.**
    receiver sees a live video track the whole time and the action is the only
    thing that tells a v0.16.0-era receiver the track is blank.
 
-   Show rule, in the policy: video renders iff a live video track is present
-   and `peerCameraOn !== false`. A new sender with the camera off says
+   Show rule, in the policy: video renders iff the slot is `connected`, a live
+   video track is present, and `peerCameraOn !== false`. The `connected` conjunct
+   is new: today `_handleMediaRemoteStream`/`_setTrackReady` write `conn.video`
+   before ICE+DTLS completes, and a track with no DTLS carries no frames — that
+   `video && !connected` window is what the circle-tile oval fix
+   (`fix/circle-tile-oval`, 2026-09-30) measured as its trigger. A new sender with the camera off says
    `cameraOn: false` → avatar. A v0.16.0 sender with the camera off sends
    `video-off`, which clears `conn.video` as today → avatar. `cameraOn`
    undefined with `conn.video` true (legacy sender, camera on) → video.
