@@ -46,6 +46,12 @@ const CAMERA_COPY: CaptureCopy = {
   failed: 'Camera unavailable',
 };
 
+/** Peer-side and own-side twin copy for a camera that is on but whose
+ *  frames are throttled by the signals cadence (spec decisions 9 and
+ *  the grid's row 2f). Lives here, once — `peer-tile-policy.ts` imports
+ *  it, so the copy-singleton pin sees exactly one holder. */
+export const VIDEO_PACED_COPY = 'video paused — slow connection';
+
 /**
  * One scope's capture arm: ended/failed report immediately (something is
  * already visibly wrong); acquiring must clear `INTENT_DIFF_GRACE_MS`
