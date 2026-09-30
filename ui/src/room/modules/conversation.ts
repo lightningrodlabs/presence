@@ -52,8 +52,9 @@ export interface ConversationPayload {
   /** True when user's mic is muted (track.enabled = false). */
   micMuted: boolean;
   /**
-   * True when the user's camera is on (peer-tile spec decision 7). The
-   * one carrier-independent statement of camera intent — the
+   * True when the user's camera is wanted AND live (peer-tile spec
+   * decision 7; written by `StreamsStore._syncCameraOnPayload`). The
+   * one carrier-independent statement of camera state — the
    * data-channel `video-on`/`video-off` actions never reached a
    * signals-only peer. `undefined` on parse means the sender predates
    * the field: the tile treats that as unknown and shows nothing extra.

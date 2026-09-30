@@ -3740,4 +3740,65 @@ describe('peer tile (spec 2026-09-30): cameraOn on the wire, silence stamps on t
     expect(tile.attention).toBe('wait');
     expect((started.store as any).peerReconnecting).toBeUndefined();
   });
+
+  it('I2: a peer that drops out of the present set without a leave signal loses both stamps and gets the full grace on return', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: true, caps: ['sdp-fsm'] });
+    for (let i = 0; i < 3; i++) { started.clock.advance(PING_INTERVAL); await flush(); await flush(); }
+    const rec = started.store._peerRecords.get(peerA)!;
+    expect(rec.audioSilentSince).toBeTypeOf('number');
+    expect(rec.videoSilentSince).toBeTypeOf('number');
+    expect(started.store.peerTileFor(peerA).statusLine).toBeDefined(); // past grace
+
+    // Drop out of the present set: no roster entry, silence past the staleness
+    // window and the carrier-hold cap.
+    started.store._knownAgents.set({});
+    for (let i = 0; i < 40 && get(started.store._presentPeers).includes(peerA); i++) {
+      started.clock.advance(PING_INTERVAL); await flush(); await flush();
+    }
+    expect(get(started.store._presentPeers).includes(peerA)).toBe(false);
+    started.clock.advance(PING_INTERVAL); await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBeUndefined();
+    expect(started.store._peerRecords.get(peerA)?.videoSilentSince).toBeUndefined();
+
+    // Return: the first present tick stamps fresh, so no line yet.
+    const returnedAt = started.clock.now();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    await flush(); await flush();
+    expect(get(started.store._presentPeers).includes(peerA)).toBe(true);
+    expect(started.store._peerRecords.get(peerA)?.videoSilentSince).toBeGreaterThanOrEqual(returnedAt);
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile.statusLine).toBeUndefined();
+    expect(tile.reason).toBe('silent-under-grace');
+  });
+
+  it('I3: cameraOn on the wire means wanted AND live — a failed acquire writes false, a later reconciler acquire writes true', async () => {
+    let fail = true;
+    const track = new FakeTrack('video');
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async () => {
+            if (fail) throw new Error('NotAllowedError');
+            return new FakeStream([track]);
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    const started = makeStarted();
+    await started.store.videoOn();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(false);
+
+    fail = false;
+    started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+    await started.store.captureReconciler.tick(); // the reconciler acquires
+    await flush();
+    started.clock.advance(PING_INTERVAL); // the next presence tick picks it up
+    await flush(); await flush();
+    expect(myConversation(started)?.cameraOn).toBe(true);
+  });
 });

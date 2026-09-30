@@ -52,6 +52,8 @@ describe('no conversation-payload re-parse outside conversation.ts', () => {
     // no conversation-payload read at all (the JSON.parse guard above
     // still covers a re-inline).
     expect(text).not.toContain('parseConversationPayload(');
+    // Positive pin beside the inverted one (final-review I4).
+    expect(text).toContain('this.streamsStore.peerTileFor(');
   });
 });
 

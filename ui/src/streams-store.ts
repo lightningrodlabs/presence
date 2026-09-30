@@ -20,7 +20,7 @@ import { initialPeerRecord, prunePendingInits, type PeerRecord } from './peer-re
 import { FsmTransport } from './transport';
 import type { PeerTransport } from './transport';
 import { computeSignalsTargets, decideWebrtcEligibility } from './transport/carrier-coverage';
-import { describePeerTile, decideSilenceStamps } from './peer-tile-policy';
+import { describePeerTile, decideSilenceStamps, webrtcVideoLive } from './peer-tile-policy';
 import type { PeerTileState } from './peer-tile-policy';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
 import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
@@ -1087,6 +1087,7 @@ export class StreamsStore {
       // reconciliation attempt in flight (never a stale phantom warning).
       this._recomputeIntentDiffs();
       this._stampTileSilence();
+      this._syncCameraOnPayload();
     });
   }
 
@@ -1797,11 +1798,34 @@ export class StreamsStore {
       event: 'MyVideoOn',
     });
 
-    // Camera intent reaches every carrier through the conversation
-    // payload (peer-tile spec decision 7) — the data-channel `video-on`
-    // action never reached a signals-only peer. The receive arm of that
-    // action stays as a legacy read for v0.16.0 senders.
-    await this._syncConversationPayload({ cameraOn: true });
+    // Camera state reaches every carrier through the conversation payload
+    // (peer-tile spec decision 7) — the data-channel `video-on` action
+    // never reached a signals-only peer. The receive arm of that action
+    // stays as a legacy read for v0.16.0 senders. The value is "wanted
+    // AND live" (`_syncCameraOnPayload`), so a failed acquire writes
+    // false here and a later reconciler acquire is picked up by the tick.
+    this._syncCameraOnPayload(true);
+  }
+
+  /**
+   * The ONE writer of `cameraOn` on my conversation payload: camera wanted
+   * AND the capture live (final-review I3 — `videoOn` used to write intent,
+   * so a denied camera made every peer's tile wait for video forever).
+   * Called on the presence tick and at both gesture sites.
+   */
+  private _syncCameraOnPayload(activate = false): void {
+    const want =
+      get(this._localIntent).camera.wanted &&
+      this.cameraSource.lifecycle.state === 'live';
+    const mine = get(this._myModuleStates)['conversation'];
+    // The tick never activates the conversation module; a gesture may (as
+    // the pre-reconciler gesture writes did via `_syncConversationPayload`).
+    if (!mine && !activate) return;
+    const current = mine ? parseConversationPayload(mine)?.cameraOn : undefined;
+    if (current === want) return;
+    void this._syncConversationPayload({ cameraOn: want }).catch(e =>
+      this.logger.logCustomMessage(`cameraOn sync failed: ${String(e)}`),
+    );
   }
 
   /**
@@ -1891,9 +1915,10 @@ export class StreamsStore {
 
   videoOff() {
     this._applyIntent({ type: 'video-off' });
-    // See videoOn: the payload carries camera intent; fire-and-forget
-    // because this gesture is synchronous for its callers.
-    void this._syncConversationPayload({ cameraOn: false }).catch(() => {});
+    // See videoOn: the payload carries camera state (wanted AND live).
+    // The reconciler is fire-and-forget because this gesture is
+    // synchronous for its callers.
+    this._syncCameraOnPayload(true);
     if (!this.captureReconciler.cameraHandleHeld) return;
 
     // Swap the keepalive onto every peer's video sender while the camera
@@ -2801,20 +2826,27 @@ export class StreamsStore {
     const payload = peerConv ? parseConversationPayload(peerConv) : null;
     const rec = this._peerRecords.get(peerB64);
     const now = this.clock.now();
-    const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
+    const slot = get(this._openConnections)[peerB64];
+    const webrtcExpected = this._webrtcExpectedFor(peerB64);
     return describePeerTile({
-      webrtcExpected: this._webrtcExpectedFor(peerB64),
+      webrtcExpected,
+      reconnectAvailable: slot !== undefined && webrtcExpected,
       audioLink: this.audioLinkFor(peerB64),
       peerMicMuted: !!payload?.micMuted,
       peerCameraOn: payload?.cameraOn,
-      slot: get(this._openConnections)[peerB64],
-      filmstripLive:
-        lastFilmstripMs !== undefined && now - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS,
+      slot,
+      filmstripLive: this._filmstripLiveFor(peerB64, now),
       audioSilentSince: rec?.audioSilentSince,
       videoSilentSince: rec?.videoSilentSince,
       qualityBucket: rec?.qualityBucket,
       now,
     });
+  }
+
+  /** Filmstrip frames from this peer within `MEDIA_LIVE_WINDOW_MS`. */
+  private _filmstripLiveFor(peerB64: AgentPubKeyB64, now: number): boolean {
+    const lastMs = filmstripController.peerLastRecvMs.get(peerB64);
+    return lastMs !== undefined && now - lastMs < MEDIA_LIVE_WINDOW_MS;
   }
 
   /** Is a WebRTC link expected with this peer? The same predicate both
@@ -2845,12 +2877,8 @@ export class StreamsStore {
       const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
       const payload = peerConv ? parseConversationPayload(peerConv) : null;
       const slot = get(this._openConnections)[peerB64];
-      const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
-      const filmstripLive =
-        lastFilmstripMs !== undefined && now - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS;
       const videoFlowing =
-        (!!slot?.connected && !!slot.video && !slot.videoMuted && payload?.cameraOn !== false) ||
-        filmstripLive;
+        webrtcVideoLive(slot, payload?.cameraOn) || this._filmstripLiveFor(peerB64, now);
       const rec = this._ensurePeerRecord(peerB64);
       const next = decideSilenceStamps({
         audioLink: this.audioLinkFor(peerB64),
@@ -2861,6 +2889,16 @@ export class StreamsStore {
       });
       rec.audioSilentSince = next.audioSilentSince;
       rec.videoSilentSince = next.videoSilentSince;
+    }
+    // A peer that left the present set without a leave signal must not
+    // carry its stamps back (final-review I2): clear the pacing fields of
+    // every non-present record. Clearing a pacing field is not a
+    // membership read (peer-record.ts invariant).
+    const present = new Set(get(this._presentPeers));
+    for (const [peerB64, rec] of this._peerRecords) {
+      if (peerB64 === this.myPubKeyB64 || present.has(peerB64)) continue;
+      rec.audioSilentSince = undefined;
+      rec.videoSilentSince = undefined;
     }
   }
 

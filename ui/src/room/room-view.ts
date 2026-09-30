@@ -3014,22 +3014,14 @@ export class RoomView extends LitElement {
    * @returns
    */
   /**
-   * The tile's audio indicator: the level meter (lit while audio flows,
-   * dark while it does not) or, when the peer has muted, the muted-mic
-   * glyph in the meter's slot — so "muted by them" and "no audio path"
-   * never look alike (peer-tile spec decision 6). Reads only the policy's
-   * answer; the muted fact came through `describePeerTile`.
+   * The tile's audio indicator: the level meter, mounted in every audio
+   * state (lit while audio flows, dark while it does not, zero for a
+   * muted peer) so the DOM is stable. The muted indicator is the module
+   * icon strip's red mic-off glyph (`conversation.ts`), not a second
+   * glyph here — a correction from the final review of peer-tile spec
+   * decision 6. The frame reads `tile.quality` only.
    */
   private _renderAudioLevelMeter(pubkeyB64: AgentPubKeyB64, tile: PeerTileState) {
-    if (tile.audio === 'muted') {
-      return html`
-        <sl-icon
-          title=${msg('muted')}
-          style="color: #c3c9eb; opacity: 0.7; height: 20px; width: 20px; margin-left: 3px; vertical-align: middle;"
-          .src=${wrapPathInSvg(mdiMicrophoneOff)}
-        ></sl-icon>
-      `;
-    }
     return html`
       <audio-level-meter style="margin-left:3px"
         .streamsStore=${this.streamsStore}

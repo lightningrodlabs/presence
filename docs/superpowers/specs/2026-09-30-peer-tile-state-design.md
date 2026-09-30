@@ -26,7 +26,7 @@ see them, do I wait or act.**
    ```ts
    type PeerTileState = {
      background: 'avatar' | 'video' | 'filmstrip';
-     audio: 'live' | 'silent' | 'muted';       // meter lit / meter dark / muted glyph
+     audio: 'live' | 'silent' | 'muted';       // meter lit / meter dark / peer muted (icon strip shows the glyph)
      statusLine: string | undefined;           // exact user copy, pinned; at most one line
      attention: 'none' | 'wait' | 'act';
      reason: string;
@@ -70,6 +70,10 @@ see them, do I wait or act.**
    to `can't connect — try Reconnect` with attention `act` at `LINK_STUCK_ACT_MS`
    (30 s, new, named in `peer-tile-policy.ts`, declared NOT-liveness: it paces when
    the UI suggests a manual action; the link authorities keep their own clocks).
+   The act copy names Reconnect only when the control exists: the Reconnect icon
+   renders only when a media slot exists (`conversation.ts`), so the store passes
+   `reconnectAvailable` (`slot !== undefined && webrtcExpected`) and without it the
+   copy is `can't connect` (attention still `act`, reason `silent-act-no-control`).
 
    _Landed._
 
@@ -86,15 +90,17 @@ see them, do I wait or act.**
 
    _Landed._
 
-6. **Peer mic muted renders a muted glyph, not an absent meter.** `audio: 'muted'`
-   → the `mdiMicrophoneOff` icon in the meter's slot. Today the meter is removed
-   from the DOM, so "muted by them" and "no audio path" look identical.
+6. **Peer mic muted: the meter stays mounted.** Corrected at the final review: the
+   module icon strip already renders the muted glyph (`conversation.ts`), so the meter
+   stays mounted in every audio state and no second glyph is added.
 
    _Landed._
 
 7. **Peer camera intent goes on the wire: `ConversationPayload.cameraOn: boolean`.**
    Additive field, same push-on-change (`_syncConversationPayload`) and pong-sweep
-   path as `micMuted`; written by `videoOn`/`videoOff`; `CONVERSATION_PAYLOAD_WRITES`
+   path as `micMuted`; written by ONE reconciler, `StreamsStore._syncCameraOnPayload`
+   (value = camera wanted AND capture live; run on the presence tick and at `videoOn`/`videoOff`,
+   so a denied or failed camera never advertises `true`); `CONVERSATION_PAYLOAD_WRITES`
    gains it (`wire-contract.test.ts` snapshot and the v0.16.0 compat-corpus fixture
    updated). Parse default for a payload without the field is `undefined`
    ("unknown"), and every unknown arm of the grid shows nothing extra — the safe
@@ -135,7 +141,8 @@ see them, do I wait or act.**
    _Landed._
 
 8. **Quality shows as the meter's frame colour, never as text.** `PeerRecord.qualityBucket`'s
-   first segment: `ok` → no frame, `poor` → amber, `bad` → red. The bucket
+   RTT band (second segment; the first is the carrier): ok/good → no frame, poor → amber, bad → red;
+   loss and jitter bands are not read (declared). The bucket
    authority (`_maybeEmitQualityChange`) is unchanged.
 
    _Landed._
@@ -169,7 +176,8 @@ Attention: `none`; `wait` = amber text, auto-recovering; `act` = red text.
 |---|---|---|---|---|---|
 | 1a | silence < 2 s | avatar | silent | — | none |
 | 1b | silence ≥ 2 s, < 30 s (any WebRTC phase) | avatar | silent | no audio — reconnecting… | wait |
-| 1c | silence ≥ 30 s | avatar | silent | can't connect — try Reconnect | act |
+| 1c | silence ≥ 30 s, a media slot exists (Reconnect control rendered) | avatar | silent | can't connect — try Reconnect | act |
+| 1c-no-slot | silence ≥ 30 s, no media slot (no Reconnect control) | avatar | silent | can't connect | act |
 | 1d | audio via signals, no filmstrip, WebRTC in any non-connected phase | avatar | live | — | none |
 | 1e | audio via signals, filmstrip active | filmstrip | live | — | none |
 | 1f | WebRTC up, audio live, `cameraOn` false or unknown, no video track | avatar | live | — | none |
@@ -177,7 +185,7 @@ Attention: `none`; `wait` = amber text, auto-recovering; `act` = red text.
 | 1h | WebRTC up, audio + video live | video | live | — | none |
 | 1i | WebRTC up, audio live, `cameraOn` true, no video track ≥ 2 s | avatar | live | connecting video… | wait |
 | 1j | peer mic muted, any phase | per video rows | muted | — (video rows' line still applies) | per video |
-| 1k | WebRTC ICE-disconnected (slot still `connected`), audio stale → `down` | avatar | silent | as 1b/1c by silence age | wait/act |
+| 1k | WebRTC ICE-disconnected (slot still `connected`), audio stale → `down` | video | silent | as 1b/1c by silence age | wait/act |
 | 1l | pongs stale/gone, media flowing | as the flow row | live | — | none |
 | 1m | pongs gone, no media | tile removed by the present predicate — unchanged | | | |
 
@@ -190,7 +198,7 @@ My carrier mode `signals`, or per-peer pinned, or the peer's `webrtcDisabled` /
 |---|---|---|---|---|---|
 | 2a | silence < 2 s | avatar | silent | — | none |
 | 2b | silence ≥ 2 s, < 30 s | avatar | silent | no audio — reconnecting… | wait |
-| 2c | silence ≥ 30 s | avatar | silent | can't connect — try Reconnect | act |
+| 2c | silence ≥ 30 s (Group 2 has no slot, so no Reconnect control) | avatar | silent | can't connect | act |
 | 2d | voice flowing, no filmstrip, `cameraOn` false or unknown | avatar | live | — | none |
 | 2e | voice flowing, filmstrip active | filmstrip | live | — | none |
 | 2f | voice flowing, `cameraOn` true, no filmstrip ≥ 2 s | avatar | live | video paused — slow connection | none |
@@ -236,7 +244,7 @@ decision 7's show rule.
   a backstop-style close of a never-connected attempt leaves the tile at row 1a/1b
   by silence age, never at a "lost" wording (there is none); `videoOn`/`videoOff`
   write `cameraOn` and send no RTC action.
-- `intent-diff-surfaces.test.ts`: the muted glyph, the quality frame, and each
+- `intent-diff-surfaces.test.ts`: the meter mounted when muted, the quality frame, and each
   status line rendered off a stubbed `peerTileFor`; the copy-singleton pin covers
   `peer-tile-policy.ts`.
 - `wire-contract.test.ts` / `compat-corpus.test.ts`: `cameraOn` in the write set;
@@ -262,7 +270,7 @@ Met 2026-09-30 at 01fe16e.
 - "reconnecting" wording no longer exists; "no audio — reconnecting…" is keyed on
   silence age, not on `lastDisconnectTime`.
 - The amber tile dot is gone; its fact is in the details overlay.
-- A muted peer shows a muted glyph.
+- A muted peer keeps the meter mounted; the icon strip shows the muted glyph.
 - Camera intent reaches signals-only peers (new wire field); we stop sending the
   data-channel `video-on`/`video-off` actions but keep reading them. A v0.16.0
   receiver shows our keepalive as blank video while our camera is off (decision

@@ -34,7 +34,7 @@ export type IntentDiffInput = {
   /** `StreamsStore.signalsCadence().mode` — the ONE send-cadence authority
    *  (`transport/signals-cadence-policy.ts`), read, never re-derived. */
   signalsCadenceMode: 'full' | 'voice-only' | 'paused';
-  /** `get(_signalsTargets).length` — how many peers receive over signals. */
+  /** `get(_signalsTargets).size` — how many peers receive over signals. */
   signalsTargetCount: number;
   now: number;
 };
@@ -146,6 +146,8 @@ export function describeIntentDiffs(input: IntentDiffInput): IntentDiff[] {
     diffs.push({
       scope: 'camera',
       severity: 'pending',
+      // The camera badge does not render elapsed time, so `since` is the
+      // evaluation time rather than a first-seen stamp.
       since: input.now,
       reason: 'camera-paced',
       copy: VIDEO_PACED_COPY,

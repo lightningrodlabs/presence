@@ -18,6 +18,7 @@ const NOW = 1_000_000;
 function base(p: Partial<PeerTileInputs>): PeerTileInputs {
   return {
     webrtcExpected: true,
+    reconnectAvailable: false,
     audioLink: 'down',
     peerMicMuted: false,
     peerCameraOn: undefined,
@@ -33,6 +34,7 @@ function base(p: Partial<PeerTileInputs>): PeerTileInputs {
 
 const NO_AUDIO = 'no audio — reconnecting…';
 const CANT_CONNECT = "can't connect — try Reconnect";
+const CANT_CONNECT_BARE = "can't connect";
 const CONNECTING_VIDEO = 'connecting video…';
 
 type Row = [string, Partial<PeerTileInputs>, PeerTileState];
@@ -45,13 +47,15 @@ const ROWS: Row[] = [
     { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: undefined, attention: 'none', reason: 'silent-under-grace' }],
   ['1b silence >= grace, WebRTC still signaling', { audioLink: 'negotiating', audioSilentSince: NOW - INTENT_DIFF_GRACE_MS, slot: { connected: false, video: false } },
     { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: NO_AUDIO, attention: 'wait', reason: 'silent-wait' }],
-  ['1c silence >= act threshold', { audioLink: 'down', audioSilentSince: NOW - LINK_STUCK_ACT_MS },
+  ['1c silence >= act threshold', { audioLink: 'down', reconnectAvailable: true, slot: { connected: false, video: false }, audioSilentSince: NOW - LINK_STUCK_ACT_MS },
     { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: CANT_CONNECT, attention: 'act', reason: 'silent-act' }],
+  ['1c-no-slot silence >= act, no Reconnect control to name', { audioLink: 'down', webrtcExpected: true, slot: undefined, audioSilentSince: NOW - LINK_STUCK_ACT_MS },
+    { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: CANT_CONNECT_BARE, attention: 'act', reason: 'silent-act-no-control' }],
   ['1d audio via signals while WebRTC establishes (the Uruguay log)', { audioLink: 'signals', slot: { connected: false, video: true }, audioSilentSince: NOW - 60_000 },
     { background: 'avatar', audio: 'live', quality: 'unknown', statusLine: undefined, attention: 'none', reason: 'audio-flowing' }],
-  ['1e WebRTC up, audio live, camera off', { audioLink: 'webrtc', peerCameraOn: false, slot: { connected: true, video: true }, qualityBucket: 'webrtc:ok:clean:smooth' },
+  ['1f WebRTC up, audio live, camera off', { audioLink: 'webrtc', peerCameraOn: false, slot: { connected: true, video: true }, qualityBucket: 'webrtc:ok:clean:smooth' },
     { background: 'avatar', audio: 'live', quality: 'ok', statusLine: undefined, attention: 'none', reason: 'audio-flowing' }],
-  ['1f filmstrip active over signals', { audioLink: 'signals', filmstripLive: true, qualityBucket: 'signals:poor:clean:smooth' },
+  ['1e filmstrip active over signals', { audioLink: 'signals', filmstripLive: true, qualityBucket: 'signals:poor:clean:smooth' },
     { background: 'filmstrip', audio: 'live', quality: 'poor', statusLine: undefined, attention: 'none', reason: 'audio-flowing' }],
   ['1g WebRTC up, video track arrived muted', { audioLink: 'webrtc', peerCameraOn: true, slot: { connected: true, video: true, videoMuted: true } },
     { background: 'avatar', audio: 'live', quality: 'unknown', statusLine: CONNECTING_VIDEO, attention: 'wait', reason: 'video-track-muted' }],
@@ -66,7 +70,7 @@ const ROWS: Row[] = [
   ['1j-muted-with-video-line muted keeps the video line', { audioLink: 'muted', peerMicMuted: true, peerCameraOn: true, slot: { connected: true, video: true, videoMuted: true } },
     { background: 'avatar', audio: 'muted', quality: 'unknown', statusLine: CONNECTING_VIDEO, attention: 'wait', reason: 'video-track-muted' }],
   // The slot still holds a (frozen) video track through ICE recovery, so
-  // the background stays 'video' — "last frame", per the spec's row 1i —
+  // the background stays 'video' (the last frame, spec row 1k) —
   // under the "no audio" line.
   ['1k ICE-disconnected: slot connected, audio down >= grace', { audioLink: 'down', slot: { connected: true, video: true }, audioSilentSince: NOW - INTENT_DIFF_GRACE_MS },
     { background: 'video', audio: 'silent', quality: 'unknown', statusLine: NO_AUDIO, attention: 'wait', reason: 'silent-wait' }],
@@ -88,7 +92,7 @@ const ROWS: Row[] = [
   ['2b signals-only silence >= grace', { webrtcExpected: false, audioLink: 'down', audioSilentSince: NOW - INTENT_DIFF_GRACE_MS },
     { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: NO_AUDIO, attention: 'wait', reason: 'silent-wait' }],
   ['2c signals-only silence >= act', { webrtcExpected: false, audioLink: 'down', audioSilentSince: NOW - LINK_STUCK_ACT_MS - 1 },
-    { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: CANT_CONNECT, attention: 'act', reason: 'silent-act' }],
+    { background: 'avatar', audio: 'silent', quality: 'unknown', statusLine: CANT_CONNECT_BARE, attention: 'act', reason: 'silent-act-no-control' }],
   ['2d voice flowing, camera off', { webrtcExpected: false, audioLink: 'signals', peerCameraOn: false },
     { background: 'avatar', audio: 'live', quality: 'unknown', statusLine: undefined, attention: 'none', reason: 'audio-flowing' }],
   ['caps-unknown: voice flowing, cameraOn unknown', { webrtcExpected: false, audioLink: 'signals', peerCameraOn: undefined, videoSilentSince: NOW - 60_000 },

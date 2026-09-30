@@ -43,6 +43,10 @@ export type PeerTileSlot = {
 export type PeerTileInputs = {
   /** `decideWebrtcEligibility(...).eligible` for this peer. */
   webrtcExpected: boolean;
+  /** A Reconnect control is rendered for this peer (the store computes
+   *  `slot !== undefined && webrtcExpected`); the act copy names it only
+   *  then (spec decision 4). */
+  reconnectAvailable: boolean;
   /** `audioLinkFor(peer)` — the flow authority. */
   audioLink: AudioLinkState;
   /** The peer's broadcast `micMuted`. */
@@ -74,6 +78,7 @@ export type PeerTileState = {
 
 const NO_AUDIO_COPY = 'no audio — reconnecting…';
 const CANT_CONNECT_COPY = "can't connect — try Reconnect";
+const CANT_CONNECT_NO_CONTROL_COPY = "can't connect";
 const CONNECTING_VIDEO_COPY = 'connecting video…';
 
 function qualityOf(bucket: string | undefined): PeerTileState['quality'] {
@@ -85,18 +90,18 @@ function qualityOf(bucket: string | undefined): PeerTileState['quality'] {
  *  before DTLS carries nothing — the circle-tile oval fix's measured
  *  trigger), present, unmuted, and the peer has not said the camera is
  *  off (spec decision 7's show rule). */
-function webrtcVideoLive(s: Pick<PeerTileInputs, 'slot' | 'peerCameraOn'>): boolean {
+export function webrtcVideoLive(
+  slot: PeerTileSlot | undefined,
+  peerCameraOn: boolean | undefined,
+): boolean {
   return (
-    !!s.slot?.connected &&
-    !!s.slot.video &&
-    !s.slot.videoMuted &&
-    s.peerCameraOn !== false
+    !!slot?.connected && !!slot.video && !slot.videoMuted && peerCameraOn !== false
   );
 }
 
 export function describePeerTile(s: PeerTileInputs): PeerTileState {
   const audioFlowing = s.audioLink === 'webrtc' || s.audioLink === 'signals';
-  const background: PeerTileState['background'] = webrtcVideoLive(s)
+  const background: PeerTileState['background'] = webrtcVideoLive(s.slot, s.peerCameraOn)
     ? 'video'
     : s.filmstripLive
       ? 'filmstrip'
@@ -129,7 +134,11 @@ export function describePeerTile(s: PeerTileInputs): PeerTileState {
       case 'down': {
         const silentFor =
           s.audioSilentSince === undefined ? 0 : s.now - s.audioSilentSince;
-        if (silentFor >= LINK_STUCK_ACT_MS) return out(CANT_CONNECT_COPY, 'act', 'silent-act');
+        if (silentFor >= LINK_STUCK_ACT_MS) {
+          return s.reconnectAvailable
+            ? out(CANT_CONNECT_COPY, 'act', 'silent-act')
+            : out(CANT_CONNECT_NO_CONTROL_COPY, 'act', 'silent-act-no-control');
+        }
         if (silentFor >= INTENT_DIFF_GRACE_MS) return out(NO_AUDIO_COPY, 'wait', 'silent-wait');
         return out(undefined, 'none', 'silent-under-grace');
       }
