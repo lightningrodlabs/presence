@@ -45,6 +45,8 @@ see them, do I wait or act.**
    its tooltip; the `if (payload?.micMuted) return html``` arm of
    `_renderAudioLevelMeter`.
 
+   _Landed._
+
 2. **Carrier never appears on the tile.** No string produced by `describePeerTile`
    names WebRTC or signals (pinned by a negative grep in the policy test). The
    details overlay (`_showConnectionDetails`) keeps every carrier fact: phase icons,
@@ -52,10 +54,14 @@ see them, do I wait or act.**
    used to carry (it moves there as a "signals: stale" marker beside the carrier
    toggle — same predicate, `!_activeAgents[peer]`, new home).
 
+   _Landed._
+
 3. **Flow beats everything.** Whenever `audioLinkFor(peer)` is `webrtc` or `signals`
    the status line is empty and attention is `none`, regardless of WebRTC phase,
    pong freshness, or how many establishment attempts have failed. This is the
    existing `decideAudioLink` contract carried one layer up.
+
+   _Landed._
 
 4. **"Connecting" and "lost" are one line.** The user knows whether they were
    hearing someone a moment ago; the action is the same. One string,
@@ -64,6 +70,8 @@ see them, do I wait or act.**
    to `can't connect — try Reconnect` with attention `act` at `LINK_STUCK_ACT_MS`
    (30 s, new, named in `peer-tile-policy.ts`, declared NOT-liveness: it paces when
    the UI suggests a manual action; the link authorities keep their own clocks).
+
+   _Landed._
 
 5. **Two local timestamps, one mechanism: `PeerRecord.audioSilentSince` and
    `PeerRecord.videoSilentSince`.** Stamped on the presence tick when the
@@ -76,9 +84,13 @@ see them, do I wait or act.**
    the tile: it is stamped on every close, including attempts that never
    connected, which is the "reconnecting" misreport in the log.
 
+   _Landed._
+
 6. **Peer mic muted renders a muted glyph, not an absent meter.** `audio: 'muted'`
    → the `mdiMicrophoneOff` icon in the meter's slot. Today the meter is removed
    from the DOM, so "muted by them" and "no audio path" look identical.
+
+   _Landed._
 
 7. **Peer camera intent goes on the wire: `ConversationPayload.cameraOn: boolean`.**
    Additive field, same push-on-change (`_syncConversationPayload`) and pong-sweep
@@ -120,9 +132,13 @@ see them, do I wait or act.**
    and their send side should go the same way. Deferred so this round's wire diff
    is one field; trigger: the next change that touches `set-peer-track`.
 
+   _Landed._
+
 8. **Quality shows as the meter's frame colour, never as text.** `PeerRecord.qualityBucket`'s
    first segment: `ok` → no frame, `poor` → amber, `bad` → red. The bucket
    authority (`_maybeEmitQualityChange`) is unchanged.
+
+   _Landed._
 
 9. **Own-side addition: one intent diff.** `describeIntentDiffs` gains scope
    `camera`, reason `camera-paced`, copy `video paused — slow connection`, when
@@ -131,10 +147,14 @@ see them, do I wait or act.**
    the one place the signals-pacing work and this UX meet; it is additive and
    reads the cadence authority, never re-derives it.
 
+   _Landed._
+
 10. **The backstop SDP timer misfire is out of scope** (`media-links.ts`, the
     `sdpTimeoutTimer` arm keyed on `SdpExchange` alone) — a separate bounded fix
     on its own branch. The 7 s FSM connection timeout and the cadence gate's
     reaction lag belong to the signals-pacing line, not here.
+
+    _Out of scope by declaration._
 
 ## The grid (the table-test contract)
 
@@ -233,6 +253,8 @@ deleted mechanisms in decision 1 and the two `_broadcastRtcAction` video sends i
 decision 7 have zero references; CLAUDE.md gains a "Peer-tile round facts" bullet
 naming the file, the `LINK_STUCK_ACT_MS` NOT-liveness declaration, the two
 `PeerRecord` fields, and the wire change with its declared interop consequence.
+
+Met 2026-09-30 at 01fe16e.
 
 ## Declared behavior changes
 
