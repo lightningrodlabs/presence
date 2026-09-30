@@ -52,6 +52,14 @@ export interface ConversationPayload {
   /** True when user's mic is muted (track.enabled = false). */
   micMuted: boolean;
   /**
+   * True when the user's camera is on (peer-tile spec decision 7). The
+   * one carrier-independent statement of camera intent — the
+   * data-channel `video-on`/`video-off` actions never reached a
+   * signals-only peer. `undefined` on parse means the sender predates
+   * the field: the tile treats that as unknown and shows nothing extra.
+   */
+  cameraOn: boolean | undefined;
+  /**
    * Global WebRTC kill switch. When true, this agent will not initiate
    * or accept WebRTC with anyone. Broadcast so remote peers can skip
    * InitRequest attempts entirely rather than timing out.
@@ -83,6 +91,7 @@ export interface ConversationPayload {
 
 export const DEFAULT_CONVERSATION_PAYLOAD: ConversationPayload = {
   micMuted: true,
+  cameraOn: false,
   webrtcDisabled: false,
   disableWebrtcWith: [],
   webrtcImpl: 'fsm',
@@ -200,6 +209,7 @@ export function parseConversationPayload(
     }
     return {
       micMuted: raw.micMuted !== undefined ? !!raw.micMuted : !!raw.muted,
+      cameraOn: raw.cameraOn === undefined ? undefined : !!raw.cameraOn,
       webrtcDisabled: !!raw.webrtcDisabled,
       disableWebrtcWith: Array.isArray(raw.disableWebrtcWith)
         ? raw.disableWebrtcWith.filter((x: unknown) => typeof x === 'string')

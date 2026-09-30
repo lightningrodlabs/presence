@@ -69,6 +69,7 @@
   "conversationPayload": {
     "writes": [
       "micMuted",
+      "cameraOn",
       "webrtcDisabled",
       "disableWebrtcWith",
       "webrtcImpl",
@@ -77,6 +78,7 @@
     ],
     "reads": [
       "micMuted",
+      "cameraOn",
       "webrtcDisabled",
       "disableWebrtcWith",
       "webrtcImpl",
