@@ -17,7 +17,7 @@
  *
  * Replaces (spec decision 1): `describeLinkEstablishment` and
  * `StreamsStore.peerReconnecting`, room-view's inline
- * `connecting media...` literal, its `!conn.connected` avatar-hiding arm,
+ * connecting-media literal, its `!conn.connected` avatar-hiding arm,
  * the amber signaling-held dot, and `_renderAudioLevelMeter`'s
  * meter-removed-when-muted arm.
  */

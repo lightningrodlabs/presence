@@ -46,7 +46,12 @@ describe('no conversation-payload re-parse outside conversation.ts', () => {
   it('room-view reads the carrier-disable answer from the store authority', () => {
     const text = src('room/room-view.ts');
     expect(text).toContain('this.streamsStore.webrtcDisabled(');
-    expect(text).toContain('parseConversationPayload(');
+    // The second pin (room-view's own `parseConversationPayload(` call for
+    // the meter's muted read) is retired: the muted fact now arrives via
+    // `StreamsStore.peerTileFor` / `describePeerTile`, and room-view holds
+    // no conversation-payload read at all (the JSON.parse guard above
+    // still covers a re-inline).
+    expect(text).not.toContain('parseConversationPayload(');
   });
 });
 

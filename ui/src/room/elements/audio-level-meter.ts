@@ -20,6 +20,11 @@ export class AudioLevelMeter extends LitElement {
   @property({ type: String })
   agentPubKeyB64 = '';
 
+  /** The tile policy's quality reading (`PeerTileState.quality`) — drawn
+   *  as the meter's frame, never as text (peer-tile spec decision 8). */
+  @property({ type: String, reflect: true })
+  quality: 'ok' | 'poor' | 'bad' | 'unknown' = 'unknown';
+
   private _intervalId = 0;
   private _brickEls: HTMLElement[] = [];
   private _lastBricks = -1;
@@ -32,6 +37,14 @@ export class AudioLevelMeter extends LitElement {
       height: 20px;
       vertical-align: middle;
       margin-right: 4px;
+    }
+    :host([quality='poor']) {
+      box-shadow: 0 0 0 1px #e7a008;
+      border-radius: 2px;
+    }
+    :host([quality='bad']) {
+      box-shadow: 0 0 0 1px #c72100;
+      border-radius: 2px;
     }
     .brick {
       width: 6px;
