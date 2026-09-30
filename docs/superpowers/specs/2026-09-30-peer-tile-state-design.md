@@ -262,7 +262,7 @@ decision 7 have zero references; CLAUDE.md gains a "Peer-tile round facts" bulle
 naming the file, the `LINK_STUCK_ACT_MS` NOT-liveness declaration, the two
 `PeerRecord` fields, and the wire change with its declared interop consequence.
 
-Met 2026-09-30 at 01fe16e.
+Met 2026-09-30 at c1902f8 (final-review fix wave).
 
 ## Declared behavior changes
 
