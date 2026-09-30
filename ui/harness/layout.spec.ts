@@ -260,14 +260,6 @@ test('layout invariants across viewport / shape / count / mode', async ({
  * past the width.
  */
 const PEER_TILE_VIEWPORTS = [320, 400, 480];
-const PEER_TILE_STATES = [
-  'no-conn',
-  'establishing',
-  'connected-video-muted',
-  'video-before-connected',
-  'connected-video',
-  'reconnecting-video',
-] as const;
 
 test('circle tile stays 1:1 through WebRTC establishment (peer-tile content stack)', async ({
   page,
@@ -285,7 +277,13 @@ test('circle tile stays 1:1 through WebRTC establishment (peer-tile content stac
     await page.waitForFunction(() => !!(window as any).harness?.peerTile);
     await page.evaluate(() => (window as any).harness.relayout());
 
-    for (const state of PEER_TILE_STATES) {
+    // The state list is the harness's own (PEER_STATES, exposed as
+    // harness.peerTile.states), so a state added there is walked here
+    // without a second copy to keep in step.
+    const states: string[] = await page.evaluate(
+      () => (window as any).harness.peerTile.states
+    );
+    for (const state of states) {
       const m = await page.evaluate(
         (s) => (window as any).harness.peerTile.setState(s),
         state
