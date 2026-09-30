@@ -239,3 +239,76 @@ test('layout invariants across viewport / shape / count / mode', async ({
   expect(violations, `\n${violations.join('\n')}\n`).toEqual([]);
   void failures;
 });
+
+/**
+ * Circle tiles stay 1:1 through WebRTC establishment.
+ *
+ * The room owner's long-standing "tile goes oval, then snaps back" flash:
+ * the circle-mode override `.video-container:not(.square-view):not(.screen-share)
+ * { overflow: visible }` (room-view.ts) makes the tile a non-scroll
+ * container, so its `min-height: auto` becomes the content-based automatic
+ * minimum that css-sizing-4 imposes on aspect-ratio boxes — and whenever
+ * the in-flow content stack (the `<video>` at `height: 100%` plus a status
+ * line) is taller than the ratio-derived height, the tile grows taller
+ * than wide. Square view keeps `overflow: hidden` (a scroll container, no
+ * content-based minimum) and never ovals — the differential.
+ *
+ * This case drives the real content stack of `_renderPeerTile` (see
+ * `peerTileContent` in layout-harness.ts) through the slot states the
+ * store writes and asserts |width - height| <= 1px after each, at tile
+ * widths where the establishment line alone is enough to tip the sum
+ * past the width.
+ */
+const PEER_TILE_VIEWPORTS = [320, 400, 480];
+const PEER_TILE_STATES = [
+  'no-conn',
+  'establishing',
+  'connected-video-muted',
+  'video-before-connected',
+  'connected-video',
+  'reconnecting-video',
+] as const;
+
+test('circle tile stays 1:1 through WebRTC establishment (peer-tile content stack)', async ({
+  page,
+}) => {
+  mkdirSync(RESULTS, { recursive: true });
+  mkdirSync(SHOTS, { recursive: true });
+  const lines: string[] = [];
+  lines.push('| viewport | state | tile w x h | video shown | video w x h | in-flow | lines | ok |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+  const violations: string[] = [];
+
+  for (const vp of PEER_TILE_VIEWPORTS) {
+    await page.setViewportSize({ width: vp, height: vp });
+    await page.goto('/harness/layout-harness.html?mode=grid&shape=circle&n=2&content=peer');
+    await page.waitForFunction(() => !!(window as any).harness?.peerTile);
+    await page.evaluate(() => (window as any).harness.relayout());
+
+    for (const state of PEER_TILE_STATES) {
+      const m = await page.evaluate(
+        (s) => (window as any).harness.peerTile.setState(s),
+        state
+      );
+      const dw = Math.abs(m.tile.width - m.tile.height);
+      const ok = dw <= 1;
+      await page.screenshot({
+        path: join(SHOTS, `circle-tile_${vp}_${state}.png`),
+      });
+      lines.push(
+        `| ${vp} | ${state} | ${m.tile.width.toFixed(1)} x ${m.tile.height.toFixed(1)} | ${m.video.shown} | ${m.video.width.toFixed(1)} x ${m.video.height.toFixed(1)} | ${m.inFlow.toFixed(1)} | ${m.lines.join(' / ')} | ${ok ? 'pass' : 'FAIL'} |`
+      );
+      if (!ok) {
+        violations.push(
+          `vp ${vp} state ${state}: tile ${m.tile.width.toFixed(1)} x ${m.tile.height.toFixed(1)} (|dw| ${dw.toFixed(1)}px, in-flow ${m.inFlow.toFixed(1)}px)`
+        );
+      }
+    }
+  }
+
+  const md = lines.join('\n');
+  // eslint-disable-next-line no-console
+  console.log('\n' + md + '\n');
+  writeFileSync(join(RESULTS, 'circle-tile-oval.md'), md + '\n');
+  expect(violations, `\n${violations.join('\n')}\n`).toEqual([]);
+});
