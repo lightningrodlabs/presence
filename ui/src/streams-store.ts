@@ -19,7 +19,9 @@ import { buildPeerLinkSnapshot, decideAudioLink } from './peer-link-policy';
 import { initialPeerRecord, prunePendingInits, type PeerRecord } from './peer-record';
 import { FsmTransport } from './transport';
 import type { PeerTransport } from './transport';
-import { computeSignalsTargets } from './transport/carrier-coverage';
+import { computeSignalsTargets, decideWebrtcEligibility } from './transport/carrier-coverage';
+import { describePeerTile, decideSilenceStamps } from './peer-tile-policy';
+import type { PeerTileState } from './peer-tile-policy';
 import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
 import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
@@ -369,17 +371,6 @@ export class StreamsStore {
         now: this.clock.now(),
       }),
     );
-  }
-
-  /**
-   * Minimal read for the tile establishment copy (Task 6, surface 2): has
-   * this peer had a prior connected session this room-session, i.e. is a
-   * fresh WebRTC attempt actually a reconnection? Exposes the boolean the
-   * view needs for `describeLinkEstablishment` without handing it the raw
-   * `lastDisconnectTime` field.
-   */
-  peerReconnecting(peerB64: AgentPubKeyB64): boolean {
-    return this._peerRecords.get(peerB64)?.lastDisconnectTime !== undefined;
   }
 
   /**
@@ -1093,6 +1084,7 @@ export class StreamsStore {
       // the reconcilers act on, so a surfaced diff always tracks a
       // reconciliation attempt in flight (never a stale phantom warning).
       this._recomputeIntentDiffs();
+      this._stampTileSilence();
     });
   }
 
@@ -1803,8 +1795,11 @@ export class StreamsStore {
       event: 'MyVideoOn',
     });
 
-    // Send 'video-on' signal to peers
-    this._broadcastRtcAction('video-on');
+    // Camera intent reaches every carrier through the conversation
+    // payload (peer-tile spec decision 7) — the data-channel `video-on`
+    // action never reached a signals-only peer. The receive arm of that
+    // action stays as a legacy read for v0.16.0 senders.
+    await this._syncConversationPayload({ cameraOn: true });
   }
 
   /**
@@ -1894,6 +1889,9 @@ export class StreamsStore {
 
   videoOff() {
     this._applyIntent({ type: 'video-off' });
+    // See videoOn: the payload carries camera intent; fire-and-forget
+    // because this gesture is synchronous for its callers.
+    void this._syncConversationPayload({ cameraOn: false }).catch(() => {});
     if (!this.captureReconciler.cameraHandleHeld) return;
 
     // Swap the keepalive onto every peer's video sender while the camera
@@ -1940,8 +1938,6 @@ export class StreamsStore {
 
     // Stop the filmstrip encoder — videoOff means no video in any carrier.
     this._reconcileSignalsVideo();
-
-    this._broadcastRtcAction('video-off');
 
     this.logger.logAgentEvent({
       agent: this.myPubKeyB64,
@@ -2790,6 +2786,80 @@ export class StreamsStore {
   lastSeenBucket(peerB64: AgentPubKeyB64): LastSeenBucket {
     const known = get(this._knownAgents)[peerB64];
     return lastSeenBucket(known?.lastSeen, this.clock.now());
+  }
+
+  /**
+   * What this peer's tile shows — the ONE decision is `describePeerTile`
+   * (`peer-tile-policy.ts`); this method only gathers the snapshot from
+   * the existing authorities, the same shape as `audioLinkFor`. Called
+   * at render time by room-view's `_renderPeerTile`.
+   */
+  peerTileFor(peerB64: AgentPubKeyB64): PeerTileState {
+    const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
+    const payload = peerConv ? parseConversationPayload(peerConv) : null;
+    const rec = this._peerRecords.get(peerB64);
+    const now = this.clock.now();
+    const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
+    return describePeerTile({
+      webrtcExpected: this._webrtcExpectedFor(peerB64),
+      audioLink: this.audioLinkFor(peerB64),
+      peerMicMuted: !!payload?.micMuted,
+      peerCameraOn: payload?.cameraOn,
+      slot: get(this._openConnections)[peerB64],
+      filmstripLive:
+        lastFilmstripMs !== undefined && now - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS,
+      audioSilentSince: rec?.audioSilentSince,
+      videoSilentSince: rec?.videoSilentSince,
+      qualityBucket: rec?.qualityBucket,
+      now,
+    });
+  }
+
+  /** Is a WebRTC link expected with this peer? The same predicate both
+   *  handshake ends apply (`decideWebrtcEligibility`, role-symmetric). */
+  private _webrtcExpectedFor(peerB64: AgentPubKeyB64): boolean {
+    return decideWebrtcEligibility({
+      role: 'initiator',
+      conversationActive: !!get(this._myModuleStates)['conversation'],
+      peerWebrtcDisabled: this.webrtcDisabled(peerB64),
+      webrtcGloballyDisabled: this.webrtcGloballyDisabled,
+      peerCapsKnown:
+        get(this._peerModuleStates)[peerB64]?.['conversation'] !== undefined,
+      peerHasSdpFsmCap: this.webrtcAvailableFor(peerB64),
+    }).eligible;
+  }
+
+  /**
+   * Presence-tick stamping of the two tile pacing timestamps (spec
+   * decision 5). Runs beside `_recomputeIntentDiffs` so the copy paces
+   * on the same tick the reconcilers act on. `_ensurePeerRecord` is a
+   * write path by contract; a row for a present peer is not a liveness
+   * claim (peer-record.ts header).
+   */
+  private _stampTileSilence(): void {
+    const now = this.clock.now();
+    for (const peerB64 of get(this._presentPeers)) {
+      if (peerB64 === this.myPubKeyB64) continue;
+      const peerConv = get(this._peerModuleStates)[peerB64]?.['conversation'];
+      const payload = peerConv ? parseConversationPayload(peerConv) : null;
+      const slot = get(this._openConnections)[peerB64];
+      const lastFilmstripMs = filmstripController.peerLastRecvMs.get(peerB64);
+      const filmstripLive =
+        lastFilmstripMs !== undefined && now - lastFilmstripMs < MEDIA_LIVE_WINDOW_MS;
+      const videoFlowing =
+        (!!slot?.connected && !!slot.video && !slot.videoMuted && payload?.cameraOn !== false) ||
+        filmstripLive;
+      const rec = this._ensurePeerRecord(peerB64);
+      const next = decideSilenceStamps({
+        audioLink: this.audioLinkFor(peerB64),
+        peerCameraOn: payload?.cameraOn,
+        videoFlowing,
+        prev: { audioSilentSince: rec.audioSilentSince, videoSilentSince: rec.videoSilentSince },
+        now,
+      });
+      rec.audioSilentSince = next.audioSilentSince;
+      rec.videoSilentSince = next.videoSilentSince;
+    }
   }
 
   /**
