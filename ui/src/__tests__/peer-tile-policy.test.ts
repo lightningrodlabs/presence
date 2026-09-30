@@ -1,6 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import {
   describePeerTile,
   decideSilenceStamps,
@@ -118,15 +116,7 @@ describe('describePeerTile — the grid', () => {
         expect(line, `${name}: "${line}"`).not.toMatch(banned);
       }
     }
-    // And the source file's string literals carry none of the words.
-    const src = readFileSync(
-      fileURLToPath(new URL('../peer-tile-policy.ts', import.meta.url)),
-      'utf8',
-    );
-    const literals = src.match(/'[^'\n]*'|"[^"\n]*"/g) ?? [];
-    for (const lit of literals) {
-      expect(lit, `literal ${lit}`).not.toMatch(banned);
-    }
+    // The pin is on what the user sees (statusLine). The source itself must name carriers — it compares AudioLinkState values and carries machine-readable reason tags — so no source-literal scan.
   });
 
   it('quality reads the bucket\'s second segment and nothing else', () => {

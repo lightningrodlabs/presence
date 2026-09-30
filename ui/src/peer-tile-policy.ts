@@ -95,7 +95,7 @@ function webrtcVideoLive(s: Pick<PeerTileInputs, 'slot' | 'peerCameraOn'>): bool
 }
 
 export function describePeerTile(s: PeerTileInputs): PeerTileState {
-  const audioFlowing = s.audioLink === `webrtc` || s.audioLink === `signals`;
+  const audioFlowing = s.audioLink === 'webrtc' || s.audioLink === 'signals';
   const background: PeerTileState['background'] = webrtcVideoLive(s)
     ? 'video'
     : s.filmstripLive
@@ -133,9 +133,9 @@ export function describePeerTile(s: PeerTileInputs): PeerTileState {
         if (silentFor >= INTENT_DIFF_GRACE_MS) return out(NO_AUDIO_COPY, 'wait', 'silent-wait');
         return out(undefined, 'none', 'silent-under-grace');
       }
-      case `muted`:
-      case `webrtc`:
-      case `signals`:
+      case 'muted':
+      case 'webrtc':
+      case 'signals':
         // unreachable by the guard above; fall through to the video arms
         break;
       default: {
@@ -160,7 +160,7 @@ export function describePeerTile(s: PeerTileInputs): PeerTileState {
       s.videoSilentSince === undefined ? 0 : s.now - s.videoSilentSince;
     if (waitingFor >= INTENT_DIFF_GRACE_MS) {
       if (s.webrtcExpected && s.slot?.connected) {
-        return out(CONNECTING_VIDEO_COPY, 'wait', `video-waiting-webrtc`);
+        return out(CONNECTING_VIDEO_COPY, 'wait', 'video-waiting-webrtc');
       }
       // Frames would come over signals; their cadence throttled them.
       return out(VIDEO_PACED_COPY, 'none', 'video-paced');
