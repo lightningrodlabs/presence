@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   describeIntentDiffs,
-  describeLinkEstablishment,
   INTENT_DIFF_GRACE_MS,
+  VIDEO_PACED_COPY,
 } from '../intent-diff-policy';
 import type { IntentDiffInput } from '../intent-diff-policy';
 import { CAPTURE_REOPEN_MAX_ATTEMPTS } from '../capture-reconcile-policy';
@@ -57,6 +57,8 @@ function input(partial: Partial<IntentDiffInput>): IntentDiffInput {
     cameraLifecycle: idle,
     cameraAttempts: 0,
     carrierDownSince: undefined,
+    signalsCadenceMode: 'full',
+    signalsTargetCount: 0,
     now: NOW,
     ...partial,
   };
@@ -394,22 +396,48 @@ describe('describeIntentDiffs — coexisting diffs (Incident B vs C confusabilit
   });
 });
 
-describe('describeLinkEstablishment', () => {
-  it('connected → null', () => {
-    expect(describeLinkEstablishment({ connected: true, reconnecting: false })).toBeNull();
-    expect(describeLinkEstablishment({ connected: true, reconnecting: true })).toBeNull();
+describe('camera paced by the signals cadence (peer-tile spec decision 9)', () => {
+  const wanted = { ...baseIntent(), camera: { wanted: true } };
+
+  it('camera wanted + cadence voice-only + a signals target → camera/pending/"video paused — slow connection"', () => {
+    const diffs = describeIntentDiffs(
+      input({ intent: wanted, cameraLifecycle: live, signalsCadenceMode: 'voice-only', signalsTargetCount: 1 })
+    );
+    expect(diffs).toEqual([
+      { scope: 'camera', severity: 'pending', since: NOW, reason: 'camera-paced', copy: VIDEO_PACED_COPY },
+    ]);
   });
 
-  it('not connected, first time → "establishing WebRTC carrier…"', () => {
-    expect(describeLinkEstablishment({ connected: false, reconnecting: false })).toEqual({
-      copy: 'establishing WebRTC carrier…',
-    });
+  it('paused cadence reports the same diff', () => {
+    const diffs = describeIntentDiffs(
+      input({ intent: wanted, cameraLifecycle: live, signalsCadenceMode: 'paused', signalsTargetCount: 2 })
+    );
+    expect(diffs.map(d => d.reason)).toEqual(['camera-paced']);
   });
 
-  it('not connected, had a prior session → "connection lost — reconnecting…"', () => {
-    expect(describeLinkEstablishment({ connected: false, reconnecting: true })).toEqual({
-      copy: 'connection lost — reconnecting…',
-    });
+  it('no signals target → [] (nobody is receiving over signals)', () => {
+    expect(
+      describeIntentDiffs(input({ intent: wanted, cameraLifecycle: live, signalsCadenceMode: 'paused', signalsTargetCount: 0 }))
+    ).toEqual([]);
+  });
+
+  it('full cadence → []', () => {
+    expect(
+      describeIntentDiffs(input({ intent: wanted, cameraLifecycle: live, signalsCadenceMode: 'full', signalsTargetCount: 3 }))
+    ).toEqual([]);
+  });
+
+  it('camera not wanted → [] even when paced', () => {
+    expect(
+      describeIntentDiffs(input({ signalsCadenceMode: 'paused', signalsTargetCount: 3 }))
+    ).toEqual([]);
+  });
+
+  it('a capture diff for the camera wins over the paced diff (one camera diff at a time)', () => {
+    const diffs = describeIntentDiffs(
+      input({ intent: wanted, cameraLifecycle: failed, cameraAttempts: 0, signalsCadenceMode: 'paused', signalsTargetCount: 1 })
+    );
+    expect(diffs.filter(d => d.scope === 'camera').map(d => d.reason)).toEqual(['camera-failed']);
   });
 });
 

@@ -31,6 +31,11 @@ export type IntentDiffInput = {
   cameraLifecycle: CaptureLifecycle;
   cameraAttempts: number;         // captureReconciler.cameraAttemptState
   carrierDownSince: number | undefined; // _signalCarrierDownSince
+  /** `StreamsStore.signalsCadence().mode` — the ONE send-cadence authority
+   *  (`transport/signals-cadence-policy.ts`), read, never re-derived. */
+  signalsCadenceMode: 'full' | 'voice-only' | 'paused';
+  /** `get(_signalsTargets).length` — how many peers receive over signals. */
+  signalsTargetCount: number;
   now: number;
 };
 
@@ -130,6 +135,23 @@ export function describeIntentDiffs(input: IntentDiffInput): IntentDiff[] {
   );
   if (camera) diffs.push(camera);
 
+  // Own-side twin of the tile's row 2f: my camera is on, the signals
+  // cadence has throttled my frames, and someone is on signals.
+  if (
+    !camera &&
+    input.intent.camera.wanted &&
+    input.signalsCadenceMode !== 'full' &&
+    input.signalsTargetCount > 0
+  ) {
+    diffs.push({
+      scope: 'camera',
+      severity: 'pending',
+      since: input.now,
+      reason: 'camera-paced',
+      copy: VIDEO_PACED_COPY,
+    });
+  }
+
   if (
     input.carrierDownSince !== undefined &&
     input.now - input.carrierDownSince >= INTENT_DIFF_GRACE_MS
@@ -146,20 +168,3 @@ export function describeIntentDiffs(input: IntentDiffInput): IntentDiff[] {
   return diffs;
 }
 
-/**
- * The per-peer link-establishment tile copy. Replaces the inline literal
- * at room-view.ts:3186 (Task 6 moves the render site here) — the
- * distinction between first-establishment and reconnection gives the
- * user the reason not to press the reconnect button during recovery.
- */
-export function describeLinkEstablishment(input: {
-  connected: boolean;
-  /** the peer had a previous connected session this room-session
-   *  (the peer record's `lastDisconnectTime !== undefined`) */
-  reconnecting: boolean;
-}): { copy: string } | null {
-  if (input.connected) return null;
-  return input.reconnecting
-    ? { copy: 'connection lost — reconnecting…' }
-    : { copy: 'establishing WebRTC carrier…' };
-}

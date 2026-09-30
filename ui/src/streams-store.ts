@@ -368,6 +368,8 @@ export class StreamsStore {
         cameraAttempts:
           this.captureReconciler.cameraAttemptState.attemptsSinceGesture,
         carrierDownSince: this._signalCarrierDownSince,
+        signalsCadenceMode: this._signalsCadence.mode,
+        signalsTargetCount: get(this._signalsTargets).size,
         now: this.clock.now(),
       }),
     );
