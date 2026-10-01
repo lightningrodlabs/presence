@@ -209,8 +209,12 @@ function tile(
  *   avatar-with-nickname   in-flow, `width: 35%`; shown only when conn is
  *                          undefined or (connected && !video). Stand-in:
  *                          a 35%-wide square, the profile-image branch
- *                          (`img { width:100%; height:auto }`) — the
- *                          taller of the element's two renderings.
+ *                          (`img { width:100%; height:auto }`). The
+ *                          identicon branch is a fixed 40px
+ *                          `holo-identicon`, taller than the 35% square
+ *                          below ~115px tile width; immaterial to the
+ *                          pin, since the avatar never shares the flow
+ *                          with the video.
  *   peer-filmstrip         host is position:absolute (its :host rule);
  *                          out of flow. Stand-in keeps that positioning.
  *   video.video-el         in-flow when conn.video (`display:none`
