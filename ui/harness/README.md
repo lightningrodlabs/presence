@@ -105,6 +105,7 @@ nix develop -c npm run harness -w ui
 | split  | 0–100                | 50       | split ratio %  (split only)      |
 | bound  | `viewport`\|`content`| viewport | `content` drops the 100vh bound (host height becomes content-driven) |
 | vh     | px                   | —        | force host height to N px (simulate an embedder reporting 100vh ≠ visible pane) |
+| content| `fill` \| `peer`     | fill     | `peer` gives tile 0 the in-flow content stack of `_renderPeerTile` (avatar / `<video>` / status lines) and exposes `harness.peerTile.setState(...)` to walk the WebRTC establishment states — the "circle tile stays 1:1" case in `layout.spec.ts` |
 
 `bound`/`vh` reproduce the **embedding** failure modes (see below); leave them
 unset for normal layout testing.

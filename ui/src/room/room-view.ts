@@ -4357,6 +4357,17 @@ export class RoomView extends LitElement {
 
       .video-container:not(.square-view):not(.screen-share) {
         overflow: visible;
+        /* overflow: visible makes this tile a non-scroll container, so
+           its min-height: auto becomes the content-based automatic
+           minimum css-sizing-4 imposes on aspect-ratio boxes: whenever
+           the in-flow stack (.video-el at height:100% plus a status
+           line -- the video-and-not-yet-connected slot during
+           establishment) is taller than the ratio height, the tile
+           grows taller than wide. Square view keeps overflow:hidden and
+           never ovals. Pinned by the "circle tile stays 1:1" case in
+           harness/layout.spec.ts. (No backticks in this comment: the
+           sheet is a css tagged template.) */
+        min-height: 0;
       }
 
       .module-replace-content {
