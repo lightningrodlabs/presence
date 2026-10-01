@@ -84,6 +84,19 @@ export type PeerRecord = {
   screenShareIceDisconnectedAt?: number; // outgoing
   // — close survivors: reset only on peer-leave
   /**
+   * Tile-copy pacing stamps (spec 2026-09-30 peer-tile state, decision
+   * 5): when this peer's audio last stopped flowing (`audioLinkFor` in
+   * negotiating/down), and when their camera was on with no frames
+   * arriving. Stamped/cleared every presence tick by
+   * `decideSilenceStamps` (`peer-tile-policy.ts`) through
+   * `StreamsStore._stampTileSilence`. Close survivors: a reconnect
+   * attempt must not reset the "how long has nothing flowed" clock —
+   * that is what escalates the copy to "try Reconnect". NEVER a liveness
+   * predicate; they pace user-facing copy only.
+   */
+  audioSilentSince?: number;
+  videoSilentSince?: number;
+  /**
    * Timestamp of the last connection close/error for this peer, used to
    * log the retry gap when a new InitRequest is created.
    */
@@ -161,6 +174,7 @@ export function resetPeerRecord(r: PeerRecord, arm: PeerRecordResetArm): PeerRec
         ...r, videoStream: undefined, pendingInits: undefined,
         qualityBucket: undefined, lastDisconnectTime: undefined,
         lastReconcileTime: undefined, signalsRttEwma: undefined,
+        audioSilentSince: undefined, videoSilentSince: undefined,
         deadTrackEscalations: undefined,
       };
     case 'screen-out-close':
