@@ -7,7 +7,7 @@
  * constructed element with a fake store — the same style as the
  * screen-share-maximize-key and idToLayout pins.
  *
- * The pure decisions (`describeIntentDiffs`, `describeLinkEstablishment`)
+ * The pure decisions (`describeIntentDiffs`, `describePeerTile`)
  * are table-tested in intent-diff-policy.test.ts; here we pin that
  * room-view derives the button on/off from `localIntent`, badges from the
  * store's `intentDiffs`, the tile copy from the policy authority, and the
@@ -26,10 +26,11 @@ import { render } from 'lit';
 import '../room/room-view';
 import type { IntentDiff } from '../intent-diff-policy';
 import type { SystemAudioRequestDecision } from '../mic-output-policy';
+import type { PeerTileState } from '../peer-tile-policy';
 
 type FakeStore = {
   clock: { now: () => number };
-  peerReconnecting: (p: string) => boolean;
+  peerTileFor: (p: string) => PeerTileState;
   disconnect: ReturnType<typeof vi.fn>;
   systemAudioRequest: SystemAudioRequestDecision;
   systemAudioOn: () => Promise<void>;
@@ -37,11 +38,16 @@ type FakeStore = {
   micSource: { lifecycle: { state: string } };
 };
 
+const TILE_QUIET: PeerTileState = {
+  background: 'avatar', audio: 'live', quality: 'unknown',
+  statusLine: undefined, attention: 'none', reason: 'audio-flowing',
+};
+
 function makeRoomView(overrides?: {
   intent?: unknown;
   diffs?: IntentDiff[];
   now?: number;
-  reconnecting?: (p: string) => boolean;
+  tile?: PeerTileState;
   systemAudioRequest?: SystemAudioRequestDecision;
   systemAudio?: { label: string; canExcludeSelf: boolean } | null;
   micLifecycle?: string;
@@ -49,7 +55,7 @@ function makeRoomView(overrides?: {
   const el = document.createElement('room-view') as any;
   const store: FakeStore = {
     clock: { now: () => overrides?.now ?? 0 },
-    peerReconnecting: overrides?.reconnecting ?? (() => false),
+    peerTileFor: () => overrides?.tile ?? TILE_QUIET,
     disconnect: vi.fn(),
     systemAudioRequest: overrides?.systemAudioRequest ?? { ok: true },
     systemAudioOn: vi.fn(async () => {}),
@@ -254,22 +260,46 @@ describe('carrier banner (surface 3)', () => {
   });
 });
 
-describe('tile establishment copy via the policy authority (surface 2)', () => {
-  it('first establishment vs reconnection is chosen by peerReconnecting', () => {
-    const fresh = makeRoomView({ reconnecting: () => false });
-    expect(fresh._tileEstablishmentCopy('peerA', false)).toBe(
-      'establishing WebRTC carrier…'
-    );
+describe('the peer tile renders the policy (surface 2)', () => {
+  function renderToDiv(tpl: unknown): HTMLElement {
+    const host = document.createElement('div');
+    render(tpl as any, host);
+    return host;
+  }
 
-    const rejoin = makeRoomView({ reconnecting: () => true });
-    expect(rejoin._tileEstablishmentCopy('peerA', false)).toBe(
-      'connection lost — reconnecting…'
-    );
+  it('a quiet tile has no status line', () => {
+    const el = makeRoomView();
+    const host = renderToDiv(el._renderTileStatusLine(TILE_QUIET));
+    expect(host.textContent!.trim()).toBe('');
   });
 
-  it('a connected link shows no establishment copy', () => {
-    const el = makeRoomView({ reconnecting: () => true });
-    expect(el._tileEstablishmentCopy('peerA', true)).toBeUndefined();
+  it('a wait line renders amber; an act line renders red, each with the policy copy verbatim', () => {
+    const el = makeRoomView();
+    const wait = renderToDiv(el._renderTileStatusLine({ ...TILE_QUIET, statusLine: 'no audio — reconnecting…', attention: 'wait' }));
+    expect(wait.textContent!.trim()).toBe('no audio — reconnecting…');
+    expect(wait.querySelector('.tile-status-wait')).toBeTruthy();
+    const act = renderToDiv(el._renderTileStatusLine({ ...TILE_QUIET, statusLine: "can't connect — try Reconnect", attention: 'act' }));
+    expect(act.textContent!.trim()).toBe("can't connect — try Reconnect");
+    expect(act.querySelector('.tile-status-act')).toBeTruthy();
+  });
+
+  it('the meter stays mounted in every audio state; muted adds no second glyph (the icon strip is the muted indicator)', () => {
+    const el = makeRoomView();
+    const live = renderToDiv(el._renderAudioLevelMeter('peerA', TILE_QUIET));
+    expect(live.querySelector('audio-level-meter')).toBeTruthy();
+    expect(live.querySelector('sl-icon')).toBeNull();
+    const silent = renderToDiv(el._renderAudioLevelMeter('peerA', { ...TILE_QUIET, audio: 'silent' }));
+    expect(silent.querySelector('audio-level-meter')).toBeTruthy();
+    const muted = renderToDiv(el._renderAudioLevelMeter('peerA', { ...TILE_QUIET, audio: 'muted' }));
+    expect(muted.querySelector('audio-level-meter')).toBeTruthy();
+    expect(muted.querySelector('sl-icon')).toBeNull();
+  });
+
+  it('the meter carries the quality bucket', () => {
+    const el = makeRoomView();
+    const host = renderToDiv(el._renderAudioLevelMeter('peerA', { ...TILE_QUIET, quality: 'bad' }));
+    const meter = host.querySelector('audio-level-meter') as any;
+    expect(meter.quality).toBe('bad');
   });
 });
 
@@ -299,13 +329,19 @@ describe('copy-singleton pin: policy strings live in exactly one source file', (
 
   const files = productionFiles(srcRoot);
   const contents = new Map(files.map(f => [f, readFileSync(f, 'utf8')]));
-  const policyFile = files.find(f => f.endsWith('intent-diff-policy.ts'))!;
+  const policyFiles = files.filter(
+    f => f.endsWith('intent-diff-policy.ts') || f.endsWith('peer-tile-policy.ts')
+  );
   const roomViewFile = files.find(f => f.endsWith('room/room-view.ts'))!;
 
-  // Copy that is pure render text — must exist ONLY in the policy.
+  // Copy that is pure render text — must exist in exactly ONE of the two
+  // policy files.
   const renderOnly = [
-    'establishing WebRTC carrier…',
-    'connection lost — reconnecting…',
+    'no audio — reconnecting…',
+    "can't connect — try Reconnect",
+    "can't connect",
+    'connecting video…',
+    'video paused — slow connection',
     'Your connection dropped — reconnecting…',
   ];
 
@@ -321,17 +357,23 @@ describe('copy-singleton pin: policy strings live in exactly one source file', (
     'Camera unavailable',
   ];
 
-  it('policy file exists and is discovered', () => {
-    expect(policyFile).toBeTruthy();
+  it('policy files exist and are discovered', () => {
+    expect(policyFiles).toHaveLength(2);
     expect(roomViewFile).toBeTruthy();
   });
 
-  it('each render-copy string appears in exactly one production file — the policy', () => {
+  it('each render-copy string appears in exactly one production file — a policy', () => {
     for (const str of renderOnly) {
       const holders = files.filter(f => contents.get(f)!.includes(str));
-      expect(holders, `"${str}" should live in exactly one file`).toEqual([
-        policyFile,
-      ]);
+      expect(holders, `"${str}" should live in exactly one file`).toHaveLength(1);
+      expect(policyFiles, `"${str}" holder must be a policy file`).toContain(holders[0]);
+    }
+  });
+
+  it('the retired tile strings exist nowhere', () => {
+    for (const str of ['connecting media...', 'establishing WebRTC carrier…', 'connection lost — reconnecting…', 'Signaling unstable']) {
+      const holders = files.filter(f => contents.get(f)!.includes(str));
+      expect(holders, `"${str}" is retired`).toEqual([]);
     }
   });
 

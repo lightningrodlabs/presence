@@ -254,10 +254,16 @@ test('layout invariants across viewport / shape / count / mode', async ({
  * content-based minimum) and never ovals — the differential.
  *
  * This case drives the real content stack of `_renderPeerTile` (see
- * `peerTileContent` in layout-harness.ts) through the slot states the
- * store writes and asserts |width - height| <= 1px after each, at tile
- * widths where the establishment line alone is enough to tip the sum
- * past the width.
+ * `peerTileContent` in layout-harness.ts) through tile states whose
+ * background and status line come from the real `describePeerTile`, and
+ * asserts |width - height| <= 1px after each, at tile widths where the
+ * status line alone is enough to tip the sum past the width.
+ *
+ * Negative control (re-run 2026-10-01 after the peer-tile merge): with
+ * the `min-height: 0` rule removed, the case fails at exactly
+ * `video-with-wait-line` and `video-with-act-line` at all three
+ * viewports — the states where a visible <video> and a status line are
+ * in flow together (peer-tile spec row 1k) — and nowhere else.
  */
 const PEER_TILE_VIEWPORTS = [320, 400, 480];
 

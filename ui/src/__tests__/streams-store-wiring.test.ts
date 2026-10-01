@@ -3602,3 +3602,203 @@ describe('StreamsStore.connect carries both host seams (release 0.16.0 Review Fo
     }
   });
 });
+
+describe('peer tile (spec 2026-09-30): cameraOn on the wire, silence stamps on the tick, peerTileFor', () => {
+  class FakeTrack {
+    readyState: 'live' | 'ended' = 'live';
+    enabled = true;
+    onended: (() => void) | null = null;
+    onmute: (() => void) | null = null;
+    onunmute: (() => void) | null = null;
+    muted = false;
+    constructor(public kind: 'audio' | 'video') {}
+    stop(): void { this.readyState = 'ended'; this.onended?.(); }
+  }
+  class FakeStream {
+    constructor(private tracks: FakeTrack[]) {}
+    getTracks() { return this.tracks; }
+    getAudioTracks() { return this.tracks.filter(t => t.kind === 'audio'); }
+    getVideoTracks() { return this.tracks.filter(t => t.kind === 'video'); }
+  }
+  class FakeMediaStream {
+    private tracks: FakeTrack[] = [];
+    addTrack(t: FakeTrack) { this.tracks.push(t); }
+    removeTrack(t: FakeTrack) { this.tracks = this.tracks.filter(x => x !== t); }
+    getTracks() { return this.tracks; }
+    getAudioTracks() { return this.tracks.filter(t => t.kind === 'audio'); }
+    getVideoTracks() { return this.tracks.filter(t => t.kind === 'video'); }
+  }
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  function installCamera(track: FakeTrack) {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { mediaDevices: { getUserMedia: async () => new FakeStream([track]) } },
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  function myConversation(started: ReturnType<typeof makeStarted>): Record<string, unknown> | null {
+    const env = get(started.store._myModuleStates)['conversation'];
+    return env ? JSON.parse(env.payload) : null;
+  }
+
+  function peerConversation(started: ReturnType<typeof makeStarted>, peer: string, payload: Record<string, unknown>) {
+    started.store._peerModuleStates.update(s => ({
+      ...s,
+      [peer]: {
+        conversation: { moduleId: 'conversation', active: true, payload: JSON.stringify(payload), updatedAt: started.clock.now() },
+      },
+    }));
+  }
+
+  beforeEach(() => { (globalThis as any).MediaStream = FakeMediaStream; });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).navigator;
+    delete (globalThis as any).MediaStream;
+  });
+
+  it('videoOn/videoOff write cameraOn to my conversation payload and send no video-on/off RTC action', async () => {
+    installCamera(new FakeTrack('video'));
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.sentData.length = 0;
+
+    await started.store.videoOn();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(true);
+
+    started.store.videoOff();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(false);
+
+    // The send side of the data-channel actions is gone (spec decision 7).
+    const actions = media.sentData.map(c => String(c.data));
+    expect(actions.some(a => a.includes('video-on') || a.includes('video-off'))).toBe(false);
+  });
+
+  it('the receive arm of video-off still clears conn.video for a legacy sender (Review Focus 5)', async () => {
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    started.store._openConnections.update(c => { c[peerA] = { ...c[peerA], video: true }; return c; });
+    media.emit({ type: 'data-channel-message', peer: peerA, connectionId: 'conn-1', data: encodeRtcAction('video-off') });
+    expect(get(started.store._openConnections)[peerA]?.video).toBe(false);
+  });
+
+  it('the tick stamps audioSilentSince for a present, reachable, silent peer and clears it when voice flows', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: false, caps: ['sdp-fsm'] });
+    started.clock.advance(PING_INTERVAL);
+    await flush(); await flush();
+    const t0 = started.store._peerRecords.get(peerA)?.audioSilentSince;
+    // Stamped when the peer first reads present and silent (the roster
+    // write itself notifies the subscription), so not necessarily on the
+    // advanced tick; the point is that it is set and then held.
+    expect(t0).toBeTypeOf('number');
+    expect(t0).toBeLessThanOrEqual(started.clock.now());
+
+    started.clock.advance(PING_INTERVAL);
+    await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBe(t0); // kept, not refreshed
+
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    started.clock.advance(PING_INTERVAL);
+    await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBeUndefined();
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('peerTileFor: audio over signals while WebRTC is still signaling shows no line (the 2026-09-30 log)', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: false, caps: ['sdp-fsm'] });
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile).toMatchObject({ background: 'avatar', audio: 'live', statusLine: undefined, attention: 'none' });
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('peerTileFor: a never-connected attempt closed by the backstop is "no audio", never a reconnect wording', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: false, caps: ['sdp-fsm'] });
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'closed', 'signaling');
+    // three ticks of silence past the grace
+    for (let i = 0; i < 3; i++) { started.clock.advance(PING_INTERVAL); await flush(); await flush(); }
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile.statusLine).toBe('no audio — reconnecting…');
+    expect(tile.attention).toBe('wait');
+    expect((started.store as any).peerReconnecting).toBeUndefined();
+  });
+
+  it('I2: a peer that drops out of the present set without a leave signal loses both stamps and gets the full grace on return', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: true, caps: ['sdp-fsm'] });
+    for (let i = 0; i < 3; i++) { started.clock.advance(PING_INTERVAL); await flush(); await flush(); }
+    const rec = started.store._peerRecords.get(peerA)!;
+    expect(rec.audioSilentSince).toBeTypeOf('number');
+    expect(rec.videoSilentSince).toBeTypeOf('number');
+    expect(started.store.peerTileFor(peerA).statusLine).toBeDefined(); // past grace
+
+    // Drop out of the present set: no roster entry, silence past the staleness
+    // window and the carrier-hold cap.
+    started.store._knownAgents.set({});
+    for (let i = 0; i < 40 && get(started.store._presentPeers).includes(peerA); i++) {
+      started.clock.advance(PING_INTERVAL); await flush(); await flush();
+    }
+    expect(get(started.store._presentPeers).includes(peerA)).toBe(false);
+    started.clock.advance(PING_INTERVAL); await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBeUndefined();
+    expect(started.store._peerRecords.get(peerA)?.videoSilentSince).toBeUndefined();
+
+    // Return: the first present tick stamps fresh, so no line yet.
+    const returnedAt = started.clock.now();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    await flush(); await flush();
+    expect(get(started.store._presentPeers).includes(peerA)).toBe(true);
+    expect(started.store._peerRecords.get(peerA)?.videoSilentSince).toBeGreaterThanOrEqual(returnedAt);
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile.statusLine).toBeUndefined();
+    expect(tile.reason).toBe('silent-under-grace');
+  });
+
+  it('I3: cameraOn on the wire means wanted AND live — a failed acquire writes false, a later reconciler acquire writes true', async () => {
+    let fail = true;
+    const track = new FakeTrack('video');
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async () => {
+            if (fail) throw new Error('NotAllowedError');
+            return new FakeStream([track]);
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    const started = makeStarted();
+    await started.store.videoOn();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(false);
+
+    fail = false;
+    started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+    await started.store.captureReconciler.tick(); // the reconciler acquires
+    await flush();
+    started.clock.advance(PING_INTERVAL); // the next presence tick picks it up
+    await flush(); await flush();
+    expect(myConversation(started)?.cameraOn).toBe(true);
+  });
+});

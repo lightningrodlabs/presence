@@ -35,7 +35,8 @@ import { RoomContainer } from '../src/room/room-container';
 import { RoomView } from '../src/room/room-view';
 import { bestColumns, GRID_TOOLBAR_RESERVE } from '../src/room/layout';
 import { bindVideoStream } from '../src/room/video-bind';
-import { describeLinkEstablishment } from '../src/intent-diff-policy';
+import { describePeerTile } from '../src/peer-tile-policy';
+import type { PeerTileInputs } from '../src/peer-tile-policy';
 
 type Mode = 'grid' | 'split';
 
@@ -206,8 +207,9 @@ function tile(
  * in-flow children can feed the tile's content-based automatic minimum
  * height, so that is where fidelity matters:
  *
- *   avatar-with-nickname   in-flow, `width: 35%`; shown only when conn is
- *                          undefined or (connected && !video). Stand-in:
+ *   avatar-with-nickname   in-flow, `width: 35%`; hidden iff the policy's
+ *                          `background !== 'avatar'` (filmstrip
+ *                          inactive here). Stand-in:
  *                          a 35%-wide square, the profile-image branch
  *                          (`img { width:100%; height:auto }`). The
  *                          identicon branch is a fixed 40px
@@ -217,19 +219,23 @@ function tile(
  *                          with the video.
  *   peer-filmstrip         host is position:absolute (its :host rule);
  *                          out of flow. Stand-in keeps that positioning.
- *   video.video-el         in-flow when conn.video (`display:none`
- *                          otherwise); `.video-el { width:100%;
- *                          height:100% }` from the real sheet.
- *   establishment line     in-flow div, `font-size: 0.8em`, present iff
- *                          describeLinkEstablishment returns copy (i.e.
- *                          !connected).
- *   "connecting media..."  in-flow div, shown iff
- *                          connected && !video && videoMuted.
+ *   video.video-el         in-flow when the policy's `background ===
+ *                          'video'` (`display:none` otherwise);
+ *                          `.video-el { width:100%; height:100% }` from
+ *                          the real sheet.
+ *   .tile-status           in-flow div (`_renderTileStatusLine`), real
+ *                          `.tile-status*` classes, present iff the
+ *                          policy returns a `statusLine`; rendered after
+ *                          the video, outside the `conn` conditional.
  *   .tile-meta             position:absolute bottom rows (30px icon row +
  *                          4px margin, 36px avatar row); out of flow.
  *
- * Not mirrored: the module-replace content, the signaling-held dot and
- * the connection-details block — all position:absolute in the template.
+ * Visibility and copy come from the REAL `describePeerTile`
+ * (src/peer-tile-policy.ts) over each state's inputs, so a state here is
+ * one render of the live template's in-flow stack.
+ *
+ * Not mirrored: the module-replace content and the connection-details
+ * block — both position:absolute in the template.
  * The two custom elements are stand-ins because the real ones need a
  * profiles context / streams store the harness does not construct.
  */
@@ -240,8 +246,7 @@ function peerTileContent(): string {
     </div>
     <div data-filmstrip style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; pointer-events: none;"></div>
     <video data-video class="video-el" style="display: none;" muted playsinline></video>
-    <div data-est style="color: #b9a884; font-size: 0.8em; display: none;"></div>
-    <div data-connecting style="color: #b9a884; font-size: 0.8em; display: none;">connecting media...</div>
+    <div data-status class="tile-status" style="display: none;"></div>
     <div class="tile-meta" style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;">
       <div style="height: 30px; margin-bottom: 4px; width: 60px;"></div>
       <div style="height: 36px; width: 60px;"></div>
@@ -453,45 +458,69 @@ window.addEventListener('resize', () => relayout());
 
 // ---- content=peer: drive tile 0 through the WebRTC establishment states ----
 //
-// The slot shapes below are the ones the store can write to
-// `_openConnections[peer]` (src/media-links.ts): the `signaling` install
-// is `{connected:false, video:false}`; `connected` flips `connected`;
-// a remote video track arriving un-muted (or unmuting) sets `video` with
-// no `connected` check, and one arriving muted sets `videoMuted`. The
-// avatar / video / status-line visibility is derived from the slot with
-// the SAME expressions RoomView._renderPeerTile uses, so a state here is
-// one render of the live template.
-interface PeerSlot {
-  connected?: boolean;
-  video?: boolean;
-  videoMuted?: boolean;
-}
+// Each state is a `PeerTileInputs` snapshot — the slot shapes are the
+// ones the store writes to `_openConnections[peer]` (src/media-links.ts)
+// and the rest are what `StreamsStore.peerTileFor` gathers. The real
+// `describePeerTile` turns it into background + status line, and the
+// stack's visibility follows with the SAME expressions
+// RoomView._renderPeerTile uses, so a state here is one render of the
+// live template.
+//
+// The oval-prone states are the ones where a visible <video> and a
+// status line are in flow together: since the peer-tile round that is
+// the spec's row 1k (slot still `connected` through ICE recovery, the
+// frozen track shown, audio down) — `video-with-wait-line` and
+// `video-with-act-line`. `video-before-connected`, the state the
+// original field report came from, no longer shows the <video> at all
+// (the policy requires `connected`), and is kept as the control.
+const TILE_NOW = 1_000_000;
+const TILE_BASE: PeerTileInputs = {
+  webrtcExpected: true,
+  audioLink: 'signals',
+  peerMicMuted: false,
+  peerCameraOn: true,
+  slot: undefined,
+  filmstripLive: false,
+  audioSilentSince: undefined,
+  videoSilentSince: undefined,
+  qualityBucket: undefined,
+  reconnectAvailable: false,
+  now: TILE_NOW,
+};
 type PeerTileState =
-  | 'no-conn' // conn undefined (signals only): avatar shown
-  | 'establishing' // conn && !connected: status line, avatar + video hidden
-  | 'connected-video-muted' // connected && !video && videoMuted: avatar + "connecting media..."
-  | 'video-before-connected' // video && !connected: <video> in flow + status line
+  | 'no-conn' // no slot, audio over signals: avatar, no line
+  | 'establishing-silent' // slot, not connected, silent past grace: avatar + wait line
+  | 'video-before-connected' // video && !connected: avatar (video hidden), no line
+  | 'connected-video-track-muted' // track arrived muted: avatar + "connecting video…"
   | 'connected-video' // connected && video: <video> only
-  | 'reconnecting-video'; // video && !connected, reconnecting copy
+  | 'video-with-wait-line' // row 1k: <video> + "no audio — reconnecting…"
+  | 'video-with-act-line'; // row 1k past the act threshold: <video> + the act line
 
-const PEER_STATES: Record<
-  PeerTileState,
-  { conn: PeerSlot | undefined; reconnecting: boolean }
-> = {
-  'no-conn': { conn: undefined, reconnecting: false },
-  establishing: { conn: { connected: false }, reconnecting: false },
-  'connected-video-muted': {
-    conn: { connected: true, videoMuted: true },
-    reconnecting: false,
+const PEER_STATES: Record<PeerTileState, Partial<PeerTileInputs>> = {
+  'no-conn': {},
+  'establishing-silent': {
+    slot: { connected: false, video: false },
+    audioLink: 'negotiating',
+    audioSilentSince: TILE_NOW - 3_000,
+    reconnectAvailable: true,
   },
-  'video-before-connected': {
-    conn: { connected: false, video: true },
-    reconnecting: false,
+  'video-before-connected': { slot: { connected: false, video: true } },
+  'connected-video-track-muted': {
+    slot: { connected: true, video: true, videoMuted: true },
+    audioLink: 'webrtc',
   },
-  'connected-video': { conn: { connected: true, video: true }, reconnecting: false },
-  'reconnecting-video': {
-    conn: { connected: false, video: true },
-    reconnecting: true,
+  'connected-video': { slot: { connected: true, video: true }, audioLink: 'webrtc' },
+  'video-with-wait-line': {
+    slot: { connected: true, video: true },
+    audioLink: 'down',
+    audioSilentSince: TILE_NOW - 3_000,
+    reconnectAvailable: true,
+  },
+  'video-with-act-line': {
+    slot: { connected: true, video: true },
+    audioLink: 'down',
+    audioSilentSince: TILE_NOW - 31_000,
+    reconnectAvailable: true,
   },
 };
 
@@ -543,24 +572,23 @@ function peerTileEls() {
     tileEl,
     avatar: q('[data-avatar]'),
     video: q('[data-video]') as HTMLVideoElement,
-    est: q('[data-est]'),
-    connecting: q('[data-connecting]'),
+    status: q('[data-status]'),
   };
 }
 
 let peerState: PeerTileState = 'no-conn';
 
 async function setPeerTileState(state: PeerTileState): Promise<PeerTileMeasure> {
-  const { conn, reconnecting } = PEER_STATES[state];
-  const { avatar, video, est, connecting } = peerTileEls();
+  const tile = describePeerTile({ ...TILE_BASE, ...PEER_STATES[state] });
+  const { avatar, video, status } = peerTileEls();
   peerState = state;
 
-  // Mirrors _renderPeerTile's `avatarHidden` (filmstrip inactive).
-  const avatarHidden = conn ? !conn.connected || !!conn.video : false;
-  avatar.style.display = avatarHidden ? 'none' : '';
+  // Mirrors _renderPeerTile's `avatarHidden` (filmstrip inactive):
+  // `filmstripActive || tile.background !== 'avatar'`.
+  avatar.style.display = tile.background !== 'avatar' ? 'none' : '';
 
-  // Mirrors `style="${conn.video ? '' : 'display: none;'}"` on the <video>.
-  const videoShown = !!conn && !!conn.video;
+  // Mirrors `style="${tile.background === 'video' ? '' : 'display: none;'}"`.
+  const videoShown = tile.background === 'video';
   video.style.display = videoShown ? '' : 'none';
   if (videoShown) {
     const stream = peerVideoStream();
@@ -580,33 +608,32 @@ async function setPeerTileState(state: PeerTileState): Promise<PeerTileMeasure> 
     }
   }
 
-  // Mirrors _tileEstablishmentCopy: copy only from the one authority.
-  const copy = conn
-    ? describeLinkEstablishment({ connected: !!conn.connected, reconnecting })?.copy
-    : undefined;
-  est.textContent = copy ?? '';
-  est.style.display = copy ? '' : 'none';
-
-  // Mirrors the "connecting media..." gate.
-  const connectingShown = !!conn && !!conn.connected && !conn.video && !!conn.videoMuted;
-  connecting.style.display = connectingShown ? '' : 'none';
+  // Mirrors _renderTileStatusLine: copy and attention only from the policy.
+  status.textContent = tile.statusLine ?? '';
+  status.style.display = tile.statusLine ? '' : 'none';
+  status.className =
+    tile.attention === 'act'
+      ? 'tile-status tile-status-act'
+      : tile.attention === 'wait'
+        ? 'tile-status tile-status-wait'
+        : 'tile-status';
 
   await nextFrames(2);
   return measurePeerTile();
 }
 
 function measurePeerTile(): PeerTileMeasure {
-  const { tileEl, avatar, video, est, connecting } = peerTileEls();
+  const { tileEl, avatar, video, status } = peerTileEls();
   const tr = tileEl.getBoundingClientRect();
   const vr = video.getBoundingClientRect();
-  const inFlowEls = [avatar, video, est, connecting].filter(
+  const inFlowEls = [avatar, video, status].filter(
     (el) => el.style.display !== 'none'
   );
   const inFlow = inFlowEls.reduce(
     (sum, el) => sum + el.getBoundingClientRect().height,
     0
   );
-  const lines = [est, connecting]
+  const lines = [status]
     .filter((el) => el.style.display !== 'none')
     .map((el) => el.textContent?.trim() ?? '');
   return {
