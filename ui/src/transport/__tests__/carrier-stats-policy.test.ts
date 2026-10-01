@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   decideFlowGlyph,
+  decideMeterLevel,
   foldSignalsRtt,
   statsForPeer,
+  SIGNALS_LEVEL_HOLD_MS,
   SIGNALS_RTT_EWMA_ALPHA,
   SIGNALS_RTT_PLAUSIBLE_MAX_MS,
 } from '../carrier-stats-policy';
@@ -266,5 +268,48 @@ describe('foldSignalsRtt — the pong-echo RTT fold (§9 item 4)', () => {
     if (spiked.action === 'fold') {
       expect(spiked.ewmaMs).toBe(400); // 100 + 0.3 * 1000
     }
+  });
+});
+
+describe('decideMeterLevel — the tile meter reads the active carrier only, and a signals peak expires', () => {
+  const NOW = 1_000_000;
+  const FRESH = NOW - 20;
+  const STALE = NOW - SIGNALS_LEVEL_HOLD_MS;
+
+  const table: Array<[string, Parameters<typeof decideMeterLevel>[0], ReturnType<typeof decideMeterLevel>]> = [
+    // The field report (2026-10-01): a muted peer on WebRTC is digital
+    // silence (analyser 0); the meter must NOT fall through to the last
+    // signals peak left over from before WebRTC took over.
+    ['webrtc connected, analyser 0, stale signals peak left behind',
+      { slot: { connected: true }, webrtcLevel: 0, signalsLevel: 0.8, lastVoiceMs: NOW - 60_000, now: NOW },
+      { level: 0, reason: 'webrtc' }],
+    ['webrtc connected, analyser 0, even a FRESH signals peak is not read',
+      { slot: { connected: true }, webrtcLevel: 0, signalsLevel: 0.8, lastVoiceMs: FRESH, now: NOW },
+      { level: 0, reason: 'webrtc' }],
+    ['webrtc connected, analyser live',
+      { slot: { connected: true }, webrtcLevel: 0.4, signalsLevel: 0.8, lastVoiceMs: FRESH, now: NOW },
+      { level: 0.4, reason: 'webrtc' }],
+    ['signals carrier (no slot), fresh frame → the peak',
+      { slot: undefined, webrtcLevel: 0, signalsLevel: 0.6, lastVoiceMs: FRESH, now: NOW },
+      { level: 0.6, reason: 'signals-fresh' }],
+    ['signals carrier (slot not connected), fresh frame → the peak',
+      { slot: { connected: false }, webrtcLevel: 0, signalsLevel: 0.6, lastVoiceMs: FRESH, now: NOW },
+      { level: 0.6, reason: 'signals-fresh' }],
+    ['signals carrier, frames stopped (mute, paused cadence, drop) → 0 at the hold boundary',
+      { slot: undefined, webrtcLevel: 0, signalsLevel: 0.6, lastVoiceMs: STALE, now: NOW },
+      { level: 0, reason: 'signals-stale' }],
+    ['signals carrier, one ms inside the hold → still the peak',
+      { slot: undefined, webrtcLevel: 0, signalsLevel: 0.6, lastVoiceMs: STALE + 1, now: NOW },
+      { level: 0.6, reason: 'signals-fresh' }],
+    ['signals carrier, no frame ever',
+      { slot: undefined, webrtcLevel: 0, signalsLevel: undefined, lastVoiceMs: undefined, now: NOW },
+      { level: 0, reason: 'no-signals-sample' }],
+    ['signals carrier, a peak with no arrival stamp is not trusted',
+      { slot: undefined, webrtcLevel: 0, signalsLevel: 0.6, lastVoiceMs: undefined, now: NOW },
+      { level: 0, reason: 'no-signals-sample' }],
+  ];
+
+  it.each(table)('%s', (_name, input, expected) => {
+    expect(decideMeterLevel(input)).toEqual(expected);
   });
 });

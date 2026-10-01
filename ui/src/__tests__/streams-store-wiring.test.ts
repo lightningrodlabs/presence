@@ -25,6 +25,7 @@ import {
 import { CAP_VOICE_BATCH } from '../transport/wire-contract';
 import { encodeRtcAction } from '../rtc-message-policy';
 import { DEAD_TRACK_REFRESH_BUDGET, deadTrackRefreshBudget } from '../transport/track-health-policy';
+import { SIGNALS_LEVEL_HOLD_MS } from '../transport/carrier-stats-policy';
 import {
   CAPTURE_REOPEN_MIN_INTERVAL_MS,
   CAPTURE_REOPEN_MAX_ATTEMPTS,
@@ -3800,5 +3801,36 @@ describe('peer tile (spec 2026-09-30): cameraOn on the wire, silence stamps on t
     started.clock.advance(PING_INTERVAL); // the next presence tick picks it up
     await flush(); await flush();
     expect(myConversation(started)?.cameraOn).toBe(true);
+  });
+});
+
+describe('audioLevelFor: the tile meter\'s one level read (2026-10-01 stuck-meter report)', () => {
+  afterEach(() => {
+    voiceController.peerAudioLevels.delete(peerA);
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('a signals peak is read while frames are fresh and expires when they stop', () => {
+    const started = makeStarted();
+    voiceController.peerAudioLevels.set(peerA, 0.8);
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    expect(started.store.audioLevelFor(peerA)).toBe(0.8);
+
+    // Frames stop (the peer muted, their cadence paused, or they dropped):
+    // the map still holds 0.8 — the meter must not.
+    started.clock.advance(SIGNALS_LEVEL_HOLD_MS);
+    expect(voiceController.peerAudioLevels.get(peerA)).toBe(0.8);
+    expect(started.store.audioLevelFor(peerA)).toBe(0);
+  });
+
+  it('on a connected WebRTC link a leftover signals peak is never read', () => {
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    voiceController.peerAudioLevels.set(peerA, 0.8);
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    // No analyser in node → the WebRTC level is 0, as for a muted peer.
+    expect(started.store.audioLevelFor(peerA)).toBe(0);
   });
 });

@@ -6,8 +6,10 @@ import type { StreamsStore } from '../../streams-store';
  * Self-updating audio level meter for a peer. Polls at 10fps, reads
  * from whichever carrier is active for this peer:
  *
- *   - WebRTC connected → reads from the AnalyserNode on the incoming stream
- *   - No WebRTC → reads from the signals carrier's peak level map
+ *   - WebRTC connected → the AnalyserNode on the incoming stream
+ *   - otherwise → the signals carrier's last frame peak, while that frame
+ *     is recent (`SIGNALS_LEVEL_HOLD_MS`)
+ * The choice is `StreamsStore.audioLevelFor`'s, not this element's.
  *
  * Renders as a vertical stack of 5 small bricks: bottom 3 green, 4th
  * amber, 5th red. Fully decoupled from Lit's reactive render cycle.
@@ -95,9 +97,12 @@ export class AudioLevelMeter extends LitElement {
   private _tick = () => {
     if (!this.streamsStore) return;
 
-    // Pick the active carrier's level source for this peer
-    const level = this.streamsStore.getWebrtcAudioLevel(this.agentPubKeyB64)
-      || (this.streamsStore.signalsAudioLevels.get(this.agentPubKeyB64) ?? 0);
+    // The active carrier's level, decided in ONE place
+    // (`StreamsStore.audioLevelFor` → `decideMeterLevel`). Never compose
+    // carrier sources here: an `||` between the WebRTC analyser and the
+    // signals peak froze the meter at a stale signals value whenever the
+    // analyser read exactly 0 (a muted peer).
+    const level = this.streamsStore.audioLevelFor(this.agentPubKeyB64);
 
     const bricks = Math.min(5, Math.round(Math.sqrt(level) * 5));
 

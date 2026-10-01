@@ -90,11 +90,21 @@ see them, do I wait or act.**
 
    _Landed._
 
-6. **Peer mic muted: the meter stays mounted.** Corrected at the final review: the
-   module icon strip already renders the muted glyph (`conversation.ts`), so the meter
-   stays mounted in every audio state and no second glyph is added.
+6. **Peer mic muted: no meter, as before this round.** The module icon strip already
+   renders the muted glyph (`conversation.ts`), so the tile adds none, and the level
+   meter is not rendered for a muted peer — there is no level to show.
 
-   _Landed._
+   History of this decision, kept because it was wrong twice: the first cut added a
+   muted glyph in the meter's slot on the false premise that nothing else showed
+   mute; the final review removed it but kept the meter mounted in every audio
+   state; a field report the next day (2026-10-01) showed that meter frozen at the
+   last level, because the signals peak map is never decayed and the element fell
+   through to it whenever the WebRTC analyser read exactly 0. The pre-round
+   behavior (meter absent when muted) is restored, and the freeze is fixed at its
+   source: `decideMeterLevel` (`transport/carrier-stats-policy.ts`) reads the active
+   carrier's level only and expires a signals peak after `SIGNALS_LEVEL_HOLD_MS`.
+
+   _Landed (restored 2026-10-01)._
 
 7. **Peer camera intent goes on the wire: `ConversationPayload.cameraOn: boolean`.**
    Additive field, same push-on-change (`_syncConversationPayload`) and pong-sweep
@@ -244,7 +254,7 @@ decision 7's show rule.
   a backstop-style close of a never-connected attempt leaves the tile at row 1a/1b
   by silence age, never at a "lost" wording (there is none); `videoOn`/`videoOff`
   write `cameraOn` and send no RTC action.
-- `intent-diff-surfaces.test.ts`: the meter mounted when muted, the quality frame, and each
+- `intent-diff-surfaces.test.ts`: the meter absent when muted, the quality frame, and each
   status line rendered off a stubbed `peerTileFor`; the copy-singleton pin covers
   `peer-tile-policy.ts`.
 - `wire-contract.test.ts` / `compat-corpus.test.ts`: `cameraOn` in the write set;
@@ -270,7 +280,8 @@ Met 2026-09-30 at c1902f8 (final-review fix wave).
 - "reconnecting" wording no longer exists; "no audio — reconnecting…" is keyed on
   silence age, not on `lastDisconnectTime`.
 - The amber tile dot is gone; its fact is in the details overlay.
-- A muted peer keeps the meter mounted; the icon strip shows the muted glyph.
+- No change for a muted peer: the meter is absent and the icon strip shows the muted
+  glyph, as before this round (decision 6's history).
 - Camera intent reaches signals-only peers (new wire field); we stop sending the
   data-channel `video-on`/`video-off` actions but keep reading them. A v0.16.0
   receiver shows our keepalive as blank video while our camera is off (decision

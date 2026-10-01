@@ -22,7 +22,7 @@ import type { PeerTransport } from './transport';
 import { computeSignalsTargets, decideWebrtcEligibility } from './transport/carrier-coverage';
 import { describePeerTile, decideSilenceStamps, webrtcVideoLive } from './peer-tile-policy';
 import type { PeerTileState } from './peer-tile-policy';
-import { foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
+import { decideMeterLevel, foldSignalsRtt, statsForPeer } from './transport/carrier-stats-policy';
 import { decideSignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { SignalsMediaCadence } from './transport/signals-cadence-policy';
 import type { PeerStats } from './transport/carrier-stats-policy';
@@ -3313,12 +3313,24 @@ export class StreamsStore {
   }
 
   /**
-   * Per-peer peak audio level from the voice (signals) carrier.
-   * Range 0.0–1.0. Updated per decoded frame (~50/sec per peer).
-   * Plain Map — not reactive. Read by the audio-level-meter element.
+   * The tile meter's one level read, range 0.0–1.0: the ACTIVE carrier's
+   * level for this peer (`decideMeterLevel`, carrier-stats-policy.ts) —
+   * the WebRTC analyser's when the slot is connected, else the last
+   * signals voice-frame peak while that frame is within
+   * `SIGNALS_LEVEL_HOLD_MS`. Polled at 10 fps by the audio-level-meter
+   * element; this method only gathers the snapshot. Replaces the
+   * element's own `getWebrtcAudioLevel(...) || signalsAudioLevels.get(...)`
+   * composition (both store members are deleted with it), which froze the
+   * meter at a stale signals peak when a peer muted.
    */
-  get signalsAudioLevels(): Map<string, number> {
-    return voiceController.peerAudioLevels;
+  audioLevelFor(peerB64: AgentPubKeyB64): number {
+    return decideMeterLevel({
+      slot: get(this._openConnections)[peerB64],
+      webrtcLevel: this.peerAudioLevels.getWebrtcAudioLevel(peerB64),
+      signalsLevel: voiceController.peerAudioLevels.get(peerB64),
+      lastVoiceMs: voiceController.peerLastRecvMs.get(peerB64),
+      now: this.clock.now(),
+    }).level;
   }
 
   /** True iff the signals-carrier voice encoder is currently capturing. */
@@ -3442,12 +3454,6 @@ export class StreamsStore {
    *  `_voiceBatchCapAllTargets` for the evaluation cadence and rationale. */
   voiceBatchEligible(): boolean {
     return this._voiceBatchCapAllTargets;
-  }
-
-  /** View-surface delegate to `peerAudioLevels` (Task 1; see
-   *  peer-audio-levels.ts). Called by the audio-level-meter element. */
-  getWebrtcAudioLevel(pubKeyB64: string): number {
-    return this.peerAudioLevels.getWebrtcAudioLevel(pubKeyB64);
   }
 
   setReceiverOverride(agentPubKeyB64: AgentPubKeyB64, moduleId: string | null): void {

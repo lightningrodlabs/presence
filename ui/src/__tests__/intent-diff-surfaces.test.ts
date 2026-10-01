@@ -283,7 +283,7 @@ describe('the peer tile renders the policy (surface 2)', () => {
     expect(act.querySelector('.tile-status-act')).toBeTruthy();
   });
 
-  it('the meter stays mounted in every audio state; muted adds no second glyph (the icon strip is the muted indicator)', () => {
+  it('the meter shows while audio is live or silent and is absent for a muted peer; no second glyph (the icon strip is the muted indicator)', () => {
     const el = makeRoomView();
     const live = renderToDiv(el._renderAudioLevelMeter('peerA', TILE_QUIET));
     expect(live.querySelector('audio-level-meter')).toBeTruthy();
@@ -291,7 +291,7 @@ describe('the peer tile renders the policy (surface 2)', () => {
     const silent = renderToDiv(el._renderAudioLevelMeter('peerA', { ...TILE_QUIET, audio: 'silent' }));
     expect(silent.querySelector('audio-level-meter')).toBeTruthy();
     const muted = renderToDiv(el._renderAudioLevelMeter('peerA', { ...TILE_QUIET, audio: 'muted' }));
-    expect(muted.querySelector('audio-level-meter')).toBeTruthy();
+    expect(muted.querySelector('audio-level-meter')).toBeNull();
     expect(muted.querySelector('sl-icon')).toBeNull();
   });
 
