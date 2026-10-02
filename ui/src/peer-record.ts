@@ -72,6 +72,11 @@ export type PeerRecord = {
     lastPhaseAt: number;
     lastPhase: ConnectionPhase | 'init-accept';
     rearms: number;
+    /** The window, computed ONCE at InitAccept from the same RTT the
+     *  FSM's own per-attempt timeout was computed from, and reused on
+     *  every re-arm: recomputing it could shrink it below the timeout the
+     *  FSM still runs on (review I1). */
+    windowMs: number;
   };
   /**
    * WebRTC AnalyserNode for reading this peer's incoming audio level.

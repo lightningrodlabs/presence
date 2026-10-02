@@ -19,7 +19,7 @@ function fullRecord(): PeerRecord {
     qualityBucket: 'poor', webrtcExitReason: 'ice-failed',
     videoStream: { id: 'video' } as unknown as MediaStream, pendingInits: [{ connectionId: 'c', t0: 7 }],
     sdpTimeoutTimer: 8,
-    sdpBackstop: { connectionId: 'c', armedAt: 17, lastPhaseAt: 18, lastPhase: 'connecting', rearms: 3 },
+    sdpBackstop: { connectionId: 'c', armedAt: 17, lastPhaseAt: 18, lastPhase: 'connecting', rearms: 3, windowMs: 19 },
     analyser: { node: {} as AnalyserNode, buffer: new Uint8Array(1) },
     outageState: { startedAt: 9, emitted: true },
     screenShareStream: { id: 'screen' } as unknown as MediaStream, screenShareIceDisconnectedAt: 10,

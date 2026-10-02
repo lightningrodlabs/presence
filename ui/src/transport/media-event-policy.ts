@@ -319,7 +319,13 @@ export type BackstopPhaseDecision =
  * after their last phase change) — the third instance of one defect after
  * review C1 (the first in-place retry) and final-review F1 (its backoff).
  * An attempt that cycles without ever succeeding is bounded by the FSM's
- * own retry budget (`ReconnectPolicy.maxAttempts` → `failed`), not here.
+ * own retry budget, not here: `ReconnectPolicy.maxAttempts` counts entries
+ * into `disconnected` (~10 × (per-attempt timeout + ≤8 s backoff) by
+ * default) before `failed`. Not counted by it: a `connecting → signaling`
+ * re-offer driven by a recreated remote FSM, and a remote higher-epoch
+ * offer that replaces our FSM under a new connectionId with no event (the
+ * replaced attempt's timer then meets the successor guard, and the
+ * replacement has no backstop — true before this change too).
  * A finished attempt disarms. Another attempt's events never touch the
  * armed timer (the successor pin).
  */

@@ -133,15 +133,22 @@ export type SimpleEventType =
   // DEAD_TRACK_REFRESH_BUDGET). detail: refreshes=N budget=B prior=P
   // audioStale=A videoStale=V.
   | 'DeadTrackEscalation'
-  // The store's SDP backstop for an initiator attempt, logged once at the
-  // attempt's end (MediaLinks._startSdpBackstop). detail:
-  //   fired lastPhase=P ageMs=A silentMs=S rearms=N windowMs=W  — the
-  //     attempt went silent for the window and was torn down;
-  //   disarm phase=P ageMs=A rearms=N — it finished (connected / failed /
-  //     idle / closed) first.
+  // The store's SDP backstop for an initiator attempt: every armed
+  // attempt leaves exactly one (MediaLinks._startSdpBackstop). detail:
+  //   disarm phase=P ageMs=A rearms=N windowMs=W — it finished
+  //     (connected / failed / idle / closed);
+  //   fired lastPhase=P ageMs=A silentMs=S rearms=N windowMs=W — it went
+  //     silent for the window and was torn down;
+  //   superseded by=ID ageMs=A rearms=N windowMs=W — the window passed
+  //     but a successor attempt owned the slot (no teardown);
+  //   skipped status=T ageMs=A rearms=N windowMs=W — the window passed
+  //     with the status already past SdpExchange (no teardown);
+  //   replaced by=ID ageMs=A rearms=N windowMs=W — a new InitAccept armed
+  //     before this attempt finished.
   // ageMs is time since InitAccept; rearms counts phase changes that
-  // extended the window. Field question it answers: how long slow
-  // establishments take, and whether an attempt ever cycles for minutes.
+  // extended the window; windowMs is the per-attempt window, frozen at
+  // InitAccept. Field question it answers: how long slow establishments
+  // take, and whether an attempt ever cycles for minutes.
   | 'SdpBackstop'
   | 'PeerLeave'
   // Carrier (WebRTC ↔ signals) transition for a given peer's audio.

@@ -8,6 +8,7 @@ import {
   SDP_TIMEOUT_CEILING_MS,
   SDP_BACKSTOP_MULTIPLIER,
   SDP_BACKSTOP_RETRY_HEADROOM_MS,
+  SDP_BACKSTOP_CEILING_MS,
 } from '../streams-store';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger, FakeKeyValueStore } from '../store-deps.testing';
@@ -1771,6 +1772,11 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(get(store._openConnections)[peerA]?.connectionId).toBe('conn-2');
     expect(media.closeCalls).toHaveLength(0);
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
+    // Forensics: the predecessor still leaves its one record.
+    const ev = started.logger.agentEvents.filter(e => e.event === 'SdpBackstop');
+    expect(ev.map(e => e.detail)).toEqual([
+      `superseded by=conn-2 ageMs=${NO_SAMPLE_BACKSTOP_MS} rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`,
+    ]);
   });
 
   /** The one SdpBackstop event, if any, for this peer. */
@@ -1814,6 +1820,65 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
       `fired lastPhase=connecting ageMs=${4 * step + NO_SAMPLE_BACKSTOP_MS} ` +
         `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=4 windowMs=${NO_SAMPLE_BACKSTOP_MS}`
     );
+  });
+
+  it('the window is frozen per attempt: an RTT that recovers mid-attempt never shrinks it below what the FSM was given (review I1)', async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    // RTT spike at InitAccept: the FSM gets the 30 s ceiling and the
+    // backstop window is 2x that plus headroom (68 s).
+    store._ensurePeerRecord(peerA).signalsRttEwma = 2_000;
+    await acceptVideo(started, 'init-1');
+    expect(lastSdpOverride(media)).toBe(SDP_TIMEOUT_CEILING_MS);
+    const window = SDP_BACKSTOP_CEILING_MS;
+
+    clock.advance(1_000);
+    media.emitPhase(peerA, 'init-1', 'connecting');
+    // The RTT recovers: recomputed now, the window would be 20 s — less
+    // than the 30 s the FSM still has for its next signaling phase.
+    store._ensurePeerRecord(peerA).signalsRttEwma = 300;
+    clock.advance(1_000);
+    media.emitPhase(peerA, 'init-1', 'signaling');
+
+    clock.advance(window - 1);
+    expect(get(store._openConnections)[peerA]?.connectionId).toBe('init-1');
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(backstopEvents(started)[0]?.detail).toBe(
+      `fired lastPhase=signaling ageMs=${2_000 + window} silentMs=${window} rearms=2 windowMs=${window}`
+    );
+  });
+
+  it('an attempt whose FSM vanished with no event, replaced by a new InitAccept, still leaves its record', async () => {
+    const started = makeStarted();
+    const { clock, transports } = started;
+    await acceptVideo(started, 'init-1');
+    clock.advance(5_000);
+    // The silent-destroy shape (fsm.destroy() emits no transition), then
+    // the slot is gone and a fresh InitAccept arrives.
+    transports.media!.vanish(peerA);
+    started.store._openConnections.update(c => { delete c[peerA]; return c; });
+    await acceptVideo(started, 'init-2');
+    expect(backstopEvents(started).map(e => [e.connectionId, e.detail])).toEqual([
+      ['init-1', `replaced by=init-2 ageMs=5000 rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`],
+    ]);
+  });
+
+  it('a re-accept onto the attempt that is already armed continues it: same age, one more re-arm, no record yet', async () => {
+    const started = makeStarted();
+    const { clock } = started;
+    await acceptVideo(started, 'init-1');
+    clock.advance(5_000);
+    // The FSM is still alive, so the transport hands back the same id.
+    started.store._openConnections.update(c => { delete c[peerA]; return c; });
+    await acceptVideo(started, 'init-2');
+    expect(backstopEvents(started)).toHaveLength(0);
+    clock.advance(NO_SAMPLE_BACKSTOP_MS);
+    expect(backstopEvents(started).map(e => e.detail)).toEqual([
+      `fired lastPhase=init-accept ageMs=${5_000 + NO_SAMPLE_BACKSTOP_MS} ` +
+        `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=1 windowMs=${NO_SAMPLE_BACKSTOP_MS}`,
+    ]);
   });
 
   it('a silent attempt is still torn down at the window — the wedge the backstop exists for', async () => {
@@ -1860,7 +1925,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(record?.sdpBackstop).toBeUndefined();
     const ev = backstopEvents(started);
     expect(ev).toHaveLength(1);
-    expect(ev[0].detail).toBe('disarm phase=connected ageMs=3000 rearms=1');
+    expect(ev[0].detail).toBe(`disarm phase=connected ageMs=3000 rearms=1 windowMs=${NO_SAMPLE_BACKSTOP_MS}`);
     // Nothing fires later.
     clock.advance(NO_SAMPLE_BACKSTOP_MS * 2);
     expect(backstopEvents(started)).toHaveLength(1);
@@ -1873,7 +1938,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     const armed = clock.pendingTimerCount;
     transports.media!.emitPhase(peerA, 'init-1', 'closed', 'signaling');
     expect(clock.pendingTimerCount).toBe(armed - 1);
-    expect(backstopEvents(started)[0]?.detail).toBe('disarm phase=closed ageMs=0 rearms=0');
+    expect(backstopEvents(started)[0]?.detail).toBe(`disarm phase=closed ageMs=0 rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`);
   });
 
   it('a new attempt after teardown replaces the tracked timer; disconnect() disarms it', async () => {
