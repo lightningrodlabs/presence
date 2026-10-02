@@ -12,6 +12,7 @@
  * session, see docs/WEBRTC_RECONNECT_IDENTITY.md).
  */
 import type { PendingInit } from './types';
+import type { ConnectionPhase } from './transport/types';
 
 export type PeerRecord = {
   // — media-session bookkeeping: reset on media close
@@ -54,8 +55,29 @@ export type PeerRecord = {
   webrtcExitReason?: string;
   videoStream?: MediaStream;
   pendingInits?: PendingInit[];
-  /** clock.setTimeout handle; the executor disarms before dropping. */
+  /** clock.setTimeout handle for the SDP backstop. Disarmed when its
+   *  attempt finishes (`decideBackstopOnPhase` → disarm), re-armed on the
+   *  attempt's phase changes, and by `disconnect()`. */
   sdpTimeoutTimer?: number;
+  /**
+   * The attempt the SDP backstop is armed for, and its forensics: when
+   * the attempt was accepted, its last phase change, and how often a
+   * phase change re-armed the timer. Written by `MediaLinks`'s backstop
+   * methods only; logged once per attempt as `SdpBackstop` (fired or
+   * disarm) and then cleared. Not owned by any reset arm, like the timer.
+   */
+  sdpBackstop?: {
+    connectionId: string;
+    armedAt: number;
+    lastPhaseAt: number;
+    lastPhase: ConnectionPhase | 'init-accept';
+    rearms: number;
+    /** The window, computed ONCE at InitAccept from the same RTT the
+     *  FSM's own per-attempt timeout was computed from, and reused on
+     *  every re-arm: recomputing it could shrink it below the timeout the
+     *  FSM still runs on (review I1). */
+    windowMs: number;
+  };
   /**
    * WebRTC AnalyserNode for reading this peer's incoming audio level.
    * Created when a peer stream arrives, removed on disconnect. The

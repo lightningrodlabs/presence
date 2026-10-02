@@ -288,3 +288,65 @@ export function routeTransportPhase(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// The SDP backstop timer (2026-10-02, from the 2026-09-30 Uruguay log)
+// ---------------------------------------------------------------------------
+
+export type BackstopPhaseInputs = {
+  /** The attempt the store's tracked SDP backstop is armed for
+   *  (`PeerRecord.sdpBackstop.connectionId`), if any. */
+  armedConnectionId: string | undefined;
+  /** The `connection-state-change` event's connectionId. */
+  eventConnectionId: string;
+  phase: ConnectionPhase;
+};
+
+export type BackstopPhaseDecision =
+  | { action: 'rearm'; reason: 'attempt-progressing' }
+  | { action: 'disarm'; reason: 'attempt-connected' | 'attempt-ended' }
+  | { action: 'none'; reason: 'not-armed' | 'other-attempt' };
+
+/**
+ * What a phase change does to the store's SDP backstop
+ * (`MediaLinks._startSdpBackstop`). The backstop exists for an attempt
+ * that goes SILENT — an FSM that wedges without a transition, or one
+ * destroyed with no event (`ConnectionManager.fsm.destroy()` emits none).
+ * A real phase change on the armed attempt is the FSM acting, so it
+ * re-arms: the window measures silence since the last phase change, not
+ * the attempt's age. Measuring age killed attempts that were still
+ * retrying in place (the 2026-09-07 and 2026-09-30 logs: 0.1 s and 6.6 s
+ * after their last phase change) — the third instance of one defect after
+ * review C1 (the first in-place retry) and final-review F1 (its backoff).
+ * An attempt that cycles without ever succeeding is bounded by the FSM's
+ * own retry budget, not here: `ReconnectPolicy.maxAttempts` counts entries
+ * into `disconnected` (~10 × (per-attempt timeout + ≤8 s backoff) by
+ * default) before `failed`. Not counted by it: a `connecting → signaling`
+ * re-offer driven by a recreated remote FSM, and a remote higher-epoch
+ * offer that replaces our FSM under a new connectionId with no event (the
+ * replaced attempt's timer then meets the successor guard, and the
+ * replacement has no backstop — true before this change too).
+ * A finished attempt disarms. Another attempt's events never touch the
+ * armed timer (the successor pin).
+ */
+export function decideBackstopOnPhase(s: BackstopPhaseInputs): BackstopPhaseDecision {
+  if (s.armedConnectionId === undefined) return { action: 'none', reason: 'not-armed' };
+  if (s.eventConnectionId !== s.armedConnectionId) return { action: 'none', reason: 'other-attempt' };
+  switch (s.phase) {
+    case 'signaling':
+    case 'connecting':
+    case 'reconnecting':
+    case 'disconnected':
+      return { action: 'rearm', reason: 'attempt-progressing' };
+    case 'connected':
+      return { action: 'disarm', reason: 'attempt-connected' };
+    case 'failed':
+    case 'idle':
+    case 'closed':
+      return { action: 'disarm', reason: 'attempt-ended' };
+    default: {
+      const exhaustive: never = s.phase;
+      return exhaustive;
+    }
+  }
+}

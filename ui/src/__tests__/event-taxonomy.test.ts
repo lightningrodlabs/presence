@@ -176,6 +176,7 @@ describe('SimpleEvent taxonomy', () => {
         "ReconcileStream": "emitted",
         "ReconcileVideo": "emitted",
         "RemoteTrack": "emitted",
+        "SdpBackstop": "emitted",
         "SdpData": "emitted",
         "SenderParams": "emitted",
         "StaleCleanup": "emitted",

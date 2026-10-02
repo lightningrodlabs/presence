@@ -54,10 +54,12 @@ import { AgentPubKey, AgentPubKeyB64, encodeHashToBase64 } from '@holochain/clie
 import { get, writable, type Writable } from '@holochain-open-dev/stores';
 import { v4 as uuidv4 } from 'uuid';
 import type { PeerTransport, TransportEvent, IceDiagnostic } from './transport';
+import type { ConnectionPhase } from './transport/types';
 import {
   routeTransportPhase,
   decideSlotWrite,
   attributeSlotEvent,
+  decideBackstopOnPhase,
 } from './transport/media-event-policy';
 import type { SlotAction } from './transport/media-event-policy';
 import {
@@ -296,6 +298,11 @@ export class MediaLinks {
   private _dispatchMediaEvent(event: TransportEvent): void {
     switch (event.type) {
       case 'connection-state-change': {
+        // The SDP backstop measures the armed attempt's silence: a phase
+        // change on it re-arms, a finished attempt disarms
+        // (`decideBackstopOnPhase`). Runs before the route so a disarm is
+        // logged with the attempt's own numbers.
+        this._onBackstopPhase(event.peer, event.connectionId, event.phase);
         // Routing lives in `routeTransportPhase` (transport/media-event-policy.ts),
         // whose switch is exhaustive over ConnectionPhase. This used to be an
         // if/else-if over three of eight phases with no else; the five it
@@ -1463,6 +1470,159 @@ export class MediaLinks {
   }
 
   /**
+   * Arm the SDP backstop for an initiator attempt (called from
+   * `handleInitAccept`). Second-line cleanup for an attempt that goes
+   * SILENT — an FSM that wedges without a transition, or one destroyed
+   * with no event — so the next ping/pong cycle can retry. The window is
+   * `_computeSdpBackstopTimeout`, computed ONCE here — the same instant
+   * and RTT `handleInitAccept` used for the FSM's own per-attempt timeout,
+   * which the FSM keeps for the whole attempt — so it stays strictly
+   * greater than that timeout plus its backoff (review C1, final-review
+   * F1) on every re-arm (review I1 of the 2026-10-02 change: recomputing
+   * at re-arm let a recovering RTT shrink it below the FSM's timeout). It
+   * measures silence: each phase change on the attempt re-arms it with
+   * that frozen window (`_onBackstopPhase`, decided by
+   * `decideBackstopOnPhase`). Before 2026-10-02 it measured the attempt's
+   * age and killed attempts still retrying in place (the 2026-09-30
+   * Uruguay log). The timer is attempt-scoped and tracked (§9 item 5): a
+   * new attempt replaces it, a successor attempt's slot survives it,
+   * `disconnect()` disarms it. Forensics: every armed attempt leaves one
+   * `SdpBackstop` event (disarm / fired / superseded / skipped / replaced).
+   */
+  private _startSdpBackstop(peer: AgentPubKeyB64, connectionId: string): void {
+    const now = this.bindings.now();
+    const record = this.bindings.ensurePeerRecord(peer);
+    const prior = record.sdpBackstop;
+    if (prior && prior.connectionId === connectionId) {
+      // The transport returned the attempt that is already armed (its FSM
+      // is still alive): the same attempt continues, so it keeps its age
+      // and its frozen window (the FSM keeps the timeout it was created
+      // with), and the re-accept counts as a re-arm.
+      prior.rearms += 1;
+      prior.lastPhase = 'init-accept';
+      prior.lastPhaseAt = now;
+      this._armSdpBackstopTimer(peer);
+      return;
+    }
+    if (prior) {
+      // An attempt that never disarmed (its FSM replaced with no event)
+      // still gets its record.
+      this._logBackstop(peer, prior.connectionId,
+        `replaced by=${connectionId} ageMs=${now - prior.armedAt} rearms=${prior.rearms} windowMs=${prior.windowMs}`);
+    }
+    record.sdpBackstop = {
+      connectionId,
+      armedAt: now,
+      lastPhaseAt: now,
+      lastPhase: 'init-accept',
+      rearms: 0,
+      windowMs: this._computeSdpBackstopTimeout(peer),
+    };
+    this._armSdpBackstopTimer(peer);
+  }
+
+  /** (Re)start the backstop timer for the armed attempt with its frozen
+   *  window. Replaces any previous timer. */
+  private _armSdpBackstopTimer(peer: AgentPubKeyB64): void {
+    const record = this.bindings.ensurePeerRecord(peer);
+    const backstop = record.sdpBackstop;
+    if (record.sdpTimeoutTimer !== undefined) this.bindings.clearTimeout(record.sdpTimeoutTimer);
+    record.sdpTimeoutTimer = undefined;
+    if (!backstop) return;
+    const { connectionId, windowMs } = backstop;
+    record.sdpTimeoutTimer = this.bindings.setTimeout(
+      () => this._fireSdpBackstop(peer, connectionId),
+      windowMs,
+    );
+  }
+
+  private _logBackstop(peer: AgentPubKeyB64, connectionId: string, detail: string): void {
+    this.bindings.logger.logAgentEvent({
+      agent: peer,
+      timestamp: this.bindings.now(),
+      event: 'SdpBackstop',
+      connectionId,
+      detail,
+    });
+  }
+
+  /** A phase change on `peer`: re-arm, disarm, or leave the backstop. */
+  private _onBackstopPhase(
+    peer: AgentPubKeyB64,
+    connectionId: string,
+    phase: ConnectionPhase,
+  ): void {
+    const record = this.bindings.peerRecord(peer);
+    const backstop = record?.sdpBackstop;
+    const decision = decideBackstopOnPhase({
+      armedConnectionId: backstop?.connectionId,
+      eventConnectionId: connectionId,
+      phase,
+    });
+    if (!record || !backstop) return;
+    switch (decision.action) {
+      case 'none':
+        return;
+      case 'rearm':
+        backstop.rearms += 1;
+        backstop.lastPhase = phase;
+        backstop.lastPhaseAt = this.bindings.now();
+        this._armSdpBackstopTimer(peer);
+        return;
+      case 'disarm':
+        if (record.sdpTimeoutTimer !== undefined) this.bindings.clearTimeout(record.sdpTimeoutTimer);
+        record.sdpTimeoutTimer = undefined;
+        record.sdpBackstop = undefined;
+        this._logBackstop(peer, backstop.connectionId,
+          `disarm phase=${phase} ageMs=${this.bindings.now() - backstop.armedAt} ` +
+          `rearms=${backstop.rearms} windowMs=${backstop.windowMs}`);
+        return;
+      default: {
+        const exhaustive: never = decision;
+        void exhaustive;
+      }
+    }
+  }
+
+  /** The window passed with no phase change on the attempt. */
+  private _fireSdpBackstop(peer: AgentPubKeyB64, connectionId: string): void {
+    const record = this.bindings.peerRecord(peer);
+    const backstop = record?.sdpBackstop;
+    if (record) {
+      record.sdpTimeoutTimer = undefined;
+      if (backstop?.connectionId === connectionId) record.sdpBackstop = undefined;
+    }
+    const now = this.bindings.now();
+    const numbers = backstop
+      ? `ageMs=${now - backstop.armedAt} rearms=${backstop.rearms} windowMs=${backstop.windowMs}`
+      : 'no-record';
+    const conn = get(this._openConnections)[peer];
+    // A successor attempt owns the slot now: its own timer owns its
+    // deadline. (Pinned by the successor-survival wiring test.)
+    if (conn && conn.connectionId !== connectionId) {
+      this._logBackstop(peer, connectionId, `superseded by=${conn.connectionId} ${numbers}`);
+      return;
+    }
+    const currentStatus = get(this.bindings.connectionStatuses())[peer];
+    if (!currentStatus || currentStatus.type !== 'SdpExchange') {
+      this._logBackstop(peer, connectionId, `skipped status=${currentStatus?.type ?? 'none'} ${numbers}`);
+      return;
+    }
+    this._logBackstop(peer, connectionId, backstop
+      ? `fired lastPhase=${backstop.lastPhase} ageMs=${now - backstop.armedAt} ` +
+        `silentMs=${now - backstop.lastPhaseAt} rearms=${backstop.rearms} windowMs=${backstop.windowMs}`
+      : 'fired no-record');
+    if (conn && !conn.connected) {
+      this.bindings.mediaTransport().closeConnection(peer, 'SDP exchange timeout');
+      this._openConnections.update(current => {
+        delete current[peer];
+        return current;
+      });
+    }
+    this.updateConnectionStatus(peer, { type: 'Disconnected' });
+  }
+
+  /**
    * Timeout (ms) for this class's own tracked SDP-exchange backstop timer
    * — second-line cleanup for an FSM that wedges without ever emitting a
    * phase transition. Deliberately NOT the same value as
@@ -1479,9 +1639,9 @@ export class MediaLinks {
    * (final-review wave F1): the FSM's attempt-2 deadline is
    * `2 * perAttempt + retryDelay`, not `2 * perAttempt`, so the headroom
    * covers that retry's own delay budget (see
-   * `SDP_BACKSTOP_RETRY_HEADROOM_MS`). Private — the sole caller,
-   * `handleInitAccept` below, is a method of this class; unlike
-   * `computeSdpTimeout`, no bare store delegate exists for this one.
+   * `SDP_BACKSTOP_RETRY_HEADROOM_MS`). Private — the sole caller is
+   * `_startSdpBackstop`, which computes it once per attempt (review I1);
+   * unlike `computeSdpTimeout`, no bare store delegate exists for this one.
    */
   private _computeSdpBackstopTimeout(peerB64: AgentPubKeyB64): number {
     const perAttempt =
@@ -1967,42 +2127,9 @@ export class MediaLinks {
 
           { const r = this.bindings.peerRecord(pubKey64); if (r) r.pendingInits = undefined; }
 
-          // Second-line backstop: if the FSM wedges without ever emitting
-          // a phase transition, this store-level timer cleans up and lets
-          // the next ping/pong cycle retry. Deliberately NOT the same
-          // window as the FSM's own per-attempt SDP timeout above
-          // (`sdpExchangeTimeoutMs: computeSdpTimeout(...)`) — it is
-          // `_computeSdpBackstopTimeout`, pinned strictly greater (2x plus
-          // `SDP_BACKSTOP_RETRY_HEADROOM_MS`, own ceiling) so it never
-          // preempts the FSM's own timeout and first in-place backoff
-          // retry (review C1; the headroom term closed a narrower
-          // instance of the same defect — final-review wave F1). The timer is
-          // ATTEMPT-scoped and TRACKED (§9 item 5): it may only tear down
-          // the attempt that armed it — a successor attempt's slot must
-          // survive this timer firing — and a new attempt for the same
-          // peer disarms the previous timer, as does disconnect().
-          const priorSdpTimer = this.bindings.peerRecord(pubKey64)?.sdpTimeoutTimer;
-          if (priorSdpTimer !== undefined) this.bindings.clearTimeout(priorSdpTimer);
-          this.bindings.ensurePeerRecord(pubKey64).sdpTimeoutTimer = this.bindings.setTimeout(() => {
-            { const r = this.bindings.peerRecord(pubKey64); if (r) r.sdpTimeoutTimer = undefined; }
-            const conn = get(this._openConnections)[pubKey64];
-            // A successor attempt owns the slot now: its own timer owns
-            // its deadline. (Pinned by the successor-survival wiring test.)
-            if (conn && conn.connectionId !== effectiveConnId) return;
-            const currentStatus = get(this.bindings.connectionStatuses())[pubKey64];
-            if (!currentStatus || currentStatus.type !== 'SdpExchange') return;
-            this.bindings.logger.logCustomMessage(
-              `SDP timeout [${pubKey64.slice(0, 8)}]: destroying stale connection`
-            );
-            if (conn && !conn.connected) {
-              this.bindings.mediaTransport().closeConnection(pubKey64, 'SDP exchange timeout');
-              this._openConnections.update(current => {
-                delete current[pubKey64];
-                return current;
-              });
-            }
-            this.updateConnectionStatus(pubKey64, { type: 'Disconnected' });
-          }, this._computeSdpBackstopTimeout(pubKey64));
+          // Second-line backstop for an attempt that goes SILENT — see
+          // `_startSdpBackstop` and `decideBackstopOnPhase`.
+          this._startSdpBackstop(pubKey64, effectiveConnId);
         }
       }
     }
