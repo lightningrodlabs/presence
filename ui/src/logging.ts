@@ -134,7 +134,9 @@ export type SimpleEventType =
   // audioStale=A videoStale=V.
   | 'DeadTrackEscalation'
   // The store's SDP backstop for an initiator attempt: every armed
-  // attempt leaves exactly one (MediaLinks._startSdpBackstop). detail:
+  // attempt leaves exactly one (MediaLinks._startSdpBackstop), except an
+  // attempt still armed at disconnect() (wiped with no record) and a
+  // re-accept onto the same attempt (merged into its one record). detail:
   //   disarm phase=P ageMs=A rearms=N windowMs=W — it finished
   //     (connected / failed / idle / closed);
   //   fired lastPhase=P ageMs=A silentMs=S rearms=N windowMs=W — it went
