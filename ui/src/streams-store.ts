@@ -1567,7 +1567,8 @@ export class StreamsStore {
   }
 
   /** Clear the ping and presence-tick intervals, and the per-peer-record
-   *  timer/pending state (sdpTimeoutTimer, screenShareStream, pendingInits). */
+   *  timer/pending state (sdpTimeoutTimer + sdpBackstop, screenShareStream,
+   *  pendingInits). */
   private _teardownTimers(): void {
     if (this.pingInterval) this.clock.clearInterval(this.pingInterval);
     if (this._presenceTickInterval !== undefined) {
@@ -1577,6 +1578,7 @@ export class StreamsStore {
     for (const r of this._peerRecords.values()) {
       if (r.sdpTimeoutTimer !== undefined) this.clock.clearTimeout(r.sdpTimeoutTimer);
       r.sdpTimeoutTimer = undefined;
+      r.sdpBackstop = undefined;
       r.screenShareStream = undefined;
       r.pendingInits = undefined;
     }

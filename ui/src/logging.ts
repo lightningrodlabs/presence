@@ -133,6 +133,16 @@ export type SimpleEventType =
   // DEAD_TRACK_REFRESH_BUDGET). detail: refreshes=N budget=B prior=P
   // audioStale=A videoStale=V.
   | 'DeadTrackEscalation'
+  // The store's SDP backstop for an initiator attempt, logged once at the
+  // attempt's end (MediaLinks._startSdpBackstop). detail:
+  //   fired lastPhase=P ageMs=A silentMs=S rearms=N windowMs=W  — the
+  //     attempt went silent for the window and was torn down;
+  //   disarm phase=P ageMs=A rearms=N — it finished (connected / failed /
+  //     idle / closed) first.
+  // ageMs is time since InitAccept; rearms counts phase changes that
+  // extended the window. Field question it answers: how long slow
+  // establishments take, and whether an attempt ever cycles for minutes.
+  | 'SdpBackstop'
   | 'PeerLeave'
   // Carrier (WebRTC ↔ signals) transition for a given peer's audio.
   | 'CarrierSwitch'
@@ -275,6 +285,7 @@ export const SIMPLE_EVENT_TAXONOMY = {
   StreamReceived: 'emitted',
   StaleCleanup: 'emitted',
   DeadTrackEscalation: 'emitted',
+  SdpBackstop: 'emitted',
   PeerLeave: 'emitted',
   CarrierSwitch: 'emitted',
   QualityBucketChange: 'emitted',

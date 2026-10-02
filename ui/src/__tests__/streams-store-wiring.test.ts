@@ -1773,6 +1773,109 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
   });
 
+  /** The one SdpBackstop event, if any, for this peer. */
+  function backstopEvents(started: Started) {
+    return started.logger.agentEvents.filter(e => e.event === 'SdpBackstop');
+  }
+
+  it('the backstop counts silence, not attempt age: a progressing attempt survives past the old deadline (2026-09-30 Uruguay replay)', async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+
+    // The FSM retries in place under the SAME connectionId, each phase
+    // change well inside the window — the shape of the field log, where
+    // the backstop tore down faa13eef mid-ICE 6.6 s after its last phase
+    // change.
+    const step = NO_SAMPLE_BACKSTOP_MS / 2;
+    for (const phase of ['connecting', 'disconnected', 'signaling', 'connecting'] as const) {
+      clock.advance(step);
+      media.emitPhase(peerA, 'init-1', phase);
+    }
+    // 2x the window since InitAccept: before this change the attempt was
+    // torn down at 1x.
+    expect(get(store._openConnections)[peerA]?.connectionId).toBe('init-1');
+    expect(media.closeCalls.some(c => c.reason === 'SDP exchange timeout')).toBe(false);
+    expect(backstopEvents(started)).toHaveLength(0);
+
+    // Then it goes SILENT: the window runs from the last phase change.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(media.closeCalls.some(c => c.reason === 'SDP exchange timeout')).toBe(true);
+
+    // Forensics: one event, carrying what the next field log needs.
+    const ev = backstopEvents(started);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].connectionId).toBe('init-1');
+    expect(ev[0].detail).toBe(
+      `fired lastPhase=connecting ageMs=${4 * step + NO_SAMPLE_BACKSTOP_MS} ` +
+        `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=4 windowMs=${NO_SAMPLE_BACKSTOP_MS}`
+    );
+  });
+
+  it('a silent attempt is still torn down at the window — the wedge the backstop exists for', async () => {
+    const started = makeStarted();
+    const { store, clock } = started;
+    await acceptVideo(started, 'init-1');
+    clock.advance(NO_SAMPLE_BACKSTOP_MS);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    const ev = backstopEvents(started);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toBe(
+      `fired lastPhase=init-accept ageMs=${NO_SAMPLE_BACKSTOP_MS} ` +
+        `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`
+    );
+  });
+
+  it("another attempt's phase changes do not extend the armed attempt's deadline", async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
+    // `disconnected` routes to ignore (no slot adoption), so the slot is
+    // still init-1's; only the decision can tell the events apart.
+    media.emitPhase(peerA, 'other-conn', 'disconnected');
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(backstopEvents(started)[0]?.detail).toMatch(/^fired .* rearms=0 /);
+  });
+
+  it('a connected attempt disarms the backstop and logs how long establishment took', async () => {
+    const started = makeStarted();
+    const { clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+    clock.advance(1_000);
+    media.emitPhase(peerA, 'init-1', 'connecting');
+    clock.advance(2_000);
+    media.emitPhase(peerA, 'init-1', 'connected', 'connecting');
+    // The backstop's own handle is cleared (the connected path arms
+    // unrelated timers of its own, so the total count is not the signal).
+    const record = started.store._peerRecords.get(peerA);
+    expect(record?.sdpTimeoutTimer).toBeUndefined();
+    expect(record?.sdpBackstop).toBeUndefined();
+    const ev = backstopEvents(started);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toBe('disarm phase=connected ageMs=3000 rearms=1');
+    // Nothing fires later.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS * 2);
+    expect(backstopEvents(started)).toHaveLength(1);
+  });
+
+  it('a closed attempt disarms too (the timer no longer outlives its attempt)', async () => {
+    const started = makeStarted();
+    const { clock, transports } = started;
+    await acceptVideo(started, 'init-1');
+    const armed = clock.pendingTimerCount;
+    transports.media!.emitPhase(peerA, 'init-1', 'closed', 'signaling');
+    expect(clock.pendingTimerCount).toBe(armed - 1);
+    expect(backstopEvents(started)[0]?.detail).toBe('disarm phase=closed ageMs=0 rearms=0');
+  });
+
   it('a new attempt after teardown replaces the tracked timer; disconnect() disarms it', async () => {
     const started = makeStarted();
     const { store, clock } = started;
@@ -1788,6 +1891,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     store.disconnect('sdp-timer-hygiene');
     live.length = 0;
     expect(clock.pendingTimerCount).toBe(0);
+    expect(store._peerRecords.get(peerA)?.sdpBackstop).toBeUndefined();
   });
 
   it('peer-leave wipes the init-retry cooldown and reconcile throttle; a plain close keeps the cooldown (the rejoin-inheritance fix)', async () => {
