@@ -9,6 +9,14 @@ import {
   SDP_BACKSTOP_MULTIPLIER,
   SDP_BACKSTOP_RETRY_HEADROOM_MS,
 } from '../streams-store';
+import {
+  ANNOTATIONS_MODULE_ID,
+  applyStroke,
+  emptyAnnotations,
+  parseAnnotationsPayload,
+  readShareAnnotationsEpoch,
+  visibleStrokes,
+} from '../room/annotation-policy';
 import { ManualClock } from '../clock.testing';
 import { makeFakeDeps, FakeLogger, FakeKeyValueStore } from '../store-deps.testing';
 import type { FakeDeps, FakeTransport } from '../store-deps.testing';
@@ -3652,5 +3660,94 @@ describe('share annotations: the epoch the store stamps (spec "Clearing")', () =
     await store.clearShareAnnotations('screen-share');
     expect(get(store._myModuleStates)['screen-share']).toBeUndefined();
     expect(bus.sentOfType('ModuleState')).toHaveLength(0);
+  });
+});
+
+describe('share annotations: the wire round trip (spec "Approaches considered", A)', () => {
+  const annotationsOf = (store: StreamsStore, author: string) =>
+    parseAnnotationsPayload(get(store._peerModuleStates)[author]?.[ANNOTATIONS_MODULE_ID]?.payload);
+
+  /** A second started store with its own key, so a signal sent by one can
+   *  be delivered to the other. */
+  function makePeerStore(clock: ManualClock, key: AgentPubKey) {
+    const fakes = makeFakeDeps({ clock, myPubKey: key });
+    const logger = new FakeLogger();
+    const store = new StreamsStore(fakes.deps, async () => '', logger.asPresenceLogger());
+    store.start();
+    live.push(store);
+    return { ...fakes, store };
+  }
+
+  it('a board write leaves the author as one ModuleState and lands in the peer\'s view under the share epoch', async () => {
+    const { store: author, clock, bus } = makeStarted();
+    const viewer = makePeerStore(clock, peerAKey);
+    author._knownAgents.set(knownFresh(clock, peerA));
+    // The viewer already holds the sharer's (peerB's) share envelope.
+    const shareEnv = { moduleId: 'screen-share', active: true, payload: JSON.stringify({ annotationsEpoch: 9 }), updatedAt: clock.now() };
+    viewer.store._peerModuleStates.set({ [peerB]: { 'screen-share': shareEnv } });
+
+    const board = applyStroke(emptyAnnotations(), peerB, 'screen-share', { id: 's1', epoch: 9, color: 1, pts: [0, 0, 100, 100] });
+    await author.updateModuleState(ANNOTATIONS_MODULE_ID, JSON.stringify(board));
+    const sent = bus.sentOfType('ModuleState');
+    expect(sent).toHaveLength(1);
+    expect(sent[0].to).toEqual([peerA]);
+
+    await viewer.bus.deliver(message(myPubKey as unknown as AgentPubKey, 'ModuleState', sent[0].payload!));
+    const epoch = readShareAnnotationsEpoch(get(viewer.store._peerModuleStates)[peerB]['screen-share']);
+    const visible = visibleStrokes([{ author: myPubKeyB64, payload: annotationsOf(viewer.store, myPubKeyB64) }], peerB, 'screen-share', epoch);
+    expect(visible.map(v => v.stroke.id)).toEqual(['s1']);
+  });
+
+  it('a store that joins after the write gets the board from a pong', async () => {
+    const { store: author, clock } = makeStarted();
+    const board = applyStroke(emptyAnnotations(), peerB, 'screen-share', { id: 's1', epoch: 9, color: 1, pts: [0, 0, 100, 100] });
+    await author.updateModuleState(ANNOTATIONS_MODULE_ID, JSON.stringify(board));
+
+    const late = makePeerStore(clock, peerAKey);
+    await late.bus.deliver(
+      message(
+        myPubKey as unknown as AgentPubKey,
+        'PongUi',
+        JSON.stringify({
+          formatVersion: 1,
+          data: {
+            connectionStatuses: {},
+            moduleStates: get(author._myModuleStates),
+            moduleStatesAt: clock.now(),
+          },
+        }),
+      ),
+    );
+    expect(annotationsOf(late.store, myPubKeyB64)).toEqual(board);
+  });
+
+  it('the sharer\'s clear-all empties the viewer\'s board with one ModuleState, and a leave removes a peer\'s strokes (Review Focus 5)', async () => {
+    const { store: sharer, clock, bus } = makeStarted();
+    sharer._knownAgents.set(knownFresh(clock, peerA));
+    await sharer.activateModule('screen-share');
+    const shareSignal = bus.sentOfType('ModuleState')[0];
+    const viewer = makePeerStore(clock, peerAKey);
+    await viewer.bus.deliver(message(myPubKey as unknown as AgentPubKey, 'ModuleState', shareSignal.payload!));
+    const epochBefore = readShareAnnotationsEpoch(get(viewer.store._peerModuleStates)[myPubKeyB64]['screen-share']);
+
+    // peerB drew on the sharer's screen under that epoch; the viewer holds it.
+    const theirs = applyStroke(emptyAnnotations(), myPubKeyB64, 'screen-share', { id: 'b1', epoch: epochBefore, color: 2, pts: [0, 0, 50, 50] });
+    await viewer.bus.deliver(
+      message(peerBKey, 'ModuleState', JSON.stringify({ moduleId: ANNOTATIONS_MODULE_ID, active: true, payload: JSON.stringify(theirs), updatedAt: clock.now() })),
+    );
+    const authors = () => [{ author: peerB, payload: annotationsOf(viewer.store, peerB) }];
+    const epoch = () => readShareAnnotationsEpoch(get(viewer.store._peerModuleStates)[myPubKeyB64]['screen-share']);
+    expect(visibleStrokes(authors(), myPubKeyB64, 'screen-share', epoch())).toHaveLength(1);
+
+    clock.advance(1000);
+    await sharer.clearShareAnnotations('screen-share');
+    const clearSignal = bus.sentOfType('ModuleState')[1];
+    await viewer.bus.deliver(message(myPubKey as unknown as AgentPubKey, 'ModuleState', clearSignal.payload!));
+    expect(epoch()).toBeGreaterThan(epochBefore);
+    expect(visibleStrokes(authors(), myPubKeyB64, 'screen-share', epoch())).toHaveLength(0);
+
+    // Review Focus 5: peerB leaves; the viewer drops peerB's module states.
+    await viewer.bus.deliver(message(peerBKey, 'LeaveUi', ''));
+    expect(get(viewer.store._peerModuleStates)[peerB]).toBeUndefined();
   });
 });
