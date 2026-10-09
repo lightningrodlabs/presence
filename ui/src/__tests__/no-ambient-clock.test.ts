@@ -100,6 +100,7 @@ const PINNED_FILES: Array<{
   // Share annotations (spec 2026-10-09): pure geometry, no time at all,
   // pinned per the owner pattern.
   { relPath: '../room/annotation-geometry.ts', patterns: FULL_PATTERNS },
+  { relPath: '../room/annotation-policy.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
