@@ -97,6 +97,9 @@ const PINNED_FILES: Array<{
   // Task 3 (capture reconciler): takes `clock` via bindings and stamps
   // every retry attempt through it — no ambient time.
   { relPath: '../capture-reconciler.ts', patterns: FULL_PATTERNS },
+  // Share annotations (spec 2026-10-09): pure geometry, no time at all,
+  // pinned per the owner pattern.
+  { relPath: '../room/annotation-geometry.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
