@@ -288,3 +288,98 @@ describe('StreamsStore.connect allAgents subscription (leak 4)', () => {
     expect(allAgents.active).toBe(0);
   });
 });
+
+describe('module-annotations-share-overlay teardown (share annotations)', () => {
+  it('disconnect releases both store subscriptions, the video listeners and the ResizeObserver', async () => {
+    const observed: Array<{ disconnected: boolean }> = [];
+    class FakeResizeObserver {
+      private rec = { disconnected: false };
+      constructor(_cb: unknown) {
+        observed.push(this.rec);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {
+        this.rec.disconnected = true;
+      }
+    }
+    (globalThis as any).ResizeObserver = FakeResizeObserver;
+    try {
+      await import('../room/modules/annotations');
+      let active = 0;
+      const pushes: Array<(v: unknown) => void> = [];
+      const counting = (value: unknown) => ({
+        subscribe(cb: (v: unknown) => void) {
+          active += 1;
+          pushes.push(cb);
+          cb(value);
+          return () => {
+            active -= 1;
+          };
+        },
+      });
+      const frame = document.createElement('div');
+      const video = document.createElement('video');
+      let listeners = 0;
+      const add = video.addEventListener.bind(video);
+      const remove = video.removeEventListener.bind(video);
+      video.addEventListener = ((...args: Parameters<typeof add>) => {
+        listeners += 1;
+        return add(...args);
+      }) as typeof video.addEventListener;
+      video.removeEventListener = ((...args: Parameters<typeof remove>) => {
+        listeners -= 1;
+        return remove(...args);
+      }) as typeof video.removeEventListener;
+      frame.appendChild(video);
+      const el = document.createElement('module-annotations-share-overlay') as any;
+      el.sharerPubKeyB64 = 'uhCAksharer';
+      el.shareModuleId = 'screen-share';
+      el.context = {
+        isMe: false,
+        connected: true,
+        circleView: false,
+        myPubKeyB64: 'uhCAkme',
+        streamsStore: { _myModuleStates: counting({}), _peerModuleStates: counting({}), clock: { now: () => 0 } },
+      };
+      frame.appendChild(el);
+      document.body.appendChild(frame);
+      await el.updateComplete;
+      expect(active).toBe(2);
+      expect(listeners).toBe(2);
+      expect(observed).toHaveLength(1);
+
+      frame.remove();
+      expect(active).toBe(0);
+      expect(listeners).toBe(0);
+      expect(observed[0].disconnected).toBe(true);
+
+      // Reconnect (a repeat() move): subscribe again, fresh values flow.
+      const frame2 = document.createElement('div');
+      const video2 = document.createElement('video');
+      const add2 = video2.addEventListener.bind(video2);
+      const remove2 = video2.removeEventListener.bind(video2);
+      video2.addEventListener = ((...args: Parameters<typeof add2>) => {
+        listeners += 1;
+        return add2(...args);
+      }) as typeof video2.addEventListener;
+      video2.removeEventListener = ((...args: Parameters<typeof remove2>) => {
+        listeners -= 1;
+        return remove2(...args);
+      }) as typeof video2.removeEventListener;
+      frame2.appendChild(video2);
+      frame2.appendChild(el);
+      document.body.appendChild(frame2);
+      await el.updateComplete;
+      expect(active).toBe(2);
+      expect(listeners).toBe(2);
+      const fresh = { annotations: { moduleId: 'annotations', active: true, payload: '{}', updatedAt: 9 } };
+      pushes[pushes.length - 2](fresh);
+      expect(el._mineStates).toEqual(fresh);
+      frame2.remove();
+      expect(active).toBe(0);
+    } finally {
+      delete (globalThis as any).ResizeObserver;
+    }
+  });
+});

@@ -104,6 +104,8 @@ import {
 import { countAudiblePeers } from '../peer-link-policy';
 import { describeLinkEstablishment } from '../intent-diff-policy';
 import type { IntentDiff } from '../intent-diff-policy';
+import { orderTiles } from './tile-order-policy';
+import type { OrderedTile } from './tile-order-policy';
 import {
   bindVideoStream,
   MAXIMIZE_REAPPLY_DELAY_MS,
@@ -675,6 +677,9 @@ export class RoomView extends LitElement {
     // without deactivating the module.
     this.streamsStore.activateModule('conversation');
     this.streamsStore.activateModule('reactions');
+    // Share annotations (spec "Activation"): on by default like reactions;
+    // the module has no toolbar button.
+    this.streamsStore.activateModule('annotations');
 
     if (this._autoJoinAudio) {
       this.streamsStore.audioOn(true).catch(() => {});
@@ -790,6 +795,22 @@ export class RoomView extends LitElement {
    */
   private _visiblePeers(): AgentPubKeyB64[] {
     return this._presentPeers.value;
+  }
+
+  /**
+   * The grid's tiles in render order — `orderTiles` (room/tile-order-policy.ts)
+   * over the present set and the phantom set. This line has no stored join
+   * time (the zome half of stable tile order is main-0.7 only), so the
+   * join map is empty and every tile sorts by pubkey: stable across screens
+   * and across present/phantom flips, not join order. Declared in
+   * docs/superpowers/specs/2026-10-09-ux-backport-0.6-design.md.
+   */
+  private _orderedTiles(): OrderedTile[] {
+    return orderTiles({
+      present: this._visiblePeers(),
+      phantoms: this.streamsStore.phantomAgents(),
+      joinedAt: {},
+    });
   }
 
   /**
@@ -2427,6 +2448,30 @@ export class RoomView extends LitElement {
   }
 
   /**
+   * Every registered module's `shareOverlayElement` (modules/types.ts),
+   * mounted into one share tile. Share annotations is the first consumer
+   * (modules/annotations.ts). Rendered after the share content and the
+   * diagnostics overlay and before the maximize icon, so the icon stays
+   * on top.
+   */
+  private _renderShareOverlays(
+    shareModuleId: string,
+    sharerPubKeyB64: AgentPubKeyB64,
+    context: ModuleRenderContext,
+  ): unknown[] {
+    return getAllModules()
+      .filter(m => !!m.shareOverlayElement)
+      .map(m => {
+        const tag = unsafeStatic(m.shareOverlayElement!);
+        return staticHtml`<${tag}
+          .sharerPubKeyB64=${sharerPubKeyB64}
+          .shareModuleId=${shareModuleId}
+          .context=${context}
+        ></${tag}>`;
+      });
+  }
+
+  /**
    * Render the shared panel from active share-type modules. Each share tile
    * is wrapped in shared-panel-frame and supports maximize via the
    * `share-${moduleId}-${pubkey}` keying scheme.
@@ -2479,6 +2524,7 @@ export class RoomView extends LitElement {
           >
             ${content}
             ${diagnosticsOverlay}
+            ${this._renderShareOverlays(moduleId, agentPubKeyB64, context)}
             <sl-icon
               title="${this._maximizedVideo === shareKey ? 'minimize' : 'maximize'}"
               .src=${this._maximizedVideo === shareKey
@@ -2603,7 +2649,7 @@ export class RoomView extends LitElement {
   }
 
   /**
-   * Render a placeholder tile per agent in `phantomAgents()` — agents
+   * Render one placeholder tile for an agent in `phantomAgents()` — an agent
    * other peers report as in-room with a working audio link, but who we
    * cannot see directly. Suppresses the normal tile chrome (no video
    * element, no module overlays, no audio meter, no per-tile connection
@@ -2611,68 +2657,60 @@ export class RoomView extends LitElement {
    * Lists the observers who DO see them so the user can tell whether
    * the issue is the peer or our own connectivity.
    */
-  private _renderPhantomTiles() {
-    const phantoms = this.streamsStore.phantomAgents();
-    if (phantoms.length === 0) return html``;
-    return html`${repeat(
-      phantoms,
-      pk => pk,
-      pk => {
-        const seeing = this.streamsStore.observersSeeing(pk);
-        const hearing = this.streamsStore.observersHearing(pk);
-        // Prefer the "heard by" framing when any observer reports live
-        // audio; fall back to "last seen by" when presence is only
-        // ping-level (impolite close in progress, link broken
-        // everywhere). "connected" is reserved for ICE + DTLS up and is
-        // not a claim this tile can make (Phase 4 item 4).
-        const label = hearing.length > 0 ? 'heard by' : 'last seen by';
-        const observers = seeing;
-        return html`
-          <div
-            class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
-            style="opacity: 0.7;"
-            title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not reachable by you"
-          >
-            <avatar-with-nickname
-              .hideNickname=${true}
-              .agentPubKey=${decodeHashFromBase64(pk)}
-              style="width: 35%;"
-            ></avatar-with-nickname>
-            <div
-              class="secondary-font"
-              style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
+  private _renderPhantomTile(pk: AgentPubKeyB64) {
+    const seeing = this.streamsStore.observersSeeing(pk);
+    const hearing = this.streamsStore.observersHearing(pk);
+    // Prefer the "heard by" framing when any observer reports live
+    // audio; fall back to "last seen by" when presence is only
+    // ping-level (impolite close in progress, link broken
+    // everywhere). "connected" is reserved for ICE + DTLS up and is
+    // not a claim this tile can make (Phase 4 item 4).
+    const label = hearing.length > 0 ? 'heard by' : 'last seen by';
+    const observers = seeing;
+    return html`
+      <div
+        class="video-container ${this.idToLayout(pk)}${this._circleView ? '' : ' square-view'}"
+        style="opacity: 0.7;"
+        title="Reported in room by ${observers.length} peer${observers.length === 1 ? '' : 's'} — not reachable by you"
+      >
+        <avatar-with-nickname
+          .hideNickname=${true}
+          .agentPubKey=${decodeHashFromBase64(pk)}
+          style="width: 35%;"
+        ></avatar-with-nickname>
+        <div
+          class="secondary-font"
+          style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #ffd900; font-size: 14px; text-align: center; max-width: 80%;"
+        >
+          reported in room — not reachable by you
+        </div>
+        ${observers.length > 0
+          ? html`<div
+              style="position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px;"
             >
-              reported in room — not reachable by you
-            </div>
-            ${observers.length > 0
-              ? html`<div
-                  style="position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 4px;"
-                >
-                  <span
-                    class="secondary-font"
-                    style="color: #c3c9eb; font-size: 18px; opacity: 0.85;"
-                    >${label}</span
+              <span
+                class="secondary-font"
+                style="color: #c3c9eb; font-size: 18px; opacity: 0.85;"
+                >${label}</span
+              >
+              <div style="display: flex; flex-direction: row; gap: 4px;">
+                ${repeat(
+                  observers,
+                  obs => obs,
+                  obs => html`<div
+                    style="width: 24px; height: 24px; display: inline-block;"
                   >
-                  <div style="display: flex; flex-direction: row; gap: 4px;">
-                    ${repeat(
-                      observers,
-                      obs => obs,
-                      obs => html`<div
-                        style="width: 24px; height: 24px; display: inline-block;"
-                      >
-                        <avatar-with-nickname
-                          .hideNickname=${true}
-                          .agentPubKey=${decodeHashFromBase64(obs)}
-                        ></avatar-with-nickname>
-                      </div>`,
-                    )}
-                  </div>
-                </div>`
-              : html``}
-          </div>
-        `;
-      },
-    )}`;
+                    <avatar-with-nickname
+                      .hideNickname=${true}
+                      .agentPubKey=${decodeHashFromBase64(obs)}
+                    ></avatar-with-nickname>
+                  </div>`,
+                )}
+              </div>
+            </div>`
+          : html``}
+      </div>
+    `;
   }
 
   renderAgentConnectionStatuses(
@@ -2905,295 +2943,8 @@ export class RoomView extends LitElement {
     `;
   }
 
-  render() {
-    const activeShares = this._getActiveShares();
-    const hasShared = activeShares.length > 0;
-    const splitMode = hasShared && !this._maximizedVideo;
-    // Simple people grid (no screen share, not maximized): JS picks the grid
-    // shape (--cols/--rows) and CSS sizes tiles in cqw/cqh to maximize area.
-    const autoGrid = !splitMode && !this._maximizedVideo;
-    return html`
-      <div
-        class="custom-log-dialog"
-        style="${this._showCustomLogDialog ? '' : 'display: none;'}"
-      >
-        <div
-          class="panel"
-          @click=${(e: any) => e.stopPropagation()}
-          @keypress=${() => undefined}
-        >
-          <div class="column secondary-font">
-            <div style="font-size: 23px; margin-bottom: 10px;">
-              ${msg('Log a custom event:')}
-            </div>
-            <textarea id="custom-log-textarea"></textarea>
-            <div class="row items-center">
-              <input type="checkbox" id="log-timestamp-checkbox" />
-              <div
-                style="margin-left: 5px; font-size: 14px; max-width: 220px; line-height: 16px; margin: 5px; text-align: left;"
-              >
-                ${msg(
-                  'take timestamp at the time of logging (default is timestamp when dialog opened)'
-                )}
-              </div>
-            </div>
-            <button
-              @click=${() => {
-                const value = this._customLogTextarea.value;
-                this.logCustomEvent(
-                  value,
-                  this._logTimestampCheckbox.checked
-                    ? undefined
-                    : this._customLogTimestamp
-                );
-                this.closeCustomLogDialog();
-              }}
-            >
-              Log!
-            </button>
-          </div>
-        </div>
-      </div>
-      ${this._logsGraphEnabled && this._logsGraphAgent
-        ? html`
-            <div style="position: fixed; bottom: 20px; left: 20px; z-index: 9;">
-              <div style="position: relative;">
-                <div
-                  class="row"
-                  style="position: absolute; top: -25px; right: -25px;"
-                >
-                  <button
-                    class="close-graph-btn"
-                    style="margin-right: 3px;${this._logsGraphMinimized
-                      ? 'display: none;'
-                      : ''}"
-                    @click=${() => {
-                      this._logsGraphMinimized = true;
-                    }}
-                  >
-                    <sl-icon .src=${wrapPathInSvg(mdiMinus)}></sl-icon>
-                  </button>
-                  <button
-                    class="close-graph-btn"
-                    style="${this._logsGraphMinimized ? 'display: none;' : ''}"
-                    @click=${() => {
-                      this._logsGraphEnabled = false;
-                      this._logsGraphMinimized = false;
-                    }}
-                  >
-                    <sl-icon .src=${wrapPathInSvg(mdiClose)}></sl-icon>
-                  </button>
-                </div>
-                <logs-graph
-                  style="border-radius: 5px; ${this._logsGraphMinimized
-                    ? 'display: none;'
-                    : ''}"
-                  .agent=${this._logsGraphAgent}
-                ></logs-graph>
-              </div>
-              <button
-                class="logs-graph-btn"
-                @click=${() => {
-                  this._logsGraphMinimized = false;
-                }}
-                style="${this._logsGraphMinimized ? '' : 'display: none;'}"
-              >
-                <div class="row items-center secondary-font">
-                  <sl-icon .src=${wrapPathInSvg(mdiChartLine)}></sl-icon>
-                  <span style="margin-left: 5px;"> ${msg('Logs Graph')} </span>
-                  <agent-avatar
-                    style="margin-bottom: -12px; margin-left: 5px;"
-                    .agentPubKey=${decodeHashFromBase64(this._logsGraphAgent)}
-                  ></agent-avatar>
-                </div>
-              </button>
-            </div>
-          `
-        : html``}
-      <div class="row center-content room-name">
-        ${this.private
-          ? html`<sl-icon
-              .src=${wrapPathInSvg(mdiLock)}
-              style="font-size: 28px; margin-right: 3px;"
-            ></sl-icon>`
-          : html``}
-        ${this.roomName()}
-      </div>
-      ${(() => {
-        // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
-        // carrier banner while the signal carrier is down. Copy + elapsed
-        // seconds live in _carrierBannerText, sourced from the ONE
-        // intentDiffs store; purely local, no wire change.
-        const banner = this._carrierBannerText();
-        return banner
-          ? html`<div class="carrier-banner">${banner}</div>`
-          : html``;
-      })()}
-      <div
-        class="videos-container${splitMode ? ' split-mode' : ''}${autoGrid
-          ? ' auto-grid'
-          : ''}"
-        style="${autoGrid && this._gridCols > 0
-          ? (() => {
-              // Same tile-count authority as _updateGrid and idToLayout.
-              const n = this._tileCount();
-              const lastK = ((n - 1) % this._gridCols) + 1;
-              // When the last row has a single item (the common odd-n / cols=2
-              // case), let it span the row so justify-items:center centers it
-              // across the columns above. Otherwise normal one-cell placement.
-              const lastSpans = lastK === 1 && this._gridCols > 1 ? this._gridCols : 1;
-              return `--cols: ${this._gridCols}; --rows: ${this._gridRows}; --tile-aspect: ${
-                this._circleView ? '1' : '1.7778'
-              }; --tile-min: ${GRID_MIN_TILE_WIDTH}px; --last-spans: ${lastSpans};`;
-            })()
-          : ''}"
-      >
-        ${this._isResizing ? html`<div class="resize-overlay"></div>` : html``}
-        ${hasShared ? html`
-        <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
-        <!-- All shares: screen-share, WAL, timer, etc. -->
-        ${this.renderSharedPanel()}
-
-        </div>
-        ${splitMode ? html`<div class="resize-handle" @mousedown=${this._onResizeStart} @touchstart=${this._onResizeStart}></div>` : html``}
-        ` : html``}
-        <div class="${splitMode ? 'people-panel' : 'layout-transparent'}">
-        <!-- My own video stream -->
-        ${(() => {
-          const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
-          const myModuleContext: ModuleRenderContext = {
-            isMe: true,
-            connected: true,
-            circleView: this._circleView,
-            streamsStore: this.streamsStore,
-            myPubKeyB64,
-          };
-          const myActiveReplace = this._getActiveReplaceModule(myPubKeyB64, myModuleContext);
-          return html`
-        <div
-          style="${this._selfViewHidden ? 'display: none;' : ''}"
-          class="video-container ${this.idToLayout('my-own-stream')}${this._circleView ? '' : ' square-view'}"
-          @dblclick=${() => this.toggleMaximized('my-own-stream')}
-        >
-          ${myActiveReplace
-            ? html`
-              <div class="module-replace-content">${myActiveReplace.html}</div>
-              <video
-                muted
-                style="display: none;"
-                id="my-own-stream"
-                class="video-el"
-              ></video>
-            `
-            : html`
-              <video
-                muted
-                style="${this._cameraOn
-                  ? ''
-                  : 'display: none;'}; transform: scaleX(-1);"
-                id="my-own-stream"
-                class="video-el"
-              ></video>
-              <avatar-with-nickname
-                .hideNickname=${true}
-                .agentPubKey=${this.roomStore.client.client.myPubKey}
-                style="width: 35%;${this._cameraOn ? ' display: none;' : ''}"
-              ></avatar-with-nickname>
-            `}
-
-          <!-- Connection states indicators -->
-          ${this._showConnectionDetails
-            ? html`<div
-                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
-              >
-                ${this.renderAgentConnectionStatuses('my-video')}
-              </div>`
-            : html``}
-
-          <!-- Module overlays (self) -->
-          ${this.renderModuleOverlays(myPubKeyB64, myModuleContext)}
-
-          <!-- Icons and Avatar/nickname for circle view (centered, stacked) -->
-          ${this._circleView
-            ? html`
-                <div
-                  class="tile-meta"
-                  style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
-                >
-                  <div class="row" style="margin-bottom: 4px;">
-                    <sl-icon
-                      title="${this._maximizedVideo === 'my-own-stream'
-                        ? 'minimize'
-                        : 'maximize'}"
-                      .src=${this._maximizedVideo === 'my-own-stream'
-                        ? wrapPathInSvg(mdiFullscreenExit)
-                        : wrapPathInSvg(mdiFullscreen)}
-                      tabindex="0"
-                      style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
-                      @click=${() => {
-                        this.toggleMaximized('my-own-stream');
-                      }}
-                      @keypress=${(e: KeyboardEvent) => {
-                        if (e.key === 'Enter') {
-                          this.toggleMaximized('my-own-stream');
-                        }
-                      }}
-                    ></sl-icon>
-                    ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
-                  </div>
-                  <div class="row" style="align-items: center;">
-                    <avatar-with-nickname
-                      .size=${36}
-                      .hideAvatar=${!this._cameraOn}
-                      .agentPubKey=${this.roomStore.client.client.myPubKey}
-                      style="height: 36px;"
-                    ></avatar-with-nickname>
-                    ${this.renderModuleSwitcher(myPubKeyB64, true)}
-                  </div>
-                </div>
-              `
-            : html`
-                <div
-                  class="tile-meta"
-                  style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
-                >
-                  ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
-                  <avatar-with-nickname
-                    .size=${36}
-                    .agentPubKey=${this.roomStore.client.client.myPubKey}
-                    style="height: 36px;"
-                  ></avatar-with-nickname>
-                  ${this.renderModuleSwitcher(myPubKeyB64, true)}
-                  <sl-icon
-                    title="${this._maximizedVideo === 'my-own-stream'
-                      ? 'minimize'
-                      : 'maximize'}"
-                    .src=${this._maximizedVideo === 'my-own-stream'
-                      ? wrapPathInSvg(mdiFullscreenExit)
-                      : wrapPathInSvg(mdiFullscreen)}
-                    tabindex="0"
-                    style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
-                    @click=${() => {
-                      this.toggleMaximized('my-own-stream');
-                    }}
-                    @keypress=${(e: KeyboardEvent) => {
-                      if (e.key === 'Enter') {
-                        this.toggleMaximized('my-own-stream');
-                      }
-                    }}
-                  ></sl-icon>
-                </div>
-              `}
-        </div>
-          `;
-        })()}
-
-        <!-- Panes for visible peers: presence-fresh OR media-live (a stale
-             signaling pong must not drop a tile whose media still flows). -->
-        ${repeat(
-          this._visiblePeers(),
-          (pubkeyB64) => pubkeyB64,
-          (pubkeyB64) => {
+  /** One present peer's grid tile (moved verbatim out of render()'s repeat). */
+  private _renderPeerTile(pubkeyB64: AgentPubKeyB64) {
             const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
             const moduleContext: ModuleRenderContext = {
               isMe: false,
@@ -3513,9 +3264,305 @@ export class RoomView extends LitElement {
                     </div>
                   `}
             </div>
-          `}
+          `
+  }
+
+  render() {
+    const activeShares = this._getActiveShares();
+    const hasShared = activeShares.length > 0;
+    const splitMode = hasShared && !this._maximizedVideo;
+    // Simple people grid (no screen share, not maximized): JS picks the grid
+    // shape (--cols/--rows) and CSS sizes tiles in cqw/cqh to maximize area.
+    const autoGrid = !splitMode && !this._maximizedVideo;
+    return html`
+      <div
+        class="custom-log-dialog"
+        style="${this._showCustomLogDialog ? '' : 'display: none;'}"
+      >
+        <div
+          class="panel"
+          @click=${(e: any) => e.stopPropagation()}
+          @keypress=${() => undefined}
+        >
+          <div class="column secondary-font">
+            <div style="font-size: 23px; margin-bottom: 10px;">
+              ${msg('Log a custom event:')}
+            </div>
+            <textarea id="custom-log-textarea"></textarea>
+            <div class="row items-center">
+              <input type="checkbox" id="log-timestamp-checkbox" />
+              <div
+                style="margin-left: 5px; font-size: 14px; max-width: 220px; line-height: 16px; margin: 5px; text-align: left;"
+              >
+                ${msg(
+                  'take timestamp at the time of logging (default is timestamp when dialog opened)'
+                )}
+              </div>
+            </div>
+            <button
+              @click=${() => {
+                const value = this._customLogTextarea.value;
+                this.logCustomEvent(
+                  value,
+                  this._logTimestampCheckbox.checked
+                    ? undefined
+                    : this._customLogTimestamp
+                );
+                this.closeCustomLogDialog();
+              }}
+            >
+              Log!
+            </button>
+          </div>
+        </div>
+      </div>
+      ${this._logsGraphEnabled && this._logsGraphAgent
+        ? html`
+            <div style="position: fixed; bottom: 20px; left: 20px; z-index: 9;">
+              <div style="position: relative;">
+                <div
+                  class="row"
+                  style="position: absolute; top: -25px; right: -25px;"
+                >
+                  <button
+                    class="close-graph-btn"
+                    style="margin-right: 3px;${this._logsGraphMinimized
+                      ? 'display: none;'
+                      : ''}"
+                    @click=${() => {
+                      this._logsGraphMinimized = true;
+                    }}
+                  >
+                    <sl-icon .src=${wrapPathInSvg(mdiMinus)}></sl-icon>
+                  </button>
+                  <button
+                    class="close-graph-btn"
+                    style="${this._logsGraphMinimized ? 'display: none;' : ''}"
+                    @click=${() => {
+                      this._logsGraphEnabled = false;
+                      this._logsGraphMinimized = false;
+                    }}
+                  >
+                    <sl-icon .src=${wrapPathInSvg(mdiClose)}></sl-icon>
+                  </button>
+                </div>
+                <logs-graph
+                  style="border-radius: 5px; ${this._logsGraphMinimized
+                    ? 'display: none;'
+                    : ''}"
+                  .agent=${this._logsGraphAgent}
+                ></logs-graph>
+              </div>
+              <button
+                class="logs-graph-btn"
+                @click=${() => {
+                  this._logsGraphMinimized = false;
+                }}
+                style="${this._logsGraphMinimized ? '' : 'display: none;'}"
+              >
+                <div class="row items-center secondary-font">
+                  <sl-icon .src=${wrapPathInSvg(mdiChartLine)}></sl-icon>
+                  <span style="margin-left: 5px;"> ${msg('Logs Graph')} </span>
+                  <agent-avatar
+                    style="margin-bottom: -12px; margin-left: 5px;"
+                    .agentPubKey=${decodeHashFromBase64(this._logsGraphAgent)}
+                  ></agent-avatar>
+                </div>
+              </button>
+            </div>
+          `
+        : html``}
+      <div class="row center-content room-name">
+        ${this.private
+          ? html`<sl-icon
+              .src=${wrapPathInSvg(mdiLock)}
+              style="font-size: 28px; margin-right: 3px;"
+            ></sl-icon>`
+          : html``}
+        ${this.roomName()}
+      </div>
+      ${(() => {
+        // Task 6 surface 3 (absorbs field-plan Task 9): a room-level
+        // carrier banner while the signal carrier is down. Copy + elapsed
+        // seconds live in _carrierBannerText, sourced from the ONE
+        // intentDiffs store; purely local, no wire change.
+        const banner = this._carrierBannerText();
+        return banner
+          ? html`<div class="carrier-banner">${banner}</div>`
+          : html``;
+      })()}
+      <div
+        class="videos-container${splitMode ? ' split-mode' : ''}${autoGrid
+          ? ' auto-grid'
+          : ''}"
+        style="${autoGrid && this._gridCols > 0
+          ? (() => {
+              // Same tile-count authority as _updateGrid and idToLayout.
+              const n = this._tileCount();
+              const lastK = ((n - 1) % this._gridCols) + 1;
+              // When the last row has a single item (the common odd-n / cols=2
+              // case), let it span the row so justify-items:center centers it
+              // across the columns above. Otherwise normal one-cell placement.
+              const lastSpans = lastK === 1 && this._gridCols > 1 ? this._gridCols : 1;
+              return `--cols: ${this._gridCols}; --rows: ${this._gridRows}; --tile-aspect: ${
+                this._circleView ? '1' : '1.7778'
+              }; --tile-min: ${GRID_MIN_TILE_WIDTH}px; --last-spans: ${lastSpans};`;
+            })()
+          : ''}"
+      >
+        ${this._isResizing ? html`<div class="resize-overlay"></div>` : html``}
+        ${hasShared ? html`
+        <div class="screen-share-panel" style="${splitMode ? `flex-basis: ${this._splitRatio}%` : ''}">
+        <!-- All shares: screen-share, WAL, timer, etc. -->
+        ${this.renderSharedPanel()}
+
+        </div>
+        ${splitMode ? html`<div class="resize-handle" @mousedown=${this._onResizeStart} @touchstart=${this._onResizeStart}></div>` : html``}
+        ` : html``}
+        <div class="${splitMode ? 'people-panel' : 'layout-transparent'}">
+        <!-- My own video stream -->
+        ${(() => {
+          const myPubKeyB64 = encodeHashToBase64(this.roomStore.client.client.myPubKey);
+          const myModuleContext: ModuleRenderContext = {
+            isMe: true,
+            connected: true,
+            circleView: this._circleView,
+            streamsStore: this.streamsStore,
+            myPubKeyB64,
+          };
+          const myActiveReplace = this._getActiveReplaceModule(myPubKeyB64, myModuleContext);
+          return html`
+        <div
+          style="${this._selfViewHidden ? 'display: none;' : ''}"
+          class="video-container ${this.idToLayout('my-own-stream')}${this._circleView ? '' : ' square-view'}"
+          @dblclick=${() => this.toggleMaximized('my-own-stream')}
+        >
+          ${myActiveReplace
+            ? html`
+              <div class="module-replace-content">${myActiveReplace.html}</div>
+              <video
+                muted
+                style="display: none;"
+                id="my-own-stream"
+                class="video-el"
+              ></video>
+            `
+            : html`
+              <video
+                muted
+                style="${this._cameraOn
+                  ? ''
+                  : 'display: none;'}; transform: scaleX(-1);"
+                id="my-own-stream"
+                class="video-el"
+              ></video>
+              <avatar-with-nickname
+                .hideNickname=${true}
+                .agentPubKey=${this.roomStore.client.client.myPubKey}
+                style="width: 35%;${this._cameraOn ? ' display: none;' : ''}"
+              ></avatar-with-nickname>
+            `}
+
+          <!-- Connection states indicators -->
+          ${this._showConnectionDetails
+            ? html`<div
+                style="display: flex; flex-direction: row; align-items: center; position: absolute; top: 10px; left: 10px; z-index: 10; background: none;"
+              >
+                ${this.renderAgentConnectionStatuses('my-video')}
+              </div>`
+            : html``}
+
+          <!-- Module overlays (self) -->
+          ${this.renderModuleOverlays(myPubKeyB64, myModuleContext)}
+
+          <!-- Icons and Avatar/nickname for circle view (centered, stacked) -->
+          ${this._circleView
+            ? html`
+                <div
+                  class="tile-meta"
+                  style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;"
+                >
+                  <div class="row" style="margin-bottom: 4px;">
+                    <sl-icon
+                      title="${this._maximizedVideo === 'my-own-stream'
+                        ? 'minimize'
+                        : 'maximize'}"
+                      .src=${this._maximizedVideo === 'my-own-stream'
+                        ? wrapPathInSvg(mdiFullscreenExit)
+                        : wrapPathInSvg(mdiFullscreen)}
+                      tabindex="0"
+                      style="color: #ffe100; height: 30px; width: 30px; cursor: pointer;"
+                      @click=${() => {
+                        this.toggleMaximized('my-own-stream');
+                      }}
+                      @keypress=${(e: KeyboardEvent) => {
+                        if (e.key === 'Enter') {
+                          this.toggleMaximized('my-own-stream');
+                        }
+                      }}
+                    ></sl-icon>
+                    ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
+                  </div>
+                  <div class="row" style="align-items: center;">
+                    <avatar-with-nickname
+                      .size=${36}
+                      .hideAvatar=${!this._cameraOn}
+                      .agentPubKey=${this.roomStore.client.client.myPubKey}
+                      style="height: 36px;"
+                    ></avatar-with-nickname>
+                    ${this.renderModuleSwitcher(myPubKeyB64, true)}
+                  </div>
+                </div>
+              `
+            : html`
+                <div
+                  class="tile-meta"
+                  style="display: flex; flex-direction: row; align-items: center; position: absolute; bottom: 10px; right: 10px; background: none;"
+                >
+                  ${this.renderModuleIconStrip(myPubKeyB64, myModuleContext)}
+                  <avatar-with-nickname
+                    .size=${36}
+                    .agentPubKey=${this.roomStore.client.client.myPubKey}
+                    style="height: 36px;"
+                  ></avatar-with-nickname>
+                  ${this.renderModuleSwitcher(myPubKeyB64, true)}
+                  <sl-icon
+                    title="${this._maximizedVideo === 'my-own-stream'
+                      ? 'minimize'
+                      : 'maximize'}"
+                    .src=${this._maximizedVideo === 'my-own-stream'
+                      ? wrapPathInSvg(mdiFullscreenExit)
+                      : wrapPathInSvg(mdiFullscreen)}
+                    tabindex="0"
+                    style="color: #ffe100; height: 24px; width: 24px; cursor: pointer; margin-left: 4px;"
+                    @click=${() => {
+                      this.toggleMaximized('my-own-stream');
+                    }}
+                    @keypress=${(e: KeyboardEvent) => {
+                      if (e.key === 'Enter') {
+                        this.toggleMaximized('my-own-stream');
+                      }
+                    }}
+                  ></sl-icon>
+                </div>
+              `}
+        </div>
+          `;
+        })()}
+
+        <!-- Peer and phantom tiles: ONE repeat keyed by pubkey in orderTiles
+             order (room/tile-order-policy.ts), so a peer keeps its slot
+             across present/phantom and ping-fresh/media-only transitions.
+             Membership is still the present predicate; on this line the
+             order is lexical by pubkey (see _orderedTiles). -->
+        ${repeat(
+          this._orderedTiles(),
+          tile => tile.pubkey,
+          tile =>
+            tile.kind === 'present'
+              ? this._renderPeerTile(tile.pubkey)
+              : this._renderPhantomTile(tile.pubkey)
         )}
-        ${this._renderPhantomTiles()}
         </div>
       </div>
       ${this.renderToggles()}
@@ -3857,6 +3904,17 @@ export class RoomView extends LitElement {
 
       .video-container:not(.square-view):not(.screen-share) {
         overflow: visible;
+        /* overflow: visible makes this tile a non-scroll container, so
+           its min-height: auto becomes the content-based automatic
+           minimum css-sizing-4 imposes on aspect-ratio boxes: whenever
+           the in-flow stack (.video-el at height:100% plus a status
+           line -- the video-and-not-yet-connected slot during
+           establishment) is taller than the ratio height, the tile
+           grows taller than wide. Square view keeps overflow:hidden and
+           never ovals. Pinned by the "circle tile stays 1:1" case in
+           harness/layout.spec.ts. (No backticks in this comment: the
+           sheet is a css tagged template.) */
+        min-height: 0;
       }
 
       .module-replace-content {
