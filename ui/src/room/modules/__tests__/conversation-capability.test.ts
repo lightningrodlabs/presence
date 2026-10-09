@@ -190,3 +190,21 @@ describe('conversationPayloadSupportsFsm — the conservative direction', () => 
     ).toBe(true);
   });
 });
+
+describe('cameraOn on the conversation payload (peer-tile spec decision 7)', () => {
+  it('the default declares the camera off', () => {
+    expect(DEFAULT_CONVERSATION_PAYLOAD.cameraOn).toBe(false);
+  });
+
+  it('a payload without the field parses to undefined — unknown, never false', () => {
+    const p = parseConversationPayload(envelope({ micMuted: true }));
+    expect(p).not.toBeNull();
+    expect(p!.cameraOn).toBeUndefined();
+  });
+
+  it('true/false round-trip; non-boolean coerces', () => {
+    expect(parseConversationPayload(envelope({ cameraOn: true }))!.cameraOn).toBe(true);
+    expect(parseConversationPayload(envelope({ cameraOn: false }))!.cameraOn).toBe(false);
+    expect(parseConversationPayload(envelope({ cameraOn: 1 }))!.cameraOn).toBe(true);
+  });
+});

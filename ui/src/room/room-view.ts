@@ -97,7 +97,6 @@ import {
   getShareModules,
   shareMaximizeKey,
 } from './modules/registry';
-import { parseConversationPayload } from './modules/conversation';
 import type { ModuleIconDefinition, ModuleRenderContext } from './modules/types';
 import { MY_OWN_SCREEN_VIDEO_ID, peerScreenVideoId } from './modules/screen-share';
 import {
@@ -116,7 +115,7 @@ import {
 } from './layout';
 import { orderTiles, OrderedTile } from './tile-order-policy';
 import { countAudiblePeers } from '../peer-link-policy';
-import { describeLinkEstablishment } from '../intent-diff-policy';
+import type { PeerTileState } from '../peer-tile-policy';
 import type { IntentDiff } from '../intent-diff-policy';
 import {
   bindVideoStream,
@@ -984,20 +983,6 @@ export class RoomView extends LitElement {
       Math.floor((this.streamsStore.clock.now() - diff.since) / 1000)
     );
     return `${diff.copy} ${elapsedS}s`;
-  }
-
-  /** Per-tile link-establishment copy via the Task 5 authority — the copy
-   *  distinguishes a first attempt from a reconnection so the user knows
-   *  not to tear the link down mid-recovery. Returns undefined once the
-   *  link is connected. */
-  private _tileEstablishmentCopy(
-    pubkeyB64: AgentPubKeyB64,
-    connected: boolean
-  ): string | undefined {
-    return describeLinkEstablishment({
-      connected,
-      reconnecting: this.streamsStore.peerReconnecting(pubkeyB64),
-    })?.copy;
   }
 
   /**
@@ -3057,30 +3042,37 @@ export class RoomView extends LitElement {
    * @returns
    */
   /**
-   * Render a small volume bar for signals-carrier audio from a peer.
-   * Only shown when connection details are visible AND the peer has no
-   * WebRTC connection (audio is flowing via signals). Reads from the
-   * plain Map on voiceController — no reactive subscription, just
-   * piggybacks on the existing render cycle.
+   * The tile's audio indicator: the level meter while the peer's mic is
+   * on (lit while audio flows, dark while it does not), and nothing while
+   * they are muted — there is no level to show, and the module icon
+   * strip's red mic-off glyph (`conversation.ts`) is the muted indicator.
+   * This is the behavior from before the peer-tile round, restored
+   * 2026-10-01: that round's final review first added a second muted
+   * glyph here, then kept the meter mounted for a muted peer, which
+   * surfaced a frozen level. The frame reads `tile.quality` only.
    */
-  private _renderAudioLevelMeter(pubkeyB64: AgentPubKeyB64) {
-    // Hide when peer's mic is muted — no audio to show levels for. The
-    // payload read goes through `parseConversationPayload` (Round 3
-    // item 5): the authority normalizes the legacy `muted` encoding and
-    // returns null for an INACTIVE module, so a deactivated module's
-    // stale payload no longer suppresses the meter (declared change —
-    // the raw JSON.parse here read micMuted out of payloads the
-    // authority rejects).
-    const peerConv =
-      this._peerModuleStates.value?.[pubkeyB64]?.['conversation'] ?? null;
-    const payload = parseConversationPayload(peerConv);
-    if (payload?.micMuted) return html``;
+  private _renderAudioLevelMeter(pubkeyB64: AgentPubKeyB64, tile: PeerTileState) {
+    if (tile.audio === 'muted') return html``;
     return html`
       <audio-level-meter style="margin-left:3px"
         .streamsStore=${this.streamsStore}
         .agentPubKeyB64=${pubkeyB64}
+        .quality=${tile.quality}
       ></audio-level-meter>
     `;
+  }
+
+  /** The tile's one status line, or nothing. Copy and attention come
+   *  from `describePeerTile`; this only maps attention to a class. */
+  private _renderTileStatusLine(tile: PeerTileState) {
+    if (!tile.statusLine) return html``;
+    const cls =
+      tile.attention === 'act'
+        ? 'tile-status tile-status-act'
+        : tile.attention === 'wait'
+          ? 'tile-status tile-status-wait'
+          : 'tile-status';
+    return html`<div class=${cls}>${tile.statusLine}</div>`;
   }
 
   /**
@@ -3178,6 +3170,7 @@ export class RoomView extends LitElement {
    */
   private _renderPeerTile(pubkeyB64: AgentPubKeyB64) {
     const conn = this._openConnections.value[pubkeyB64] as OpenConnectionInfo | undefined;
+    const tile = this.streamsStore.peerTileFor(pubkeyB64);
     const moduleContext: ModuleRenderContext = {
       isMe: false,
       connected: true,
@@ -3190,23 +3183,12 @@ export class RoomView extends LitElement {
     const activeReplaceModule = this._getActiveReplaceModule(pubkeyB64, moduleContext);
     const videoElId = `video-${pubkeyB64}`;
 
-    // Avatar visibility:
-    //   - conn undefined (signals mode, no WebRTC peer):       show
-    //   - conn defined && !conn.connected (still establishing): hide
-    //                                                          (status text below shows instead)
-    //   - conn defined && conn.connected && !conn.video:       show
-    //   - conn defined && conn.connected && conn.video:        hide (WebRTC video covers it)
-    // Hide the avatar when WebRTC video is live OR when the
-    // filmstrip is currently displaying a clip from this peer.
-    // Hiding while filmstrip is active prevents the avatar
-    // from flashing through any transparent moment in the
-    // bg-image swap.
+    // The avatar shows unless something covers it: WebRTC video or a
+    // filmstrip clip (paint-hold from the element, plus the policy's
+    // background). An establishing link no longer hides it — audio may
+    // well be flowing (peer-tile spec decision 1).
     const filmstripActive = this._filmstripActivePeers.has(pubkeyB64);
-    const avatarHidden = filmstripActive
-      ? true
-      : conn
-        ? !conn.connected || !!conn.video
-        : false;
+    const avatarHidden = filmstripActive || tile.background !== 'avatar';
     return html`
     <div
       class="video-container ${this.idToLayout(pubkeyB64)}${this._circleView ? '' : ' square-view'}"
@@ -3247,59 +3229,13 @@ export class RoomView extends LitElement {
       ${conn
         ? html`
             <video
-              style="${conn.video ? '' : 'display: none;'}"
+              style="${tile.background === 'video' ? '' : 'display: none;'}"
               id="${videoElId}"
               class="video-el"
             ></video>
-            ${(() => {
-              // Copy lives ONLY in intent-diff-policy.ts
-              // (describeLinkEstablishment) — first-establishment
-              // vs reconnection is decided there, not inline here.
-              const est = this._tileEstablishmentCopy(
-                pubkeyB64,
-                !!conn.connected
-              );
-              return est
-                ? html`<div
-                    style="color: #b9a884; font-size: 0.8em;"
-                  >
-                    ${est}
-                  </div>`
-                : html``;
-            })()}
-            <div
-              style="color: #b9a884; font-size: 0.8em; ${conn.connected && !conn.video && conn.videoMuted ? '' : 'display: none'}"
-            >
-              connecting media...
-            </div>
           `
         : html``}
-
-      <!--
-        Signaling-held indicator. This tile is rendered from the
-        present predicate; if the peer is NOT in _activeAgents,
-        the only reason they are present is media-flowing — on
-        either carrier. Surface a quiet amber marker so the user
-        understands the link is degraded-but-recovering and does
-        NOT manually tear it down. (Was additionally gated on
-        conn?.connected, which covered only the WebRTC half and
-        so missed the signals-only peer whose tile Phase 2
-        deliberately preserves — PR #4 F1.)
-      -->
-      ${!this._activeAgents.value[pubkeyB64]
-        ? html`
-            <sl-tooltip
-              hoist
-              class="tooltip-filled"
-              placement="top"
-              content="Signaling unstable — holding this connection on live media. It should recover on its own."
-            >
-              <div
-                style="position: absolute; top: 10px; right: 10px; width: 10px; height: 10px; border-radius: 50%; background: #e7a008; box-shadow: 0 0 6px #e7a008; opacity: 0.85;"
-              ></div>
-            </sl-tooltip>
-          `
-        : html``}
+      ${this._renderTileStatusLine(tile)}
 
       <!-- Connection detail statuses (debug) -->
       ${this._showConnectionDetails
@@ -3308,6 +3244,12 @@ export class RoomView extends LitElement {
           >
             <div style="display: flex; flex-direction: row; align-items: center; gap: 6px;">
               ${this.renderAgentConnectionStatuses('video', pubkeyB64)}
+              ${!this._activeAgents.value[pubkeyB64]
+                ? html`<sl-tooltip hoist class="tooltip-filled" placement="top"
+                    content="signals: stale — this peer is held present on live media">
+                    <div style="width: 10px; height: 10px; border-radius: 50%; background: #e7a008; opacity: 0.85;"></div>
+                  </sl-tooltip>`
+                : html``}
               ${this._renderCarrierToggle(pubkeyB64)}
               ${this._renderTranscribingIcon(this._peerModuleStates.value?.[pubkeyB64])}
             </div>
@@ -3352,12 +3294,12 @@ export class RoomView extends LitElement {
               <div class="row" style="align-items: center;">
                 <avatar-with-nickname
                   .size=${36}
-                  .hideAvatar=${!conn?.video}
+                  .hideAvatar=${tile.background !== 'video'}
                   .agentPubKey=${decodeHashFromBase64(pubkeyB64)}
                   style="height: 36px;"
                 ></avatar-with-nickname>
                 ${this.renderModuleSwitcher(pubkeyB64)}
-                ${this._renderAudioLevelMeter(pubkeyB64)}
+                ${this._renderAudioLevelMeter(pubkeyB64, tile)}
                 ${this._showConnectionDetails
                   ? html`
                       <sl-tooltip
@@ -3442,7 +3384,7 @@ export class RoomView extends LitElement {
                   }
                 }}
               ></sl-icon>
-              ${this._renderAudioLevelMeter(pubkeyB64)}
+              ${this._renderAudioLevelMeter(pubkeyB64, tile)}
               ${this._showConnectionDetails
                 ? html`
                     <sl-tooltip
@@ -4446,6 +4388,17 @@ export class RoomView extends LitElement {
 
       .video-container:not(.square-view):not(.screen-share) {
         overflow: visible;
+        /* overflow: visible makes this tile a non-scroll container, so
+           its min-height: auto becomes the content-based automatic
+           minimum css-sizing-4 imposes on aspect-ratio boxes: whenever
+           the in-flow stack (.video-el at height:100% plus a status
+           line -- the video-and-not-yet-connected slot during
+           establishment) is taller than the ratio height, the tile
+           grows taller than wide. Square view keeps overflow:hidden and
+           never ovals. Pinned by the "circle tile stays 1:1" case in
+           harness/layout.spec.ts. (No backticks in this comment: the
+           sheet is a css tagged template.) */
+        min-height: 0;
       }
 
       .module-replace-content {
@@ -4468,6 +4421,18 @@ export class RoomView extends LitElement {
 
       .tile-meta {
         z-index: 5;
+      }
+
+      .tile-status {
+        color: #b9a884;
+        font-size: 0.8em;
+        text-align: center;
+      }
+      .tile-status-wait {
+        color: #e7a008;
+      }
+      .tile-status-act {
+        color: #e07070;
       }
 
       .maximize-icon {

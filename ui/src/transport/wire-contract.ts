@@ -197,6 +197,7 @@ export function emittableSignalTypes(
 /** Fields this build writes into its conversation payload. */
 export const CONVERSATION_PAYLOAD_WRITES = [
   'micMuted',
+  'cameraOn',
   'webrtcDisabled',
   'disableWebrtcWith',
   'webrtcImpl',

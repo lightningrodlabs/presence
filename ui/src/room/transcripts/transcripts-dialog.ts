@@ -1,5 +1,5 @@
 import { LitElement, css, html, nothing } from 'lit';
-import { customElement, property, state } from 'lit/decorators.js';
+import { customElement, property, query, state } from 'lit/decorators.js';
 import { localized, msg, str } from '@lit/localize';
 import { mdiArrowLeft, mdiDeleteOutline, mdiDownloadOutline, mdiEyeOutline } from '@mdi/js';
 import { wrapPathInSvg } from '@holochain-open-dev/elements';
@@ -27,8 +27,17 @@ function countWords(n: number): string {
 }
 
 /**
- * Overlay listing this room's stored transcripts with view, download and
+ * Modal listing this room's stored transcripts with view, download and
  * delete.
+ *
+ * A native `<dialog>` opened with `showModal()`, so it renders in the top
+ * layer: its containing block is the viewport whatever the host's
+ * ancestors are. A `position: fixed` overlay was laid out against the
+ * home page's `.bottom-panel` instead (`container-type` makes an element
+ * the containing block of its fixed descendants) and scrolled off screen
+ * with it. Escape acts as the Back button while a transcript is open
+ * (the dialog's `cancel` event, prevented) and closes the dialog from the
+ * list (its `close` event).
  *
  * Events: `transcripts-close`.
  */
@@ -46,9 +55,16 @@ export class TranscriptsDialog extends LitElement {
   @state() private _viewing: StoredTranscript | null = null;
   @state() private _confirmDelete: string | null = null;
 
+  @query('dialog') private _dialog!: HTMLDialogElement | null;
+
   connectedCallback() {
     super.connectedCallback();
     void this._reload();
+  }
+
+  firstUpdated() {
+    const dialog = this._dialog;
+    if (dialog && !dialog.open) dialog.showModal();
   }
 
   private async _reload() {
@@ -196,28 +212,43 @@ export class TranscriptsDialog extends LitElement {
 
   render() {
     return html`
-      <div class="dialog" @click=${() => this._close()}>
-        <div class="panel" @click=${(e: Event) => e.stopPropagation()} @keypress=${() => undefined}>
+      <!-- The panel fills the dialog, so a click whose target is the dialog
+           itself landed on the backdrop. -->
+      <dialog
+        @click=${(e: Event) => {
+          if (e.target === e.currentTarget) this._close();
+        }}
+        @cancel=${(e: Event) => {
+          if (!this._viewing) return;
+          e.preventDefault();
+          this._viewing = null;
+        }}
+        @close=${() => this._close()}
+      >
+        <div class="panel">
           <div class="column" style="gap: 12px;">
             ${this._viewing ? this._renderView(this._viewing) : this._renderList()}
           </div>
         </div>
-      </div>
+      </dialog>
     `;
   }
 
   static styles = css`
     :host { display: contents; }
-    .dialog {
-      position: fixed; inset: 0; z-index: 25;
-      display: flex; align-items: center; justify-content: center;
-      background: rgba(0, 0, 0, 0.35);
+    dialog {
+      border: none; padding: 0; background: transparent;
+      max-width: none; max-height: none; overflow: visible;
     }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
     .panel {
+      box-sizing: border-box;
       background: white; color: #222; border-radius: 12px;
       padding: 18px 20px; width: min(720px, 92vw); max-height: 85vh;
       overflow: auto; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
       font-family: 'Ubuntu', sans-serif;
+      /* The home page centers its text; a transcript reads left-aligned. */
+      text-align: left;
     }
     .row { display: flex; flex-direction: row; align-items: center; }
     .column { display: flex; flex-direction: column; }

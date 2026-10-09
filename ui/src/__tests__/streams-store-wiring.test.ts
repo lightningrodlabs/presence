@@ -8,6 +8,7 @@ import {
   SDP_TIMEOUT_CEILING_MS,
   SDP_BACKSTOP_MULTIPLIER,
   SDP_BACKSTOP_RETRY_HEADROOM_MS,
+  SDP_BACKSTOP_CEILING_MS,
 } from '../streams-store';
 import {
   ANNOTATIONS_MODULE_ID,
@@ -33,6 +34,7 @@ import {
 import { CAP_VOICE_BATCH } from '../transport/wire-contract';
 import { encodeRtcAction } from '../rtc-message-policy';
 import { DEAD_TRACK_REFRESH_BUDGET, deadTrackRefreshBudget } from '../transport/track-health-policy';
+import { SIGNALS_LEVEL_HOLD_MS } from '../transport/carrier-stats-policy';
 import {
   CAPTURE_REOPEN_MIN_INTERVAL_MS,
   CAPTURE_REOPEN_MAX_ATTEMPTS,
@@ -1783,6 +1785,173 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     expect(get(store._openConnections)[peerA]?.connectionId).toBe('conn-2');
     expect(media.closeCalls).toHaveLength(0);
     expect(get(store._connectionStatuses)[peerA]?.type).toBe('SdpExchange');
+    // Forensics: the predecessor still leaves its one record.
+    const ev = started.logger.agentEvents.filter(e => e.event === 'SdpBackstop');
+    expect(ev.map(e => e.detail)).toEqual([
+      `superseded by=conn-2 ageMs=${NO_SAMPLE_BACKSTOP_MS} rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`,
+    ]);
+  });
+
+  /** The one SdpBackstop event, if any, for this peer. */
+  function backstopEvents(started: Started) {
+    return started.logger.agentEvents.filter(e => e.event === 'SdpBackstop');
+  }
+
+  it('the backstop counts silence, not attempt age: a progressing attempt survives past the old deadline (2026-09-30 Uruguay replay)', async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+
+    // The FSM retries in place under the SAME connectionId, each phase
+    // change well inside the window — the shape of the field log, where
+    // the backstop tore down faa13eef mid-ICE 6.6 s after its last phase
+    // change.
+    const step = NO_SAMPLE_BACKSTOP_MS / 2;
+    for (const phase of ['connecting', 'disconnected', 'signaling', 'connecting'] as const) {
+      clock.advance(step);
+      media.emitPhase(peerA, 'init-1', phase);
+    }
+    // 2x the window since InitAccept: before this change the attempt was
+    // torn down at 1x.
+    expect(get(store._openConnections)[peerA]?.connectionId).toBe('init-1');
+    expect(media.closeCalls.some(c => c.reason === 'SDP exchange timeout')).toBe(false);
+    expect(backstopEvents(started)).toHaveLength(0);
+
+    // Then it goes SILENT: the window runs from the last phase change.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS - 1);
+    expect(get(store._openConnections)[peerA]).toBeDefined();
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(media.closeCalls.some(c => c.reason === 'SDP exchange timeout')).toBe(true);
+
+    // Forensics: one event, carrying what the next field log needs.
+    const ev = backstopEvents(started);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].connectionId).toBe('init-1');
+    expect(ev[0].detail).toBe(
+      `fired lastPhase=connecting ageMs=${4 * step + NO_SAMPLE_BACKSTOP_MS} ` +
+        `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=4 windowMs=${NO_SAMPLE_BACKSTOP_MS}`
+    );
+  });
+
+  it('the window is frozen per attempt: an RTT that recovers mid-attempt never shrinks it below what the FSM was given (review I1)', async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    // RTT spike at InitAccept: the FSM gets the 30 s ceiling and the
+    // backstop window is 2x that plus headroom (68 s).
+    store._ensurePeerRecord(peerA).signalsRttEwma = 2_000;
+    await acceptVideo(started, 'init-1');
+    expect(lastSdpOverride(media)).toBe(SDP_TIMEOUT_CEILING_MS);
+    const window = SDP_BACKSTOP_CEILING_MS;
+
+    clock.advance(1_000);
+    media.emitPhase(peerA, 'init-1', 'connecting');
+    // The RTT recovers: recomputed now, the window would be 20 s — less
+    // than the 30 s the FSM still has for its next signaling phase.
+    store._ensurePeerRecord(peerA).signalsRttEwma = 300;
+    clock.advance(1_000);
+    media.emitPhase(peerA, 'init-1', 'signaling');
+
+    clock.advance(window - 1);
+    expect(get(store._openConnections)[peerA]?.connectionId).toBe('init-1');
+    clock.advance(1);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(backstopEvents(started)[0]?.detail).toBe(
+      `fired lastPhase=signaling ageMs=${2_000 + window} silentMs=${window} rearms=2 windowMs=${window}`
+    );
+  });
+
+  it('an attempt whose FSM vanished with no event, replaced by a new InitAccept, still leaves its record', async () => {
+    const started = makeStarted();
+    const { clock, transports } = started;
+    await acceptVideo(started, 'init-1');
+    clock.advance(5_000);
+    // The silent-destroy shape (fsm.destroy() emits no transition), then
+    // the slot is gone and a fresh InitAccept arrives.
+    transports.media!.vanish(peerA);
+    started.store._openConnections.update(c => { delete c[peerA]; return c; });
+    await acceptVideo(started, 'init-2');
+    expect(backstopEvents(started).map(e => [e.connectionId, e.detail])).toEqual([
+      ['init-1', `replaced by=init-2 ageMs=5000 rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`],
+    ]);
+  });
+
+  it('a re-accept onto the attempt that is already armed continues it: same age, one more re-arm, no record yet', async () => {
+    const started = makeStarted();
+    const { clock } = started;
+    await acceptVideo(started, 'init-1');
+    clock.advance(5_000);
+    // The FSM is still alive, so the transport hands back the same id.
+    started.store._openConnections.update(c => { delete c[peerA]; return c; });
+    await acceptVideo(started, 'init-2');
+    expect(backstopEvents(started)).toHaveLength(0);
+    clock.advance(NO_SAMPLE_BACKSTOP_MS);
+    expect(backstopEvents(started).map(e => e.detail)).toEqual([
+      `fired lastPhase=init-accept ageMs=${5_000 + NO_SAMPLE_BACKSTOP_MS} ` +
+        `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=1 windowMs=${NO_SAMPLE_BACKSTOP_MS}`,
+    ]);
+  });
+
+  it('a silent attempt is still torn down at the window — the wedge the backstop exists for', async () => {
+    const started = makeStarted();
+    const { store, clock } = started;
+    await acceptVideo(started, 'init-1');
+    clock.advance(NO_SAMPLE_BACKSTOP_MS);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    const ev = backstopEvents(started);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toBe(
+      `fired lastPhase=init-accept ageMs=${NO_SAMPLE_BACKSTOP_MS} ` +
+        `silentMs=${NO_SAMPLE_BACKSTOP_MS} rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`
+    );
+  });
+
+  it("another attempt's phase changes do not extend the armed attempt's deadline", async () => {
+    const started = makeStarted();
+    const { store, clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
+    // `disconnected` routes to ignore (no slot adoption), so the slot is
+    // still init-1's; only the decision can tell the events apart.
+    media.emitPhase(peerA, 'other-conn', 'disconnected');
+    clock.advance(NO_SAMPLE_BACKSTOP_MS / 2);
+    expect(get(store._openConnections)[peerA]).toBeUndefined();
+    expect(backstopEvents(started)[0]?.detail).toMatch(/^fired .* rearms=0 /);
+  });
+
+  it('a connected attempt disarms the backstop and logs how long establishment took', async () => {
+    const started = makeStarted();
+    const { clock, transports } = started;
+    const media = transports.media!;
+    await acceptVideo(started, 'init-1');
+    clock.advance(1_000);
+    media.emitPhase(peerA, 'init-1', 'connecting');
+    clock.advance(2_000);
+    media.emitPhase(peerA, 'init-1', 'connected', 'connecting');
+    // The backstop's own handle is cleared (the connected path arms
+    // unrelated timers of its own, so the total count is not the signal).
+    const record = started.store._peerRecords.get(peerA);
+    expect(record?.sdpTimeoutTimer).toBeUndefined();
+    expect(record?.sdpBackstop).toBeUndefined();
+    const ev = backstopEvents(started);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toBe(`disarm phase=connected ageMs=3000 rearms=1 windowMs=${NO_SAMPLE_BACKSTOP_MS}`);
+    // Nothing fires later.
+    clock.advance(NO_SAMPLE_BACKSTOP_MS * 2);
+    expect(backstopEvents(started)).toHaveLength(1);
+  });
+
+  it('a closed attempt disarms too (the timer no longer outlives its attempt)', async () => {
+    const started = makeStarted();
+    const { clock, transports } = started;
+    await acceptVideo(started, 'init-1');
+    const armed = clock.pendingTimerCount;
+    transports.media!.emitPhase(peerA, 'init-1', 'closed', 'signaling');
+    expect(clock.pendingTimerCount).toBe(armed - 1);
+    expect(backstopEvents(started)[0]?.detail).toBe(`disarm phase=closed ageMs=0 rearms=0 windowMs=${NO_SAMPLE_BACKSTOP_MS}`);
   });
 
   it('a new attempt after teardown replaces the tracked timer; disconnect() disarms it', async () => {
@@ -1800,6 +1969,7 @@ describe('InitAccept lifecycle (§9 item 5)', () => {
     store.disconnect('sdp-timer-hygiene');
     live.length = 0;
     expect(clock.pendingTimerCount).toBe(0);
+    expect(store._peerRecords.get(peerA)?.sdpBackstop).toBeUndefined();
   });
 
   it('peer-leave wipes the init-retry cooldown and reconcile throttle; a plain close keeps the cooldown (the rejoin-inheritance fix)', async () => {
@@ -3613,6 +3783,237 @@ describe('StreamsStore.connect carries both host seams (release 0.16.0 Review Fo
       // describe's unstub hook would otherwise decide what disconnect sees.
       store.disconnect('wiring-test-connect-seams');
     }
+  });
+});
+
+describe('peer tile (spec 2026-09-30): cameraOn on the wire, silence stamps on the tick, peerTileFor', () => {
+  class FakeTrack {
+    readyState: 'live' | 'ended' = 'live';
+    enabled = true;
+    onended: (() => void) | null = null;
+    onmute: (() => void) | null = null;
+    onunmute: (() => void) | null = null;
+    muted = false;
+    constructor(public kind: 'audio' | 'video') {}
+    stop(): void { this.readyState = 'ended'; this.onended?.(); }
+  }
+  class FakeStream {
+    constructor(private tracks: FakeTrack[]) {}
+    getTracks() { return this.tracks; }
+    getAudioTracks() { return this.tracks.filter(t => t.kind === 'audio'); }
+    getVideoTracks() { return this.tracks.filter(t => t.kind === 'video'); }
+  }
+  class FakeMediaStream {
+    private tracks: FakeTrack[] = [];
+    addTrack(t: FakeTrack) { this.tracks.push(t); }
+    removeTrack(t: FakeTrack) { this.tracks = this.tracks.filter(x => x !== t); }
+    getTracks() { return this.tracks; }
+    getAudioTracks() { return this.tracks.filter(t => t.kind === 'audio'); }
+    getVideoTracks() { return this.tracks.filter(t => t.kind === 'video'); }
+  }
+  const flush = () => new Promise<void>(r => setTimeout(r, 0));
+
+  function installCamera(track: FakeTrack) {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { mediaDevices: { getUserMedia: async () => new FakeStream([track]) } },
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  function myConversation(started: ReturnType<typeof makeStarted>): Record<string, unknown> | null {
+    const env = get(started.store._myModuleStates)['conversation'];
+    return env ? JSON.parse(env.payload) : null;
+  }
+
+  function peerConversation(started: ReturnType<typeof makeStarted>, peer: string, payload: Record<string, unknown>) {
+    started.store._peerModuleStates.update(s => ({
+      ...s,
+      [peer]: {
+        conversation: { moduleId: 'conversation', active: true, payload: JSON.stringify(payload), updatedAt: started.clock.now() },
+      },
+    }));
+  }
+
+  beforeEach(() => { (globalThis as any).MediaStream = FakeMediaStream; });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as any).navigator;
+    delete (globalThis as any).MediaStream;
+  });
+
+  it('videoOn/videoOff write cameraOn to my conversation payload and send no video-on/off RTC action', async () => {
+    installCamera(new FakeTrack('video'));
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    media.sentData.length = 0;
+
+    await started.store.videoOn();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(true);
+
+    started.store.videoOff();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(false);
+
+    // The send side of the data-channel actions is gone (spec decision 7).
+    const actions = media.sentData.map(c => String(c.data));
+    expect(actions.some(a => a.includes('video-on') || a.includes('video-off'))).toBe(false);
+  });
+
+  it('the receive arm of video-off still clears conn.video for a legacy sender (Review Focus 5)', async () => {
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    started.store._openConnections.update(c => { c[peerA] = { ...c[peerA], video: true }; return c; });
+    media.emit({ type: 'data-channel-message', peer: peerA, connectionId: 'conn-1', data: encodeRtcAction('video-off') });
+    expect(get(started.store._openConnections)[peerA]?.video).toBe(false);
+  });
+
+  it('the tick stamps audioSilentSince for a present, reachable, silent peer and clears it when voice flows', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: false, caps: ['sdp-fsm'] });
+    started.clock.advance(PING_INTERVAL);
+    await flush(); await flush();
+    const t0 = started.store._peerRecords.get(peerA)?.audioSilentSince;
+    // Stamped when the peer first reads present and silent (the roster
+    // write itself notifies the subscription), so not necessarily on the
+    // advanced tick; the point is that it is set and then held.
+    expect(t0).toBeTypeOf('number');
+    expect(t0).toBeLessThanOrEqual(started.clock.now());
+
+    started.clock.advance(PING_INTERVAL);
+    await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBe(t0); // kept, not refreshed
+
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    started.clock.advance(PING_INTERVAL);
+    await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBeUndefined();
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('peerTileFor: audio over signals while WebRTC is still signaling shows no line (the 2026-09-30 log)', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: false, caps: ['sdp-fsm'] });
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile).toMatchObject({ background: 'avatar', audio: 'live', statusLine: undefined, attention: 'none' });
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('peerTileFor: a never-connected attempt closed by the backstop is "no audio", never a reconnect wording', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: false, caps: ['sdp-fsm'] });
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'closed', 'signaling');
+    // three ticks of silence past the grace
+    for (let i = 0; i < 3; i++) { started.clock.advance(PING_INTERVAL); await flush(); await flush(); }
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile.statusLine).toBe('no audio — reconnecting…');
+    expect(tile.attention).toBe('wait');
+    expect((started.store as any).peerReconnecting).toBeUndefined();
+  });
+
+  it('I2: a peer that drops out of the present set without a leave signal loses both stamps and gets the full grace on return', async () => {
+    const started = makeStarted();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    peerConversation(started, peerA, { micMuted: false, cameraOn: true, caps: ['sdp-fsm'] });
+    for (let i = 0; i < 3; i++) { started.clock.advance(PING_INTERVAL); await flush(); await flush(); }
+    const rec = started.store._peerRecords.get(peerA)!;
+    expect(rec.audioSilentSince).toBeTypeOf('number');
+    expect(rec.videoSilentSince).toBeTypeOf('number');
+    expect(started.store.peerTileFor(peerA).statusLine).toBeDefined(); // past grace
+
+    // Drop out of the present set: no roster entry, silence past the staleness
+    // window and the carrier-hold cap.
+    started.store._knownAgents.set({});
+    for (let i = 0; i < 40 && get(started.store._presentPeers).includes(peerA); i++) {
+      started.clock.advance(PING_INTERVAL); await flush(); await flush();
+    }
+    expect(get(started.store._presentPeers).includes(peerA)).toBe(false);
+    started.clock.advance(PING_INTERVAL); await flush(); await flush();
+    expect(started.store._peerRecords.get(peerA)?.audioSilentSince).toBeUndefined();
+    expect(started.store._peerRecords.get(peerA)?.videoSilentSince).toBeUndefined();
+
+    // Return: the first present tick stamps fresh, so no line yet.
+    const returnedAt = started.clock.now();
+    started.store._knownAgents.set(knownFresh(started.clock, peerA));
+    await flush(); await flush();
+    expect(get(started.store._presentPeers).includes(peerA)).toBe(true);
+    expect(started.store._peerRecords.get(peerA)?.videoSilentSince).toBeGreaterThanOrEqual(returnedAt);
+    const tile = started.store.peerTileFor(peerA);
+    expect(tile.statusLine).toBeUndefined();
+    expect(tile.reason).toBe('silent-under-grace');
+  });
+
+  it('I3: cameraOn on the wire means wanted AND live — a failed acquire writes false, a later reconciler acquire writes true', async () => {
+    let fail = true;
+    const track = new FakeTrack('video');
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        mediaDevices: {
+          getUserMedia: async () => {
+            if (fail) throw new Error('NotAllowedError');
+            return new FakeStream([track]);
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+    const started = makeStarted();
+    await started.store.videoOn();
+    await flush();
+    expect(myConversation(started)?.cameraOn).toBe(false);
+
+    fail = false;
+    started.clock.advance(CAPTURE_REOPEN_MIN_INTERVAL_MS);
+    await started.store.captureReconciler.tick(); // the reconciler acquires
+    await flush();
+    started.clock.advance(PING_INTERVAL); // the next presence tick picks it up
+    await flush(); await flush();
+    expect(myConversation(started)?.cameraOn).toBe(true);
+  });
+});
+
+describe('audioLevelFor: the tile meter\'s one level read (2026-10-01 stuck-meter report)', () => {
+  afterEach(() => {
+    voiceController.peerAudioLevels.delete(peerA);
+    voiceController.peerLastRecvMs.delete(peerA);
+  });
+
+  it('a signals peak is read while frames are fresh and expires when they stop', () => {
+    const started = makeStarted();
+    voiceController.peerAudioLevels.set(peerA, 0.8);
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    expect(started.store.audioLevelFor(peerA)).toBe(0.8);
+
+    // Frames stop (the peer muted, their cadence paused, or they dropped):
+    // the map still holds 0.8 — the meter must not.
+    started.clock.advance(SIGNALS_LEVEL_HOLD_MS);
+    expect(voiceController.peerAudioLevels.get(peerA)).toBe(0.8);
+    expect(started.store.audioLevelFor(peerA)).toBe(0);
+  });
+
+  it('on a connected WebRTC link a leftover signals peak is never read', () => {
+    const started = makeStarted();
+    const media = started.transports.media!;
+    media.emitPhase(peerA, 'conn-1', 'signaling');
+    media.emitPhase(peerA, 'conn-1', 'connected', 'connecting');
+    voiceController.peerAudioLevels.set(peerA, 0.8);
+    voiceController.peerLastRecvMs.set(peerA, started.clock.now());
+    // No analyser in node → the WebRTC level is 0, as for a muted peer.
+    expect(started.store.audioLevelFor(peerA)).toBe(0);
   });
 });
 

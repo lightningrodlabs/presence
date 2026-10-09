@@ -18,10 +18,13 @@ function fullRecord(): PeerRecord {
     refreshRequestsSent: 15,
     qualityBucket: 'poor', webrtcExitReason: 'ice-failed',
     videoStream: { id: 'video' } as unknown as MediaStream, pendingInits: [{ connectionId: 'c', t0: 7 }],
-    sdpTimeoutTimer: 8, analyser: { node: {} as AnalyserNode, buffer: new Uint8Array(1) },
+    sdpTimeoutTimer: 8,
+    sdpBackstop: { connectionId: 'c', armedAt: 17, lastPhaseAt: 18, lastPhase: 'connecting', rearms: 3, windowMs: 19 },
+    analyser: { node: {} as AnalyserNode, buffer: new Uint8Array(1) },
     outageState: { startedAt: 9, emitted: true },
     screenShareStream: { id: 'screen' } as unknown as MediaStream, screenShareIceDisconnectedAt: 10,
     lastDisconnectTime: 11, lastReconcileTime: 12, signalsRttEwma: 13,
+    audioSilentSince: 4_001, videoSilentSince: 4_002,
     deadTrackEscalations: 16,
     connectionEpoch: 14,
   };
@@ -56,6 +59,7 @@ describe('resetPeerRecord', () => {
       videoStream: undefined, pendingInits: undefined,
       qualityBucket: undefined, lastDisconnectTime: undefined,
       lastReconcileTime: undefined, signalsRttEwma: undefined,
+      audioSilentSince: undefined, videoSilentSince: undefined,
       deadTrackEscalations: undefined,
       // iceDisconnectedAt survives this row alone — the nested close row
       // (media-close-full, applied first by the executor) did the rest.
@@ -82,5 +86,15 @@ describe('resetPeerRecord', () => {
     expect(afterClose.refreshRequestsSent).toBeUndefined();
     const afterLeave = resetPeerRecord(afterClose, 'media-leave-residue');
     expect(afterLeave.deadTrackEscalations).toBeUndefined();
+  });
+  it('the tile pacing stamps survive a media close and die only on leave (spec decision 5)', () => {
+    const afterClose = resetPeerRecord(fullRecord(), 'media-close-full');
+    expect(afterClose.audioSilentSince).toBe(4_001);
+    expect(afterClose.videoSilentSince).toBe(4_002);
+    const afterStale = resetPeerRecord(afterClose, 'media-stale-residue');
+    expect(afterStale.audioSilentSince).toBe(4_001);
+    const afterLeave = resetPeerRecord(afterStale, 'media-leave-residue');
+    expect(afterLeave.audioSilentSince).toBeUndefined();
+    expect(afterLeave.videoSilentSince).toBeUndefined();
   });
 });

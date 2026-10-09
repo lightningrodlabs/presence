@@ -25,11 +25,18 @@
  *   n      = people tile count   (default 2)
  *   shares = screen-share count  (default 1, split mode only)
  *   split  = split ratio %       (default 50, split mode only)
+ *   content = fill | peer        (default fill) — `peer` gives tile 0 the
+ *            in-flow content stack of RoomView._renderPeerTile instead of
+ *            the flat fill, and exposes `harness.peerTile` to drive it
+ *            through the WebRTC establishment states. See peerTileContent.
  */
 import { PresenceApp } from '../src/presence-app';
 import { RoomContainer } from '../src/room/room-container';
 import { RoomView } from '../src/room/room-view';
 import { bestColumns, GRID_TOOLBAR_RESERVE } from '../src/room/layout';
+import { bindVideoStream } from '../src/room/video-bind';
+import { describePeerTile } from '../src/peer-tile-policy';
+import type { PeerTileInputs } from '../src/peer-tile-policy';
 
 type Mode = 'grid' | 'split';
 
@@ -89,6 +96,11 @@ const splitRatio = parseFloat(params.get('split') ?? '50');
 // — reproduces what a nested/seamless embedder does, where cqh resolves against
 // an over-tall container and tiles overflow the visible window.
 const bound = params.get('bound') ?? 'viewport';
+// content=peer: tile 0 carries the real peer-tile content stack (see
+// peerTileContent) so the tile's automatic minimum height is driven by the
+// same in-flow children the live tile has. Default `fill` keeps the flat
+// fill the layout invariants were written against.
+const content = params.get('content') ?? 'fill';
 const isRect = shape === 'rect';
 const aspect = isRect ? 16 / 9 : 1;
 
@@ -177,12 +189,68 @@ function tile(
   label: string,
   classes: string[],
   role: 'person' | 'share',
-  expectAspect: number
+  expectAspect: number,
+  inner?: string
 ): string {
   const cls = ['video-container', ...classes].join(' ');
-  return `<div class="${cls}" data-tile data-role="${role}" data-aspect="${expectAspect}">
-    <div class="harness-fill">${label}</div>
+  const body = inner ?? `<div class="harness-fill">${label}</div>`;
+  const peerAttr = inner ? ' data-peer-tile' : '';
+  return `<div class="${cls}" data-tile data-role="${role}" data-aspect="${expectAspect}"${peerAttr}>
+    ${body}
   </div>`;
+}
+
+/**
+ * The IN-FLOW content stack of one peer tile, mirroring
+ * RoomView._renderPeerTile (src/room/room-view.ts) child by child, in
+ * document order, with the same inline styles the template writes. Only
+ * in-flow children can feed the tile's content-based automatic minimum
+ * height, so that is where fidelity matters:
+ *
+ *   avatar-with-nickname   in-flow, `width: 35%`; hidden iff the policy's
+ *                          `background !== 'avatar'` (filmstrip
+ *                          inactive here). Stand-in:
+ *                          a 35%-wide square, the profile-image branch
+ *                          (`img { width:100%; height:auto }`). The
+ *                          identicon branch is a fixed 40px
+ *                          `holo-identicon`, taller than the 35% square
+ *                          below ~115px tile width; immaterial to the
+ *                          pin, since the avatar never shares the flow
+ *                          with the video.
+ *   peer-filmstrip         host is position:absolute (its :host rule);
+ *                          out of flow. Stand-in keeps that positioning.
+ *   video.video-el         in-flow when the policy's `background ===
+ *                          'video'` (`display:none` otherwise);
+ *                          `.video-el { width:100%; height:100% }` from
+ *                          the real sheet.
+ *   .tile-status           in-flow div (`_renderTileStatusLine`), real
+ *                          `.tile-status*` classes, present iff the
+ *                          policy returns a `statusLine`; rendered after
+ *                          the video, outside the `conn` conditional.
+ *   .tile-meta             position:absolute bottom rows (30px icon row +
+ *                          4px margin, 36px avatar row); out of flow.
+ *
+ * Visibility and copy come from the REAL `describePeerTile`
+ * (src/peer-tile-policy.ts) over each state's inputs, so a state here is
+ * one render of the live template's in-flow stack.
+ *
+ * Not mirrored: the module-replace content and the connection-details
+ * block — both position:absolute in the template.
+ * The two custom elements are stand-ins because the real ones need a
+ * profiles context / streams store the harness does not construct.
+ */
+function peerTileContent(): string {
+  return `
+    <div data-avatar style="width: 35%;">
+      <div style="width: 100%; aspect-ratio: 1 / 1; border-radius: 50%; background: #556;"></div>
+    </div>
+    <div data-filmstrip style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; pointer-events: none;"></div>
+    <video data-video class="video-el" style="display: none;" muted playsinline></video>
+    <div data-status class="tile-status" style="display: none;"></div>
+    <div class="tile-meta" style="display: flex; flex-direction: column; align-items: center; position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); background: none; white-space: nowrap;">
+      <div style="height: 30px; margin-bottom: 4px; width: 60px;"></div>
+      <div style="height: 36px; width: 60px;"></div>
+    </div>`;
 }
 
 function peopleTiles(count: number): string {
@@ -190,7 +258,14 @@ function peopleTiles(count: number): string {
   const shapeCls = isRect ? 'square-view' : '';
   let out = '';
   for (let i = 0; i < count; i += 1) {
-    out += tile(`${i + 1}`, [layout, shapeCls].filter(Boolean), 'person', aspect);
+    const inner = content === 'peer' && i === 0 ? peerTileContent() : undefined;
+    out += tile(
+      `${i + 1}`,
+      [layout, shapeCls].filter(Boolean),
+      'person',
+      aspect,
+      inner
+    );
   }
   return out;
 }
@@ -381,8 +456,205 @@ function measure(): HarnessReport {
 relayout();
 window.addEventListener('resize', () => relayout());
 
+// ---- content=peer: drive tile 0 through the WebRTC establishment states ----
+//
+// Each state is a `PeerTileInputs` snapshot — the slot shapes are the
+// ones the store writes to `_openConnections[peer]` (src/media-links.ts)
+// and the rest are what `StreamsStore.peerTileFor` gathers. The real
+// `describePeerTile` turns it into background + status line, and the
+// stack's visibility follows with the SAME expressions
+// RoomView._renderPeerTile uses, so a state here is one render of the
+// live template.
+//
+// The oval-prone states are the ones where a visible <video> and a
+// status line are in flow together: since the peer-tile round that is
+// the spec's row 1k (slot still `connected` through ICE recovery, the
+// frozen track shown, audio down) — `video-with-wait-line` and
+// `video-with-act-line`. `video-before-connected`, the state the
+// original field report came from, no longer shows the <video> at all
+// (the policy requires `connected`), and is kept as the control.
+const TILE_NOW = 1_000_000;
+const TILE_BASE: PeerTileInputs = {
+  webrtcExpected: true,
+  audioLink: 'signals',
+  peerMicMuted: false,
+  peerCameraOn: true,
+  slot: undefined,
+  filmstripLive: false,
+  audioSilentSince: undefined,
+  videoSilentSince: undefined,
+  qualityBucket: undefined,
+  reconnectAvailable: false,
+  now: TILE_NOW,
+};
+type PeerTileState =
+  | 'no-conn' // no slot, audio over signals: avatar, no line
+  | 'establishing-silent' // slot, not connected, silent past grace: avatar + wait line
+  | 'video-before-connected' // video && !connected: avatar (video hidden), no line
+  | 'connected-video-track-muted' // track arrived muted: avatar + "connecting video…"
+  | 'connected-video' // connected && video: <video> only
+  | 'video-with-wait-line' // row 1k: <video> + "no audio — reconnecting…"
+  | 'video-with-act-line'; // row 1k past the act threshold: <video> + the act line
+
+const PEER_STATES: Record<PeerTileState, Partial<PeerTileInputs>> = {
+  'no-conn': {},
+  'establishing-silent': {
+    slot: { connected: false, video: false },
+    audioLink: 'negotiating',
+    audioSilentSince: TILE_NOW - 3_000,
+    reconnectAvailable: true,
+  },
+  'video-before-connected': { slot: { connected: false, video: true } },
+  'connected-video-track-muted': {
+    slot: { connected: true, video: true, videoMuted: true },
+    audioLink: 'webrtc',
+  },
+  'connected-video': { slot: { connected: true, video: true }, audioLink: 'webrtc' },
+  'video-with-wait-line': {
+    slot: { connected: true, video: true },
+    audioLink: 'down',
+    audioSilentSince: TILE_NOW - 3_000,
+    reconnectAvailable: true,
+  },
+  'video-with-act-line': {
+    slot: { connected: true, video: true },
+    audioLink: 'down',
+    audioSilentSince: TILE_NOW - 31_000,
+    reconnectAvailable: true,
+  },
+};
+
+interface PeerTileMeasure {
+  state: PeerTileState;
+  tile: { width: number; height: number };
+  video: { shown: boolean; width: number; height: number };
+  /** summed heights of the in-flow children currently displayed */
+  inFlow: number;
+  lines: string[];
+}
+
+let peerStream: MediaStream | null = null;
+function peerVideoStream(): MediaStream {
+  if (peerStream) return peerStream;
+  // A 4:3 source, like a 640x480 camera: the shape a real remote stream
+  // would give the <video> if its percentage height ever fell back to the
+  // intrinsic ratio.
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.fillStyle = '#2a6';
+    ctx.fillRect(0, 0, 640, 480);
+  }
+  peerStream = canvas.captureStream(5);
+  return peerStream;
+}
+
+function nextFrames(n: number): Promise<void> {
+  return new Promise((resolve) => {
+    const step = (left: number) => {
+      if (left <= 0) {
+        resolve();
+        return;
+      }
+      requestAnimationFrame(() => step(left - 1));
+    };
+    step(n);
+  });
+}
+
+function peerTileEls() {
+  const tileEl = rvShadow.querySelector('[data-peer-tile]') as HTMLElement | null;
+  if (!tileEl) throw new Error('content=peer not active');
+  const q = (sel: string) => tileEl.querySelector(sel) as HTMLElement;
+  return {
+    tileEl,
+    avatar: q('[data-avatar]'),
+    video: q('[data-video]') as HTMLVideoElement,
+    status: q('[data-status]'),
+  };
+}
+
+let peerState: PeerTileState = 'no-conn';
+
+async function setPeerTileState(state: PeerTileState): Promise<PeerTileMeasure> {
+  const tile = describePeerTile({ ...TILE_BASE, ...PEER_STATES[state] });
+  const { avatar, video, status } = peerTileEls();
+  peerState = state;
+
+  // Mirrors _renderPeerTile's `avatarHidden` (filmstrip inactive):
+  // `filmstripActive || tile.background !== 'avatar'`.
+  avatar.style.display = tile.background !== 'avatar' ? 'none' : '';
+
+  // Mirrors `style="${tile.background === 'video' ? '' : 'display: none;'}"`.
+  const videoShown = tile.background === 'video';
+  video.style.display = videoShown ? '' : 'none';
+  if (videoShown) {
+    const stream = peerVideoStream();
+    const bound = bindVideoStream(video, stream, 'ensure');
+    if (bound.action === 'bound' && video.readyState < 1) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 2000);
+        video.addEventListener(
+          'loadedmetadata',
+          () => {
+            clearTimeout(t);
+            resolve();
+          },
+          { once: true }
+        );
+      });
+    }
+  }
+
+  // Mirrors _renderTileStatusLine: copy and attention only from the policy.
+  status.textContent = tile.statusLine ?? '';
+  status.style.display = tile.statusLine ? '' : 'none';
+  status.className =
+    tile.attention === 'act'
+      ? 'tile-status tile-status-act'
+      : tile.attention === 'wait'
+        ? 'tile-status tile-status-wait'
+        : 'tile-status';
+
+  await nextFrames(2);
+  return measurePeerTile();
+}
+
+function measurePeerTile(): PeerTileMeasure {
+  const { tileEl, avatar, video, status } = peerTileEls();
+  const tr = tileEl.getBoundingClientRect();
+  const vr = video.getBoundingClientRect();
+  const inFlowEls = [avatar, video, status].filter(
+    (el) => el.style.display !== 'none'
+  );
+  const inFlow = inFlowEls.reduce(
+    (sum, el) => sum + el.getBoundingClientRect().height,
+    0
+  );
+  const lines = [status]
+    .filter((el) => el.style.display !== 'none')
+    .map((el) => el.textContent?.trim() ?? '');
+  return {
+    state: peerState,
+    tile: { width: tr.width, height: tr.height },
+    video: {
+      shown: video.style.display !== 'none',
+      width: vr.width,
+      height: vr.height,
+    },
+    inFlow,
+    lines,
+  };
+}
+
 (window as unknown as Record<string, unknown>).harness = {
   relayout,
   measure,
   expectedAspect: aspect,
+  peerTile:
+    content === 'peer'
+      ? { setState: setPeerTileState, measure: measurePeerTile, states: Object.keys(PEER_STATES) }
+      : undefined,
 };

@@ -237,3 +237,59 @@ export function decideFlowGlyph(input: FlowGlyphInputs): FlowGlyphDecision {
     reason: flow === 'idle' ? 'webrtc-not-flowing' : 'webrtc-flowing',
   };
 }
+
+// ---------------------------------------------------------------------------
+// Tile audio-level meter (2026-10-01 stuck-meter report)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long the last signals voice-frame peak may be painted after the
+ * frame arrived. A PAINT hold, NOT a liveness predicate (working
+ * agreement 2): frames arrive every 20–60 ms while a peer is sending, so
+ * half a second without one means the peak no longer describes anything.
+ * `voiceController.peerAudioLevels` is written per decoded frame and never
+ * decayed; without this bound the meter froze at the last peak whenever
+ * frames stopped (mute, a paused cadence, a silent drop).
+ */
+export const SIGNALS_LEVEL_HOLD_MS = 500;
+
+export type MeterLevelInputs = {
+  /** The `_openConnections` slot — the carrier is `carrierFor(slot)`,
+   *  never re-derived here. */
+  slot: WebrtcSlot | undefined;
+  /** `PeerAudioLevels.getWebrtcAudioLevel(peer)` — 0 with no analyser,
+   *  and exactly 0 for a muted peer's digital silence. */
+  webrtcLevel: number;
+  /** `voiceController.peerAudioLevels.get(peer)` — the last decoded
+   *  frame's peak, however old. */
+  signalsLevel: number | undefined;
+  /** `voiceController.peerLastRecvMs.get(peer)`, on the store clock. */
+  lastVoiceMs: number | undefined;
+  now: number;
+};
+
+export type MeterLevel = {
+  level: number;
+  reason: 'webrtc' | 'signals-fresh' | 'signals-stale' | 'no-signals-sample';
+};
+
+/**
+ * The ONE read behind the tile's audio-level meter. The meter shows the
+ * ACTIVE carrier's level and nothing else: on WebRTC the analyser's, with
+ * no fall-through to signals (the element used to compose the two with
+ * `||`, so a muted peer's analyser 0 fell through to a signals peak left
+ * over from before WebRTC took over — the field report); on signals the
+ * last frame's peak, only while that frame is within the paint hold.
+ */
+export function decideMeterLevel(s: MeterLevelInputs): MeterLevel {
+  if (carrierFor(s.slot).carrier === 'webrtc') {
+    return { level: s.webrtcLevel, reason: 'webrtc' };
+  }
+  if (s.signalsLevel === undefined || s.lastVoiceMs === undefined) {
+    return { level: 0, reason: 'no-signals-sample' };
+  }
+  if (s.now - s.lastVoiceMs < SIGNALS_LEVEL_HOLD_MS) {
+    return { level: s.signalsLevel, reason: 'signals-fresh' };
+  }
+  return { level: 0, reason: 'signals-stale' };
+}

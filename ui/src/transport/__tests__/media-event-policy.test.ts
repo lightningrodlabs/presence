@@ -3,6 +3,7 @@ import {
   routeTransportPhase,
   decideSlotWrite,
   attributeSlotEvent,
+  decideBackstopOnPhase,
 } from '../media-event-policy';
 import type { TransportPhaseRoute } from '../media-event-policy';
 import type { ConnectionPhase } from '../types';
@@ -242,5 +243,42 @@ describe('attributeSlotEvent — the one supersede/no-slot guard, exported for t
 
   it('no slot at all is a no-slot attribution (e.g. an error after the phase close cleared the slot)', () => {
     expect(attributeSlotEvent('live-1', undefined)).toEqual({ outcome: 'no-slot' });
+  });
+});
+
+describe('decideBackstopOnPhase — the SDP backstop counts silence, not attempt age', () => {
+  // The backstop exists for an attempt that goes SILENT (a wedged FSM, or
+  // one destroyed with no event). A phase change on the armed attempt is
+  // the FSM acting, so it re-arms; a finished attempt disarms. Every
+  // ConnectionPhase has a row (the never-guard makes a new phase a compile
+  // error). Field basis: the 2026-09-07 and 2026-09-30 logs, where the
+  // backstop killed attempts 0.1 s and 6.6 s after their last phase change.
+  const expected: Record<ConnectionPhase, ReturnType<typeof decideBackstopOnPhase>> = {
+    signaling: { action: 'rearm', reason: 'attempt-progressing' },
+    connecting: { action: 'rearm', reason: 'attempt-progressing' },
+    reconnecting: { action: 'rearm', reason: 'attempt-progressing' },
+    disconnected: { action: 'rearm', reason: 'attempt-progressing' },
+    connected: { action: 'disarm', reason: 'attempt-connected' },
+    failed: { action: 'disarm', reason: 'attempt-ended' },
+    idle: { action: 'disarm', reason: 'attempt-ended' },
+    closed: { action: 'disarm', reason: 'attempt-ended' },
+  };
+
+  it.each(ALL_PHASES)('armed attempt, phase %s', phase => {
+    expect(
+      decideBackstopOnPhase({ armedConnectionId: 'c1', eventConnectionId: 'c1', phase })
+    ).toEqual(expected[phase]);
+  });
+
+  it.each(ALL_PHASES)('another attempt\'s %s never touches the armed timer (the successor pin)', phase => {
+    expect(
+      decideBackstopOnPhase({ armedConnectionId: 'c1', eventConnectionId: 'c2', phase })
+    ).toEqual({ action: 'none', reason: 'other-attempt' });
+  });
+
+  it.each(ALL_PHASES)('nothing armed, phase %s', phase => {
+    expect(
+      decideBackstopOnPhase({ armedConnectionId: undefined, eventConnectionId: 'c1', phase })
+    ).toEqual({ action: 'none', reason: 'not-armed' });
   });
 });
