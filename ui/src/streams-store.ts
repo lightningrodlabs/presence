@@ -57,6 +57,7 @@ import {
   OthersConnectionStatusEntry,
 } from './types';
 import { getModule } from './room/modules/registry';
+import { stampShareAnnotationsEpoch } from './room/annotation-policy';
 import {
   DEFAULT_CONVERSATION_PAYLOAD,
   ConversationPayload,
@@ -2703,7 +2704,15 @@ export class StreamsStore {
 
   async activateModule(moduleId: string, payload?: string): Promise<void> {
     const mod = getModule(moduleId);
-    const actualPayload = payload ?? mod?.defaultState?.() ?? '{}';
+    let actualPayload = payload ?? mod?.defaultState?.() ?? '{}';
+    // Share annotations (spec "Clearing"): every share-type module's
+    // payload carries `annotationsEpoch`, stamped HERE on the injected
+    // clock — the ONE generic site — so a share restart mints a new epoch
+    // and empties the board on every screen. A non-object payload is
+    // left alone and reads as epoch 0 (annotation-policy.ts).
+    if (mod?.type === 'share') {
+      actualPayload = stampShareAnnotationsEpoch(actualPayload, this.clock.now());
+    }
     const envelope: ModuleStateEnvelope = {
       moduleId,
       active: true,
@@ -2741,6 +2750,22 @@ export class StreamsStore {
     };
     this._myModuleStates.update(s => ({ ...s, [moduleId]: envelope }));
     await this._broadcastModuleState(envelope);
+  }
+
+  /**
+   * The sharer's clear-all for share annotations (spec "Clearing"): a new
+   * `annotationsEpoch` in the share payload, which every overlay reads
+   * through `readShareAnnotationsEpoch` (annotation-policy.ts). One
+   * ModuleState signal empties the board on every screen. No-op when the
+   * share is not active.
+   */
+  async clearShareAnnotations(shareModuleId: string): Promise<void> {
+    const existing = get(this._myModuleStates)[shareModuleId];
+    if (!existing?.active) return;
+    await this.updateModuleState(
+      shareModuleId,
+      stampShareAnnotationsEpoch(existing.payload, this.clock.now()),
+    );
   }
 
   async sendModuleData(

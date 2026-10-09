@@ -1,6 +1,7 @@
 import { TemplateResult } from 'lit';
 import type { StreamsStore } from '../../streams-store';
 import type { ModuleStateEnvelope } from '../../types';
+import type { AnnotationSurfaceKind } from '../annotation-geometry';
 
 export type { ModuleStateEnvelope };
 
@@ -91,6 +92,23 @@ export interface ModuleDefinition {
    * Defaults to 'video-container screen-share' if omitted.
    */
   shareWrapperClass?: string;
+
+  /**
+   * Custom element tag mounted into EVERY share tile, on top of the share
+   * content and under the maximize icon (room-view.ts, renderSharedPanel).
+   * It receives `.sharerPubKeyB64`, `.shareModuleId` and `.context` as
+   * properties. Share annotations (room/modules/annotations.ts) is the
+   * first consumer.
+   */
+  shareOverlayElement?: string;
+
+  /**
+   * Where annotation strokes land on THIS module's share tile
+   * (annotation-geometry.ts, surfaceBox). 'tile' (the default) is the
+   * tile's content box; 'contained-video' is the rectangle the tile's
+   * one <video> occupies under `object-fit: contain`.
+   */
+  annotationSurface?: AnnotationSurfaceKind;
 
   /** Content rendered on top of the pane, always visible when module is active. */
   renderOverlay?(
