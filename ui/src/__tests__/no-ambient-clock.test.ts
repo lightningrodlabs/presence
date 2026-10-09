@@ -130,6 +130,9 @@ const PINNED_FILES: Array<{
   // (`clock: this.clock`), assigned once in the constructor, not a
   // late-bound arrow (the field itself is never reassigned).
   { relPath: '../presence-loop.ts', patterns: FULL_PATTERNS },
+  // Share annotations (spec 2026-10-09): pure geometry, no time at all,
+  // pinned per the owner pattern.
+  { relPath: '../room/annotation-geometry.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
