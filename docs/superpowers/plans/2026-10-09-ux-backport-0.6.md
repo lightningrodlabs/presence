@@ -457,11 +457,11 @@ For Moss 0.15 / Holochain 0.6. (The Holochain 0.7 line is versioned 0.16.x.)
 
 - **In-place update:** the happ bundle is byte-identical to v0.14.8–v0.14.11 (`happSha256 ae12f592…`, verified by `npm run release:check` and by extracting the happ from the uploaded webhapp). Moss offers this as an in-place update, same network, no reinstall.
 - **DNA/network:** unchanged, `<DNA HASH>` (`hc dna hash` on the packaged bundle). 0.14.12 agents share rooms with all 0.14.x agents.
-- **Wire surface:** no new signal type and no capability. Two additive payloads ride the existing module-state signal: a new `annotations` module, and an `annotationsEpoch` field on share payloads. A peer on 0.14.8 through 0.14.11 stores both and ignores them, so people on those versions see no drawings, and a share from one of those versions cannot be cleared by its owner. The compat-corpus fixture diff against 0.14.11 is version and provenance only.
+- **Wire surface:** no new signal type and no capability. Two additive payloads ride the existing module-state signal: a new `annotations` module, and an `annotationsEpoch` field on share payloads. A peer on 0.14.8 through 0.14.11 stores both and ignores them, so people on those versions see no drawings, and a share from one of those versions cannot be cleared by its owner, nor does restarting it clear the drawings made on it. They stay until an author draws, undoes or clears. The compat-corpus fixture diff against 0.14.11 is version and provenance only.
 
 ## What's new
 
-- **Draw on a shared screen or a shared asset.** Every share tile has a small tool strip at its bottom-left: a pen, eight colors, undo my last stroke, clear mine, and, on your own share, clear all. Anyone in the room can draw, and everyone sees every drawing in the author's color. Someone who joins later sees the drawings that exist. Drawings stay until their author removes them, the sharer clears them, or the share stops.
+- **Draw on a shared screen or a shared asset.** Every share tile has a small tool strip at its bottom-left: a pen, eight colors, undo my last stroke, clear mine, and, on your own share, clear all. Anyone in the room can draw, and everyone sees every drawing in the author's color. Someone who joins later sees the drawings that exist. Drawings stay until their author removes them, the sharer clears them, or, for a share from 0.14.12 or later, the share stops.
 - **Drawings land on the shared image.** On a screen share, a stroke is placed relative to the video image, not the tile. Two people whose tiles letterbox the share differently still see the mark on the same spot. On a shared asset, a stroke is placed relative to the tile.
 - **Tiles keep their place.** The room grid now has one stable order, the same on every screen. A peer whose connection flickers no longer jumps to the end of the grid and back. On this line the order is by participant key, not join order.
 
@@ -489,11 +489,11 @@ Expected: the three sums equal Step 5's triple. On a mismatch, delete the asset 
 
 - [ ] **Step 7: Record the release**
 
-Append to `fixtures/releases.json` an entry in the shape of the 0.14.11 entry: version `0.14.12`, the release URL, the triple, and `releasedAt` as the GitHub publish time in milliseconds (`date -u -d <publishedAt> +%s` times 1000). Then:
+Append to `fixtures/releases.json` an entry in the shape of the 0.14.11 entry: version `0.14.12`, the release URL, the triple, and `releasedAt` as the GitHub publish time in milliseconds (`date -u -d <publishedAt> +%s` times 1000). Before committing `fixtures/releases.json`, append to the `UX backport round facts` bullet in CLAUDE.md the sentence "Merged into `main-0.6` as `<merge sha>` and released as v0.14.12 (`fixtures/releases.json`)." with the real merge sha, and run the drift test (`cd ui && nix develop -c npx vitest run src/__tests__/claude-md-drift.test.ts`). Then:
 
 ```bash
 nix develop -c npm run release:check
-git add fixtures/releases.json
+git add fixtures/releases.json CLAUDE.md
 git commit -m "release: record v0.14.12 artifact hashes — arms the release gate"
 git push origin main-0.6
 ```
@@ -519,7 +519,7 @@ Insert after the `0.14.11` version entry inside the Presence `versionBranch: "0.
             webhappSha256: "<webhapp sha256 from Step 5>",
             uiSha256: "<dist.zip sha256 from Step 5>"
           },
-          changelog: "Update to Presence 0.14.11. Same rooms and same network as every earlier 0.14 version.\n\nWhat is new:\n\n- Draw on a shared screen or a shared asset. Every share tile has a tool strip at its bottom-left: a pen, eight colors, undo my last stroke, clear mine, and, on your own share, clear all. Anyone in the room can draw, and everyone sees every drawing in the author's color. Someone who joins later sees the drawings that exist. Drawings stay until their author removes them, the sharer clears them, or the share stops.\n- On a screen share, a stroke is placed relative to the video image, so people whose tiles letterbox the share differently see the mark on the same spot. On a shared asset, it is placed relative to the tile.\n- Tiles keep their place. The room grid has one stable order, the same on every screen, so a peer whose connection flickers no longer jumps to the end and back.\n- A circle tile no longer grows taller than wide while its video connection is being set up.\n\nPeople on 0.14.8 to 0.14.11 see no drawings, and a share from one of those versions cannot be cleared by its owner. Everything else keeps working together as before.",
+          changelog: "Update to Presence 0.14.12. Same rooms and same network as every earlier 0.14 version.\n\nWhat is new:\n\n- Draw on a shared screen or a shared asset. Every share tile has a tool strip at its bottom-left: a pen, eight colors, undo my last stroke, clear mine, and, on your own share, clear all. Anyone in the room can draw, and everyone sees every drawing in the author's color. Someone who joins later sees the drawings that exist. Drawings stay until their author removes them, the sharer clears them, or, for a share from 0.14.12 or later, the share stops.\n- On a screen share, a stroke is placed relative to the video image, so people whose tiles letterbox the share differently see the mark on the same spot. On a shared asset, it is placed relative to the tile.\n- Tiles keep their place. The room grid has one stable order, the same on every screen, so a peer whose connection flickers no longer jumps to the end and back. On this version the order is by participant key, not join order.\n- A circle tile no longer grows taller than wide while its video connection is being set up.\n\nPeople on 0.14.8 to 0.14.11 see no drawings, and a share from one of those versions cannot be cleared by its owner, nor does restarting it clear the drawings made on it. They stay until an author draws, undoes or clears. Everything else keeps working together as before.",
           releasedAt: <releasedAt from Step 7>,
         },
 ```
