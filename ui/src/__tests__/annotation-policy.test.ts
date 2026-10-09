@@ -253,6 +253,21 @@ describe('parseAnnotationsPayload (remote input)', () => {
     const raw = JSON.stringify(payloadWith([[SHARER, 'wal', [stroke('ok'), { ...stroke('bad'), pts: [1] }]]]));
     expect(parseAnnotationsPayload(raw)).toEqual(payloadWith([[SHARER, 'wal', [stroke('ok')]]]));
   });
+  it('skips a __proto__ sharer key and leaves Object.prototype untouched', () => {
+    const raw = `{"v":1,"boards":{"__proto__":{"x":{"strokes":[${JSON.stringify(stroke('a'))}]}}}}`;
+    expect(parseAnnotationsPayload(raw)).toEqual(emptyAnnotations());
+    expect(({} as any).x).toBeUndefined();
+  });
+  it('skips a __proto__ share-module key under a normal sharer', () => {
+    const raw = `{"v":1,"boards":{"${SHARER}":{"__proto__":{"strokes":[${JSON.stringify(stroke('a'))}]}}}}`;
+    expect(parseAnnotationsPayload(raw)).toEqual(emptyAnnotations());
+    expect(({} as any).strokes).toBeUndefined();
+    expect(Object.getPrototypeOf(parseAnnotationsPayload(raw).boards)).toBe(Object.prototype);
+  });
+  it('whitelists stroke fields so unknown fields never enter state', () => {
+    const raw = JSON.stringify(payloadWith([[SHARER, 'wal', [{ ...stroke('a'), extra: 1 } as AnnotationStroke]]]));
+    expect(parseAnnotationsPayload(raw)).toEqual(payloadWith([[SHARER, 'wal', [stroke('a')]]]));
+  });
   it('keeps only the newest MAX_BOARD_STROKES of an over-full remote board (Review Focus 1)', () => {
     const many = Array.from({ length: MAX_BOARD_STROKES + 10 }, (_, i) => stroke(`s${i}`));
     const out = parseAnnotationsPayload(JSON.stringify(payloadWith([[SHARER, 'wal', many]])));
