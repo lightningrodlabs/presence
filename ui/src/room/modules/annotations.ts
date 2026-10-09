@@ -113,6 +113,8 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
       position: absolute;
       bottom: 10px;
       left: 55px;
+      max-width: calc(100% - 65px);
+      flex-wrap: wrap;
       display: flex;
       align-items: center;
       gap: 4px;
@@ -242,17 +244,20 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
   }
 
   private _onPointerDown(e: PointerEvent) {
+    if (e.button !== 0 || e.isPrimary === false) return;
     if (!this.pen || !this._surface) return;
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
     this._drawing = [...this._toGrid(e)];
   }
 
   private _onPointerMove(e: PointerEvent) {
+    if (e.isPrimary === false) return;
     if (!this._drawing || !this._surface) return;
     this._drawing = [...this._drawing, ...this._toGrid(e)];
   }
 
   private _onPointerUp(e: PointerEvent) {
+    if (e.isPrimary === false) return;
     const raw = this._drawing;
     this._drawing = null;
     if (!raw || !this._surface) return;

@@ -40,7 +40,8 @@ const payloadWith = (
 ): AnnotationsPayload => {
   const p = emptyAnnotations();
   for (const [sharer, moduleId, strokes] of boards) {
-    (p.boards[sharer] ??= {})[moduleId] = { strokes };
+    if (!Object.prototype.hasOwnProperty.call(p.boards, sharer)) p.boards[sharer] = {};
+    p.boards[sharer][moduleId] = { strokes };
   }
   return p;
 };
@@ -263,6 +264,20 @@ describe('parseAnnotationsPayload (remote input)', () => {
     expect(parseAnnotationsPayload(raw)).toEqual(emptyAnnotations());
     expect(({} as any).strokes).toBeUndefined();
     expect(Object.getPrototypeOf(parseAnnotationsPayload(raw).boards)).toBe(Object.prototype);
+  });
+  it('a prototype-property sharer key leaks nothing onto Object.prototype functions', () => {
+    const raw = JSON.stringify(payloadWith([['toString', 'screen-share', [stroke('a')]]]));
+    const out = parseAnnotationsPayload(raw);
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype.toString, 'screen-share')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(out.boards, 'toString')).toBe(true);
+    expect(out.boards['toString']['screen-share'].strokes).toHaveLength(1);
+  });
+  it('bounds the number of boards on receive by the byte cap', () => {
+    const big = (id: string) => stroke(id, 1, 0, Array.from({ length: 400 }, (_, i) => 1000 + i));
+    const boards: Array<[string, string, AnnotationStroke[]]> = Array.from({ length: 30 }, (_, i) => [`agent${i}`, 'wal', [big('s' + i)]]);
+    const raw = JSON.stringify(payloadWith(boards));
+    expect(new TextEncoder().encode(raw).length).toBeGreaterThan(MAX_ANNOTATIONS_PAYLOAD_BYTES);
+    expect(payloadBytes(parseAnnotationsPayload(raw))).toBeLessThanOrEqual(MAX_ANNOTATIONS_PAYLOAD_BYTES);
   });
   it('whitelists stroke fields so unknown fields never enter state', () => {
     const raw = JSON.stringify(payloadWith([[SHARER, 'wal', [{ ...stroke('a'), extra: 1 } as AnnotationStroke]]]));

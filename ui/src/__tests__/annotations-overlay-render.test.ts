@@ -141,6 +141,7 @@ describe('the tool strip', () => {
     const css = (ModuleAnnotationsShareOverlay.styles as { cssText: string }).cssText.replace(/\s+/g, ' ');
     // room-view's .maximize-icon covers x 5-45px at the bottom-left; the strip starts at 55px.
     expect(css).toMatch(/\.strip \{[^}]*left: 55px/);
+    expect(css).toMatch(/\.strip \{[^}]*flex-wrap: wrap/);
   });
 });
 
@@ -265,6 +266,45 @@ describe('strokes', () => {
     canvas.dispatchEvent(new Event('pointercancel', { bubbles: true }));
     pointer(canvas, 'pointerup', 300, 300);
     expect(store.updateModuleState).not.toHaveBeenCalled();
+  });
+
+  it('a right-button press starts no stroke', async () => {
+    const store = makeStore(viewerStates('wal'));
+    const el = await mount({ isMe: false, shareModuleId: 'wal', store });
+    el.pen = true;
+    await el.updateComplete;
+    const canvas = q(el, '.canvas')!;
+    canvas.dispatchEvent(new MouseEvent('pointerdown', { clientX: 10, clientY: 10, button: 2, bubbles: true, composed: true }));
+    pointer(canvas, 'pointermove', 200, 200);
+    pointer(canvas, 'pointerup', 300, 300);
+    expect(store.updateModuleState).not.toHaveBeenCalled();
+  });
+
+  it('a second pointer does not alter the primary stroke', async () => {
+    const secondary = (target: Element, type: string, x: number, y: number) => {
+      const ev = new MouseEvent(type, { clientX: x, clientY: y, bubbles: true, composed: true });
+      Object.defineProperty(ev, 'isPrimary', { value: false });
+      target.dispatchEvent(ev);
+    };
+    const run = async (withSecond: boolean) => {
+      const store = makeStore(viewerStates('wal'));
+      const el = await mount({ isMe: false, shareModuleId: 'wal', store });
+      el.pen = true;
+      await el.updateComplete;
+      const canvas = q(el, '.canvas')!;
+      pointer(canvas, 'pointerdown', 10, 10);
+      pointer(canvas, 'pointermove', 200, 10);
+      if (withSecond) {
+        secondary(canvas, 'pointerdown', 350, 250);
+        secondary(canvas, 'pointermove', 380, 280);
+        secondary(canvas, 'pointerup', 390, 290);
+      }
+      pointer(canvas, 'pointermove', 200, 200);
+      pointer(canvas, 'pointerup', 10, 200);
+      expect(store.updateModuleState).toHaveBeenCalledTimes(1);
+      return JSON.parse((store.updateModuleState.mock.calls[0] as [string, string])[1]).boards[SHARER]['wal'].strokes[0].pts;
+    };
+    expect(await run(true)).toEqual(await run(false));
   });
 
   it('a stroke of one point writes nothing', async () => {
