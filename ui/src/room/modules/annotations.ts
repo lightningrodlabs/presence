@@ -16,7 +16,6 @@
  */
 import { LitElement, css, html, nothing, svg } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { StoreSubscriber } from '@holochain-open-dev/stores';
 import { mdiDeleteSweep, mdiEraser, mdiPencil, mdiUndo } from '@mdi/js';
 import { getModule, getShareModules, registerModule } from './registry';
 import type { ModuleDefinition, ModuleRenderContext, ModuleStateEnvelope } from './types';
@@ -65,16 +64,12 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
   private _video: HTMLVideoElement | null = null;
   private _resizeObserver: ResizeObserver | null = null;
 
-  _mine = new StoreSubscriber(
-    this,
-    () => this.context.streamsStore._myModuleStates,
-    () => [this.context],
-  );
-  _peers = new StoreSubscriber(
-    this,
-    () => this.context.streamsStore._peerModuleStates,
-    () => [this.context],
-  );
+  // Own subscriptions, not StoreSubscriber: that controller never
+  // resubscribes after a DOM move (repeat() moves share frames), leaving
+  // a frozen snapshot whose writes would clobber newer state.
+  @state() _mineStates: Record<string, ModuleStateEnvelope> = {};
+  @state() _peerStates: Record<AgentPubKeyB64, Record<string, ModuleStateEnvelope>> = {};
+  private _unsubs: Array<() => void> = [];
 
   static styles = css`
     :host {
@@ -156,6 +151,15 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    const store = this.context.streamsStore;
+    this._unsubs.push(
+      store._myModuleStates.subscribe(v => {
+        this._mineStates = v;
+      }),
+      store._peerModuleStates.subscribe(v => {
+        this._peerStates = v;
+      }),
+    );
     // The share tile holds at most one <video> (screen-share.ts,
     // renderShare); the asset tile holds none and uses the tile surface.
     this._video = this.parentElement?.querySelector('video') ?? null;
@@ -169,6 +173,7 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
   }
 
   disconnectedCallback() {
+    for (const u of this._unsubs.splice(0)) u();
     this._video?.removeEventListener('loadedmetadata', this._measure);
     this._video?.removeEventListener('resize', this._measure);
     this._video = null;
@@ -187,13 +192,13 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
   // --- reads ---------------------------------------------------------------
 
   private _myPayload(): AnnotationsPayload {
-    return parseAnnotationsPayload(this._mine.value?.[ANNOTATIONS_MODULE_ID]?.payload);
+    return parseAnnotationsPayload(this._mineStates?.[ANNOTATIONS_MODULE_ID]?.payload);
   }
 
   private _shareEnvelope(): ModuleStateEnvelope | null {
     return this.context.isMe
-      ? (this._mine.value?.[this.shareModuleId] ?? null)
-      : (this._peers.value?.[this.sharerPubKeyB64]?.[this.shareModuleId] ?? null);
+      ? (this._mineStates?.[this.shareModuleId] ?? null)
+      : (this._peerStates?.[this.sharerPubKeyB64]?.[this.shareModuleId] ?? null);
   }
 
   private _epoch(): number {
@@ -202,7 +207,7 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
 
   private _visible(): VisibleStroke[] {
     const authors = [{ author: this.context.myPubKeyB64, payload: this._myPayload() }];
-    for (const [peer, modules] of Object.entries(this._peers.value ?? {})) {
+    for (const [peer, modules] of Object.entries(this._peerStates)) {
       authors.push({ author: peer, payload: parseAnnotationsPayload(modules[ANNOTATIONS_MODULE_ID]?.payload) });
     }
     return visibleStrokes(authors, this.sharerPubKeyB64, this.shareModuleId, this._epoch());
@@ -216,9 +221,9 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
 
   private _write(next: AnnotationsPayload): void {
     const active = activeShareEpochs(
-      this._mine.value ?? {},
+      this._mineStates,
       this.context.myPubKeyB64,
-      this._peers.value ?? {},
+      this._peerStates,
       getShareModules().map(m => m.id),
     );
     void this.context.streamsStore.updateModuleState(

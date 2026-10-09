@@ -307,9 +307,11 @@ describe('module-annotations-share-overlay teardown (share annotations)', () => 
     try {
       await import('../room/modules/annotations');
       let active = 0;
+      const pushes: Array<(v: unknown) => void> = [];
       const counting = (value: unknown) => ({
         subscribe(cb: (v: unknown) => void) {
           active += 1;
+          pushes.push(cb);
           cb(value);
           return () => {
             active -= 1;
@@ -351,6 +353,31 @@ describe('module-annotations-share-overlay teardown (share annotations)', () => 
       expect(active).toBe(0);
       expect(listeners).toBe(0);
       expect(observed[0].disconnected).toBe(true);
+
+      // Reconnect (a repeat() move): subscribe again, fresh values flow.
+      const frame2 = document.createElement('div');
+      const video2 = document.createElement('video');
+      const add2 = video2.addEventListener.bind(video2);
+      const remove2 = video2.removeEventListener.bind(video2);
+      video2.addEventListener = ((...args: Parameters<typeof add2>) => {
+        listeners += 1;
+        return add2(...args);
+      }) as typeof video2.addEventListener;
+      video2.removeEventListener = ((...args: Parameters<typeof remove2>) => {
+        listeners -= 1;
+        return remove2(...args);
+      }) as typeof video2.removeEventListener;
+      frame2.appendChild(video2);
+      frame2.appendChild(el);
+      document.body.appendChild(frame2);
+      await el.updateComplete;
+      expect(active).toBe(2);
+      expect(listeners).toBe(2);
+      const fresh = { annotations: { moduleId: 'annotations', active: true, payload: '{}', updatedAt: 9 } };
+      pushes[pushes.length - 2](fresh);
+      expect(el._mineStates).toEqual(fresh);
+      frame2.remove();
+      expect(active).toBe(0);
     } finally {
       delete (globalThis as any).ResizeObserver;
     }
