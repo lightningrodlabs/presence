@@ -391,3 +391,71 @@ describe('StreamsStore.connect allAgents subscription (leak 4)', () => {
     expect(allAgents.active).toBe(0);
   });
 });
+
+describe('module-annotations-share-overlay teardown (share annotations)', () => {
+  it('disconnect releases both store subscriptions, the video listeners and the ResizeObserver', async () => {
+    const observed: Array<{ disconnected: boolean }> = [];
+    class FakeResizeObserver {
+      private rec = { disconnected: false };
+      constructor(_cb: unknown) {
+        observed.push(this.rec);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {
+        this.rec.disconnected = true;
+      }
+    }
+    (globalThis as any).ResizeObserver = FakeResizeObserver;
+    try {
+      await import('../room/modules/annotations');
+      let active = 0;
+      const counting = (value: unknown) => ({
+        subscribe(cb: (v: unknown) => void) {
+          active += 1;
+          cb(value);
+          return () => {
+            active -= 1;
+          };
+        },
+      });
+      const frame = document.createElement('div');
+      const video = document.createElement('video');
+      let listeners = 0;
+      const add = video.addEventListener.bind(video);
+      const remove = video.removeEventListener.bind(video);
+      video.addEventListener = ((...args: Parameters<typeof add>) => {
+        listeners += 1;
+        return add(...args);
+      }) as typeof video.addEventListener;
+      video.removeEventListener = ((...args: Parameters<typeof remove>) => {
+        listeners -= 1;
+        return remove(...args);
+      }) as typeof video.removeEventListener;
+      frame.appendChild(video);
+      const el = document.createElement('module-annotations-share-overlay') as any;
+      el.sharerPubKeyB64 = 'uhCAksharer';
+      el.shareModuleId = 'screen-share';
+      el.context = {
+        isMe: false,
+        connected: true,
+        circleView: false,
+        myPubKeyB64: 'uhCAkme',
+        streamsStore: { _myModuleStates: counting({}), _peerModuleStates: counting({}), clock: { now: () => 0 } },
+      };
+      frame.appendChild(el);
+      document.body.appendChild(frame);
+      await el.updateComplete;
+      expect(active).toBe(2);
+      expect(listeners).toBe(2);
+      expect(observed).toHaveLength(1);
+
+      frame.remove();
+      expect(active).toBe(0);
+      expect(listeners).toBe(0);
+      expect(observed[0].disconnected).toBe(true);
+    } finally {
+      delete (globalThis as any).ResizeObserver;
+    }
+  });
+});

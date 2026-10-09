@@ -12,3 +12,4 @@ import './screen-share';
 import './voice';
 import './video-filmstrip';
 import './transcription';
+import './annotations';
