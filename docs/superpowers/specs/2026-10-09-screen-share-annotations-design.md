@@ -2,7 +2,7 @@
 
 Written 2026-10-09. Built on `main-0.7` at `cf7084f` (the v0.16.0 release), branch `feat/screen-share-annotations`. The plan is `docs/superpowers/plans/2026-10-09-screen-share-annotations.md`.
 
-Status: design approved in conversation. Not landed.
+Status: landed on feat/screen-share-annotations (see the commits in git log). Decisions 1-6 landed.
 
 ## Problem
 
@@ -20,12 +20,12 @@ A participant who watches a share cannot point at anything on it. The only way t
 
 The decisions below were made in conversation on 2026-10-09.
 
-1. Authors and audience: everyone draws, everyone sees all strokes.
-2. Lifetime: until cleared. No fade.
-3. Tools: a freehand pen and a color palette of eight. No shapes, no text, no eraser.
-4. Delivery: when the pen lifts, the stroke is sent once. Nothing is streamed while the pen moves.
-5. State ownership (approach A below): each author owns their strokes and broadcasts them as their own module state. The sharer owns only a clear epoch.
-6. Scope: the overlay mounts on every share tile. A share module declares only how to find its drawing surface.
+1. Authors and audience: everyone draws, everyone sees all strokes. (landed)
+2. Lifetime: until cleared. No fade. (landed)
+3. Tools: a freehand pen and a color palette of eight. No shapes, no text, no eraser. (landed)
+4. Delivery: when the pen lifts, the stroke is sent once. Nothing is streamed while the pen moves. (landed)
+5. State ownership (approach A below): each author owns their strokes and broadcasts them as their own module state. The sharer owns only a clear epoch. (landed)
+6. Scope: the overlay mounts on every share tile. A share module declares only how to find its drawing surface. (landed with amendment: the overlay's tool strip is placed at `bottom: 10px; left: 55px`, because the maximize icon covered the corner)
 
 ### Approaches considered
 
@@ -113,7 +113,7 @@ A remote stroke is input from another machine. `parseAnnotationsPayload` (`annot
 - `color` is a palette index.
 - `epoch` is a finite number.
 
-A board with no valid strokes is dropped. If `v` is not 1, the whole payload is dropped. This follows the clip-geometry rule R20 in `docs/superpowers/specs/2026-09-08-signals-media-extraction-design.md`.
+A board with no valid strokes is dropped. If `v` is not 1, the whole payload is dropped. (landed with amendment: the parser also skips the keys `__proto__`, `constructor` and `prototype` at both board levels and rebuilds each accepted stroke as `{ id, epoch, color, pts }`, because a review found a remote payload could write onto `Object.prototype`) This follows the clip-geometry rule R20 in `docs/superpowers/specs/2026-09-08-signals-media-extraction-design.md`.
 
 ## Clearing
 
@@ -149,7 +149,7 @@ annotationSurface?: 'tile' | 'contained-video';
 
 ### The overlay element
 
-`module-annotations-share-overlay` (`ui/src/room/modules/annotations.ts`) is a Lit element. It subscribes to `_myModuleStates` and `_peerModuleStates` on the store. It aggregates every author's board for its tile through `visibleStrokes` (`annotation-policy.ts`), which applies the epoch filter. It draws the strokes as SVG polylines in an `<svg viewBox="0 0 10000 10000" preserveAspectRatio="none">` positioned over the surface.
+`module-annotations-share-overlay` (`ui/src/room/modules/annotations.ts`) is a Lit element. It subscribes to `_myModuleStates` and `_peerModuleStates` on the store. (landed with amendment: it subscribes itself in `connectedCallback` and releases in `disconnectedCallback` instead of using `StoreSubscriber`, because the library never resubscribes after a `repeat()` DOM move, and the reconnect row in `view-teardown-symmetry.test.ts` pins it) It aggregates every author's board for its tile through `visibleStrokes` (`annotation-policy.ts`), which applies the epoch filter. It draws the strokes as SVG polylines in an `<svg viewBox="0 0 10000 10000" preserveAspectRatio="none">` positioned over the surface.
 
 The surface comes from `surfaceBox` (`ui/src/room/annotation-geometry.ts`), a pure function. For `'tile'`, the surface is the element's own box. For `'contained-video'`, it is `containedVideoBox(tileWidth, tileHeight, videoWidth, videoHeight)`, also pure. The element finds the one `<video>` in its share frame (`this.parentElement`) and reads `videoWidth` and `videoHeight`. It re-runs the function on the video's `loadedmetadata` and `resize` events and on a `ResizeObserver` on itself. Until a video surface has metadata, the pen is disabled and nothing is drawn. A tile surface is always ready.
 
@@ -159,7 +159,7 @@ The stroke id is the author's clock stamp and a per-element counter. It needs to
 
 ### The tool strip
 
-A small strip in the bottom-left corner of the tile, rendered by the overlay element:
+A small strip in the bottom-left corner of the tile, rendered by the overlay element (landed with amendment: the strip sits at `bottom: 10px; left: 55px` rather than at the corner, because the maximize icon occupies the 5-45px box at the frame's bottom-left and covered it, and paired source pins hold the offset):
 
 - Pen on or off.
 - The palette of eight colors, `ANNOTATION_PALETTE` (`annotation-policy.ts`). The default is `defaultColorFor(myPubKeyB64)`, a palette index from the pubkey, so two authors usually differ.
