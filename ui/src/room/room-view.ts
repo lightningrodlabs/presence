@@ -675,6 +675,9 @@ export class RoomView extends LitElement {
     // without deactivating the module.
     this.streamsStore.activateModule('conversation');
     this.streamsStore.activateModule('reactions');
+    // Share annotations (spec "Activation"): on by default like reactions;
+    // the module has no toolbar button.
+    this.streamsStore.activateModule('annotations');
 
     if (this._autoJoinAudio) {
       this.streamsStore.audioOn(true).catch(() => {});
@@ -2427,6 +2430,30 @@ export class RoomView extends LitElement {
   }
 
   /**
+   * Every registered module's `shareOverlayElement` (modules/types.ts),
+   * mounted into one share tile. Share annotations is the first consumer
+   * (modules/annotations.ts). Rendered after the share content and the
+   * diagnostics overlay and before the maximize icon, so the icon stays
+   * on top.
+   */
+  private _renderShareOverlays(
+    shareModuleId: string,
+    sharerPubKeyB64: AgentPubKeyB64,
+    context: ModuleRenderContext,
+  ): unknown[] {
+    return getAllModules()
+      .filter(m => !!m.shareOverlayElement)
+      .map(m => {
+        const tag = unsafeStatic(m.shareOverlayElement!);
+        return staticHtml`<${tag}
+          .sharerPubKeyB64=${sharerPubKeyB64}
+          .shareModuleId=${shareModuleId}
+          .context=${context}
+        ></${tag}>`;
+      });
+  }
+
+  /**
    * Render the shared panel from active share-type modules. Each share tile
    * is wrapped in shared-panel-frame and supports maximize via the
    * `share-${moduleId}-${pubkey}` keying scheme.
@@ -2479,6 +2506,7 @@ export class RoomView extends LitElement {
           >
             ${content}
             ${diagnosticsOverlay}
+            ${this._renderShareOverlays(moduleId, agentPubKeyB64, context)}
             <sl-icon
               title="${this._maximizedVideo === shareKey ? 'minimize' : 'maximize'}"
               .src=${this._maximizedVideo === shareKey
