@@ -136,6 +136,12 @@ describe('the tool strip', () => {
     expect(css).toMatch(/:host\(\[pen\]\) \.canvas \{[^}]*pointer-events: auto/);
     expect(css).toMatch(/:host\(\[pen\]\) \.canvas \{[^}]*touch-action: none/);
   });
+
+  it('the strip clears the maximize icon (source pin)', () => {
+    const css = (ModuleAnnotationsShareOverlay.styles as { cssText: string }).cssText.replace(/\s+/g, ' ');
+    // room-view's .maximize-icon covers x 5-45px at the bottom-left; the strip starts at 55px.
+    expect(css).toMatch(/\.strip \{[^}]*left: 55px/);
+  });
 });
 
 describe('the surface', () => {

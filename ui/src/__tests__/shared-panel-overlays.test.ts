@@ -6,6 +6,8 @@
  * with a fake store, rendering the template method into a detached host.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 vi.mock('../room/logs-graph', () => ({}));
 
@@ -67,5 +69,13 @@ describe('renderSharedPanel share overlays', () => {
     const host = document.createElement('div');
     render(el.renderSharedPanel(), host);
     expect(host.querySelector('module-annotations-share-overlay')).toBeNull();
+  });
+});
+
+describe('maximize icon geometry (source pin)', () => {
+  it('.maximize-icon stays at bottom 5px / left 5px; the annotations strip offset (left: 55px) depends on it', () => {
+    const src = readFileSync(join(__dirname, '..', 'room', 'room-view.ts'), 'utf8');
+    const rules = src.match(/\.maximize-icon \{[^}]*\}/g) ?? [];
+    expect(rules.some(r => /bottom: 5px;/.test(r) && /left: 5px;/.test(r))).toBe(true);
   });
 });
