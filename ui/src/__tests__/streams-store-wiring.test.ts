@@ -2690,4 +2690,21 @@ describe('share annotations: the wire round trip (spec "Approaches considered", 
     await viewer.bus.deliver(message(peerBKey, 'LeaveUi', ''));
     expect(get(viewer.store._peerModuleStates)[peerB]).toBeUndefined();
   });
+
+  it('a peer on a build with no annotations module (0.14.8-0.14.11) stores the envelope and ignores it', async () => {
+    // This suite registers wal, raise-hand and screen-share only, so the
+    // started store has no `annotations` module — exactly a 0.14.11 peer.
+    const { store, bus, clock } = makeStarted();
+    const envelope = {
+      moduleId: ANNOTATIONS_MODULE_ID,
+      active: true,
+      payload: JSON.stringify(applyStroke(emptyAnnotations(), peerB, 'screen-share', { id: 's', epoch: 1, color: 0, pts: [0, 0, 10, 10] })),
+      updatedAt: clock.now(),
+    };
+    await expect(bus.deliver(message(peerAKey, 'ModuleState', JSON.stringify(envelope)))).resolves.toBeUndefined();
+    expect(get(store._peerModuleStates)[peerA]?.[ANNOTATIONS_MODULE_ID]?.payload).toBe(envelope.payload);
+    // A share payload with the new field parses as before for the share module.
+    await bus.deliver(message(peerAKey, 'ModuleState', JSON.stringify({ moduleId: 'screen-share', active: true, payload: JSON.stringify({ annotationsEpoch: 5 }), updatedAt: clock.now() })));
+    expect(get(store._peerModuleStates)[peerA]?.['screen-share']?.active).toBe(true);
+  });
 });
