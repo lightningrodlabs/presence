@@ -16,7 +16,7 @@
 - Run every test and command through `nix develop -c`. The gate is `nix develop -c npm run verify`.
 - Commit messages carry no co-author footer and no Claude attribution.
 - No new signal type and no new capability. The wire-contract snapshot, the event taxonomy and the compat corpus do not change.
-- Constants: `ANNOTATION_GRID` 10000, `MAX_STROKE_POINTS` 200, `MAX_BOARD_STROKES` 50, `MAX_ANNOTATIONS_PAYLOAD_BYTES` 12288, `MIN_POINT_SPACING` 40. All four policy constants are declared NOT-liveness in their doc comment.
+- Constants: `ANNOTATION_GRID` 10000, `MAX_STROKE_POINTS` 200, `MAX_BOARD_STROKES` 50, `MAX_ANNOTATIONS_PAYLOAD_BYTES` 4096, `MIN_POINT_SPACING` 40. All four policy constants are declared NOT-liveness in their doc comment.
 - The module id is `annotations`. The overlay tag is `module-annotations-share-overlay`.
 - Pure modules take plain objects and return plain objects. No DOM, no time, no mocks in their tests. `ui/src/transport/media-event-policy.ts` is the template.
 - New source files go into `ui/src/__tests__/no-ambient-clock.test.ts`'s `PINNED_FILES` with `FULL_PATTERNS`.
@@ -536,7 +536,7 @@ export const ANNOTATIONS_MODULE_ID = 'annotations';
  */
 export const MAX_STROKE_POINTS = 200;
 export const MAX_BOARD_STROKES = 50;
-export const MAX_ANNOTATIONS_PAYLOAD_BYTES = 12288;
+export const MAX_ANNOTATIONS_PAYLOAD_BYTES = 4096;
 /** Pen-up thinning: drop a point closer than this (grid units) to the
  *  previous kept point. Payload size, NOT liveness. */
 export const MIN_POINT_SPACING = 40;

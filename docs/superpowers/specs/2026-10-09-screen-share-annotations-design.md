@@ -98,11 +98,11 @@ Three named constants in `ui/src/room/annotation-policy.ts` bound the payload. T
 
 - `MAX_STROKE_POINTS` (200): a stroke longer than this is cut at its tail.
 - `MAX_BOARD_STROKES` (50): an author's board drops its oldest stroke to make room.
-- `MAX_ANNOTATIONS_PAYLOAD_BYTES` (12288): the serialized payload drops the oldest stroke of the largest board until it fits.
+- `MAX_ANNOTATIONS_PAYLOAD_BYTES` (4096): the serialized payload drops the oldest stroke of the largest board until it fits.
 
 On pen-up, the author thins the stroke. A point closer than `MIN_POINT_SPACING` (40 grid units) to the previous kept point is dropped. The last point is always kept. A circle or an underline then costs about 30 to 60 points, or 300 to 600 bytes.
 
-Every pong carries the full payload to every peer. At the byte cap and five peers, that is about 30 kbps of upstream pong traffic. This is the recorded cost of approach A. The trigger for a digest-and-fetch design is a field export that shows pong size as a cause of signal delay.
+Every pong carries the full payload to every peer. The cost is the payload bytes times eight, times the peer count, divided by `PING_INTERVAL` (2 s), in both directions. At the 4096-byte cap and five peers, that is about 80 kbps upstream, and it is reached only while the author's boards are full, about 8 to 12 typical strokes. This is the recorded cost of approach A. The trigger for a digest-and-fetch design is a field export that shows pong size as a cause of signal delay.
 
 ### Validation on receive
 
@@ -119,7 +119,7 @@ A board with no valid strokes is dropped. If `v` is not 1, the whole payload is 
 
 An author's undo-last and clear-mine are state writes of the author's own board through `StreamsStore.updateModuleState('annotations', ...)`.
 
-The sharer's clear-all is an epoch. When `StreamsStore.activateModule` activates a share-type module whose payload is a JSON object, it stamps `annotationsEpoch` into that payload. The stamp comes from the store's injected clock. This is one generic site. The shared asset's `parseSharedWalPayload` reads only its own fields and tolerates the extra one. A new store method, `clearShareAnnotations(shareModuleId)`, merges a new stamp into that module's current payload and broadcasts it.
+The sharer's clear-all is an epoch. When `StreamsStore.activateModule` activates a share-type module whose payload is a JSON object, it stamps `annotationsEpoch` into that payload. The stamp comes from the store's injected clock. This is one generic site. The shared asset's `parseWalPayload` reads only its own fields and tolerates the extra one. A new store method, `clearShareAnnotations(shareModuleId)`, merges a new stamp into that module's current payload and broadcasts it.
 
 A stroke carries the epoch it was drawn under. The overlay renders only strokes whose epoch equals the share's current epoch. `readShareAnnotationsEpoch` (`annotation-policy.ts`) reads it from the sharer's share envelope. One signal from the sharer therefore empties the board on every screen. A share restart does the same, because activation mints a new epoch.
 
@@ -153,7 +153,7 @@ annotationSurface?: 'tile' | 'contained-video';
 
 The surface comes from `surfaceBox` (`ui/src/room/annotation-geometry.ts`), a pure function. For `'tile'`, the surface is the element's own box. For `'contained-video'`, it is `containedVideoBox(tileWidth, tileHeight, videoWidth, videoHeight)`, also pure. The element finds the one `<video>` in its share frame (`this.parentElement`) and reads `videoWidth` and `videoHeight`. It re-runs the function on the video's `loadedmetadata` and `resize` events and on a `ResizeObserver` on itself. Until a video surface has metadata, the pen is disabled and nothing is drawn. A tile surface is always ready.
 
-Pointer input uses pointer events, so mouse, touch and pen all work. The element converts a pointer position to grid units with `toGrid` (`annotation-geometry.ts`) and keeps the in-progress points locally. On `pointerup`, it thins the points and builds the stroke with the share's current epoch and the chosen color. It then writes the board through `applyStroke` and `updateModuleState`. A stroke of fewer than two points is dropped.
+Pointer input uses pointer events, so mouse, touch and pen all work. The element converts a pointer position to grid units with `toGrid` (`annotation-geometry.ts`) and keeps the in-progress points locally. The in-progress stroke renders locally and is never sent. On `pointerup`, it thins the points and builds the stroke with the share's current epoch and the chosen color. It then writes the board through `applyStroke` and `updateModuleState`. A stroke of fewer than two points is dropped.
 
 The stroke id is the author's clock stamp and a per-element counter. It needs to be unique only within the author's own board.
 
@@ -232,7 +232,7 @@ A real drawing across two machines is a manual check, as conductor-level validat
 
 ## Out of scope
 
-- Live preview of a stroke while the pen moves.
+- Remote live preview of a stroke while the pen moves. The author sees their own in-progress stroke locally.
 - Shapes, text, an eraser and per-stroke removal by clicking.
 - Line width.
 - Annotations over agent tiles.
