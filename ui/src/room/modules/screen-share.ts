@@ -23,6 +23,10 @@ const screenShareModule: ModuleDefinition = {
   icon: mdiMonitorScreenshot,
   activationControl: 'sender',
   shareWrapperClass: 'video-container screen-share',
+  // The share image is letterboxed by `.video-container.screen-share
+  // .video-el { object-fit: contain }` (room-view.ts), so strokes map to
+  // the video's content box, not the tile (spec "The drawing surface").
+  annotationSurface: 'contained-video',
 
   renderShare(
     agentPubKeyB64: string,
