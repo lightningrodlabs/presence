@@ -14,6 +14,10 @@ import { orderTiles } from '../room/tile-order-policy';
  * policy, order was `_knownAgents` insertion order with media-only peers and
  * phantoms appended in later segments, and a pong hiccup on a peer with
  * live media moved their tile to the tail and back.
+ *
+ * On the Holochain 0.6 line nothing reads the DHT for join times and
+ * room-view passes an empty map, so every tile sorts lexically by pubkey
+ * (room/tile-order-policy.ts header).
  */
 
 const A = 'uhCAkAAAA';
@@ -22,6 +26,10 @@ const C = 'uhCAkCCCC';
 const D = 'uhCAkDDDD';
 
 describe('orderTiles', () => {
+  it('with an empty join map (the 0.6 line) every tile sorts by pubkey, phantoms interleaved', () => {
+    expect(orderTiles({ present: [C, A], phantoms: [B], joinedAt: {} })).toEqual([{ pubkey: A, kind: 'present' }, { pubkey: B, kind: 'phantom' }, { pubkey: C, kind: 'present' }]);
+  });
+
   it('sorts present peers by joinedAt ascending, independent of input order', () => {
     const joinedAt = { [A]: 300, [B]: 100, [C]: 200 };
     const fromOne = orderTiles({ present: [A, B, C], phantoms: [], joinedAt });

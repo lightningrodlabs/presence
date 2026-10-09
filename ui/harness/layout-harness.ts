@@ -450,7 +450,7 @@ window.addEventListener('resize', () => relayout());
 // ---- content=peer: drive tile 0 through the WebRTC establishment states ----
 //
 // The slot shapes below are the ones the store can write to
-// `_openConnections[peer]` (src/media-links.ts): the `signaling` install
+// `_openConnections[peer]` (src/streams-store.ts): the `signaling` install
 // is `{connected:false, video:false}`; `connected` flips `connected`;
 // a remote video track arriving un-muted (or unmuting) sets `video` with
 // no `connected` check, and one arriving muted sets `videoMuted`. The
