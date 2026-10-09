@@ -82,6 +82,9 @@ export function defaultColorFor(pubKeyB64: string): number {
 
 // --- parsing (remote input) -------------------------------------------
 
+/** Keys that would reach Object.prototype through a plain-object write. */
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function isValidStroke(s: unknown): s is AnnotationStroke {
   if (!s || typeof s !== 'object') return false;
   const { id, epoch, color, pts } = s as Record<string, unknown>;
@@ -114,11 +117,16 @@ export function parseAnnotationsPayload(raw: string | null | undefined): Annotat
   const rawBoards = (data as { boards?: unknown }).boards;
   if (!rawBoards || typeof rawBoards !== 'object') return out;
   for (const [sharer, perModule] of Object.entries(rawBoards as Record<string, unknown>)) {
+    if (UNSAFE_KEYS.has(sharer)) continue;
     if (!perModule || typeof perModule !== 'object') continue;
     for (const [shareModuleId, board] of Object.entries(perModule as Record<string, unknown>)) {
+      if (UNSAFE_KEYS.has(shareModuleId)) continue;
       const rawStrokes = (board as { strokes?: unknown } | null)?.strokes;
       if (!Array.isArray(rawStrokes)) continue;
-      const strokes = rawStrokes.filter(isValidStroke).slice(-MAX_BOARD_STROKES);
+      const strokes = rawStrokes
+        .filter(isValidStroke)
+        .map(({ id, epoch, color, pts }) => ({ id, epoch, color, pts }))
+        .slice(-MAX_BOARD_STROKES);
       if (strokes.length === 0) continue;
       (out.boards[sharer] ??= {})[shareModuleId] = { strokes };
     }
