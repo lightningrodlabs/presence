@@ -2,7 +2,7 @@
 
 Written 2026-10-09. Branch `backport/ux-0.6` off `origin/main-0.6` at `9dfde3f`, in the worktree `.claude/worktrees/backport-0.6`. The plan is `docs/superpowers/plans/2026-10-09-ux-backport-0.6.md`.
 
-Status: design approved in conversation. Not landed.
+Status: landed on backport/ux-0.6 (see the commits in git log). Decisions 1-4 landed.
 
 ## Problem
 
@@ -12,15 +12,15 @@ Status: design approved in conversation. Not landed.
 
 Made in conversation on 2026-10-09.
 
-1. Features in scope: share annotations, the circle-tile oval fix, and the UI-only variant of stable tile order.
-2. The branch ends with a 0.14.12 release from `main-0.6`, including the curation entry.
-3. Out of scope, with the reason for each:
+1. Features in scope: share annotations, the circle-tile oval fix, and the UI-only variant of stable tile order. (landed)
+2. The branch ends with a 0.14.12 release from `main-0.6`, including the curation entry. (landed)
+3. Out of scope, with the reason for each: (landed)
    - The peer-tile state round. It builds on `PeerRecord` and the store-decomposition line, which `main-0.6` closed out as 0.7-only (`9dfde3f`), and it adds a conversation-payload field. It is a later round of its own, not a backport.
    - The zome half of stable tile order. On 0.6 it is a declared happ change and a separate install for every 0.14.x user.
    - The muted-peer meter fix (`da9bc85`). It repairs a regression the peer-tile round introduced. The 0.6 meter never had it.
    - System audio and transcription. They need Moss host seams that exist only in `@theweave/api` 0.7.x. The 0.6 line is on `^0.6.9`.
    - Dead-track escalation and the SDP backstop rework. They are connection logic, not UX, and they build on `PeerRecord` and `MediaLinks`.
-4. Provenance: each feature arrives by `git cherry-pick -x` of its 0.7 code commits where they apply, and by hand where 0.6 diverged, so every commit names its source. The 0.7 docs commits are not picked. The 0.6 `CLAUDE.md` gets one backport fact bullet.
+4. Provenance: each feature arrives by `git cherry-pick -x` of its 0.7 code commits where they apply, and by hand where 0.6 diverged, so every commit names its source. The 0.7 docs commits are not picked. The 0.6 `CLAUDE.md` gets one backport fact bullet. (landed)
 
 ## Baseline
 
