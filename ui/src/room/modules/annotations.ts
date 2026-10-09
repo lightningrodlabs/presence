@@ -105,10 +105,14 @@ export class ModuleAnnotationsShareOverlay extends LitElement {
       stroke-linejoin: round;
       vector-effect: non-scaling-stroke;
     }
+    /* left is 55px, not 10px: room-view's .maximize-icon (room-view.ts)
+       is absolute at bottom 5px / left 5px, 40x40, z-index 3 above this
+       host, so it covers x 5-45px; the strip starts 10px clear of it or
+       the pen toggle cannot be clicked. */
     .strip {
       position: absolute;
       bottom: 10px;
-      left: 10px;
+      left: 55px;
       display: flex;
       align-items: center;
       gap: 4px;
