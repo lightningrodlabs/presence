@@ -32,6 +32,11 @@ import { VOICE_BATCH_FRAMES } from '../room/modules/voice';
 import { voiceController } from '../room/modules/voice';
 import { filmstripController } from '../room/modules/video-filmstrip';
 import type { RoomSignal, StoreEventPayload } from '../types';
+// Registry side effects: the share-annotations block reads module types from it
+// (reactions is not imported: emoji-picker-element needs requestAnimationFrame).
+import '../room/modules/wal';
+import '../room/modules/raise-hand';
+import '../room/modules/screen-share';
 
 /**
  * Phase 6 item 2 — the point of the phase: the wiring between the pure
@@ -2540,5 +2545,52 @@ describe('signals media cadence gates the senders (Task 7)', () => {
       mode: 'full',
       reason: 'no-sample',
     });
+  });
+});
+
+describe('share annotations: the epoch the store stamps (spec "Clearing")', () => {
+  it('activating a share-type module stamps annotationsEpoch from the clock and keeps the payload fields', async () => {
+    const { store, clock } = makeStarted();
+    await store.activateModule('wal', JSON.stringify({ weaveUrl: 'weave://x' }));
+    const payload = JSON.parse(get(store._myModuleStates)['wal'].payload);
+    expect(payload).toEqual({ weaveUrl: 'weave://x', annotationsEpoch: clock.now() });
+  });
+
+  it('negative control: activating an agent-type module stamps nothing', async () => {
+    const { store } = makeStarted();
+    await store.activateModule('raise-hand');
+    expect(JSON.parse(get(store._myModuleStates)['raise-hand'].payload)).toEqual({});
+  });
+
+  it('a share module with no payload gets an object holding only the epoch', async () => {
+    const { store, clock } = makeStarted();
+    await store.activateModule('screen-share');
+    expect(JSON.parse(get(store._myModuleStates)['screen-share'].payload)).toEqual({
+      annotationsEpoch: clock.now(),
+    });
+  });
+
+  it('clearShareAnnotations rewrites the share payload with a newer epoch and broadcasts it', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.activateModule('screen-share');
+    const first = JSON.parse(get(store._myModuleStates)['screen-share'].payload).annotationsEpoch;
+    clock.advance(1000);
+    await store.clearShareAnnotations('screen-share');
+    const second = JSON.parse(get(store._myModuleStates)['screen-share'].payload).annotationsEpoch;
+    expect(second).toBeGreaterThan(first);
+    const sent = bus.sentOfType('ModuleState');
+    expect(sent).toHaveLength(2);
+    const last = JSON.parse(sent[1].payload!);
+    expect(last.moduleId).toBe('screen-share');
+    expect(JSON.parse(last.payload).annotationsEpoch).toBe(second);
+  });
+
+  it('clearShareAnnotations on a module that is not active does nothing', async () => {
+    const { store, clock, bus } = makeStarted();
+    store._knownAgents.set(knownFresh(clock, peerA));
+    await store.clearShareAnnotations('screen-share');
+    expect(get(store._myModuleStates)['screen-share']).toBeUndefined();
+    expect(bus.sentOfType('ModuleState')).toHaveLength(0);
   });
 });
