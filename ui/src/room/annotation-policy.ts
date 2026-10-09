@@ -25,7 +25,7 @@ export const ANNOTATIONS_MODULE_ID = 'annotations';
  */
 export const MAX_STROKE_POINTS = 200;
 export const MAX_BOARD_STROKES = 50;
-export const MAX_ANNOTATIONS_PAYLOAD_BYTES = 12288;
+export const MAX_ANNOTATIONS_PAYLOAD_BYTES = 4096;
 /** Pen-up thinning: drop a point closer than this (grid units) to the
  *  previous kept point. Payload size, NOT liveness. */
 export const MIN_POINT_SPACING = 40;
@@ -128,10 +128,11 @@ export function parseAnnotationsPayload(raw: string | null | undefined): Annotat
         .map(({ id, epoch, color, pts }) => ({ id, epoch, color, pts }))
         .slice(-MAX_BOARD_STROKES);
       if (strokes.length === 0) continue;
-      (out.boards[sharer] ??= {})[shareModuleId] = { strokes };
+      const own = Object.prototype.hasOwnProperty.call(out.boards, sharer) ? out.boards[sharer] : (out.boards[sharer] = {});
+      own[shareModuleId] = { strokes };
     }
   }
-  return out;
+  return enforceBounds(out);
 }
 
 // --- the share epoch -----------------------------------------------------
