@@ -101,6 +101,8 @@ const PINNED_FILES: Array<{
   // pinned per the owner pattern.
   { relPath: '../room/annotation-geometry.ts', patterns: FULL_PATTERNS },
   { relPath: '../room/annotation-policy.ts', patterns: FULL_PATTERNS },
+  // The overlay element: the stroke id reads the store's injected clock.
+  { relPath: '../room/modules/annotations.ts', patterns: FULL_PATTERNS },
 ];
 
 for (const { relPath, patterns } of PINNED_FILES) {
