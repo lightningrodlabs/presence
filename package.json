@@ -30,10 +30,14 @@
   },
   "devDependencies": {
     "@holochain-playground/cli": "^0.1.1",
-    "@holochain/hc-spin": "^0.700.0",
-    "@theweave/cli": "0.16.0-dev.5",
+    "@holochain/hc-spin": "^0.700.1-rc.0",
+    "@theweave/cli": "^0.16.0-rc.2",
     "concurrently": "^6.2.1",
     "rimraf": "^3.0.2"
+  },
+  "overrides": {
+    "@holochain/client": "^0.21.1",
+    "@types/node": "^25.2.0"
   },
   "engines": {
     "npm": ">=7.0.0"
