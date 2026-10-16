@@ -1,7 +1,7 @@
 # tests/ — conductor-level (tryorama) workspace
 
-Runs against the Holochain 0.7 stack: `@holochain/client` ^0.21.0 and
-`@holochain-open-dev/tryorama` ^0.20.0. Requires `workdir/presence.happ`
+Runs against the Holochain 0.7.1 stack: `@holochain/client` ^0.21.1 and
+`@holochain-open-dev/tryorama` ^0.21.0. Requires `workdir/presence.happ`
 (root `npm run build:happ`); root `npm test` builds the happ and then runs
 `npm t -w tests`, which executes the `src/room` suite only.
 
@@ -23,11 +23,16 @@ Contents:
 
 - `src/room/room.test.ts` — DNA integration suite (the gate content): every
   coordinator extern reachable without a UI, across two conductors — room
-  info, the ALL_AGENTS anchor, attachment CRUD, descendent rooms, and the
-  ping/pong + `send_message` remote-signal path.
+  info, the ALL_AGENTS anchor, attachment CRUD, descendent rooms, the
+  ping/pong remote-signal path, and the direct-signal path the UI's
+  `Message` traffic rides since 0.17.0 (`sendDirectSignal` A→B with the
+  conductor-stamped `from_agent`, a payload past the old 8 KiB comfort zone,
+  and the msgpack `{ msg_type, payload }` body `ui/src/direct-signal.ts`
+  writes — pinned here from the other side of the wire).
 - `src/signal-latency/signal-latency.test.ts` — a signal latency/throughput
   measurement rig (two agents, one conductor, RTT and sustained-throughput
-  stats with p95/p99). Written 2026-04, sat untracked until the 2026-08 retro
+  stats with p95/p99). Since 0.17.0 the message legs ride direct signals; the
+  0.16.4→0.17.0 before/after numbers are in that release's notes. Written 2026-04, sat untracked until the 2026-08 retro
   (§7.5 item 4). It is a measurement instrument, not a regression gate — its
   assertions are delivery sanity checks, not thresholds. Run it with
   `npm run test:latency -w tests`; it is deliberately excluded from `test`.

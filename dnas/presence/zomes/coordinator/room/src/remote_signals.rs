@@ -1,5 +1,11 @@
 use hdk::prelude::*;
 
+/// The zome's remote-signal vocabulary: passive presence only. Since 0.17.0
+/// (Holochain 0.7.1) every frontend message rides a direct signal from the
+/// UI to the peer's app interface (`AppWebsocket.sendDirectSignal`, granted
+/// in `init`); the zome never sees it. Ping/Pong stays here on purpose: the
+/// pong is answered inside the zome, so an agent whose UI is closed still
+/// answers.
 #[derive(Serialize, Deserialize, SerializedBytes, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum SignalPayload {
@@ -10,14 +16,6 @@ pub enum SignalPayload {
     /// Backend auto-response to Ping
     Pong {
         from_agent: AgentPubKey,
-    },
-    /// Generic UI message — all frontend signal types go through this variant.
-    /// msg_type and payload are opaque to the backend; semantics are defined
-    /// entirely in the frontend.
-    Message {
-        from_agent: AgentPubKey,
-        msg_type: String,
-        payload: String,
     },
 }
 
@@ -31,7 +29,6 @@ pub fn recv_remote_signal(signal: ExternIO) -> ExternResult<()> {
     match signal_payload.clone() {
         SignalPayload::Ping { from_agent } => pong(from_agent),
         SignalPayload::Pong { .. } => emit_signal(signal_payload),
-        SignalPayload::Message { .. } => emit_signal(signal_payload),
     }
 }
 
@@ -60,27 +57,4 @@ fn pong(from_agent: AgentPubKey) -> ExternResult<()> {
         .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
 
     send_remote_signal(encoded_signal, vec![from_agent])
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SendMessageInput {
-    pub to_agents: Vec<AgentPubKey>,
-    pub msg_type: String,
-    pub payload: String,
-}
-
-/// Send a generic message to the given agents. The msg_type and payload are
-/// opaque to the backend — all semantics are defined in the frontend.
-#[hdk_extern]
-pub fn send_message(input: SendMessageInput) -> ExternResult<()> {
-    let signal_payload = SignalPayload::Message {
-        from_agent: agent_info()?.agent_initial_pubkey,
-        msg_type: input.msg_type,
-        payload: input.payload,
-    };
-
-    let encoded_signal = ExternIO::encode(signal_payload)
-        .map_err(|err| wasm_error!(WasmErrorInner::Guest(err.into())))?;
-
-    send_remote_signal(encoded_signal, input.to_agents)
 }

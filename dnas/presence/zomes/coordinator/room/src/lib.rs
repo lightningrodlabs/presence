@@ -21,6 +21,14 @@ pub fn init(_: ()) -> ExternResult<InitCallbackResult> {
     );
     create_cap_grant(cap_grant_entry)?;
 
+    // Direct-signal grant: any agent may deliver `Message` traffic (the
+    // frontend's PingUi/handshake/SDP/module data) straight to this cell's
+    // app interface, with no zome call on either side.
+    create_cap_grant(CapGrant::new_direct_signal_grant(
+        "presence direct signals".into(),
+        GrantConstraint::Unrestricted,
+    ))?;
+
     // register own public key on global anchor
     add_agent_to_anchor(())?;
     Ok(InitCallbackResult::Pass)

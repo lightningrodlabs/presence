@@ -3,11 +3,25 @@
  *
  * Tests signal delivery between two agents (same conductor), then measures
  * round-trip latency and sustained throughput.
+ *
+ * Since 0.17.0 the message legs ride direct signals (`sendDirectSignal`, no
+ * zome call on either side; msgpack `{ msg_type, payload }` body, the layout
+ * `ui/src/direct-signal.ts` writes). Ping/pong is still the zome's remote
+ * signal. The 0.16.4-shape numbers (send_message zome call → remote signal)
+ * are recorded in the 0.17.0 release notes for comparison.
  */
 
 import { describe, it, expect } from 'vitest';
 import { Scenario, runScenario } from '@holochain-open-dev/tryorama';
-import { CellType, encodeHashToBase64 } from '@holochain/client';
+import {
+  CellType,
+  SignalType,
+  encodeHashToBase64,
+  type AgentPubKey,
+  type AppWebsocket,
+  type DnaHash,
+} from '@holochain/client';
+import { decode, encode } from '@msgpack/msgpack';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -21,6 +35,34 @@ const ZOME_NAME = 'room';
 
 function makePayload(bytes: number): string {
   return 'x'.repeat(bytes);
+}
+
+type MessageBody = { msg_type: string; payload: string };
+
+/** One direct signal per message — the UI's `RoomClient.sendMessage` shape. */
+async function sendDirect(
+  ws: AppWebsocket,
+  dnaHash: DnaHash,
+  to: AgentPubKey[],
+  msgType: string,
+  payload: string
+): Promise<void> {
+  await ws.sendDirectSignal({
+    dna_hash: dnaHash,
+    agents: to,
+    signal: encode({ msg_type: msgType, payload } satisfies MessageBody),
+  });
+}
+
+/** The body of an incoming direct signal, or null for anything else. */
+function directBody(signal: any): (MessageBody & { from_agent: AgentPubKey }) | null {
+  if (signal?.type !== SignalType.AppDirect) return null;
+  try {
+    const body = decode(signal.value.signal) as MessageBody;
+    return { ...body, from_agent: signal.value.from_agent };
+  } catch {
+    return null;
+  }
 }
 
 function computeStats(values: number[]) {
@@ -113,10 +155,21 @@ async function setupTwoAgentsSameConductor(scenario: Scenario) {
   const callZomeB = async (fnName: string, payload: any) =>
     appWsB.callZome({ cell_id: cellIdB, zome_name: ZOME_NAME, fn_name: fnName, payload });
 
+  // init() commits the direct-signal grant; it runs lazily on the first
+  // zome call, and a cell without the grant drops direct signals silently.
+  await callZomeA('get_all_agents', { input: null, local: true });
+  await callZomeB('get_all_agents', { input: null, local: true });
+
+  const dnaHash = cellIdA[0];
+  const sendA = (to: AgentPubKey[], msgType: string, payload: string) =>
+    sendDirect(appWsA, dnaHash, to, msgType, payload);
+  const sendB = (to: AgentPubKey[], msgType: string, payload: string) =>
+    sendDirect(appWsB, dnaHash, to, msgType, payload);
+
   console.log(`  Agent A: ${encodeHashToBase64(agentAKey)}`);
   console.log(`  Agent B: ${encodeHashToBase64(agentBKey)}`);
 
-  return { conductor, agentAKey, agentBKey, appWsA, appWsB, callZomeA, callZomeB };
+  return { conductor, agentAKey, agentBKey, appWsA, appWsB, callZomeA, callZomeB, sendA, sendB };
 }
 
 describe('Signal Latency Tests (same conductor)', () => {
@@ -126,7 +179,7 @@ describe('Signal Latency Tests (same conductor)', () => {
    */
   it('verifies basic signal delivery between two agents', async () => {
     await runScenario(async (scenario: Scenario) => {
-      const { callZomeA, callZomeB, agentAKey, agentBKey, appWsA, appWsB } =
+      const { callZomeA, callZomeB, agentAKey, agentBKey, appWsA, appWsB, sendA } =
         await setupTwoAgentsSameConductor(scenario);
 
       // Collect ALL signals on both websockets
@@ -160,22 +213,14 @@ describe('Signal Latency Tests (same conductor)', () => {
 
       // Test 3: A sends message to B
       console.log('\n  === A sends message to B ===');
-      await callZomeA('send_message', {
-        to_agents: [agentBKey],
-        msg_type: 'TestMsg',
-        payload: 'hello',
-      });
+      await sendA([agentBKey], 'TestMsg', 'hello');
       await new Promise((r) => setTimeout(r, 5000));
       console.log(`  Signals on A after msg: ${signalsA.length}`);
       console.log(`  Signals on B after msg: ${signalsB.length}`);
 
       // Test 4: A sends message to self (same agent)
       console.log('\n  === A sends message to self ===');
-      await callZomeA('send_message', {
-        to_agents: [agentAKey],
-        msg_type: 'SelfTest',
-        payload: 'selfie',
-      });
+      await sendA([agentAKey], 'SelfTest', 'selfie');
       await new Promise((r) => setTimeout(r, 5000));
       console.log(`  Signals on A after self-msg: ${signalsA.length}`);
 
@@ -262,20 +307,15 @@ describe('Signal Latency Tests (same conductor)', () => {
       const PAYLOAD_SIZES = [80, 500, 1000, 5000, 10000, 50000];
       const ITERATIONS = 20;
 
-      const { callZomeA, callZomeB, agentAKey, agentBKey, appWsA, appWsB } =
+      const { agentBKey, appWsA, appWsB, sendA, sendB } =
         await setupTwoAgentsSameConductor(scenario);
 
       // Agent B echoes messages back
       appWsB.on('signal', async (signal: any) => {
-        if (signal.type !== 'app') return;
-        const payload = signal.value.payload as any;
-        if (payload?.type === 'Message' && payload?.msg_type === 'LatencyTest') {
+        const msg = directBody(signal);
+        if (msg?.msg_type === 'LatencyTest') {
           try {
-            await callZomeB('send_message', {
-              to_agents: [payload.from_agent],
-              msg_type: 'LatencyEcho',
-              payload: payload.payload,
-            });
+            await sendB([msg.from_agent], 'LatencyEcho', msg.payload);
           } catch (e: any) {
             console.error(`  Echo failed: ${e.message}`);
           }
@@ -293,9 +333,8 @@ describe('Signal Latency Tests (same conductor)', () => {
           let echoTime = 0;
 
           const unsub = appWsA.on('signal', (signal: any) => {
-            if (signal.type !== 'app') return;
-            const p = signal.value.payload as any;
-            if (p?.type === 'Message' && p?.msg_type === 'LatencyEcho') {
+            const p = directBody(signal);
+            if (p?.msg_type === 'LatencyEcho') {
               echoTime = performance.now();
               if (echoResolve) echoResolve();
             }
@@ -309,11 +348,7 @@ describe('Signal Latency Tests (same conductor)', () => {
           );
 
           const sendTime = performance.now();
-          await callZomeA('send_message', {
-            to_agents: [agentBKey],
-            msg_type: 'LatencyTest',
-            payload: payloadStr,
-          });
+          await sendA([agentBKey], 'LatencyTest', payloadStr);
 
           try {
             await Promise.race([echoPromise, timeout]);
@@ -341,12 +376,11 @@ describe('Signal Latency Tests (same conductor)', () => {
       const PAYLOAD_SIZE = 500;
       const received: Map<number, number> = new Map();
 
-      const { callZomeA, agentBKey, appWsB } = await setupTwoAgentsSameConductor(scenario);
+      const { agentBKey, appWsB, sendA } = await setupTwoAgentsSameConductor(scenario);
 
       appWsB.on('signal', (signal: any) => {
-        if (signal.type !== 'app') return;
-        const p = signal.value.payload as any;
-        if (p?.type === 'Message' && p?.msg_type === 'ThroughputTest') {
+        const p = directBody(signal);
+        if (p?.msg_type === 'ThroughputTest') {
           try {
             const data = JSON.parse(p.payload);
             received.set(data.seq, performance.now());
@@ -374,11 +408,7 @@ describe('Signal Latency Tests (same conductor)', () => {
           sendTimes.set(seq, loopStart);
 
           try {
-            await callZomeA('send_message', {
-              to_agents: [agentBKey],
-              msg_type: 'ThroughputTest',
-              payload: JSON.stringify({ seq, data: payloadData }),
-            });
+            await sendA([agentBKey], 'ThroughputTest', JSON.stringify({ seq, data: payloadData }));
           } catch (e: any) {
             sendErrors++;
           }
