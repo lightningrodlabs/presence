@@ -8,8 +8,8 @@ README section that states it.
 | File | What it is |
 |---|---|
 | [`minimal-host.ts`](minimal-host.ts) | The smallest thing that works: one host record for both carriers, `getUserMedia` devices, a 48 kHz `AudioContext` unlocked by a click, a `FilmstripPlayback` painting into an `<img>` per peer. The transport is an interface you supply — a WebSocket broadcast relay is the easy one. No Holochain. |
-| [`holochain-host.ts`](holochain-host.ts) | The full one, over `@holochain/client`: a call-membership set that *is* the target set, a ping/pong loop feeding `decideSignalsMediaCadence`, a `media-hello` capability handshake behind `batchEligible()`, the per-peer carrier switch, refcounted devices, and per-peer video with A/V skew reporting. |
-| [`holochain-zome.rs`](holochain-zome.rs) | The coordinator-zome half of the Holochain example — `send_message` and `recv_remote_signal`, copied from Presence's room zome. |
+| [`holochain-host.ts`](holochain-host.ts) | The full one, over `@holochain/client` direct signals (Holochain 0.7.1+): a call-membership set that *is* the target set, a ping/pong loop feeding `decideSignalsMediaCadence`, a `media-hello` capability handshake behind `batchEligible()`, the per-peer carrier switch, refcounted devices, and per-peer video with A/V skew reporting. |
+| [`holochain-zome.rs`](holochain-zome.rs) | The coordinator-zome half of the Holochain example — the one direct-signal capability grant in `init`, copied from Presence's room zome. No zome code touches the messages. |
 
 ## How they are checked
 
@@ -33,16 +33,17 @@ Rust. Drop it into your own coordinator zome and build it there.
 
 ## The three lines you change first
 
-1. **The zome and role names.** `ROLE_NAME` and `ZOME_NAME` at the top of
-   `holochain-host.ts` are Presence's; yours will differ, as will the
-   `fn_name` if you do not paste `holochain-zome.rs` verbatim.
+1. **The role name.** `ROLE_NAME` at the top of `holochain-host.ts` is
+   Presence's; yours will differ. It names the cell whose DNA the direct
+   signals go to and whose `init` commits the grant in `holochain-zome.rs`.
 2. **The roster.** `joinCall(peer)` / `leaveCall(peer)` are called by your
    application, from whatever already knows who is in the call. The set they
    maintain is `host.targets()` — nothing else decides who receives media.
 3. **The transport.** In `minimal-host.ts` that is the `Channel` interface;
-   in `holochain-host.ts` it is `sendTo` plus the `client.on('signal')`
-   dispatch. The library never touches either — it calls `host.send` and you
-   call `receiveFrame`.
+   in `holochain-host.ts` it is `sendTo` (one `sendDirectSignal` per message)
+   plus the `client.on('signal')` dispatch on `SignalType.AppDirect`. The
+   library never touches either — it calls `host.send` and you call
+   `receiveFrame`.
 
 Everything else — the `media-hello` / `media-ping` / `media-pong` message
 names, the `voice-batch-v1` capability string, the ping interval, the EWMA

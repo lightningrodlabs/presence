@@ -61,8 +61,8 @@ export type SignalBus = {
   /** Subscribe to incoming room signals. Returns the unsubscribe. */
   onSignal(handler: (signal: RoomSignal) => void | Promise<void>): () => void;
   /** Send a message signal to the given agents (fire-and-forget wire
-   *  semantics; the promise rejects on the local zome call failing, not
-   *  on non-delivery). */
+   *  semantics; the promise rejects on the local conductor refusing the
+   *  direct-signal request, not on non-delivery). */
   sendMessage(
     toAgents: AgentPubKey[],
     msgType: SignalMsgType,

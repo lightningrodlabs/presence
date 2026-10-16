@@ -1,28 +1,36 @@
 /**
- * Holochain host — voice + filmstrip over remote signals.
+ * Holochain host — voice + filmstrip over direct signals (Holochain 0.7.1+).
  *
  * The full shape: a call-membership set that IS the target set, a ping/pong
  * loop that measures the channel and feeds `decideSignalsMediaCadence`, a
  * `media-hello` capability handshake behind `batchEligible()`, a per-peer
  * carrier switch, refcounted devices, and a `FilmstripPlayback` per peer.
  *
- * The zome half is `holochain-zome.rs` beside this file: `send_message`
- * relays an opaque `{ msg_type, payload }` to a list of agents, and
- * `recv_remote_signal` re-emits it to the receiving agent's UI. Nothing in
- * the backend knows what any of these messages mean.
+ * The transport is `AppWebsocket.sendDirectSignal`: an app-interface request
+ * that carries an opaque byte string (up to 1 MiB) to a list of agents with
+ * no zome call on either side. The receiver gets it as a `SignalType.AppDirect`
+ * signal whose `from_agent` the conductor stamped. The zome half is
+ * `holochain-zome.rs` beside this file — one capability grant in `init`,
+ * nothing else; no zome code ever sees these messages. The bytes are
+ * msgpack `{ msg_type, payload }`, the layout Presence uses, so a Presence
+ * peer and this host agree on the wire.
  *
- * Three lines to change first: `ROLE_NAME`/`ZOME_NAME` (yours), `joinCall` /
+ * Three lines to change first: `ROLE_NAME` (yours), `joinCall` /
  * `leaveCall`'s callers (your roster), and `MEDIA_*` below if your app
  * already has a message vocabulary.
  */
 
 import {
   AppWebsocket,
+  CellType,
   SignalType,
   encodeHashToBase64,
   decodeHashFromBase64,
   type AgentPubKey,
+  type DirectSignal,
+  type DnaHash,
 } from '@holochain/client';
+import { decode, encode } from '@msgpack/msgpack';
 import {
   FilmstripCarrier,
   FilmstripPlayback,
@@ -56,7 +64,6 @@ const MEDIA_PONG = 'media-pong';
 const CAP_VOICE_BATCH = 'voice-batch-v1';
 
 const ROLE_NAME = 'presence';
-const ZOME_NAME = 'room';
 
 const PING_INTERVAL_MS = 3000;
 /** No pong from anyone for this many intervals = the channel is down. */
@@ -78,6 +85,8 @@ interface PongPayload {
 // ---------------------------------------------------------------------------
 
 let client: AppWebsocket | null = null;
+/** The network the direct signals go to — this role's DNA, read once at connect. */
+let dnaHash: DnaHash | null = null;
 
 /**
  * Who we are in a call with. This set IS `host.targets()` — the library reads
@@ -104,17 +113,24 @@ let audioCtx: AudioContext | null = null;
 let codec: OpusCodec | null = null;
 
 // ---------------------------------------------------------------------------
-// Sending: one zome call per message, to a list of agents.
+// Sending: one direct signal per message, to a list of agents.
 // ---------------------------------------------------------------------------
 
+/** The wire body, on both ends. */
+interface MessageBody {
+  msg_type: string;
+  payload: string;
+}
+
 async function sendTo(peers: Iterable<PeerId>, msgType: string, payload: string): Promise<void> {
-  const toAgents: AgentPubKey[] = [...peers].map(p => decodeHashFromBase64(p));
-  if (toAgents.length === 0 || !client) return;
-  await client.callZome({
-    role_name: ROLE_NAME,
-    zome_name: ZOME_NAME,
-    fn_name: 'send_message',
-    payload: { to_agents: toAgents, msg_type: msgType, payload },
+  const agents: AgentPubKey[] = [...peers].map(p => decodeHashFromBase64(p));
+  if (agents.length === 0 || !client || !dnaHash) return;
+  // Resolves when the local conductor accepted the request — best effort,
+  // like any signal; a recipient without the grant from `init` drops it.
+  await client.sendDirectSignal({
+    dna_hash: dnaHash,
+    agents,
+    signal: encode({ msg_type: msgType, payload } satisfies MessageBody),
   });
 }
 
@@ -209,12 +225,22 @@ const filmstrip = new FilmstripCarrier();
 // Receiving.
 // ---------------------------------------------------------------------------
 
-/** The zome's `SignalPayload::Message` variant, as it arrives on the client. */
-interface ZomeMessageSignal {
-  type: string;
-  from_agent: Uint8Array;
-  msg_type: string;
-  payload: string;
+/**
+ * The bytes are remote input: msgpack that is not a `{ msg_type, payload }`
+ * map (a different app on the same DNA, a newer peer) is dropped, never
+ * thrown. Extra keys are ignored.
+ */
+function decodeBody(bytes: Uint8Array): MessageBody | null {
+  let body: unknown;
+  try {
+    body = decode(bytes);
+  } catch {
+    return null;
+  }
+  if (body === null || typeof body !== 'object' || body instanceof Map) return null;
+  const { msg_type, payload } = body as Record<string, unknown>;
+  if (typeof msg_type !== 'string' || typeof payload !== 'string') return null;
+  return { msg_type, payload };
 }
 
 /**
@@ -230,10 +256,12 @@ function parseJson<T>(s: string): T | null {
   }
 }
 
-function handleSignal(raw: unknown): void {
-  const msg = raw as ZomeMessageSignal;
-  if (msg?.type !== 'Message') return; // Ping/Pong variants are the zome's own
-  const peer = encodeHashToBase64(msg.from_agent);
+function handleSignal(signal: DirectSignal): void {
+  const msg = decodeBody(signal.signal);
+  if (!msg) return;
+  // `from_agent` is the conductor's stamp on the envelope — not a field the
+  // sender wrote, so a peer cannot impersonate another.
+  const peer = encodeHashToBase64(signal.from_agent);
 
   switch (msg.msg_type) {
     case 'voice':
@@ -404,9 +432,13 @@ export async function connect(): Promise<void> {
   await audioCtx.resume();
 
   client = await AppWebsocket.connect();
+  const appInfo = await client.appInfo();
+  const cell = appInfo?.cell_info[ROLE_NAME]?.find(c => c.type === CellType.Provisioned);
+  if (!cell || cell.type !== CellType.Provisioned) throw new Error(`no provisioned cell for role ${ROLE_NAME}`);
+  dnaHash = cell.value.cell_id[0];
   client.on('signal', signal => {
-    if (signal.type !== SignalType.App) return;
-    handleSignal(signal.value.payload);
+    if (signal.type !== SignalType.AppDirect) return; // zome app signals are not ours
+    handleSignal(signal.value);
   });
 
   codec = await resolveCodec();
@@ -432,4 +464,5 @@ export async function disconnect(): Promise<void> {
   await audioCtx?.close();
   audioCtx = null;
   client = null;
+  dnaHash = null;
 }

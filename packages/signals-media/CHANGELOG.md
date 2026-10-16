@@ -2,6 +2,18 @@
 
 All notable changes to `@lightningrodlabs/signals-media`.
 
+## Unreleased
+
+### Changed
+
+- The Holochain example (`examples/holochain-host.ts`, `examples/holochain-zome.rs`,
+  README "Wiring the channel") now rides Holochain 0.7.1 direct signals:
+  `AppWebsocket.sendDirectSignal` with a msgpack `{ msg_type, payload }` body,
+  received as `SignalType.AppDirect` with the conductor-stamped `from_agent`. The
+  zome half shrinks to one `CapGrant::new_direct_signal_grant` in `init`; the
+  `send_message` / `recv_remote_signal` pair is gone. Library code is unchanged —
+  the transport was always the host's.
+
 ## 0.1.0 — 2026-09-10
 
 Initial release. Opus voice and low-fps JPEG filmstrip video between peers over

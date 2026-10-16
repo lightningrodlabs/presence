@@ -1,7 +1,7 @@
 # @lightningrodlabs/signals-media
 
 Opus voice and low-fps JPEG video between peers **over any message channel** —
-no WebRTC, no ICE, no TURN. You bring the transport (Holochain remote signals, a
+no WebRTC, no ICE, no TURN. You bring the transport (Holochain direct signals, a
 WebSocket, anything that moves a string to a peer); the library owns capture,
 encode, pacing, admission, decode and playout.
 
@@ -189,30 +189,41 @@ per-peer state and stops capture. Sending starts at `startCapture()`.
 ### Wiring the channel
 
 The library never touches your transport. You call `receiveFrame` when a payload
-arrives, and implement `send` however you like. Over Holochain remote signals the
-zome pair is a generic message send plus the remote-signal receiver — in
-Presence's room zome (`dnas/presence/zomes/coordinator/room/src/remote_signals.rs`):
+arrives, and implement `send` however you like. Over Holochain (0.7.1+) the
+transport is a direct signal — `AppWebsocket.sendDirectSignal`, an app-interface
+request that carries up to 1 MiB of opaque bytes to a list of agents with no
+zome call on either side. The zome's only part is a capability grant in `init`
+(Presence's room zome, `dnas/presence/zomes/coordinator/room/src/lib.rs`):
 
 ```rust
-// send_message(SendMessageInput { to_agents, msg_type, payload })
-//   -> send_remote_signal(SignalPayload::Message { from_agent, msg_type, payload })
-// recv_remote_signal(..) -> emit_signal(..)  // reaches the RECEIVING agent's UI
+create_cap_grant(CapGrant::new_direct_signal_grant(
+    "direct signals".into(),
+    GrantConstraint::Unrestricted,
+))?;
 ```
 
-`msg_type` carries the `MediaKind` (`'voice'` / `'filmstrip'`) and `payload`
-carries the library's string verbatim. On the client — this is the
-`@holochain/client` ^0.21 shape, where `on('signal')` hands you a tagged
-`Signal` and the zome payload sits under `value.payload`:
+The bytes are msgpack `{ msg_type, payload }`: `msg_type` carries the
+`MediaKind` (`'voice'` / `'filmstrip'`) and `payload` carries the library's
+string verbatim. On the client — the `@holochain/client` ^0.21.1 shape, where
+`on('signal')` hands you a tagged `Signal` and a direct signal arrives as
+`SignalType.AppDirect` with the sender stamped by the conductor:
 
 ```ts
 import { SignalType, encodeHashToBase64 } from '@holochain/client';
+import { decode, encode } from '@msgpack/msgpack';
+
+await client.sendDirectSignal({
+  dna_hash,                                   // the role's DNA, from appInfo()
+  agents,                                     // AgentPubKey[]
+  signal: encode({ msg_type: 'voice', payload }),
+});
 
 client.on('signal', signal => {
-  if (signal.type !== SignalType.App) return;          // 'app' | 'system'
-  const { from_agent, msg_type, payload } = signal.value.payload as {
-    from_agent: Uint8Array; msg_type: string; payload: string;
+  if (signal.type !== SignalType.AppDirect) return;   // 'app' | 'app_direct' | 'system'
+  const { msg_type, payload } = decode(signal.value.signal) as {
+    msg_type: string; payload: string;
   };
-  const peer = encodeHashToBase64(from_agent);
+  const peer = encodeHashToBase64(signal.value.from_agent);
   if (msg_type === 'voice') voice.receiveFrame(peer, payload);
   else if (msg_type === 'filmstrip') filmstrip.receiveFrame(peer, payload);
 });
