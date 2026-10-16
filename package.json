@@ -33,7 +33,8 @@
     "@holochain/hc-spin": "^0.700.1-rc.0",
     "@theweave/cli": "^0.16.0-rc.2",
     "concurrently": "^6.2.1",
-    "rimraf": "^3.0.2"
+    "rimraf": "^3.0.2",
+    "typescript": "4.9.5"
   },
   "overrides": {
     "@holochain/client": "^0.21.1",
