@@ -19,6 +19,10 @@ export type MediaSettingsBindings = {
   /** micSource.changeDevice / cameraSource.changeDevice, late-bound. */
   changeMicDevice: (deviceId: string) => Promise<void>;
   changeCameraDevice: (deviceId: string) => Promise<void>;
+  /** micSource.setOutputDevice, late-bound — applies the chosen sink to
+   *  the shared AudioContext (signals voice playout). The view applies
+   *  it to its own media elements by subscribing to `audioOutputId()`. */
+  setPlayoutSink: (deviceId: string | undefined) => void;
   /** StreamsStore._broadcastRtcAction, late-bound. */
   broadcastRtcAction: (action: 'change-audio-input' | 'change-video-input') => void;
   logAgentEvent: (e: SimpleEvent) => void;
@@ -136,6 +140,23 @@ export class MediaSettings {
     // id is stored and the next acquire picks it up.
     await this.bindings.changeMicDevice(deviceId);
     this.bindings.broadcastRtcAction('change-audio-input');
+  }
+
+  /**
+   * The ONE writer of `_audioOutputId`. Local-only: unlike the input
+   * change there is no RTC action to broadcast — peers do not care which
+   * speaker we play them on. Applied at two sites (see `audio-sink.ts`):
+   * the shared AudioContext here via the binding, and room-view's media
+   * elements via its `audioOutputId()` subscription.
+   */
+  changeAudioOutput(deviceId: string | undefined) {
+    this.bindings.logAgentEvent({
+      agent: this.bindings.myPubKeyB64(),
+      timestamp: this.bindings.now(),
+      event: 'ChangeMyAudioOutput',
+    });
+    this._audioOutputId.set(deviceId);
+    this.bindings.setPlayoutSink(deviceId);
   }
 
   async updateMediaDevices() {

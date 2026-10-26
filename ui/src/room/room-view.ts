@@ -123,6 +123,7 @@ import {
   LAYOUT_SWITCH_REAPPLY_DELAY_MS,
   STREAM_EVENT_DOM_SETTLE_MS,
 } from './video-bind';
+import { applyAudioSink } from '../audio-sink';
 import {
   profilesStoreContext,
   type ProfilesStore,
@@ -960,6 +961,70 @@ export class RoomView extends LitElement {
     `;
   }
 
+  /**
+   * The audio output section of the mic menu: one row per `audiooutput`
+   * device, the checked row being the store's `audioOutputId()`
+   * (`undefined` = the default device, as the input rows read it). A
+   * platform that enumerates no outputs (WebKitGTK, Firefox without the
+   * permission) gets no section at all. A click is the one gesture onto
+   * `StreamsStore.changeAudioOutput`; the sink reaches the elements
+   * through `_applyAudioOutput` on the re-render that follows.
+   */
+  private _renderAudioOutputRows() {
+    const devices = this._audioOutputDevices.value ?? [];
+    if (devices.length === 0) return html``;
+    const selectedId = this._audioOutputId.value;
+    return html`
+      <div class="system-audio-divider"></div>
+      <div class="input-source-title">${msg('Audio Output')}</div>
+      ${devices.map(device => {
+        const isSelected = selectedId
+          ? device.deviceId === selectedId
+          : device.deviceId === 'default';
+        const act = () => {
+          this.closeClosables();
+          this.streamsStore.changeAudioOutput(device.deviceId);
+        };
+        return html`
+          <div
+            class="audio-source audio-output column"
+            tabindex="0"
+            @click=${act}
+            @keypress=${(e: KeyboardEvent) => {
+              if (e.key === 'Enter') act();
+            }}
+          >
+            <div class="row">
+              <div style="${isSelected ? '' : 'color: transparent'}">
+                &#10003;&nbsp;
+              </div>
+              <div>${deviceLabel(device.label)}</div>
+            </div>
+          </div>
+        `;
+      })}
+    `;
+  }
+
+  /**
+   * Apply the chosen audio output to every media element this view
+   * plays through — the peer and screen-share `<video>`s in the shadow
+   * root and the two chime `Audio`s — the HTMLMediaElement half of the
+   * output selection (`audio-sink.ts`; the AudioContext half is
+   * `MicSource.setOutputDevice`). Runs after every render because tiles
+   * mount and remount freely; `applyAudioSink` skips an element already
+   * on the wanted sink, so the steady-state cost is a property read.
+   */
+  private _applyAudioOutput() {
+    const id = this._audioOutputId.value;
+    const warn = (e: unknown) => console.warn('room-view: setSinkId failed', e);
+    this.shadowRoot
+      ?.querySelectorAll<HTMLMediaElement>('video, audio')
+      .forEach(el => applyAudioSink(el, id, warn));
+    applyAudioSink(this._joinAudio, id, warn);
+    applyAudioSink(this._leaveAudio, id, warn);
+  }
+
   /** Warning-badge class for a capture toggle: '' when met, amber-pulsing
    *  while the reconciler is still trying (`pending`), static red once it
    *  has given up (`failed`). The button's `title` is the diff's copy. */
@@ -1237,6 +1302,7 @@ export class RoomView extends LitElement {
     }
     this._updateGrid();
     this._ensurePeerVideoStreams();
+    this._applyAudioOutput();
     this._requestNewSpeakerLabels();
   }
 
@@ -2287,6 +2353,7 @@ export class RoomView extends LitElement {
                     ${this.streamsStore.canCaptureAudioSources
                       ? this._renderSystemAudioRow()
                       : html``}
+                    ${this._renderAudioOutputRows()}
                   </div>
                 `
               : html``}

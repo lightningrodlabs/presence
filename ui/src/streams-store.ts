@@ -613,6 +613,7 @@ export class StreamsStore {
       mediaDevices: this.deps.mediaDevices,
       changeMicDevice: id => this.micSource.changeDevice(id),
       changeCameraDevice: id => this.cameraSource.changeDevice(id),
+      setPlayoutSink: id => this.micSource.setOutputDevice(id),
       broadcastRtcAction: a => this._broadcastRtcAction(a),
       logAgentEvent: e => this.logger.logAgentEvent(e),
       now: () => this.clock.now(),
@@ -1981,6 +1982,10 @@ export class StreamsStore {
 
   async changeAudioInput(deviceId: string) {
     return this.mediaSettings.changeAudioInput(deviceId);
+  }
+
+  changeAudioOutput(deviceId: string | undefined) {
+    this.mediaSettings.changeAudioOutput(deviceId);
   }
 
   async audioOn(enabled: boolean) {

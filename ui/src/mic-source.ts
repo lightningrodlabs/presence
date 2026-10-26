@@ -1,4 +1,5 @@
 import { decideMicOutput, isLiveTrack, type MicOutputMode } from './mic-output-policy';
+import { applyAudioSink } from './audio-sink';
 
 /**
  * MicSource — transport-agnostic owner of the user's microphone.
@@ -200,6 +201,11 @@ export class MicSource {
   private _lifecycle: CaptureLifecycle = { state: 'idle' };
 
   private _audioContext: AudioContext | null = null;
+
+  /** The chosen audio output for the shared context (`setOutputDevice`);
+   *  `undefined` = the default output. Held here so a context created
+   *  after the choice (the context is lazy) still comes up on it. */
+  private _outputDeviceId: string | undefined = undefined;
 
   /**
    * Guards against concurrent open attempts from multiple parallel
@@ -426,6 +432,9 @@ export class MicSource {
     if (this._audioContext) return this._audioContext;
     try {
       this._audioContext = new AudioContext({ sampleRate: 48000 });
+      applyAudioSink(this._audioContext, this._outputDeviceId, e =>
+        console.warn('MicSource: AudioContext.setSinkId failed', e)
+      );
       // Best-effort unlock; in Electron this normally succeeds without a
       // gesture, and the error path is harmless on browsers that require one.
       this._audioContext.resume().catch(() => {});
@@ -795,6 +804,20 @@ export class MicSource {
     // old graph's existence.
     if (this._openingPromise) return this._mixin !== null;
     return this._reconcileOutput();
+  }
+
+  /**
+   * Route the shared context's output (signals voice playout) to
+   * `deviceId`, the one AudioContext half of the output selection
+   * (`audio-sink.ts`). Applied now if the context exists and again at
+   * creation otherwise. No-op on platforms without
+   * `AudioContext.setSinkId`.
+   */
+  setOutputDevice(deviceId: string | undefined): void {
+    this._outputDeviceId = deviceId;
+    applyAudioSink(this._audioContext, deviceId, e =>
+      console.warn('MicSource: AudioContext.setSinkId failed', e)
+    );
   }
 
   /** Resume the shared context under a user gesture (`systemAudioOn`
