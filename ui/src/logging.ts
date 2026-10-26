@@ -116,6 +116,7 @@ export type SimpleEventType =
   | 'MyVideoOn'
   | 'MyVideoOff'
   | 'ChangeMyAudioInput'
+  | 'ChangeMyAudioOutput'   // the user picked an audio output device (local-only; no wire action)
   | 'ChangeMyVideoInput'
   | 'SystemAudioEnded'      // the host or platform ended an included system-audio grant
   | 'TrackArrivedMuted'
@@ -285,6 +286,7 @@ export const SIMPLE_EVENT_TAXONOMY = {
   MyVideoOn: 'emitted',
   MyVideoOff: 'emitted',
   ChangeMyAudioInput: 'emitted',
+  ChangeMyAudioOutput: 'emitted',
   ChangeMyVideoInput: 'emitted',
   SystemAudioEnded: 'emitted',
   TrackArrivedMuted: 'emitted',

@@ -143,6 +143,7 @@ describe('SimpleEvent taxonomy', () => {
         "AudibilityOutageStart": "emitted",
         "CarrierSwitch": "emitted",
         "ChangeMyAudioInput": "emitted",
+        "ChangeMyAudioOutput": "emitted",
         "ChangeMyVideoInput": "emitted",
         "Connected": "emitted",
         "ConnectionAborted": "emitted",

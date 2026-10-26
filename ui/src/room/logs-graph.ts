@@ -228,6 +228,7 @@ export class LogsGraph extends LitElement {
             'MyVideoOn',
             'MyVideoOff',
             'ChangeMyAudioInput',
+            'ChangeMyAudioOutput',
           ]
         ) {
           if (payload.agent !== encodeHashToBase64(this.client.myPubKey))
