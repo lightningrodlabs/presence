@@ -54,13 +54,15 @@ describe('transcription start phase', () => {
     g.window = savedWindow;
   });
 
-  it('warms the model on bind and reports starting until the session is open', async () => {
+  it('does not warm the model on bind, and reports starting until the session is open', async () => {
     g.MediaStreamTrackProcessor = class {};
     if (!g.window) g.window = { setInterval: vi.fn(() => 1), clearInterval: vi.fn(), localStorage: { getItem: () => null } };
     const host = gatedHost();
     transcriptionController.bind(fakeStore(host.localModels));
     await Promise.resolve();
-    expect(host.warmUp).toHaveBeenCalledTimes(1);
+    // bind() runs when a room mounts: a warm-up there loaded the model on
+    // every host with Transcription on, whether or not anybody transcribed.
+    expect(host.warmUp).not.toHaveBeenCalled();
 
     expect(get(transcriptionController.isStarting)).toBe(false);
     const starting = transcriptionController.startCapture();
@@ -131,6 +133,90 @@ const requestedEnvelope = (): ModuleStateEnvelope => ({
   active: true,
   payload: JSON.stringify({ enabled: true, requested: true }),
   updatedAt: 1,
+});
+
+/**
+ * The warm-up's one site: a peer's request becoming pending for this
+ * user, which is when a prompt is about to be answered. Starting a
+ * session needs none — `openSession()` loads the model itself.
+ */
+describe('model warm-up on a pending peer request', () => {
+  const g = globalThis as any;
+  const savedWindow = g.window;
+  let stored: Record<string, string>;
+
+  beforeEach(() => {
+    stored = {};
+    g.window = {
+      setInterval: vi.fn(() => 1),
+      clearInterval: vi.fn(),
+      localStorage: {
+        getItem: (k: string) => stored[k] ?? null,
+        setItem: (k: string, v: string) => { stored[k] = v; },
+      },
+    };
+  });
+  afterEach(() => {
+    transcriptionController.unbind();
+    g.window = savedWindow;
+  });
+
+  const hostWith = (warmUp: () => Promise<void>) => ({
+    capabilities: async () => ({ asr: { available: true } }),
+    asr: { warmUp },
+  });
+
+  it('a request that becomes pending warms the model once', () => {
+    const warmUp = vi.fn(async () => {});
+    const { store } = moduleStore(hostWith(warmUp));
+    transcriptionController.bind(store);
+    expect(warmUp).not.toHaveBeenCalled();
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    expect(get(transcriptionController.pendingRequests).has('peer')).toBe(true);
+    expect(warmUp).toHaveBeenCalledTimes(1);
+  });
+
+  it('a second peer asking while the first is still pending does not warm again', () => {
+    const warmUp = vi.fn(async () => {});
+    const { store } = moduleStore(hostWith(warmUp));
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    transcriptionController.onPeerTranscriptionChange('peer2', null, requestedEnvelope());
+    expect(get(transcriptionController.pendingRequests).size).toBe(2);
+    expect(warmUp).toHaveBeenCalledTimes(1);
+  });
+
+  it('a rejected warm-up (no consent yet, Transcription off) is ignored and the request stays pending', async () => {
+    // vitest fails the run on an unhandled rejection, so this is the pin
+    // on the catch.
+    const warmUp = vi.fn(async () => { throw new Error('transcription not allowed for this Tool'); });
+    const { store } = moduleStore(hostWith(warmUp));
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    await new Promise(r => setTimeout(r, 0));
+    expect(warmUp).toHaveBeenCalledTimes(1);
+    expect(get(transcriptionController.pendingRequests).has('peer')).toBe(true);
+  });
+
+  it('auto-accept opens a session and does not warm first', async () => {
+    stored[AUTO_ACCEPT_KEY] = 'true';
+    const warmUp = vi.fn(async () => {});
+    const { store } = moduleStore(hostWith(warmUp));
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    await Promise.resolve();
+    expect(warmUp).not.toHaveBeenCalled();
+    expect(get(transcriptionController.pendingRequests).size).toBe(0);
+  });
+
+  it('a request we already answered by enabling does not warm', () => {
+    const warmUp = vi.fn(async () => {});
+    const { store, states } = moduleStore(hostWith(warmUp));
+    transcriptionController.bind(store);
+    states.set({ transcription: requestedEnvelope() });
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    expect(warmUp).not.toHaveBeenCalled();
+  });
 });
 
 describe('a host without local models (the old-Moss case)', () => {

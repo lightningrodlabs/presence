@@ -328,13 +328,6 @@ class TranscriptionController {
 
   bind(store: StreamsStore) {
     this.store = store;
-    // Start the model now so a later openSession() returns at once.
-    // Older hosts have no warmUp, and a host with Transcription off rejects;
-    // neither is an error here.
-    const asr = store.localModels?.asr;
-    if (typeof asr?.warmUp === 'function') {
-      asr.warmUp().catch(() => undefined);
-    }
     // Frame numbering is per speaker per bind: receivers drop a repeated
     // (transcriber, seq) and keep what they hold across our leave, so
     // every capture session in this bind continues the count, and a new
@@ -525,12 +518,26 @@ class TranscriptionController {
       return;
     }
 
-    this.pendingRequests.update(s => {
-      if (s.has(peerPubKeyB64)) return s;
-      const next = new Set(s);
-      next.add(peerPubKeyB64);
-      return next;
-    });
+    const pending = get(this.pendingRequests);
+    if (pending.has(peerPubKeyB64)) return;
+    // The first pending request is when this user is about to be asked:
+    // start the model now so that accepting opens a session at once. This
+    // is the warm-up's one site — `bind()` ran it on every room mount and
+    // loaded the model on hosts where nobody transcribed, and the paths
+    // that open a session (`startCapture`, auto-accept above) need none,
+    // because `openSession()` loads the model itself. Older hosts have no
+    // warmUp, and the host rejects it while Transcription is off or this
+    // user has not yet allowed this Tool to transcribe (the host asks at
+    // the first `openSession()`, never here); neither is an error.
+    if (pending.size === 0) {
+      const asr = this.store.localModels?.asr;
+      if (typeof asr?.warmUp === 'function') {
+        asr.warmUp().catch(() => undefined);
+      }
+    }
+    const next = new Set(pending);
+    next.add(peerPubKeyB64);
+    this.pendingRequests.set(next);
   }
 
   /**
