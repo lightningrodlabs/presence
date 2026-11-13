@@ -935,11 +935,17 @@ export class RoomView extends LitElement {
     // own text; nothing important hides in a hover title.
     const request = this.streamsStore.systemAudioRequest;
     const disabled = !active && !request.ok;
+    // A host refusal is said in the row too: `unsupported` disables it
+    // for the session, `disabled` leaves it a retry (the decision is ok).
     const label = active
       ? `✓ ${msg('Including')}: ${active.label}${active.canExcludeSelf ? '' : ` ${msg('(may echo)')}`}`
       : !request.ok && request.reason === 'request-pending'
         ? msg('Choosing sources…')
-        : msg('Include audio from…');
+        : !request.ok && request.reason === 'host-refused'
+          ? msg('This computer cannot capture audio from other apps')
+          : request.ok && request.hostRefused === 'disabled'
+            ? msg('Audio Sources is off in Moss. Turn it on, then click here to try again')
+            : msg('Include audio from…');
     const act = async () => {
       if (disabled) return;
       this.closeClosables();

@@ -184,6 +184,27 @@ describe('the "Include audio from…" row renders the store\'s one request gate'
     expect(el.streamsStore.systemAudioOn).not.toHaveBeenCalled();
   });
 
+  it('the host cannot capture on this machine → disabled, the row says why in its own text, and a click is swallowed', async () => {
+    const { el, row } = renderRow({
+      systemAudioRequest: { ok: false, reason: 'host-refused', hostRefused: 'unsupported' },
+    });
+    expect(row.classList.contains('disabled')).toBe(true);
+    expect(row.textContent).toContain('This computer cannot capture audio from other apps');
+    expect(row.textContent).not.toContain('Include audio from…');
+    row.click();
+    await Promise.resolve();
+    expect(el.streamsStore.systemAudioOn).not.toHaveBeenCalled();
+  });
+
+  it('Audio Sources is off in Moss → enabled, the row says so, and a click retries', async () => {
+    const { el, row } = renderRow({ systemAudioRequest: { ok: true, hostRefused: 'disabled' } });
+    expect(row.classList.contains('disabled')).toBe(false);
+    expect(row.textContent).toContain('Audio Sources is off in Moss');
+    row.click();
+    await Promise.resolve();
+    expect(el.streamsStore.systemAudioOn).toHaveBeenCalledTimes(1);
+  });
+
   it('active → enabled whatever the gate says (the store reports already-active), label carries the source and the echo note; a click is the off gesture', async () => {
     const { el, row } = renderRow({
       systemAudioRequest: { ok: false, reason: 'already-active' },
