@@ -209,6 +209,21 @@ describe('model warm-up on a pending peer request', () => {
     expect(get(transcriptionController.pendingRequests).size).toBe(0);
   });
 
+  it('a host whose asr has no warmUp still queues the request (the typeof guard)', () => {
+    const { store } = moduleStore({ capabilities: async () => ({ asr: { available: true } }), asr: {} });
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('peer', null, requestedEnvelope());
+    expect(get(transcriptionController.pendingRequests).has('peer')).toBe(true);
+  });
+
+  it('our own request does not warm', () => {
+    const warmUp = vi.fn(async () => {});
+    const { store } = moduleStore(hostWith(warmUp));
+    transcriptionController.bind(store);
+    transcriptionController.onPeerTranscriptionChange('me', null, requestedEnvelope());
+    expect(warmUp).not.toHaveBeenCalled();
+  });
+
   it('a request we already answered by enabling does not warm', () => {
     const warmUp = vi.fn(async () => {});
     const { store, states } = moduleStore(hostWith(warmUp));

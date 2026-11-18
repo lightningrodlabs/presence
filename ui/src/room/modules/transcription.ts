@@ -528,7 +528,9 @@ class TranscriptionController {
     // because `openSession()` loads the model itself. Older hosts have no
     // warmUp, and the host rejects it while Transcription is off or this
     // user has not yet allowed this Tool to transcribe (the host asks at
-    // the first `openSession()`, never here); neither is an error.
+    // the first `openSession()`, never here); neither is an error. Cost,
+    // declared: where this Tool already has consent, a prompt the user
+    // then declines or ignores has still loaded the model.
     if (pending.size === 0) {
       const asr = this.store.localModels?.asr;
       if (typeof asr?.warmUp === 'function') {
