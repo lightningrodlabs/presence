@@ -78,6 +78,13 @@ describe('decideSystemAudioRequest', () => {
 });
 
 describe('audioSourceRefusalOf (the host refusal, told from every other failure)', () => {
+  it('retirement trigger: the installed @theweave/api does not export isAudioSourceUnavailableError yet', async () => {
+    // When this fails, delete audioSourceRefusalOf's body and call the
+    // api helper instead (mic-output-policy.ts, its DECLARED PARALLEL COPY note).
+    const api = await import('@theweave/api');
+    expect('isAudioSourceUnavailableError' in api).toBe(false);
+  });
+
   /** What the host iframe's copy of `@theweave/api` throws: its own class, so only the shape crosses. */
   const refusal = (reason: unknown, name = 'AudioSourceUnavailableError') => {
     const e = new Error(`The host cannot capture audio sources: ${String(reason)}`);

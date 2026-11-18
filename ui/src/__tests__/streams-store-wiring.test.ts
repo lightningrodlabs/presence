@@ -3258,6 +3258,20 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(started.store.systemAudioRequest).toEqual({ ok: true });
   });
 
+  it('a generic failure after a disabled refusal clears the reason: the label no longer claims Audio Sources is off', async () => {
+    let refuse = true;
+    const started = makeStartedWithCapture(async () => {
+      if (refuse) throw hostRefusal('disabled');
+      throw new Error('Only one audio source picker may be open at a time.');
+    });
+    await started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true, hostRefused: 'disabled' });
+    refuse = false;
+    await started.store.systemAudioOn();
+    expect(started.events.some(e => e.type === 'error')).toBe(true);
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+  });
+
   it('a cancelled picker records nothing and the row stays enabled', async () => {
     const started = makeStartedWithCapture(async () => null);
     await started.store.systemAudioOn();

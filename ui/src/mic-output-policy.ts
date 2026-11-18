@@ -79,8 +79,10 @@ export type AudioSourceRefusal = 'unsupported' | 'disabled';
  * DECLARED PARALLEL COPY of `isAudioSourceUnavailableError`
  * (`@theweave/api`, `audio-source-capture.ts`; Moss PR #270), which no
  * published version exported when this landed (2026-11-13: 0.7.0-rc.4
- * does not). Retire this body onto that helper at the first
- * `@theweave/api` bump that exports it. A reason this build does not
+ * does not). Retire this body onto that helper when the installed
+ * `@theweave/api` exports it: `ui/package.json`'s caret range can pick
+ * that version up with no edit, so `mic-output-policy.test.ts` fails
+ * the moment the installed package exports the helper. A reason this build does not
  * know reads as null, so it takes the generic error path.
  */
 export function audioSourceRefusalOf(e: unknown): AudioSourceRefusal | null {
@@ -121,9 +123,10 @@ export type SystemAudioRequestDecision =
  * mixin alone, so sharing what you are playing neither requires nor opens
  * the microphone (field feedback, 2026-09-24).
  *
- * A host refusal splits on whether it can change while the room is open.
- * `unsupported` cannot — the machine has no capture backend — so it
- * blocks. `disabled` can: the host attaches the seam only when Audio
+ * A host refusal splits on whether a retry in this room visit can help.
+ * `unsupported` will not — the host reports no usable capture backend
+ * (none on this machine, or its device enumeration failed) — so it
+ * blocks until the next join rebuilds the store. `disabled` can: the host attaches the seam only when Audio
  * Sources is on at iframe load, so that refusal means the user switched
  * it off since, and switching it back on makes the next request succeed.
  * It therefore stays ok, carrying the reason for the row's label.

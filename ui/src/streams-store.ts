@@ -456,9 +456,11 @@ export class StreamsStore {
    *  picker resolves). */
   private _systemAudioPending = false;
 
-  /** The host's refusal of the last `systemAudioOn` request, or null: set
-   *  in that request's catch, cleared by any request the host let through
-   *  to its picker (a grant or a cancel). Read only by `systemAudioRequest`. */
+  /** The host's refusal of the last `systemAudioOn` request that reached
+   *  the seam, or null: set when that request was refused, cleared by every
+   *  other outcome (a grant, a cancel, or any other failure). Lives as long
+   *  as the store, which `room-container.ts` rebuilds on every join, so it
+   *  lasts one room visit at most. Read only by `systemAudioRequest`. */
   private _systemAudioRefusal: AudioSourceRefusal | null = null;
 
   /** The active system-audio share's label/echo-warning, or null. */
@@ -2212,6 +2214,8 @@ export class StreamsStore {
           console.warn(`Audio source capture refused by the host: ${refusal}`);
           return;
         }
+        // Not a refusal, so whatever the last one said no longer holds.
+        this._systemAudioRefusal = null;
         const error = `Failed to capture audio sources: ${e instanceof Error ? e.message : String(e)}`;
         console.error(error);
         this.eventCallback({ type: 'error', error });
