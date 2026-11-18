@@ -32,6 +32,8 @@
  * on the main thread).
  */
 
+import { decideSample } from './filmstrip-sampling-policy';
+
 const DEFAULT_CAPTURE_SIDE = 192;
 const JPEG_QUALITY = 0.6;
 
@@ -62,6 +64,11 @@ let captureReader: ReadableStreamDefaultReader<any> | null = null;
 let pipelineGeneration = 0;
 let capturePeriodMs = 167;
 let captureSide = DEFAULT_CAPTURE_SIDE;
+/**
+ * When the next sample is due (see `decideSample`); `null` restarts the
+ * schedule at the next frame. Module-level so a rate change can restart it.
+ */
+let nextSampleDueMs: number | null = null;
 
 self.onmessage = (e: MessageEvent<WorkerInputMessage>) => {
   const msg = e.data;
@@ -73,6 +80,9 @@ self.onmessage = (e: MessageEvent<WorkerInputMessage>) => {
       break;
     case 'setFps':
       capturePeriodMs = msg.capturePeriodMs;
+      // A schedule built on the old period could hold the next sample
+      // back by up to that whole period.
+      nextSampleDueMs = null;
       break;
     case 'setCaptureSide':
       captureSide = msg.captureSide;
@@ -132,7 +142,7 @@ async function pumpCapture(gen: number): Promise<void> {
   let H = captureSide;
   let canvas: any = null;
   let cctx: any = null;
-  let lastSampleMs = 0;
+  nextSampleDueMs = null;
 
   // Rolling-window stats. "frames" here = sent 1-frame clips; the
   // message field names keep the historical clip terminology so the
@@ -170,8 +180,13 @@ async function pumpCapture(gen: number): Promise<void> {
 
     try {
       const P = capturePeriodMs;
-      const dueForSample = lastSampleMs === 0 || now - lastSampleMs >= P;
-      if (dueForSample) {
+      const decision = decideSample({
+        frameMs: now,
+        nextDueMs: nextSampleDueMs,
+        periodMs: P,
+      });
+      nextSampleDueMs = decision.nextDueMs;
+      if (decision.sample) {
         // Re-read the side each sample so setCaptureSide() applies on
         // the next frame.
         if (!canvas || W !== captureSide) {
@@ -188,7 +203,6 @@ async function pumpCapture(gen: number): Promise<void> {
         const sx = (vw - side) / 2;
         const sy = (vh - side) / 2;
         cctx.drawImage(vf, sx, sy, side, side, 0, 0, W, H);
-        lastSampleMs = now;
         // Sender wall-clock ms at frame capture — the shared timebase
         // with voice's `wts`, basis for receiver-side A/V skew.
         const t0 = Date.now();
@@ -203,6 +217,10 @@ async function pumpCapture(gen: number): Promise<void> {
 
         if (blob) {
           const buf = await blob.arrayBuffer();
+          // Read before the postMessage below: transferring `buf`
+          // detaches it, and a detached buffer's byteLength is 0, which is
+          // why the `[filmstrip tx] bw=` stat always read 0.0kbps.
+          const byteLength = buf.byteLength;
           // Transfer the ArrayBuffer to the main thread (zero-copy).
           (self as any).postMessage(
             {
@@ -218,7 +236,7 @@ async function pumpCapture(gen: number): Promise<void> {
             [buf]
           );
           framesThisWindow += 1;
-          bytesThisWindow += buf.byteLength;
+          bytesThisWindow += byteLength;
         }
         encodeSumMs += encodeEnd - now;
 
