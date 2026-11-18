@@ -935,16 +935,30 @@ export class RoomView extends LitElement {
     // own text; nothing important hides in a hover title.
     const request = this.streamsStore.systemAudioRequest;
     const disabled = !active && !request.ok;
+    // A host refusal is said in the row too: `unsupported` disables it
+    // for the session, `disabled` leaves it a retry (the decision is ok).
     const label = active
       ? `✓ ${msg('Including')}: ${active.label}${active.canExcludeSelf ? '' : ` ${msg('(may echo)')}`}`
       : !request.ok && request.reason === 'request-pending'
         ? msg('Choosing sources…')
-        : msg('Include audio from…');
+        : !request.ok && request.reason === 'host-refused'
+          ? msg('This computer cannot capture audio from other apps')
+          : request.ok && request.hostRefused === 'disabled'
+            ? msg('Audio Sources is off in Moss. Turn it on, then click here to try again')
+            : msg('Include audio from…');
     const act = async () => {
       if (disabled) return;
       this.closeClosables();
-      if (active) this.streamsStore.systemAudioOff();
-      else await this.streamsStore.systemAudioOn();
+      if (active) {
+        this.streamsStore.systemAudioOff();
+        return;
+      }
+      await this.streamsStore.systemAudioOn();
+      // The menu closed under the click, before the host answered. A host
+      // refusal is said only in this row's label, so reopen the menu to put
+      // it in view: otherwise the click looks like it did nothing.
+      const after = this.streamsStore.systemAudioRequest;
+      if ('hostRefused' in after && after.hostRefused) this._showAudioSources = true;
     };
     return html`
       <div class="system-audio-divider"></div>

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  audioSourceRefusalOf,
   decideMicOutput,
   decideSystemAudioRequest,
   isLiveTrack,
@@ -62,8 +63,47 @@ describe('decideSystemAudioRequest', () => {
     ['no host seam (older Moss)', { seamAvailable: false }, { ok: false, reason: 'no-seam' }],
     ['a capture is held', { active: true }, { ok: false, reason: 'already-active' }],
     ['the picker is up', { pending: true }, { ok: false, reason: 'request-pending' }],
+    // The host refused the last request before any picker opened.
+    ['this machine cannot capture: blocked for the session', { hostRefused: 'unsupported' },
+      { ok: false, reason: 'host-refused', hostRefused: 'unsupported' }],
+    ['Audio Sources went off in Moss: a click retries, and the decision carries why', { hostRefused: 'disabled' },
+      { ok: true, hostRefused: 'disabled' }],
+    ['no seam beats a refusal', { seamAvailable: false, hostRefused: 'unsupported' }, { ok: false, reason: 'no-seam' }],
+    ['the picker is up beats a retryable refusal', { pending: true, hostRefused: 'disabled' },
+      { ok: false, reason: 'request-pending' }],
   ];
   it.each(rows)('%s', (_name, patch, expected) => {
     expect(decideSystemAudioRequest({ ...base, ...patch })).toEqual(expected);
+  });
+});
+
+describe('audioSourceRefusalOf (the host refusal, told from every other failure)', () => {
+  it('retirement trigger: the installed @theweave/api does not export isAudioSourceUnavailableError yet', async () => {
+    // When this fails, delete audioSourceRefusalOf's body and call the
+    // api helper instead (mic-output-policy.ts, its DECLARED PARALLEL COPY note).
+    const api = await import('@theweave/api');
+    expect('isAudioSourceUnavailableError' in api).toBe(false);
+  });
+
+  /** What the host iframe's copy of `@theweave/api` throws: its own class, so only the shape crosses. */
+  const refusal = (reason: unknown, name = 'AudioSourceUnavailableError') => {
+    const e = new Error(`The host cannot capture audio sources: ${String(reason)}`);
+    e.name = name;
+    (e as { reason?: unknown }).reason = reason;
+    return e;
+  };
+  const rows: Array<[string, unknown, ReturnType<typeof audioSourceRefusalOf>]> = [
+    ['unsupported', refusal('unsupported'), 'unsupported'],
+    ['disabled', refusal('disabled'), 'disabled'],
+    ['a reason this build does not know', refusal('quota'), null],
+    ['no reason', refusal(undefined), null],
+    ['another error carrying a reason', refusal('unsupported', 'Error'), null],
+    ['a plain error', new Error('nope'), null],
+    ['a non-Error with the same fields', { name: 'AudioSourceUnavailableError', reason: 'disabled' }, null],
+    ['a string', 'unsupported', null],
+    ['null', null, null],
+  ];
+  it.each(rows)('%s', (_name, thrown, expected) => {
+    expect(audioSourceRefusalOf(thrown)).toBe(expected);
   });
 });

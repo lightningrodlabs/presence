@@ -61,8 +61,38 @@ export function isLiveTrack(track: MediaStreamTrack | null): track is MediaStrea
   return !!track && track.readyState === 'live';
 }
 
+/**
+ * Why the host refused a capture request before any picker opened:
+ * `unsupported` — its capture backend cannot run on this machine;
+ * `disabled` — the user switched the Audio Sources service off in Moss.
+ */
+export type AudioSourceRefusal = 'unsupported' | 'disabled';
+
+/**
+ * The host's refusal read off a rejected `captureAudioSources`, or null
+ * for every other failure. The contract is the error's shape — name
+ * `AudioSourceUnavailableError`, `reason` one of `AudioSourceRefusal` —
+ * not its class: the Tool and the host iframe each bundle their own copy
+ * of `@theweave/api`, so `instanceof` against ours never matches what
+ * the iframe throws.
+ *
+ * DECLARED PARALLEL COPY of `isAudioSourceUnavailableError`
+ * (`@theweave/api`, `audio-source-capture.ts`; Moss PR #270), which no
+ * published version exported when this landed (2026-11-13: 0.7.0-rc.4
+ * does not). Retire this body onto that helper when the installed
+ * `@theweave/api` exports it: `ui/package.json`'s caret range can pick
+ * that version up with no edit, so `mic-output-policy.test.ts` fails
+ * the moment the installed package exports the helper. A reason this build does not
+ * know reads as null, so it takes the generic error path.
+ */
+export function audioSourceRefusalOf(e: unknown): AudioSourceRefusal | null {
+  if (!(e instanceof Error) || e.name !== 'AudioSourceUnavailableError') return null;
+  const reason = (e as { reason?: unknown }).reason;
+  return reason === 'unsupported' || reason === 'disabled' ? reason : null;
+}
+
 /** Why a system-audio request cannot start right now (`decideSystemAudioRequest`). */
-export type SystemAudioRequestBlock = 'no-seam' | 'already-active' | 'request-pending';
+export type SystemAudioRequestBlock = 'no-seam' | 'already-active' | 'request-pending' | 'host-refused';
 
 export type SystemAudioRequestInput = {
   /** The host offers `captureAudioSources` (older hosts do not). */
@@ -71,11 +101,16 @@ export type SystemAudioRequestInput = {
   active: boolean;
   /** A request is awaiting the host picker (the host allows one). */
   pending: boolean;
+  /** The host's refusal of the last request, if it refused it (`audioSourceRefusalOf`). */
+  hostRefused?: AudioSourceRefusal;
 };
 
 export type SystemAudioRequestDecision =
-  | { ok: true }
-  | { ok: false; reason: SystemAudioRequestBlock };
+  /** `hostRefused` rides an ok decision when the last request was refused
+   *  for a cause the user can undo: the row stays a retry and says why. */
+  | { ok: true; hostRefused?: 'disabled' }
+  | { ok: false; reason: Exclude<SystemAudioRequestBlock, 'host-refused'> }
+  | { ok: false; reason: 'host-refused'; hostRefused: 'unsupported' };
 
 /**
  * The ONE gate on starting a system-audio request. `StreamsStore.systemAudioOn`
@@ -87,11 +122,23 @@ export type SystemAudioRequestDecision =
  * had to be built on a device track; `decideMicOutput` now mixes the
  * mixin alone, so sharing what you are playing neither requires nor opens
  * the microphone (field feedback, 2026-09-24).
+ *
+ * A host refusal splits on whether a retry in this room visit can help.
+ * `unsupported` will not — the host reports no usable capture backend
+ * (none on this machine, or its device enumeration failed) — so it
+ * blocks until the next join rebuilds the store. `disabled` can: the host attaches the seam only when Audio
+ * Sources is on at iframe load, so that refusal means the user switched
+ * it off since, and switching it back on makes the next request succeed.
+ * It therefore stays ok, carrying the reason for the row's label.
  */
 export function decideSystemAudioRequest(input: SystemAudioRequestInput): SystemAudioRequestDecision {
   if (!input.seamAvailable) return { ok: false, reason: 'no-seam' };
   if (input.active) return { ok: false, reason: 'already-active' };
   if (input.pending) return { ok: false, reason: 'request-pending' };
+  if (input.hostRefused === 'unsupported') {
+    return { ok: false, reason: 'host-refused', hostRefused: 'unsupported' };
+  }
+  if (input.hostRefused === 'disabled') return { ok: true, hostRefused: 'disabled' };
   return { ok: true };
 }
 

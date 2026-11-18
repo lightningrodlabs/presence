@@ -74,8 +74,10 @@ import type { StreamsStoreDeps } from './store-deps';
 import { PresenceLogger } from './logging';
 import { MicSource } from './mic-source';
 import {
+  audioSourceRefusalOf,
   decideSystemAudioRequest,
   isLiveTrack,
+  type AudioSourceRefusal,
   type SystemAudioRequestDecision,
 } from './mic-output-policy';
 import { CameraSource } from './camera-source';
@@ -327,6 +329,7 @@ export class StreamsStore {
       seamAvailable: this.captureAudioSources !== undefined,
       active: this._systemAudioCapture !== null,
       pending: this._systemAudioPending,
+      hostRefused: this._systemAudioRefusal ?? undefined,
     });
   }
 
@@ -452,6 +455,13 @@ export class StreamsStore {
    *  `_systemAudioCapture` alone cannot guard (it is only set AFTER the
    *  picker resolves). */
   private _systemAudioPending = false;
+
+  /** The host's refusal of the last `systemAudioOn` request that reached
+   *  the seam, or null: set when that request was refused, cleared by every
+   *  other outcome (a grant, a cancel, or any other failure). Lives as long
+   *  as the store, which `room-container.ts` rebuilds on every join, so it
+   *  lasts one room visit at most. Read only by `systemAudioRequest`. */
+  private _systemAudioRefusal: AudioSourceRefusal | null = null;
 
   /** The active system-audio share's label/echo-warning, or null. */
   private _systemAudio: Writable<SystemAudioState | null> = writable(null);
@@ -2182,8 +2192,8 @@ export class StreamsStore {
     const seam = this.captureAudioSources;
     if (!seam) return;
     // The row disables itself from this same decision, so every remaining
-    // reason here is benign: no host seam, a share already running, or a
-    // second click while the picker is up.
+    // reason here is benign: no host seam, a share already running, a
+    // second click while the picker is up, or a host that cannot capture.
     if (!this.systemAudioRequest.ok) return;
     // Under the click: a suspended context would mix silence (Electron
     // rarely suspends, and this is free).
@@ -2195,11 +2205,24 @@ export class StreamsStore {
       try {
         capture = await seam({ audioContext });
       } catch (e: unknown) {
+        // The host refused before any picker opened. That is an answer,
+        // not a failure: the row states it from `systemAudioRequest`, so
+        // there is no error event. Everything else is a failure.
+        const refusal = audioSourceRefusalOf(e);
+        if (refusal) {
+          this._systemAudioRefusal = refusal;
+          console.warn(`Audio source capture refused by the host: ${refusal}`);
+          return;
+        }
+        // Not a refusal, so whatever the last one said no longer holds.
+        this._systemAudioRefusal = null;
         const error = `Failed to capture audio sources: ${e instanceof Error ? e.message : String(e)}`;
         console.error(error);
         this.eventCallback({ type: 'error', error });
         return;
       }
+      // The host got as far as its picker, so it is not refusing.
+      this._systemAudioRefusal = null;
       if (!capture) return;
       if (!isLiveTrack(capture.track)) {
         // Resolved already ended (spec Section 3): nothing to include.

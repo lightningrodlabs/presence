@@ -3198,6 +3198,101 @@ describe('system audio (spec Section 4): the capture seam, the mixin swap, and e
     expect(started.calls).toHaveLength(2);
   });
 
+  /** What the host iframe throws on a refusal: another copy's class, so only name and reason cross. */
+  function hostRefusal(reason: 'unsupported' | 'disabled'): Error {
+    const e = new Error(`The host cannot capture audio sources: ${reason}`);
+    e.name = 'AudioSourceUnavailableError';
+    (e as { reason?: string }).reason = reason;
+    return e;
+  }
+
+  it('the host refuses as unsupported: the reason is recorded, no intent, no error event, and no second request reaches the seam', async () => {
+    const started = makeStartedWithCapture(async () => { throw hostRefusal('unsupported'); });
+
+    await started.store.systemAudioOn();
+    await flush();
+
+    expect(started.store.systemAudioRequest).toEqual({ ok: false, reason: 'host-refused', hostRefused: 'unsupported' });
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(get(started.store.systemAudio)).toBeNull();
+    expect(started.events.some(e => e.type === 'error')).toBe(false);
+
+    // This machine cannot capture and that does not change in a session.
+    await started.store.systemAudioOn();
+    expect(started.calls).toHaveLength(1);
+  });
+
+  it('the host refuses as disabled: the reason is recorded but a retry reaches the seam, and a grant clears it', async () => {
+    let refuse = true;
+    const started = makeStartedWithCapture(async () => {
+      if (refuse) throw hostRefusal('disabled');
+      return fakeCapture();
+    });
+
+    await started.store.systemAudioOn();
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true, hostRefused: 'disabled' });
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+    expect(started.events.some(e => e.type === 'error')).toBe(false);
+
+    // The user turned Audio Sources back on in Moss and clicked again.
+    refuse = false;
+    await started.store.systemAudioOn();
+    await flush();
+    expect(started.calls).toHaveLength(2);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(true);
+    started.store.systemAudioOff();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+  });
+
+  it('a cancelled picker after a disabled refusal clears the reason: the host got as far as the picker', async () => {
+    let refuse = true;
+    const started = makeStartedWithCapture(async () => {
+      if (refuse) throw hostRefusal('disabled');
+      return null;
+    });
+    await started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true, hostRefused: 'disabled' });
+    refuse = false;
+    await started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+  });
+
+  it('a generic failure after a disabled refusal clears the reason: the label no longer claims Audio Sources is off', async () => {
+    let refuse = true;
+    const started = makeStartedWithCapture(async () => {
+      if (refuse) throw hostRefusal('disabled');
+      throw new Error('Only one audio source picker may be open at a time.');
+    });
+    await started.store.systemAudioOn();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true, hostRefused: 'disabled' });
+    refuse = false;
+    await started.store.systemAudioOn();
+    expect(started.events.some(e => e.type === 'error')).toBe(true);
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+  });
+
+  it('a cancelled picker records nothing and the row stays enabled', async () => {
+    const started = makeStartedWithCapture(async () => null);
+    await started.store.systemAudioOn();
+    await flush();
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+    expect(started.events.some(e => e.type === 'error')).toBe(false);
+    expect(get(started.store.localIntent).mic.includeSystemAudio).toBe(false);
+  });
+
+  it('negative control: an error that is not a host refusal records nothing and keeps the generic error event', async () => {
+    const started = makeStartedWithCapture(async () => {
+      const e = new Error('The host cannot capture audio sources: quota');
+      e.name = 'AudioSourceUnavailableError';
+      (e as { reason?: string }).reason = 'quota';
+      throw e;
+    });
+    await started.store.systemAudioOn();
+    expect(started.events.some(e => e.type === 'error')).toBe(true);
+    expect(started.store.systemAudioRequest).toEqual({ ok: true });
+  });
+
   it('the grant lands while a device reopen is in flight and that reopen fails: the share runs on without a microphone (PR #5 re-review)', async () => {
     const device1 = new FakeTrack('audio', 'd1');
     let rejectOpen!: () => void;
