@@ -949,8 +949,16 @@ export class RoomView extends LitElement {
     const act = async () => {
       if (disabled) return;
       this.closeClosables();
-      if (active) this.streamsStore.systemAudioOff();
-      else await this.streamsStore.systemAudioOn();
+      if (active) {
+        this.streamsStore.systemAudioOff();
+        return;
+      }
+      await this.streamsStore.systemAudioOn();
+      // The menu closed under the click, before the host answered. A host
+      // refusal is said only in this row's label, so reopen the menu to put
+      // it in view: otherwise the click looks like it did nothing.
+      const after = this.streamsStore.systemAudioRequest;
+      if ('hostRefused' in after && after.hostRefused) this._showAudioSources = true;
     };
     return html`
       <div class="system-audio-divider"></div>
